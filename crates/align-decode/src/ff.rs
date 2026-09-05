@@ -35,10 +35,23 @@ pub fn resolve_bin(env_var: &str, name: &str) -> Option<PathBuf> {
         }
     }
     std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|d| d.join(name))
-            .find(|p| p.is_file())
+        std::env::split_paths(&paths).find_map(|directory| find_in_directory(&directory, name))
     })
+}
+
+fn find_in_directory(directory: &Path, name: &str) -> Option<PathBuf> {
+    let plain = directory.join(name);
+    if plain.is_file() {
+        return Some(plain);
+    }
+    #[cfg(windows)]
+    {
+        let executable = directory.join(format!("{name}.exe"));
+        if executable.is_file() {
+            return Some(executable);
+        }
+    }
+    None
 }
 
 pub fn ffprobe_bin() -> Option<PathBuf> {
@@ -623,6 +636,26 @@ pub fn decode_window(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn executable_lookup_uses_platform_suffix() {
+        let directory =
+            std::env::temp_dir().join(format!("align-bin-lookup-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let name = if cfg!(windows) {
+            "ffprobe.exe"
+        } else {
+            "ffprobe"
+        };
+        let binary = directory.join(name);
+        std::fs::write(&binary, b"fixture").unwrap();
+        assert_eq!(
+            super::find_in_directory(&directory, "ffprobe"),
+            Some(binary)
+        );
+        assert!(super::find_in_directory(&directory, "missing").is_none());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn packet_timing_sorts_b_frames_but_detects_presentation_gaps() {
         use align_core::VideoFrameRateMode;
