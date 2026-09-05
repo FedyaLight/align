@@ -35,7 +35,7 @@ def main():
             writer.writeframes(b''.join(struct.pack('<hh', v, -v) for v in body[start:end]))
     env = dict(os.environ, ALIGN_BACKEND='portable')
     def run(arguments, name):
-        proc = subprocess.run([str(cli), *arguments], env=env, capture_output=True, text=True, timeout=180)
+        proc = subprocess.run([str(cli), *arguments], env=env, capture_output=True, text=True, encoding="utf-8", timeout=180)
         (output / (name + '.stderr')).write_text(proc.stderr, encoding='utf-8')
         (output / (name + '.json')).write_text(proc.stdout, encoding='utf-8')
         if proc.returncode:
