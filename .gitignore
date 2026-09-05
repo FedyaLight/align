@@ -1,0 +1,15 @@
+.build/
+.swiftpm/
+.codex/
+dist/
+.DS_Store
+/target/
+work/*-export*/
+work/*-output/
+work/*-check Masks/
+work/*.prproj
+work/*
+!work/*.md
+!work/ui-current.png
+work/inspect
+Support/AppIcon.iconset/

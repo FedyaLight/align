@@ -1,0 +1,23 @@
+[package]
+name = "align-gpui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Native GPUI desktop app: Metal on macOS, DirectX on Windows, Vulkan on Linux. Single codebase."
+
+[[bin]]
+name = "align"
+path = "src/main.rs"
+
+[dependencies]
+align-core.workspace = true
+align-decode.workspace = true
+gpui.workspace = true
+futures.workspace = true
+mimalloc.workspace = true
+
+[dev-dependencies]
+# Same renderer the GPUI sprite atlas uses: the test below parses every
+# icon exactly like `SvgRenderer::render_pixmap` does.
+usvg = "=0.45.1"

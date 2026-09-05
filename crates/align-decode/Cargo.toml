@@ -1,0 +1,50 @@
+[package]
+name = "align-decode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Cross-platform media inspect/decode: Symphonia for audio containers, bundled FFmpeg sidecar for MOV/MP4/MTS/MXF/R3D, rubato resample."
+
+[dependencies]
+align-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+symphonia.workspace = true
+rubato.workspace = true
+hound.workspace = true
+ltc.workspace = true
+sha2.workspace = true
+blake3.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", default-features = false, features = ["std", "alloc"] }
+block2 = "0.6"
+objc2-core-media = "0.3"
+objc2-core-audio-types = "0.3"
+objc2-core-graphics = "0.3"
+objc2-core-foundation = "0.3"
+objc2-av-foundation = { version = "0.3", default-features = false, features = [
+    "AVAsset",
+    "AVAssetReader",
+    "AVAssetReaderOutput",
+    "AVAssetTrack",
+    "AVMediaFormat",
+    "AVSampleCursor",
+    "block2",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+    "objc2-core-media",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "alloc",
+    "NSArray",
+    "NSDictionary",
+    "NSError",
+    "NSObject",
+    "NSString",
+    "NSURL",
+    "NSValue",
+] }

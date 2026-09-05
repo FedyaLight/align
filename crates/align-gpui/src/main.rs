@@ -1,0 +1,228 @@
+//! align: native GPUI desktop app (Metal / DirectX / Vulkan via Blade).
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+mod icons;
+mod lane;
+mod motion;
+mod state;
+mod text_input;
+mod theme;
+mod views;
+
+use gpui::{
+    App, AppContext, Application, Bounds, Entity, Global, KeyBinding, Menu, MenuItem,
+    SystemMenuType, TitlebarOptions, WindowBounds, WindowOptions, actions, px, size,
+};
+
+actions!(
+    align,
+    [
+        AboutAlign,
+        LightAppearance,
+        DarkAppearance,
+        SystemAppearance,
+        AddMedia,
+        ReloadAndSynchronize,
+        ExportTimeline,
+        OpenPathFixer,
+        ClearAnalysisCache,
+        QuitApp,
+        HideApp,
+        HideOthersApp,
+        ShowAllApps,
+        MinimizeWindow,
+        ZoomWindow,
+        ToggleFullscreen
+    ]
+);
+
+/// Root view handle, reachable from app-level menu actions (which have
+/// no focused view to dispatch through). Window operations themselves
+/// live as view-level `on_action` handlers: dispatch already holds the
+/// window checked out, so they use the borrowed `&mut Window` directly.
+#[derive(Clone)]
+struct AppView(Entity<views::AlignApp>);
+
+impl Global for AppView {}
+
+fn show_about(cx: &mut App) {
+    let Some(view) = cx.try_global::<AppView>().map(|app| app.0.clone()) else {
+        return;
+    };
+    view.update(cx, |this, cx| {
+        this.data.show_about = true;
+        cx.notify();
+    });
+}
+
+fn clear_analysis_cache(cx: &mut App) {
+    let Some(view) = cx.try_global::<AppView>().map(|app| app.0.clone()) else {
+        return;
+    };
+    let cache = align_core::FingerprintCache::new(None);
+    let statistics = cache.statistics();
+    cache.clear();
+    view.update(cx, |this, cx| {
+        this.data.status = if statistics.file_count == 0 {
+            "Analysis cache is already empty.".into()
+        } else {
+            format!(
+                "Cleared {} cached analysis file{} ({:.1} MB).",
+                statistics.file_count,
+                if statistics.file_count == 1 { "" } else { "s" },
+                statistics.total_bytes as f64 / 1_048_576.0
+            )
+        };
+        cx.notify();
+    });
+}
+
+fn update_view(
+    cx: &mut App,
+    update: impl FnOnce(&mut views::AlignApp, &mut gpui::Context<views::AlignApp>),
+) {
+    let Some(view) = cx.try_global::<AppView>().map(|app| app.0.clone()) else {
+        return;
+    };
+    view.update(cx, update);
+}
+
+fn main() {
+    Application::new()
+        .with_assets(icons::FileAssets)
+        .run(|cx: &mut App| {
+            text_input::init(cx);
+            // System commands: without registered actions + bindings + menus
+            // macOS swallows keys like Cmd+Q and the menu bar stays empty.
+            cx.on_action(|_: &AboutAlign, cx| show_about(cx));
+            cx.on_action(|_: &LightAppearance, cx| {
+                update_view(cx, |this, cx| {
+                    this.data.appearance = Some(theme::ThemeMode::Light);
+                    cx.notify();
+                })
+            });
+            cx.on_action(|_: &DarkAppearance, cx| {
+                update_view(cx, |this, cx| {
+                    this.data.appearance = Some(theme::ThemeMode::Dark);
+                    cx.notify();
+                })
+            });
+            cx.on_action(|_: &SystemAppearance, cx| {
+                update_view(cx, |this, cx| {
+                    this.data.appearance = None;
+                    cx.notify();
+                })
+            });
+            cx.on_action(|_: &ClearAnalysisCache, cx| clear_analysis_cache(cx));
+            cx.on_action(|_: &AddMedia, cx| update_view(cx, |this, cx| this.add_media(cx)));
+            cx.on_action(|_: &ReloadAndSynchronize, cx| {
+                update_view(cx, |this, cx| this.start_sync(cx));
+            });
+            cx.on_action(|_: &ExportTimeline, cx| {
+                update_view(cx, |this, cx| this.start_export_sheet(cx));
+            });
+            cx.on_action(|_: &OpenPathFixer, cx| {
+                update_view(cx, |this, cx| this.open_path_fixer(cx));
+            });
+            // Generated icon assets are disposable. Fingerprints are an
+            // OS-managed performance cache and must outlive the session.
+            cx.on_action(|_: &QuitApp, cx| {
+                icons::cleanup();
+                cx.quit();
+            });
+            cx.on_action(|_: &HideApp, cx| cx.hide());
+            cx.on_action(|_: &HideOthersApp, cx| cx.hide_other_apps());
+            cx.on_action(|_: &ShowAllApps, cx| cx.unhide_other_apps());
+            cx.bind_keys([
+                KeyBinding::new("cmd-q", QuitApp, None),
+                KeyBinding::new("cmd-h", HideApp, None),
+                KeyBinding::new("alt-cmd-h", HideOthersApp, None),
+                KeyBinding::new("cmd-m", MinimizeWindow, None),
+                KeyBinding::new("cmd-o", AddMedia, None),
+                KeyBinding::new("cmd-r", ReloadAndSynchronize, None),
+                KeyBinding::new("cmd-e", ExportTimeline, None),
+                KeyBinding::new("ctrl-cmd-f", ToggleFullscreen, None),
+            ]);
+            cx.set_menus(vec![
+                Menu {
+                    name: "Align".into(),
+                    items: vec![
+                        MenuItem::action("About Align", AboutAlign),
+                        MenuItem::separator(),
+                        MenuItem::os_submenu("Services", SystemMenuType::Services),
+                        MenuItem::separator(),
+                        MenuItem::action("Hide Align", HideApp),
+                        MenuItem::action("Hide Others", HideOthersApp),
+                        MenuItem::action("Show All", ShowAllApps),
+                        MenuItem::separator(),
+                        MenuItem::action("Quit Align", QuitApp),
+                    ],
+                },
+                Menu {
+                    name: "File".into(),
+                    items: vec![
+                        MenuItem::action("Add Media…", AddMedia),
+                        MenuItem::action("Reload and Synchronize", ReloadAndSynchronize),
+                        MenuItem::separator(),
+                        MenuItem::action("Export…", ExportTimeline),
+                        MenuItem::separator(),
+                        MenuItem::action("Path Fixer…", OpenPathFixer),
+                        MenuItem::action("Clear Analysis Cache", ClearAnalysisCache),
+                    ],
+                },
+                Menu {
+                    name: "View".into(),
+                    items: vec![
+                        MenuItem::action("Light Appearance", LightAppearance),
+                        MenuItem::action("Dark Appearance", DarkAppearance),
+                        MenuItem::action("System Appearance", SystemAppearance),
+                    ],
+                },
+                Menu {
+                    name: "Window".into(),
+                    items: vec![
+                        MenuItem::action("Minimize", MinimizeWindow),
+                        MenuItem::action("Zoom", ZoomWindow),
+                        MenuItem::separator(),
+                        MenuItem::action("Toggle Full Screen", ToggleFullscreen),
+                    ],
+                },
+            ]);
+
+            let bounds = Bounds::centered(None, size(px(880.), px(540.)), cx);
+            let view = cx.new(views::AlignApp::new);
+            cx.set_global(AppView(view.clone()));
+            let window = match cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(size(px(760.), px(440.))),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("Align".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                {
+                    let view = view.clone();
+                    move |_, _| view
+                },
+            ) {
+                Ok(window) => window,
+                Err(_) => {
+                    eprintln!("error: could not open application window");
+                    std::process::exit(1);
+                }
+            };
+            cx.set_global(AppView(view));
+            // Initial keyboard focus: without it system shortcuts stay dead
+            // until the user clicks something focusable (of which we have none).
+            window
+                .update(cx, |view, window, _| {
+                    window.focus(&view.focus_handle);
+                })
+                .ok();
+            cx.activate(true);
+        });
+}

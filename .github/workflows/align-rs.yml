@@ -1,0 +1,111 @@
+name: align-rs
+
+on:
+  push:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "script/**"
+      - ".github/workflows/align-rs.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "script/**"
+  workflow_dispatch:
+
+jobs:
+  check-test:
+    name: check · test · clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # System FFmpeg for the portable backend's container tier + fixtures.
+      - name: Install FFmpeg (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libasound2-dev libudev-dev libvulkan-dev
+      - name: Install FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+      - name: Install FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y
+      - name: cargo check
+        run: cargo check --workspace --all-targets
+      - name: cargo clippy (deny warnings, ours)
+        # Transitive future-incompat notices are not ours; fail only on real lints.
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Build release CLI
+        run: cargo build --release -p align-cli
+      - name: Verify release CLI
+        shell: bash
+        run: |
+          exe=""
+          if [[ "${{ runner.os }}" == "Windows" ]]; then exe=".exe"; fi
+          python script/check-release-smoke.py "target/release/align-cli$exe" release-smoke
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-${{ runner.os }}
+          path: release-smoke/
+
+
+  release:
+    name: release binaries (${{ matrix.os }})
+    needs: check-test
+    if: startsWith(github.ref, 'refs/tags/align-rs-v')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows'
+        with:
+          msystem: MINGW64
+          install: >-
+            curl diffutils make mingw-w64-x86_64-gcc nasm pkgconf tar xz
+      - name: Build release
+        run: cargo build --release -p align-cli -p align-gpui
+      - name: Build minimal FFmpeg sidecars (Linux)
+        if: runner.os == 'Linux'
+        run: ./script/build-ffmpeg-minimal.sh target/ffmpeg-minimal
+      - name: Build minimal FFmpeg sidecars (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: ./script/build-ffmpeg-minimal.sh target/ffmpeg-minimal
+      - name: Stage release
+        shell: bash
+        run: |
+          exe=""
+          if [[ "${{ runner.os }}" == "Windows" ]]; then exe=".exe"; fi
+          mkdir -p dist-bundle
+          cp "target/release/align-cli$exe" "target/release/align$exe" dist-bundle/
+          cp THIRD_PARTY_NOTICES.txt dist-bundle/
+          if [[ "${{ runner.os }}" != "macOS" ]]; then
+            cp target/ffmpeg-minimal/* dist-bundle/
+          fi
+          ls -la dist-bundle/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: align-${{ runner.os }}
+          path: dist-bundle/

@@ -1,0 +1,53 @@
+[workspace]
+members = ["crates/align-core", "crates/align-decode", "crates/align-cli", "crates/align-gpui"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+align-core = { path = "crates/align-core" }
+align-decode = { path = "crates/align-decode" }
+bincode = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+quick-xml = { version = "0.37", features = ["serialize"] }
+sha2 = "0.10"
+blake3 = "1"
+thiserror = "2"
+futures = "0.3"
+clap = { version = "4", features = ["derive"] }
+realfft = "3"
+rustfft = "6"
+num-complex = "0.4"
+rubato = "0.15"
+symphonia = { version = "0.5", default-features = false, features = [
+    # Only containers/codecs the media set needs (WAV/AIFF/M4A/MP3/PCM);
+    # video containers go through the ffmpeg tier, not Symphonia.
+    "wav",
+    "aiff",
+    "isomp4",
+    "mp3",
+    "aac",
+    "alac",
+    "pcm",
+] }
+hound = "3"
+ltc = "0.2"
+dirs = "6"
+gpui = "0.2.2"
+mimalloc = { version = "0.1", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+# Size levers that cost no runtime speed: single codegen unit and no
+# unwind tables in the shipped binaries (tests keep the dev profile).
+codegen-units = 1
+panic = "abort"
+strip = true
+# Один job декода ~128 КБ стейта; thin-LTO даёт почти max скорость
+# без 10-минутных сборок fat-LTO на CI под 3 ОС.

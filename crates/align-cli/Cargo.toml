@@ -1,0 +1,19 @@
+[package]
+name = "align-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Align batch CLI (sync / export / export-json)."
+
+[[bin]]
+name = "align-cli"
+path = "src/main.rs"
+
+[dependencies]
+align-core.workspace = true
+align-decode.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+mimalloc.workspace = true
