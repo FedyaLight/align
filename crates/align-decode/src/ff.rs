@@ -441,7 +441,7 @@ impl AudioPipe {
                 break;
             }
             self.leftover.extend_from_slice(&chunk[..n]);
-            let usable = self.leftover.len() / 4 * 4;
+            let usable = complete_frame_bytes(self.leftover.len(), self.channels)?;
             frames.clear();
             frames.extend(
                 self.leftover[..usable]
@@ -455,6 +455,9 @@ impl AudioPipe {
             }
         }
         let status = self.child.wait().map_err(DecodeError::Io)?;
+        if !self.leftover.is_empty() {
+            return Err(DecodeError::InvalidPcm);
+        }
         Ok(status.success())
     }
 }
@@ -465,6 +468,14 @@ impl Drop for AudioPipe {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+fn complete_frame_bytes(bytes: usize, channels: usize) -> Result<usize, DecodeError> {
+    let frame_bytes = channels
+        .checked_mul(4)
+        .filter(|&n| n > 0)
+        .ok_or(DecodeError::InvalidPcm)?;
+    Ok(bytes / frame_bytes * frame_bytes)
 }
 
 /// s32le twin of [`AudioPipe`] for bit-exact integer stems.
@@ -529,7 +540,7 @@ impl AudioPipeI32 {
                 break;
             }
             self.leftover.extend_from_slice(&chunk[..n]);
-            let usable = self.leftover.len() / 4 * 4;
+            let usable = complete_frame_bytes(self.leftover.len(), self.channels)?;
             frames.clear();
             frames.extend(
                 self.leftover[..usable]
@@ -543,6 +554,9 @@ impl AudioPipeI32 {
             }
         }
         let status = self.child.wait().map_err(DecodeError::Io)?;
+        if !self.leftover.is_empty() {
+            return Err(DecodeError::InvalidPcm);
+        }
         Ok(status.success())
     }
 }
@@ -636,6 +650,26 @@ pub fn decode_window(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pipe_fragments_preserve_complete_multichannel_frames() {
+        for channels in [1, 2, 3, 6, 8] {
+            let original: Vec<u8> = (0..channels * 4 * 37).map(|n| n as u8).collect();
+            for chunk_size in [1, 3, 4, 7, 13, 64, 257] {
+                let mut pending = Vec::new();
+                let mut reconstructed = Vec::new();
+                for chunk in original.chunks(chunk_size) {
+                    pending.extend_from_slice(chunk);
+                    let usable = super::complete_frame_bytes(pending.len(), channels).unwrap();
+                    assert_eq!(usable % (channels * 4), 0);
+                    reconstructed.extend(pending.drain(..usable));
+                }
+                assert!(pending.is_empty());
+                assert_eq!(reconstructed, original);
+            }
+        }
+        assert!(super::complete_frame_bytes(4, 0).is_err());
+    }
+
     #[test]
     fn executable_lookup_uses_platform_suffix() {
         let directory =
