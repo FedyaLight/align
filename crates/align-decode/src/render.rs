@@ -229,8 +229,6 @@ impl WavWriter {
 
 /// Rendered segment: source range stretched to the island range.
 struct Segment {
-    source_start: f64,
-    source_duration: f64,
     resampler: Vec<FftFixedIn<f32>>,
     pending: Vec<Vec<f32>>,
     skip: usize,
@@ -241,7 +239,7 @@ struct Segment {
 
 impl Segment {
     fn new(
-        source_start: f64,
+        _source_start: f64,
         source_duration: f64,
         target_duration: f64,
         sample_rate: f64,
@@ -264,8 +262,6 @@ impl Segment {
             .first()
             .map_or(0, |r: &FftFixedIn<f32>| r.output_delay());
         Ok(Self {
-            source_start,
-            source_duration,
             resampler,
             pending: vec![Vec::new(); channels],
             skip,
@@ -407,74 +403,45 @@ pub fn render_drift_cancellable(
     ));
     let result = (|| {
         let mut writer = WavWriter::create(&tmp, sample_rate as u32, channels, false)?;
-        let mut segs: Vec<Segment> = segments
-            .iter()
-            .map(|(s, sd, td)| Segment::new(*s, *sd, *td, sample_rate, channels))
-            .collect::<Result<_, _>>()?;
-        let total_target: usize = segs.iter().map(|s| s.expected).sum();
-        let mut seg_idx = 0usize;
-        let mut seg_consumed = 0f64; // source seconds consumed in current segment
-        let mut source_pos = 0f64; // source seconds streamed so far
-        let rate = sample_rate;
-        backend
-            .decode_native(source, 0, None, &mut |block: NativeBlock| {
-                check_cancel(cancel).map_err(decode_render_error)?;
-                let mut offset = 0usize;
-                let mut remaining = block.frames[0].len();
-                while remaining > 0 && seg_idx < segs.len() {
-                    // Skip source audio before the first mapped point.
-                    let seg_start = segs[seg_idx].source_start;
-                    if source_pos < seg_start {
-                        let skip = ((seg_start - source_pos) * rate).round() as usize;
-                        let skip = skip.min(remaining);
-                        offset += skip;
-                        remaining -= skip;
-                        source_pos += skip as f64 / rate;
-                        continue;
-                    }
-                    let seg = &mut segs[seg_idx];
-                    let seg_frames_left =
-                        ((seg.source_duration - seg_consumed) * rate).round() as usize;
-                    // The block may extend past the segment: split it.
-                    let take = remaining.min(seg_frames_left.max(1));
-                    let slice: Vec<Vec<f32>> = block
-                        .frames
-                        .iter()
-                        .map(|ch| ch[offset..offset + take].to_vec())
-                        .collect();
-                    let out = seg.push(slice).map_err(decode_render_error)?;
-                    writer
-                        .write_f32(channels, &out)
-                        .map_err(decode_render_error)?;
-                    offset += take;
-                    remaining -= take;
-                    seg_consumed += take as f64 / rate;
-                    source_pos += take as f64 / rate;
-                    if seg_consumed + 1e-9 >= seg.source_duration {
-                        let tail = seg.finish(cancel).map_err(decode_render_error)?;
+        for &(source_start, source_duration, target_duration) in &segments {
+            check_cancel(cancel)?;
+            let ratio = target_duration / source_duration;
+            // Supply real neighboring samples to each independent filter.
+            // Zero-padding at an internal knot otherwise creates an impulse
+            // whenever the signal is nonzero there. Guard audio is filtered
+            // but excluded from the emitted segment length.
+            let start_frame = (source_start * sample_rate).round() as usize;
+            let guard_frames = start_frame.min(4096);
+            let decode_start = (start_frame - guard_frames) as f64 / sample_rate;
+            let decode_end =
+                (source_start + source_duration + 4096.0 / sample_rate).min(probe.duration_seconds);
+            let mut segment = Segment::new(
+                source_start,
+                source_duration,
+                target_duration,
+                sample_rate,
+                channels,
+            )?;
+            segment.skip += (guard_frames as f64 * ratio).round() as usize;
+            backend
+                .decode_native(
+                    source,
+                    0,
+                    Some((decode_start, Some((decode_end - decode_start).max(0.0)))),
+                    &mut |block: NativeBlock| {
+                        check_cancel(cancel).map_err(decode_render_error)?;
+                        let out = segment.push(block.frames).map_err(decode_render_error)?;
                         writer
-                            .write_f32(channels, &tail)
-                            .map_err(decode_render_error)?;
-                        seg_idx += 1;
-                        seg_consumed = 0.0;
-                    }
-                }
-                // Audio past the last mapped point is dropped (mapping spans
-                // the placed range by construction).
-                Ok(())
-            })
-            .map_err(RenderError::from)?;
-        // Flush a trailing segment when the stream ends exactly on it.
-        while seg_idx < segs.len() {
-            let tail = segs[seg_idx].finish(cancel)?;
-            writer
-                .write_f32(channels, &tail)
-                .map_err(decode_render_error)?;
-            seg_idx += 1;
+                            .write_f32(channels, &out)
+                            .map_err(decode_render_error)
+                    },
+                )
+                .map_err(RenderError::from)?;
+            let tail = segment.finish(cancel)?;
+            writer.write_f32(channels, &tail)?;
         }
         check_cancel(cancel)?;
         writer.finalize()?;
-        let _ = total_target;
         Ok::<(), RenderError>(())
     })();
     match result {
@@ -1302,7 +1269,7 @@ mod tests {
         };
         let tone = |time: f64, channel: usize| {
             let frequency = [317.0, 733.0][channel];
-            0.4 * (std::f64::consts::TAU * frequency * time).sin()
+            0.4 * (std::f64::consts::TAU * frequency * time + [0.37, 0.83][channel]).sin()
         };
         let mut writer = hound::WavWriter::create(&src, spec).unwrap();
         for frame in 0..8 * rate {
@@ -1358,6 +1325,30 @@ mod tests {
             assert!(
                 rms < one_sample_rms,
                 "channel {channel}: analytic RMS error {rms}, one-sample bound {one_sample_rms}"
+            );
+        }
+        // Inspect the previously excluded 40 ms around the rate change.
+        // Bound instantaneous error by one source-sample sine displacement,
+        // allowing 0.001 for numerical filter error.
+        for channel in 0..2 {
+            let mut peak_error = 0.0_f64;
+            for frame in ((3.984 * f64::from(rate)) as usize)..((4.024 * f64::from(rate)) as usize)
+            {
+                let time = frame as f64 / f64::from(rate);
+                let source = if time < 4.004 {
+                    time / 1.001
+                } else {
+                    4.0 + (time - 4.004) / 0.999
+                };
+                peak_error = peak_error
+                    .max((f64::from(samples[frame * 2 + channel]) - tone(source, channel)).abs());
+            }
+            let bound = 0.8
+                * (std::f64::consts::PI * [317.0, 733.0][channel] / f64::from(rate)).sin()
+                + 0.001;
+            assert!(
+                peak_error < bound,
+                "channel {channel}: seam peak {peak_error}, bound {bound}"
             );
         }
         std::fs::remove_dir_all(dir).unwrap();

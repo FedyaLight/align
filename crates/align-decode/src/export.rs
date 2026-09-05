@@ -319,7 +319,7 @@ pub fn export_prepared(
                         format!("drift {}{}ppm", if ppm >= 0 { "+" } else { "" }, ppm)
                     };
                     let destination = audio_dir.join(format!(
-                        "{stem} – {correction} – {suffix}-{}-{}-r10.wav",
+                        "{stem} – {correction} – {suffix}-{}-{}-r11.wav",
                         item.mapping_digest(),
                         source_tags[&item.clip.url]
                     ));
@@ -428,7 +428,7 @@ pub fn export_prepared(
                     let urls = (0..channels)
                         .map(|channel| {
                             let destination = precision_dir.join(format!(
-                                "{stem} – channel {} – {suffix}-{}-{}-{}-r10.wav",
+                                "{stem} – channel {} – {suffix}-{}-{}-{}-r11.wav",
                                 channel + 1,
                                 prepared.precision_digest(),
                                 source_tags[&item.clip.url],
@@ -567,7 +567,7 @@ fn pad_plan(
     Some((
         pad,
         audio_dir.join(format!(
-            "{stem} – pad {pad} – {suffix}-{tag}-{}-{}-{source_tag}-r10.wav",
+            "{stem} – pad {pad} – {suffix}-{tag}-{}-{}-{source_tag}-r11.wav",
             item.selected_source_in("audio").to_bits(),
             item.selected_source_out("audio").to_bits()
         )),
