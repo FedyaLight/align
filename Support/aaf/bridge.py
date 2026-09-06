@@ -172,7 +172,11 @@ def read_audio(path):
 def read_timeline(path, audio_only=False):
     """Read linked picture/sound edits; retain each track's rational clock."""
     with aaf2.open(str(path), 'r') as container:
-        def resolve(clip, rate, visited):
+        def resolve(clip, rate, visited, offset=0, length=None):
+            length = int(clip.length) if length is None else length
+            source_start = int(clip.start) + offset
+            if source_start < 0 or length < 0:
+                raise ValueError('Negative AAF source range')
             mob = clip.mob
             if mob is None:
                 raise ValueError('AAF source reference is unresolved')
@@ -194,7 +198,7 @@ def read_timeline(path, audio_only=False):
                         raise ValueError('AAF source requires one media locator')
                     physical = slot['PhysicalTrackNumber'].value if 'PhysicalTrackNumber' in slot else None
                     if slot.media_kind == 'Picture':
-                        return locator_path(urls[0]), int(clip.start), None
+                        return [(locator_path(urls[0]), source_start, None, length)]
                     if physical is None:
                         sound_slots = [s for s in mob.slots if s.media_kind == 'Sound']
                         if len(sound_slots) != 1:
@@ -202,17 +206,30 @@ def read_timeline(path, audio_only=False):
                         physical = 1
                     if physical < 1:
                         raise ValueError('Invalid AAF physical channel')
-                    return locator_path(urls[0]), int(clip.start), int(physical) - 1
+                    return [(locator_path(urls[0]), source_start, int(physical) - 1, length)]
             segment = slot.segment
-            if isinstance(segment, aaf2.components.Sequence):
-                parts = list(segment.components)
-                if len(parts) != 1:
-                    raise ValueError('Edited AAF source mob is not implemented')
-                segment = parts[0]
-            if not isinstance(segment, aaf2.components.SourceClip):
-                raise ValueError('Unsupported AAF source component')
-            media, source_in, channel = resolve(segment, source_rate, visited | {key})
-            return media, source_in + int(clip.start), channel
+            parts = list(segment.components) if isinstance(segment, aaf2.components.Sequence) else [segment]
+            output = []
+            cursor = 0
+            covered = 0
+            for part in parts:
+                part_length = int(part.length)
+                if part_length < 0:
+                    raise ValueError('Negative AAF source component length')
+                begin = max(source_start, cursor)
+                end = min(source_start + length, cursor + part_length)
+                if begin < end:
+                    if isinstance(part, aaf2.components.SourceClip):
+                        output.extend(resolve(part, source_rate, visited | {key}, begin - cursor, end - begin))
+                    elif isinstance(part, aaf2.components.Filler):
+                        output.append((None, 0, None, end - begin))
+                    else:
+                        raise ValueError('Unsupported AAF source component')
+                    covered += end - begin
+                cursor += part_length
+            if covered != length:
+                raise ValueError('AAF source reference exceeds its source sequence')
+            return output
 
         sequences = []
         for composition in container.content.toplevel():
@@ -234,8 +251,12 @@ def read_timeline(path, audio_only=False):
                     if length < 0:
                         raise ValueError('Negative AAF component length')
                     if isinstance(part, aaf2.components.SourceClip):
-                        media, source_in, channel = resolve(part, rate, set())
-                        clips.append({'path': media, 'start': cursor, 'source_in': source_in, 'length': length, 'channel': channel})
+                        position = cursor
+                        for media, source_in, channel, span in resolve(part, rate, set()):
+                            if media is not None and span:
+                                clips.append({'path': media, 'start': position, 'source_in': source_in,
+                                    'length': span, 'channel': channel})
+                            position += span
                     elif not isinstance(part, aaf2.components.Filler):
                         raise ValueError('Unsupported AAF timeline component')
                     cursor += length

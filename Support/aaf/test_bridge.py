@@ -11,6 +11,39 @@ import aaf2
 
 
 class SourceValidation(unittest.TestCase):
+    def test_nested_source_sequence_splits_cuts_and_preserves_gaps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            media = Path(directory) / 'mono.wav'
+            with wave.open(str(media), 'wb') as writer:
+                writer.setparams((1, 2, 48000, 0, 'NONE', 'PCM'))
+                writer.writeframes(b'\0' * 2000)
+            path = Path(directory) / 'nested.aaf'
+            with aaf2.open(str(path), 'w') as container:
+                metadata = {'format': {'format_name': 'wav'}, 'streams': [{
+                    'codec_type': 'audio', 'sample_rate': '48000', 'duration_ts': 1000, 'channels': 1}]}
+                master, _, _ = container.content.create_ama_link(str(media), metadata)
+                nested = container.create.CompositionMob('Nested edits')
+                container.content.mobs.append(nested)
+                slot = nested.create_sound_slot(48000)
+                slot.segment.components.append(master.create_source_clip(slot_id=1, start=100, length=100, media_kind='sound'))
+                slot.segment.components.append(container.create.Filler('sound', 20))
+                slot.segment.components.append(master.create_source_clip(slot_id=1, start=500, length=100, media_kind='sound'))
+                slot.segment.length = 220
+                top = container.create.CompositionMob('Top'); top.usage = 'Usage_TopLevel'
+                container.content.mobs.append(top)
+                target = top.create_sound_slot(48000)
+                target.segment.components.append(nested.create_source_clip(slot_id=slot.slot_id, start=50, length=120, media_kind='sound'))
+                target.segment.length = 120
+            clips = read_timeline(path)['sequences'][0]['tracks'][0]['clips']
+            self.assertEqual([(clip['start'], clip['source_in'], clip['length']) for clip in clips],
+                [(0, 150, 50), (70, 500, 50)])
+            with aaf2.open(str(path), 'rw') as container:
+                top = next(container.content.toplevel())
+                top.slots[0].segment.components[0].length = 171
+                top.slots[0].segment.length = 171
+            with self.assertRaisesRegex(ValueError, 'exceeds'):
+                read_timeline(path)
+
     def test_picture_export_links_real_media_and_preserves_output_on_error(self):
         with tempfile.TemporaryDirectory() as directory:
             media = Path(directory) / 'camera.mov'
