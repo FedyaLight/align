@@ -30,7 +30,7 @@ pub fn read(
     cancel: &AtomicBool,
 ) -> Result<TimelineDraft, TimelineError> {
     if is_aaf(path) {
-        Ok(crate::aaf::read_audio(path, cancel)?.into_draft(path, sequence)?)
+        Ok(crate::aaf::read_timeline(path, cancel)?.into_draft(path, sequence)?)
     } else {
         Ok(align_core::read_timeline(path, sequence)?)
     }
@@ -41,7 +41,7 @@ pub fn sequences(
     cancel: &AtomicBool,
 ) -> Result<Vec<TimelineSequenceSummary>, TimelineError> {
     if is_aaf(path) {
-        Ok(crate::aaf::read_audio(path, cancel)?.summaries())
+        Ok(crate::aaf::read_timeline(path, cancel)?.summaries())
     } else {
         Ok(align_core::timeline_sequence_summaries(path)?)
     }

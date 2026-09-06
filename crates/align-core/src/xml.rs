@@ -247,6 +247,7 @@ pub struct DraftEdit {
     pub fcp7_labels_xml: Option<String>,
     /// Resolution for imported edit times; AAF uses the track sample rate.
     pub time_scale: i32,
+    pub include_embedded_audio: bool,
     pub audio_source_channel: Option<usize>,
     pub fcpxml_audio_role: Option<String>,
     pub track_index: usize,
@@ -478,7 +479,7 @@ impl TimelineDraft {
         for video in self
             .edits
             .iter()
-            .filter(|e| e.media_type == DraftMediaKind::Video)
+            .filter(|e| e.media_type == DraftMediaKind::Video && e.include_embedded_audio)
         {
             let explicit: Vec<_> = audio_edits
                 .iter()
@@ -567,11 +568,12 @@ impl TimelineDraft {
                     continue;
                 }
             }
-            let embedded = if edit.media_type == DraftMediaKind::Video {
-                closest_embedded_audio(edit, &audio_edits, self.frame_duration.as_seconds())
-            } else {
-                None
-            };
+            let embedded =
+                if edit.media_type == DraftMediaKind::Video && edit.include_embedded_audio {
+                    closest_embedded_audio(edit, &audio_edits, self.frame_duration.as_seconds())
+                } else {
+                    None
+                };
             let transition =
                 transitions_by_left.get(&format!("{}:{}", edit.media_type.raw(), edit.id));
             let linked_audio_edit = embedded.map(|audio| TimelineLinkedAudioEdit {
@@ -622,7 +624,11 @@ impl TimelineDraft {
                 enabled: edit.enabled,
                 track_enabled: edit.track_enabled,
                 track_locked: edit.track_locked,
-                audio_enabled: embedded.map(|a| a.enabled),
+                audio_enabled: if edit.include_embedded_audio {
+                    embedded.map(|a| a.enabled)
+                } else {
+                    Some(false)
+                },
                 audio_track_enabled: embedded.map(|a| a.track_enabled),
                 audio_track_locked: embedded.map(|a| a.track_locked),
                 transition_after: if edit.media_type == DraftMediaKind::Video {
@@ -1442,6 +1448,7 @@ fn read_fcp7(
                         .first()
                         .map(|&labels| ctx.doc.verbatim(labels).to_string()),
                     time_scale: 1_000_000,
+                    include_embedded_audio: true,
                     audio_source_channel: if ctx.media_type == DraftMediaKind::Audio {
                         ctx.doc
                             .children_named(clip_item, "sourcetrack")
@@ -2526,6 +2533,7 @@ fn read_fcpxml(
                 fcp7_retime_duration: None,
                 fcp7_labels_xml: None,
                 time_scale: 1_000_000,
+                include_embedded_audio: true,
                 audio_source_channel: None,
                 fcpxml_audio_role: None,
                 track_index: (lane + place.lane_shift).max(0) as usize,
@@ -2558,6 +2566,7 @@ fn read_fcpxml(
                 fcp7_retime_duration: None,
                 fcp7_labels_xml: None,
                 time_scale: 1_000_000,
+                include_embedded_audio: true,
                 audio_source_channel: {
                     let components = refs.doc.children_named(clip, "audio-channel-source");
                     if components.len() == 1 {
@@ -2649,6 +2658,7 @@ fn read_fcpxml(
                 fcp7_retime_duration: None,
                 fcp7_labels_xml: None,
                 time_scale: 1_000_000,
+                include_embedded_audio: true,
                 audio_source_channel: None,
                 fcpxml_audio_role: None,
                 track_index: (lane + place.lane_shift).max(0) as usize,
@@ -2692,6 +2702,7 @@ fn read_fcpxml(
                 fcp7_retime_duration: None,
                 fcp7_labels_xml: None,
                 time_scale: 1_000_000,
+                include_embedded_audio: true,
                 audio_source_channel: None,
                 fcpxml_audio_role: refs
                     .doc
@@ -4063,6 +4074,7 @@ mod tests {
             fcp7_retime_duration: None,
             fcp7_labels_xml: None,
             time_scale: 1_000_000,
+            include_embedded_audio: true,
             audio_source_channel: None,
             fcpxml_audio_role: None,
             track_index: 1,

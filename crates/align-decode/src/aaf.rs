@@ -41,7 +41,11 @@ pub struct ImportedSequence {
 #[derive(Debug, Deserialize)]
 pub struct ImportedTrack {
     pub name: String,
+    #[serde(default)]
     pub sample_rate: u32,
+    #[serde(default)]
+    pub media_kind: ImportedKind,
+    pub edit_rate: Option<ImportedRate>,
     pub clips: Vec<ImportedClip>,
 }
 #[derive(Debug, Deserialize)]
@@ -50,7 +54,31 @@ pub struct ImportedClip {
     pub start: u64,
     pub source_in: u64,
     pub length: u64,
-    pub channel: usize,
+    pub channel: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ImportedKind {
+    #[default]
+    Sound,
+    Picture,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportedRate {
+    pub numerator: u32,
+    pub denominator: u32,
+}
+
+impl ImportedTrack {
+    fn clock(&self) -> (u32, u32) {
+        self.edit_rate
+            .as_ref()
+            .map_or((self.sample_rate, 1), |rate| {
+                (rate.numerator, rate.denominator)
+            })
+    }
 }
 
 impl ImportedAudio {
@@ -92,8 +120,13 @@ impl ImportedAudio {
             ))
         })?;
         let mut edits = Vec::new();
+        let mut frame_duration = None;
         for (track_index, track) in sequence.tracks.into_iter().enumerate() {
-            let rate = track.sample_rate as f64;
+            let (numerator, denominator) = track.clock();
+            let rate = numerator as f64 / denominator as f64;
+            if track.media_kind == ImportedKind::Picture {
+                frame_duration.get_or_insert(MediaTime::new(denominator as i64, numerator as i32));
+            }
             for (clip_index, clip) in track.clips.into_iter().enumerate() {
                 edits.push(DraftEdit {
                     id: format!("aaf-{index}-{track_index}-{clip_index}"),
@@ -102,7 +135,10 @@ impl ImportedAudio {
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned()),
                     url: clip.path,
-                    media_type: DraftMediaKind::Audio,
+                    media_type: match track.media_kind {
+                        ImportedKind::Sound => DraftMediaKind::Audio,
+                        ImportedKind::Picture => DraftMediaKind::Video,
+                    },
                     source_in: clip.source_in as f64 / rate,
                     source_out: (clip.source_in + clip.length) as f64 / rate,
                     timeline_start: clip.start as f64 / rate,
@@ -115,8 +151,9 @@ impl ImportedAudio {
                     fcp7_retime_out: None,
                     fcp7_retime_duration: None,
                     fcp7_labels_xml: None,
-                    time_scale: track.sample_rate as i32,
-                    audio_source_channel: Some(clip.channel),
+                    time_scale: numerator as i32,
+                    include_embedded_audio: false,
+                    audio_source_channel: clip.channel,
                     fcpxml_audio_role: None,
                     track_index: track_index + 1,
                     enabled: true,
@@ -128,7 +165,7 @@ impl ImportedAudio {
         }
         if edits.is_empty() {
             return Err(AafError::Writer(
-                "AAF sequence contains no audio clips".into(),
+                "AAF sequence contains no media clips".into(),
             ));
         }
         Ok(TimelineDraft {
@@ -136,7 +173,7 @@ impl ImportedAudio {
             name: sequence.name,
             // Audio AAF has no picture edit rate. Use the application's default
             // picture rate while retaining each edit's native sample clock.
-            frame_duration: MediaTime::new(1, 25),
+            frame_duration: frame_duration.unwrap_or(MediaTime::new(1, 25)),
             edits,
             transitions: Vec::new(),
             warnings: Vec::new(),
@@ -145,6 +182,19 @@ impl ImportedAudio {
 }
 
 pub fn read_audio(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, AafError> {
+    read_response(path, cancel, "read-audio", 1)
+}
+
+pub fn read_timeline(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, AafError> {
+    read_response(path, cancel, "read-timeline", 2)
+}
+
+fn read_response(
+    path: &Path,
+    cancel: &AtomicBool,
+    operation: &str,
+    version: u32,
+) -> Result<ImportedAudio, AafError> {
     if cancel.load(Ordering::Relaxed) {
         return Err(AafError::Cancelled);
     }
@@ -153,7 +203,7 @@ pub fn read_audio(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, Aaf
     // cancellable process supervision and automatic temporary-file cleanup.
     let mut output = tempfile::tempfile()?;
     let mut child = Command::new(executable)
-        .arg("read-audio")
+        .arg(operation)
         .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::from(output.try_clone()?))
@@ -173,29 +223,43 @@ pub fn read_audio(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, Aaf
     output.seek(SeekFrom::Start(0))?;
     let result: ImportedAudio =
         serde_json::from_reader(output).map_err(|e| AafError::Writer(e.to_string()))?;
+    if result.version != version {
+        return Err(AafError::Writer(
+            "AAF module protocol version mismatch".into(),
+        ));
+    }
     validate_import(&result)?;
     Ok(result)
 }
 
 fn validate_import(result: &ImportedAudio) -> Result<(), AafError> {
-    if result.version != 1 || result.sequences.is_empty() {
+    if ![1, 2].contains(&result.version) || result.sequences.is_empty() {
         return Err(AafError::Writer("Unsupported or empty AAF response".into()));
     }
     for sequence in &result.sequences {
         for track in &sequence.tracks {
-            if track.sample_rate == 0
-                || track.sample_rate > i32::MAX as u32
+            let (numerator, denominator) = track.clock();
+            let valid_end = |start: u64, length: u64| {
+                start
+                    .checked_add(length)
+                    .and_then(|end| end.checked_mul(denominator as u64))
+                    .is_some_and(|end| end < (1u64 << 52))
+            };
+            if numerator == 0
+                || numerator > i32::MAX as u32
+                || denominator == 0
+                || (result.version == 2 && track.edit_rate.is_none())
+                || (track.media_kind == ImportedKind::Sound && denominator != 1)
                 || track.clips.iter().any(|clip| {
                     clip.length == 0
-                        || clip.channel == usize::MAX
-                        || clip
-                            .start
-                            .checked_add(clip.length)
-                            .is_none_or(|end| end > (1u64 << 53) - 1)
-                        || clip
-                            .source_in
-                            .checked_add(clip.length)
-                            .is_none_or(|end| end > (1u64 << 53) - 1)
+                        || match track.media_kind {
+                            ImportedKind::Sound => {
+                                clip.channel.is_none_or(|channel| channel == usize::MAX)
+                            }
+                            ImportedKind::Picture => clip.channel.is_some(),
+                        }
+                        || !valid_end(clip.start, clip.length)
+                        || !valid_end(clip.source_in, clip.length)
                 })
             {
                 return Err(AafError::Writer("Invalid AAF sample range".into()));
@@ -370,6 +434,41 @@ pub fn audio_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picture_clock_and_separate_sound_survive_resolution() {
+        let imported: ImportedAudio = serde_json::from_value(serde_json::json!({
+            "version":2,"sequences":[{"name":"Camera edit","tracks":[
+                {"name":"V1","media_kind":"picture","edit_rate":{"numerator":30000,"denominator":1001},
+                 "clips":[{"path":"/camera.mov","start":7,"source_in":11,"length":101,"channel":null}]},
+                {"name":"A1","media_kind":"sound","edit_rate":{"numerator":48000,"denominator":1},
+                 "clips":[{"path":"/camera.mov","start":11211,"source_in":17618,"length":161762,"channel":1}]}
+            ]}]
+        })).unwrap();
+        let draft = imported.into_draft(Path::new("camera.aaf"), None).unwrap();
+        assert_eq!(
+            draft.frame_duration,
+            align_core::MediaTime::new(1001, 30000)
+        );
+        let clip: align_core::Clip = serde_json::from_value(serde_json::json!({
+            "id":"camera","url":"/camera.mov","kind":"video","duration":{"value":10,"timescale":1},
+            "audio":[{"sampleRate":48000.0,"channels":2}],
+            "video":{"width":1920,"height":1080,"frameDuration":{"value":1001,"timescale":30000}}
+        }))
+        .unwrap();
+        let resolved = draft.resolve(&[clip]);
+        assert_eq!(resolved.edits.len(), 2);
+        let video = &resolved.edits[0];
+        assert_eq!(video.source_in, align_core::MediaTime::new(11011, 30000));
+        assert_eq!(
+            video.timeline_start,
+            align_core::MediaTime::new(7007, 30000)
+        );
+        assert_eq!(video.source_out, align_core::MediaTime::new(112112, 30000));
+        assert_eq!(video.audio_enabled, Some(false));
+        assert!(video.linked_audio_edit.is_none());
+        assert_eq!(resolved.edits[1].audio_source_channel, Some(1));
+    }
 
     fn stereo_import() -> ImportedAudio {
         serde_json::from_value(serde_json::json!({
@@ -577,7 +676,7 @@ mod tests {
         )
         .unwrap();
         validate_import(&imported).unwrap();
-        assert_eq!(imported.sequences[0].tracks[0].clips[0].channel, 1);
+        assert_eq!(imported.sequences[0].tracks[0].clips[0].channel, Some(1));
         imported.sequences[0].tracks[0].clips[0].start = u64::MAX;
         assert!(validate_import(&imported).is_err());
         imported.sequences[0].tracks[0].clips[0].start = 0;
@@ -590,7 +689,7 @@ mod tests {
         imported.sequences[0].tracks[0].sample_rate = 0;
         assert!(validate_import(&imported).is_err());
         imported.sequences[0].tracks[0].sample_rate = 48000;
-        imported.version = 2;
+        imported.version = 3;
         assert!(validate_import(&imported).is_err());
         imported.version = 1;
         imported.sequences.clear();
