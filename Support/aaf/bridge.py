@@ -9,6 +9,8 @@ from pathlib import Path
 import sys
 import struct
 import tempfile
+from fractions import Fraction
+from urllib.parse import urlparse, unquote
 
 import aaf2
 
@@ -107,7 +109,76 @@ def write_audio(document, destination):
             os.unlink(temporary)
 
 
+def read_audio(path):
+    """Read sound compositions; unsupported graph nodes fail explicitly."""
+    with aaf2.open(str(path), 'r') as container:
+        def resolve(clip, rate, visited):
+            mob = clip.mob
+            if mob is None:
+                raise ValueError('AAF source reference is unresolved')
+            key = (str(mob.mob_id), clip.slot_id)
+            if key in visited:
+                raise ValueError('Cyclic AAF source reference')
+            slot = mob.slot_at(clip.slot_id)
+            source_rate = Fraction(str(slot.edit_rate))
+            if source_rate != rate:
+                raise ValueError('Mixed-rate AAF source chain is not implemented')
+            if isinstance(mob, aaf2.mobs.SourceMob):
+                descriptor = mob.descriptor
+                if descriptor is not None and 'Locator' in descriptor:
+                    urls = [loc['URLString'].value for loc in descriptor['Locator'].value
+                            if 'URLString' in loc]
+                    if len(urls) != 1:
+                        raise ValueError('AAF source requires one media locator')
+                    parsed = urlparse(urls[0])
+                    if parsed.scheme != 'file' or parsed.netloc not in ('', 'localhost'):
+                        raise ValueError('AAF source locator is not a local file')
+                    return unquote(parsed.path), int(clip.start)
+            segment = slot.segment
+            if isinstance(segment, aaf2.components.Sequence):
+                parts = list(segment.components)
+                if len(parts) != 1:
+                    raise ValueError('Edited AAF source mob is not implemented')
+                segment = parts[0]
+            if not isinstance(segment, aaf2.components.SourceClip):
+                raise ValueError('Unsupported AAF source component')
+            media, source_in = resolve(segment, source_rate, visited | {key})
+            return media, source_in + int(clip.start)
+
+        sequences = []
+        for composition in container.content.toplevel():
+            tracks = []
+            for slot in composition.slots:
+                if slot.media_kind != 'Sound':
+                    raise ValueError('Non-audio AAF slots are not implemented')
+                rate = Fraction(str(slot.edit_rate))
+                if rate.denominator != 1 or rate <= 0:
+                    raise ValueError('Unsupported AAF sound edit rate')
+                segment = slot.segment
+                parts = list(segment.components) if isinstance(segment, aaf2.components.Sequence) else [segment]
+                clips = []
+                cursor = 0
+                for part in parts:
+                    length = int(part.length)
+                    if length < 0:
+                        raise ValueError('Negative AAF component length')
+                    if isinstance(part, aaf2.components.SourceClip):
+                        media, source_in = resolve(part, rate, set())
+                        clips.append({'path': media, 'start': cursor, 'source_in': source_in, 'length': length})
+                    elif not isinstance(part, aaf2.components.Filler):
+                        raise ValueError('Unsupported AAF timeline component')
+                    cursor += length
+                tracks.append({'name': slot.name or '', 'sample_rate': int(rate), 'clips': clips})
+            sequences.append({'name': composition.name, 'tracks': tracks})
+        if not sequences:
+            raise ValueError('AAF has no top-level composition')
+        return {'version': 1, 'sequences': sequences}
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == 'read-audio':
+        print(json.dumps(read_audio(sys.argv[2])))
+        return
     if len(sys.argv) != 4 or sys.argv[1] != 'write-audio':
         raise ValueError('Usage: align-aaf write-audio manifest.json destination.aaf')
     with open(sys.argv[2], encoding='utf-8') as stream:

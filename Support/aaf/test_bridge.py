@@ -4,7 +4,7 @@ import unittest
 import wave
 from pathlib import Path
 
-from bridge import write_audio
+from bridge import write_audio, read_audio
 
 
 class SourceValidation(unittest.TestCase):
@@ -23,6 +23,9 @@ class SourceValidation(unittest.TestCase):
             }]}
             output = root / 'test.aaf'
             write_audio(manifest, output)
+            restored = read_audio(output)['sequences'][0]
+            self.assertEqual(restored['tracks'][0]['clips'][0]['length'], 480)
+            self.assertEqual(Path(restored['tracks'][0]['clips'][0]['path']), source.resolve())
             original = output.read_bytes()
             for field in ('rate', 'frames', 'truncation'):
                 bad = copy.deepcopy(manifest)
