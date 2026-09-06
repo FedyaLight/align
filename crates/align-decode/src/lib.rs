@@ -12,6 +12,7 @@
 use std::path::Path;
 use thiserror::Error;
 
+pub mod aaf;
 pub mod backend;
 pub mod export;
 pub mod ff;
