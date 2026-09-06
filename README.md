@@ -143,7 +143,7 @@ cargo build --release -p align-cli -p align-gpui
    VFR-предупреждения portable (Variable + Unknown, оба с тестами)~~ —
    готово.
 3. Упаковка: `script/package-macos.sh [dir]` собирает `Align.app`
-   (ad-hoc sign, LSMinimum 15.0, без ffmpeg по умолчанию) + `align-cli`
+   (ad-hoc sign, LSMinimum 15.0, с FFmpeg sidecars по умолчанию) + `align-cli`
    в `~/Downloads/Align-macOS`; CI делает то же на 3 ОС
    (`.github/workflows/align-rs.yml`). Дальше — dmg/msi/AppImage,
    Developer ID и нотаризация для распространения.
@@ -156,7 +156,9 @@ cargo build --release -p align-cli -p align-gpui
    рендер в Resolve. В текущем исходном коде дополнительно поддержаны
    вложенные SourceClip/Sequence/Filler, активные Selector и извлечение
    встроенного моно PCM в кэш. Эти дополнения включены в R21.
-   Остались встроенное видео/многоканальное аудио, преобразование частот,
+   Встроенное многоканальное PCM с явными номерами физических каналов
+   также поддержано (проверено стерео). Остались встроенное видео,
+   сжатое встроенное аудио, преобразование частот,
    эффекты, переходы и изменение скорости; неподдерживаемые конструкции
    завершаются явной ошибкой. Проверки: `script/check-aaf-smoke.py`,
    `script/check-aaf-picture-smoke.py`, `script/check-aaf-embedded-smoke.py`.
