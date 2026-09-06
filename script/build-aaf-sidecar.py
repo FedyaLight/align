@@ -5,6 +5,9 @@ Build environment: install Support/aaf/build-requirements.txt into a venv.
 Usage: python script/build-aaf-sidecar.py OUTPUT_DIRECTORY
 """
 import argparse
+from importlib.metadata import distribution
+import shutil
+import sysconfig
 from pathlib import Path
 import subprocess
 import sys
@@ -28,6 +31,19 @@ def main():
     executable = output / ('align-aaf.exe' if sys.platform == 'win32' else 'align-aaf')
     if not executable.is_file():
         raise RuntimeError('AAF build did not produce an executable')
+    licenses = output / 'AAF-Licenses'
+    licenses.mkdir(exist_ok=True)
+    for package in ('pyaaf2', 'pyinstaller'):
+        dist = distribution(package)
+        for entry in dist.files or []:
+            if Path(entry).name.lower() in ('license', 'copying.txt'):
+                shutil.copyfile(dist.locate_file(entry), licenses / (package + '-LICENSE.txt'))
+    python_license = Path(sys.base_prefix) / 'Resources' / 'English.lproj' / 'Documentation' / 'LICENSE.txt'
+    candidates = [Path(sysconfig.get_path("stdlib")) / "LICENSE.txt", python_license, Path(sys.base_prefix) / 'LICENSE.txt', Path(sys.base_prefix) / 'LICENSE']
+    for candidate in candidates:
+        if candidate.is_file():
+            shutil.copyfile(candidate, licenses / 'Python-LICENSE.txt')
+            break
     print(executable)
 
 

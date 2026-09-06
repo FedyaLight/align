@@ -14,6 +14,13 @@ BUNDLE_ID="com.align.app"
 # (~190 MB for the pair, duplicated for app + CLI).
 BUNDLE_FFMPEG="${BUNDLE_FFMPEG:-0}"
 
+# Build the self-contained AAF module before touching an existing package.
+AAF_BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/align-aaf-package.XXXXXX")"
+trap 'rm -rf "$AAF_BUILD_DIR"' EXIT
+python3 -m venv "$AAF_BUILD_DIR/venv"
+"$AAF_BUILD_DIR/venv/bin/python" -m pip install -r "$ROOT_DIR/Support/aaf/build-requirements.txt"
+"$AAF_BUILD_DIR/venv/bin/python" "$ROOT_DIR/script/build-aaf-sidecar.py" "$AAF_BUILD_DIR/dist"
+
 echo "==> building release"
 cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml" -p align-cli -p align-gpui
 
@@ -34,6 +41,12 @@ cp "$ROOT_DIR/THIRD_PARTY_NOTICES.txt" "$RESOURCES/THIRD_PARTY_NOTICES.txt"
 cp "$BIN_DIR/align-cli" "$OUT_DIR/align-cli"
 cp "$ROOT_DIR/THIRD_PARTY_NOTICES.txt" "$OUT_DIR/THIRD_PARTY_NOTICES.txt"
 chmod +x "$OUT_DIR/align-cli"
+cp "$AAF_BUILD_DIR/dist/align-aaf" "$APP_MACOS/align-aaf"
+cp "$AAF_BUILD_DIR/dist/align-aaf" "$OUT_DIR/align-aaf"
+cp -R "$AAF_BUILD_DIR/dist/AAF-Licenses" "$RESOURCES/AAF-Licenses"
+cp -R "$AAF_BUILD_DIR/dist/AAF-Licenses" "$OUT_DIR/AAF-Licenses"
+chmod +x "$APP_MACOS/align-aaf" "$OUT_DIR/align-aaf"
+
 
 # Bundled sidecars (opt-in via BUNDLE_FFMPEG=1): resolved from exe dir
 # first, so both binaries find them.
@@ -87,6 +100,7 @@ Align – кроссплатформенный синхронизатор мед
 
   Align.app            — графическое приложение (двойной клик)
   align-cli            — batch CLI: sync / export / export-json
+  align-aaf            — автономный модуль AAF (Python пользователю не нужен)
   THIRD_PARTY_NOTICES.txt — лицензии сторонних компонентов
 $([ "$BUNDLE_FFMPEG" == "1" ] && echo "  ffmpeg, ffprobe      — bundled sidecars для видеоконтейнеров
                          (находятся автоматически рядом с бинарниками)" || echo "  (без bundled ffmpeg: на macOS используется Apple backend;
