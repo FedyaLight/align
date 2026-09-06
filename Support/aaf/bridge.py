@@ -172,6 +172,19 @@ def read_audio(path):
 def read_timeline(path, audio_only=False):
     """Read linked picture/sound edits; retain each track's rational clock."""
     with aaf2.open(str(path), 'r') as container:
+        def selected(segment):
+            seen = set()
+            while isinstance(segment, aaf2.components.Selector):
+                identity = id(segment)
+                if identity in seen:
+                    raise ValueError('Cyclic AAF selector')
+                seen.add(identity)
+                choice = segment['Selected'].value
+                if choice is None or choice.media_kind != segment.media_kind or choice.length != segment.length:
+                    raise ValueError('Invalid AAF selected segment')
+                segment = choice
+            return segment
+
         def resolve(clip, rate, visited, offset=0, length=None):
             length = int(clip.length) if length is None else length
             source_start = int(clip.start) + offset
@@ -207,12 +220,13 @@ def read_timeline(path, audio_only=False):
                     if physical < 1:
                         raise ValueError('Invalid AAF physical channel')
                     return [(locator_path(urls[0]), source_start, int(physical) - 1, length)]
-            segment = slot.segment
+            segment = selected(slot.segment)
             parts = list(segment.components) if isinstance(segment, aaf2.components.Sequence) else [segment]
             output = []
             cursor = 0
             covered = 0
             for part in parts:
+                part = selected(part)
                 part_length = int(part.length)
                 if part_length < 0:
                     raise ValueError('Negative AAF source component length')
@@ -242,11 +256,12 @@ def read_timeline(path, audio_only=False):
                 rate = Fraction(str(slot.edit_rate))
                 if rate <= 0 or (slot.media_kind == 'Sound' and rate.denominator != 1):
                     raise ValueError('Unsupported AAF edit rate')
-                segment = slot.segment
+                segment = selected(slot.segment)
                 parts = list(segment.components) if isinstance(segment, aaf2.components.Sequence) else [segment]
                 clips = []
                 cursor = 0
                 for part in parts:
+                    part = selected(part)
                     length = int(part.length)
                     if length < 0:
                         raise ValueError('Negative AAF component length')

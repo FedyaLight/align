@@ -37,9 +37,21 @@ class SourceValidation(unittest.TestCase):
             clips = read_timeline(path)['sequences'][0]['tracks'][0]['clips']
             self.assertEqual([(clip['start'], clip['source_in'], clip['length']) for clip in clips],
                 [(0, 150, 50), (70, 500, 50)])
+            # Wrap the nested reference in a selector. Its inactive filler
+            # must not replace the selected montage or add extra duration.
+            with aaf2.open(str(path), 'rw') as container:
+                top = next(container.content.toplevel())
+                sequence = top.slots[0].segment
+                chosen = sequence.components.pop(0)
+                selector = container.create.Selector(media_kind='sound', length=120)
+                selector['Selected'].value = chosen
+                selector['Alternates'].append(container.create.Filler('sound', 120))
+                sequence.components.append(selector)
+            self.assertEqual(read_timeline(path)['sequences'][0]['tracks'][0]['clips'], clips)
             with aaf2.open(str(path), 'rw') as container:
                 top = next(container.content.toplevel())
                 top.slots[0].segment.components[0].length = 171
+                top.slots[0].segment.components[0]['Selected'].value.length = 171
                 top.slots[0].segment.length = 171
             with self.assertRaisesRegex(ValueError, 'exceeds'):
                 read_timeline(path)
