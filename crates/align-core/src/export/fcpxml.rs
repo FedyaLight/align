@@ -22,18 +22,27 @@ fn audio_channel_end(item: &ExportItem) -> String {
 }
 
 pub fn write(timeline: &ExportTimeline, include_multicam_clip: bool) -> String {
+    write_with_storylines(timeline, include_multicam_clip, false)
+}
+
+pub fn write_with_storylines(
+    timeline: &ExportTimeline,
+    include_multicam_clip: bool,
+    group_storylines: bool,
+) -> String {
     let island = timeline.islands.first().cloned().unwrap_or(ExportIsland {
         id: 0,
         clips: Vec::new(),
         duration: 0.0,
     });
-    write_island(timeline, &island, include_multicam_clip)
+    write_island(timeline, &island, include_multicam_clip, group_storylines)
 }
 
 fn write_island(
     timeline: &ExportTimeline,
     island: &ExportIsland,
     include_multicam: bool,
+    group_storylines: bool,
 ) -> String {
     let frame_duration = timeline.frame_duration;
     let width = island
@@ -277,6 +286,7 @@ fn write_island(
             .collect::<Vec<_>>(),
     );
 
+    let mut stories = std::collections::BTreeMap::<i64, String>::new();
     for item in video_items {
         let media_url = item
             .corrected_audio_url
@@ -301,8 +311,18 @@ fn write_island(
                 .unwrap_or("")
                 .to_string()
         }));
-        xml += &format!(
-            "              <asset-clip ref=\"{asset_id}\" lane=\"{lane}\" offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{clip_name}\" srcEnable=\"video\" enabled=\"{}\"/>\n",
+        let target = if group_storylines {
+            stories.entry(lane as i64).or_default()
+        } else {
+            &mut xml
+        };
+        let lane_attribute = if group_storylines {
+            String::new()
+        } else {
+            format!(" lane=\"{lane}\"")
+        };
+        *target += &format!(
+            "              <asset-clip ref=\"{asset_id}\" {lane_attribute} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{clip_name}\" srcEnable=\"video\" enabled=\"{}\"/>\n",
             xml_text::fcpxml_time(MediaTime::microseconds(item.start)),
             xml_text::fcpxml_time(MediaTime::microseconds(item.timeline_duration)),
             xml_text::fcpxml_time(MediaTime::microseconds(item.source_in)),
@@ -342,12 +362,27 @@ fn write_island(
             format!(" audioRole=\"{}\"", xml_text::escape(role))
         });
         let audio_channel_end = audio_channel_end(item);
-        xml += &format!(
-            "              <asset-clip ref=\"{asset_id}\" lane=\"{lane}\" offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{clip_name}\" srcEnable=\"audio\" enabled=\"{}\"{audio_role}{audio_channel_end}\n",
+        let target = if group_storylines {
+            stories.entry(lane).or_default()
+        } else {
+            &mut xml
+        };
+        let lane_attribute = if group_storylines {
+            String::new()
+        } else {
+            format!(" lane=\"{lane}\"")
+        };
+        *target += &format!(
+            "              <asset-clip ref=\"{asset_id}\" {lane_attribute} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{clip_name}\" srcEnable=\"audio\" enabled=\"{}\"{audio_role}{audio_channel_end}\n",
             xml_text::fcpxml_time(MediaTime::microseconds(item.start)),
             xml_text::fcpxml_time(MediaTime::microseconds(duration)),
             xml_text::fcpxml_time(MediaTime::microseconds(item.source_in)),
             u8::from(item.is_enabled("audio")),
+        );
+    }
+    for (lane, clips) in stories {
+        xml += &format!(
+            "              <spine lane=\"{lane}\" offset=\"0s\">\n{clips}              </spine>\n"
         );
     }
     xml += "            </gap>\n          </spine>\n        </sequence>\n      </project>\n";
@@ -394,6 +429,45 @@ mod tests {
     use super::super::otio::tests::fixture_timeline;
     use super::*;
     use crate::xml::{read_timeline, timeline_sequence_summaries};
+
+    #[test]
+    fn storylines_preserve_track_and_source_ranges() {
+        let timeline = fixture_timeline();
+        let directory =
+            std::env::temp_dir().join(format!("align-storyline-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let plain = directory.join("plain.fcpxml");
+        let grouped = directory.join("grouped.fcpxml");
+        std::fs::write(&plain, write(&timeline, false)).unwrap();
+        let xml = write_with_storylines(&timeline, false, true);
+        assert!(xml.contains("<spine lane="));
+        std::fs::write(&grouped, xml).unwrap();
+        let plain = read_timeline(&plain, None).unwrap();
+        let grouped = read_timeline(&grouped, None).unwrap();
+        let signature = |draft: crate::xml::TimelineDraft| {
+            let mut rows = draft
+                .edits
+                .into_iter()
+                .map(|edit| {
+                    format!(
+                        "{} {:?} {} {} {} {} {} {:?}",
+                        edit.url.display(),
+                        edit.media_type,
+                        edit.track_index,
+                        edit.timeline_start,
+                        edit.timeline_end,
+                        edit.source_in,
+                        edit.source_out,
+                        edit.audio_source_channel
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort();
+            rows
+        };
+        assert_eq!(signature(plain), signature(grouped));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn fcpxml_roundtrips_through_importer() {

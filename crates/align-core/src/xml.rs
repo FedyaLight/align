@@ -2943,6 +2943,30 @@ fn read_fcpxml(
                         &mut *next_number,
                     );
                 }
+                "spine" => {
+                    let offset = fcpxml_time(refs.doc.attr(node, "offset"));
+                    let lane = refs
+                        .doc
+                        .attr(node, "lane")
+                        .and_then(|value| value.parse::<i64>().ok())
+                        .unwrap_or(0);
+                    let child = StoryPlacement {
+                        shift: place.shift + offset,
+                        lane_shift: place.lane_shift + lane,
+                        depth: place.depth + 1,
+                        ..place
+                    };
+                    let kids = refs.doc.nodes[node].children.clone();
+                    read_fcpxml_story(
+                        refs,
+                        &kids,
+                        child,
+                        &mut *visited,
+                        &mut *warnings,
+                        &mut *edits,
+                        &mut *next_number,
+                    );
+                }
                 _ => {
                     let kids: Vec<usize> = refs.doc.nodes[node].children.clone();
                     read_fcpxml_story(
