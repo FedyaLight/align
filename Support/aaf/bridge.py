@@ -122,7 +122,12 @@ def locator_path(url):
 
 
 def read_audio(path):
-    """Read sound compositions; unsupported graph nodes fail explicitly."""
+    """Compatibility entry point for audio-only compositions."""
+    return read_timeline(path, audio_only=True)
+
+
+def read_timeline(path, audio_only=False):
+    """Read linked picture/sound edits; retain each track's rational clock."""
     with aaf2.open(str(path), 'r') as container:
         def resolve(clip, rate, visited):
             mob = clip.mob
@@ -132,6 +137,8 @@ def read_audio(path):
             if key in visited:
                 raise ValueError('Cyclic AAF source reference')
             slot = mob.slot_at(clip.slot_id)
+            if slot.media_kind != clip.media_kind:
+                raise ValueError('AAF source media kind mismatch')
             source_rate = Fraction(str(slot.edit_rate))
             if source_rate != rate:
                 raise ValueError('Mixed-rate AAF source chain is not implemented')
@@ -143,6 +150,8 @@ def read_audio(path):
                     if len(urls) != 1:
                         raise ValueError('AAF source requires one media locator')
                     physical = slot['PhysicalTrackNumber'].value if 'PhysicalTrackNumber' in slot else None
+                    if slot.media_kind == 'Picture':
+                        return locator_path(urls[0]), int(clip.start), None
                     if physical is None:
                         sound_slots = [s for s in mob.slots if s.media_kind == 'Sound']
                         if len(sound_slots) != 1:
@@ -166,11 +175,11 @@ def read_audio(path):
         for composition in container.content.toplevel():
             tracks = []
             for slot in composition.slots:
-                if slot.media_kind != 'Sound':
-                    raise ValueError('Non-audio AAF slots are not implemented')
+                if slot.media_kind not in ('Sound', 'Picture') or (audio_only and slot.media_kind != 'Sound'):
+                    raise ValueError('Unsupported AAF track kind: ' + slot.media_kind)
                 rate = Fraction(str(slot.edit_rate))
-                if rate.denominator != 1 or rate <= 0:
-                    raise ValueError('Unsupported AAF sound edit rate')
+                if rate <= 0 or (slot.media_kind == 'Sound' and rate.denominator != 1):
+                    raise ValueError('Unsupported AAF edit rate')
                 segment = slot.segment
                 parts = list(segment.components) if isinstance(segment, aaf2.components.Sequence) else [segment]
                 clips = []
@@ -185,14 +194,22 @@ def read_audio(path):
                     elif not isinstance(part, aaf2.components.Filler):
                         raise ValueError('Unsupported AAF timeline component')
                     cursor += length
-                tracks.append({'name': slot.name or '', 'sample_rate': int(rate), 'clips': clips})
+                if audio_only:
+                    tracks.append({'name': slot.name or '', 'sample_rate': int(rate), 'clips': clips})
+                else:
+                    tracks.append({'name': slot.name or '', 'media_kind': slot.media_kind.lower(),
+                        'edit_rate': {'numerator': rate.numerator, 'denominator': rate.denominator},
+                        'clips': clips})
             sequences.append({'name': composition.name, 'tracks': tracks})
         if not sequences:
             raise ValueError('AAF has no top-level composition')
-        return {'version': 1, 'sequences': sequences}
+        return {'version': 1 if audio_only else 2, 'sequences': sequences}
 
 
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == 'read-timeline':
+        print(json.dumps(read_timeline(sys.argv[2])))
+        return
     if len(sys.argv) == 3 and sys.argv[1] == 'read-audio':
         print(json.dumps(read_audio(sys.argv[2])))
         return
