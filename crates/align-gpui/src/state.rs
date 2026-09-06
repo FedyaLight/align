@@ -108,6 +108,7 @@ pub struct SequencePicker {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ExportTarget {
+    Aaf,
     ResolveOtio,
     ResolveXml,
     Premiere,
@@ -115,12 +116,13 @@ pub enum ExportTarget {
 }
 
 impl ExportTarget {
-    pub fn all() -> [Self; 4] {
+    pub fn all() -> [Self; 5] {
         [
             Self::ResolveOtio,
             Self::ResolveXml,
             Self::Premiere,
             Self::FinalCutPro,
+            Self::Aaf,
         ]
     }
 
@@ -130,6 +132,7 @@ impl ExportTarget {
             Self::ResolveXml => "DaVinci Resolve (.xml)",
             Self::Premiere => "Adobe Premiere Pro (.xml)",
             Self::FinalCutPro => "Final Cut Pro (.fcpxml)",
+            Self::Aaf => "AAF audio (.aaf)",
         }
     }
 
@@ -142,6 +145,7 @@ impl ExportTarget {
             Self::ResolveXml => vec![TimelineExportFormat::ResolveXML],
             Self::Premiere => vec![TimelineExportFormat::PremiereXML],
             Self::FinalCutPro => vec![TimelineExportFormat::FinalCutProXML],
+            Self::Aaf => vec![TimelineExportFormat::Aaf],
         }
     }
 }

@@ -39,6 +39,9 @@ enum Command {
         sequence: Option<usize>,
         #[arg(long)]
         no_drift: bool,
+        /// Export AAF audio tracks (requires the bundled align-aaf module).
+        #[arg(long)]
+        aaf: bool,
         #[arg(long)]
         replaced_audio: bool,
         /// Also create complete camera files with external audio replacing scratch audio.
@@ -70,6 +73,9 @@ enum Command {
         stage: Option<usize>,
         #[arg(long)]
         no_drift: bool,
+        /// Export AAF audio tracks (requires the bundled align-aaf module).
+        #[arg(long)]
+        aaf: bool,
         #[arg(long)]
         replaced_audio: bool,
         /// Also create complete camera files with external audio replacing scratch audio.
@@ -552,6 +558,7 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
         Some(Command::Export {
             sequence,
             no_drift,
+            aaf,
             replaced_audio,
             export_media,
             unmatched,
@@ -605,7 +612,11 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
                     backend: pipeline.backend(),
                     timeline: &timeline,
                     directory: &output,
-                    formats: &align_core::export_model::TimelineExportFormat::default_formats(),
+                    formats: &if aaf {
+                        vec![align_core::export_model::TimelineExportFormat::Aaf]
+                    } else {
+                        align_core::export_model::TimelineExportFormat::default_formats()
+                    },
                     correct_drift: !no_drift,
                     include_replaced_sequence: replaced_audio,
                     include_media_files: export_media,
@@ -618,6 +629,7 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
         Some(Command::ExportJson {
             stage,
             no_drift,
+            aaf,
             replaced_audio,
             export_media,
             unmatched,
@@ -657,7 +669,11 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
                     backend: pipeline.backend(),
                     timeline: &timeline,
                     directory: &output,
-                    formats: &align_core::export_model::TimelineExportFormat::default_formats(),
+                    formats: &if aaf {
+                        vec![align_core::export_model::TimelineExportFormat::Aaf]
+                    } else {
+                        align_core::export_model::TimelineExportFormat::default_formats()
+                    },
                     correct_drift: !no_drift,
                     include_replaced_sequence: replaced_audio,
                     include_media_files: export_media,
@@ -715,6 +731,7 @@ mod tests {
         let Some(Command::Export {
             settings,
             no_drift,
+            aaf,
             replaced_audio,
             export_media,
             label_unmatched,
@@ -738,6 +755,7 @@ mod tests {
             options.track_content.default,
             align_core::TrackContent::Linear
         );
+        assert!(!aaf);
         assert!(no_drift);
         assert!(replaced_audio);
         assert!(export_media);
