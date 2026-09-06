@@ -499,6 +499,7 @@ impl AlignApp {
         let cancel = self.data.cancel.clone();
         let drift = self.data.export_drift;
         let replaced = self.data.export_replaced;
+        let storylines = self.data.export_storylines;
         let media = self.data.export_media;
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<ExportMsg>();
         std::thread::spawn(move || {
@@ -529,6 +530,7 @@ impl AlignApp {
                     correct_drift: drift,
                     include_replaced_sequence: replaced,
                     include_media_files: media,
+                    group_fcpxml_storylines: storylines,
                     cancel: &cancel,
                 },
                 Some(&mut progress),
@@ -3271,6 +3273,20 @@ fn export_sheet(
                 cx.notify();
             },
         ));
+        if data.export_selected.contains(&ExportTarget::FinalCutPro) {
+            group = group.child(check_row(
+                cx,
+                theme,
+                "exp-storylines",
+                data.export_storylines,
+                "Group FCPXML tracks as storylines".to_string(),
+                !busy,
+                |this, _, _, cx| {
+                    this.data.export_storylines = !this.data.export_storylines;
+                    cx.notify();
+                },
+            ));
+        }
         if data.export_selected.contains(&ExportTarget::Premiere) {
             let on = data.export_replaced;
             group = group.child(check_row(

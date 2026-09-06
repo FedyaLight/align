@@ -116,7 +116,13 @@ pub fn export(
         .validate_audio_source_channels()
         .map_err(ExportError::Timeline)?;
     std::fs::create_dir_all(directory).map_err(|e| ExportError::Io(e.to_string()))?;
-    write_artifacts(timeline, directory, formats, include_replaced_sequence)
+    write_artifacts(
+        timeline,
+        directory,
+        formats,
+        include_replaced_sequence,
+        false,
+    )
 }
 
 /// Drift-corrected export with precision stems — mirrors `exportPrepared`.
@@ -131,6 +137,7 @@ pub struct ExportRequest<'a> {
     pub correct_drift: bool,
     pub include_replaced_sequence: bool,
     pub include_media_files: bool,
+    pub group_fcpxml_storylines: bool,
     pub cancel: &'a std::sync::atomic::AtomicBool,
 }
 
@@ -151,6 +158,7 @@ pub fn export_prepared(
         correct_drift,
         include_replaced_sequence,
         include_media_files,
+        group_fcpxml_storylines,
         cancel,
     } = request;
     // Combine up front: the writer floors the combined island's starts, and
@@ -522,6 +530,7 @@ pub fn export_prepared(
         directory,
         &standard_formats,
         include_replaced_sequence,
+        group_fcpxml_storylines,
     )?;
     if wants_aaf {
         let manifest = crate::aaf::timeline_manifest(&corrected, cancel)
@@ -827,6 +836,7 @@ fn write_artifacts(
     directory: &Path,
     formats: &[TimelineExportFormat],
     include_replaced_sequence: bool,
+    group_fcpxml_storylines: bool,
 ) -> Result<Vec<ExportArtifact>, ExportError> {
     let mut combined = ExportTimeline::new(
         vec![timeline.combined_island(1.0)],
@@ -862,7 +872,12 @@ fn write_artifacts(
                     .into_bytes()
             }
             TimelineExportFormat::FinalCutProXML => {
-                align_core::export::fcpxml::write(&combined, true).into_bytes()
+                align_core::export::fcpxml::write_with_storylines(
+                    &combined,
+                    true,
+                    group_fcpxml_storylines,
+                )
+                .into_bytes()
             }
         };
         // Atomic write: tmp + rename.
@@ -994,6 +1009,7 @@ mod tests {
                     correct_drift: false,
                     include_replaced_sequence: false,
                     include_media_files: false,
+                    group_fcpxml_storylines: false,
                     cancel: &std::sync::atomic::AtomicBool::new(false),
                 },
                 None,
@@ -1110,6 +1126,7 @@ mod tests {
                 correct_drift: false,
                 include_replaced_sequence: false,
                 include_media_files: false,
+                group_fcpxml_storylines: false,
                 cancel: &std::sync::atomic::AtomicBool::new(false),
             },
             None,

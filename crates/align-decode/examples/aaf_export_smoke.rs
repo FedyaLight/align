@@ -17,6 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             correct_drift: true,
             include_replaced_sequence: false,
             include_media_files: false,
+            group_fcpxml_storylines: false,
             cancel: &AtomicBool::new(false),
         },
         None,

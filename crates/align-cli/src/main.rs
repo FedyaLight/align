@@ -44,6 +44,9 @@ enum Command {
         aaf: bool,
         #[arg(long)]
         replaced_audio: bool,
+        /// Group FCPXML tracks into separate storylines.
+        #[arg(long)]
+        fcpxml_storylines: bool,
         /// Also create complete camera files with external audio replacing scratch audio.
         #[arg(long)]
         export_media: bool,
@@ -78,6 +81,9 @@ enum Command {
         aaf: bool,
         #[arg(long)]
         replaced_audio: bool,
+        /// Group FCPXML tracks into separate storylines.
+        #[arg(long)]
+        fcpxml_storylines: bool,
         /// Also create complete camera files with external audio replacing scratch audio.
         #[arg(long)]
         export_media: bool,
@@ -559,6 +565,7 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
             no_drift,
             aaf,
             replaced_audio,
+            fcpxml_storylines,
             export_media,
             unmatched,
             prevent_group_overlaps,
@@ -620,6 +627,7 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
                     correct_drift: !no_drift,
                     include_replaced_sequence: replaced_audio,
                     include_media_files: export_media,
+                    group_fcpxml_storylines: fcpxml_storylines,
                     cancel: &cancel,
                 },
                 None,
@@ -631,6 +639,7 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
             no_drift,
             aaf,
             replaced_audio,
+            fcpxml_storylines,
             export_media,
             unmatched,
             prevent_group_overlaps,
@@ -677,6 +686,7 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
                     correct_drift: !no_drift,
                     include_replaced_sequence: replaced_audio,
                     include_media_files: export_media,
+                    group_fcpxml_storylines: fcpxml_storylines,
                     cancel: &cancel,
                 },
                 None,
@@ -733,6 +743,7 @@ mod tests {
             no_drift,
             aaf,
             replaced_audio,
+            fcpxml_storylines,
             export_media,
             label_unmatched,
             ..
@@ -758,6 +769,7 @@ mod tests {
         assert!(!aaf);
         assert!(no_drift);
         assert!(replaced_audio);
+        assert!(!fcpxml_storylines);
         assert!(export_media);
         assert!(label_unmatched);
     }
