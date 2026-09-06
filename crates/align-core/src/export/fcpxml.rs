@@ -283,7 +283,12 @@ fn write_island(
     let audio_items: Vec<&ExportItem> = island
         .clips
         .iter()
-        .filter(|i| !i.clip.audio.is_empty())
+        .filter(|i| {
+            !i.clip.audio.is_empty()
+                && !(i.clip.video.is_some()
+                    && i.audio_enabled == Some(false)
+                    && i.linked_audio_edit.is_none())
+        })
         .collect();
     let video_assignments = allocate(
         &video_items
@@ -553,6 +558,23 @@ mod tests {
             2
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn video_only_edit_does_not_invent_disabled_camera_audio() {
+        let mut timeline = fixture_timeline();
+        for item in &mut timeline.islands[0].clips {
+            if item.clip.video.is_some() {
+                item.audio_enabled = Some(false);
+            }
+        }
+        let xml = write(&timeline, false);
+        assert_eq!(xml.matches("<video ref=").count(), 1);
+        assert_eq!(xml.matches("<audio ref=").count(), 1);
+        timeline.islands[0].clips[0].enabled = false;
+        let xml = write(&timeline, false);
+        assert!(xml.contains("enabled=\"0\""));
+        assert_eq!(xml.matches("<video ref=").count(), 1);
     }
 
     #[test]
