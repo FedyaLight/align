@@ -1,5 +1,5 @@
-//! Process boundary for the bundled AAF writer.
-use serde::Serialize;
+//! Cancellable process boundary for the bundled AAF reader and writer.
+use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -28,13 +28,91 @@ pub struct AudioClip {
     pub channels: u16,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ImportedAudio {
+    pub version: u32,
+    pub sequences: Vec<ImportedSequence>,
+}
+#[derive(Debug, Deserialize)]
+pub struct ImportedSequence {
+    pub name: String,
+    pub tracks: Vec<ImportedTrack>,
+}
+#[derive(Debug, Deserialize)]
+pub struct ImportedTrack {
+    pub name: String,
+    pub sample_rate: u32,
+    pub clips: Vec<ImportedClip>,
+}
+#[derive(Debug, Deserialize)]
+pub struct ImportedClip {
+    pub path: PathBuf,
+    pub start: u64,
+    pub source_in: u64,
+    pub length: u64,
+    pub channel: usize,
+}
+
+pub fn read_audio(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, AafError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(AafError::Cancelled);
+    }
+    let executable = crate::ff::resolve_bin("ALIGN_AAF", "align-aaf").ok_or(AafError::Missing)?;
+    // A file avoids stdout pipe deadlocks on large compositions while retaining
+    // cancellable process supervision and automatic temporary-file cleanup.
+    let mut output = tempfile::tempfile()?;
+    let mut child = Command::new(executable)
+        .arg("read-audio")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(output.try_clone()?))
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let status = crate::export::wait_render_process(&mut child, cancel).map_err(|error| {
+        if cancel.load(Ordering::Relaxed) {
+            AafError::Cancelled
+        } else {
+            AafError::Writer(error.to_string())
+        }
+    })?;
+    if !status.success() {
+        return Err(AafError::Writer(status.to_string()));
+    }
+    use std::io::{Seek, SeekFrom};
+    output.seek(SeekFrom::Start(0))?;
+    let result: ImportedAudio =
+        serde_json::from_reader(output).map_err(|e| AafError::Writer(e.to_string()))?;
+    validate_import(&result)?;
+    Ok(result)
+}
+
+fn validate_import(result: &ImportedAudio) -> Result<(), AafError> {
+    if result.version != 1 || result.sequences.is_empty() {
+        return Err(AafError::Writer("Unsupported or empty AAF response".into()));
+    }
+    for sequence in &result.sequences {
+        for track in &sequence.tracks {
+            if track.sample_rate == 0
+                || track.clips.iter().any(|clip| {
+                    clip.length == 0
+                        || clip.start.checked_add(clip.length).is_none()
+                        || clip.source_in.checked_add(clip.length).is_none()
+                })
+            {
+                return Err(AafError::Writer("Invalid AAF sample range".into()));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AafError {
     #[error("AAF support module is missing; reinstall the complete Align package")]
     Missing,
-    #[error("AAF export cancelled")]
+    #[error("AAF operation cancelled")]
     Cancelled,
-    #[error("AAF writer failed: {0}")]
+    #[error("AAF support module failed: {0}")]
     Writer(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -231,5 +309,47 @@ mod tests {
             ),
             Err(AafError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn cancelled_import_does_not_start_reader() {
+        assert!(matches!(
+            read_audio(Path::new("missing.aaf"), &AtomicBool::new(true)),
+            Err(AafError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn reader_validates_sample_ranges_and_preserves_channels() {
+        let mut imported: ImportedAudio = serde_json::from_str(
+            r#"{
+            "version":1,"sequences":[{"name":"Edit","tracks":[{
+                "name":"Audio","sample_rate":48000,"clips":[{
+                    "path":"/media/stereo.wav","start":96000,"source_in":24000,
+                    "length":672000,"channel":1
+                }]
+            }]}]
+        }"#,
+        )
+        .unwrap();
+        validate_import(&imported).unwrap();
+        assert_eq!(imported.sequences[0].tracks[0].clips[0].channel, 1);
+        imported.sequences[0].tracks[0].clips[0].start = u64::MAX;
+        assert!(validate_import(&imported).is_err());
+        imported.sequences[0].tracks[0].clips[0].start = 0;
+        imported.sequences[0].tracks[0].clips[0].source_in = u64::MAX;
+        assert!(validate_import(&imported).is_err());
+        imported.sequences[0].tracks[0].clips[0].source_in = 0;
+        imported.sequences[0].tracks[0].clips[0].length = 0;
+        assert!(validate_import(&imported).is_err());
+        imported.sequences[0].tracks[0].clips[0].length = 1;
+        imported.sequences[0].tracks[0].sample_rate = 0;
+        assert!(validate_import(&imported).is_err());
+        imported.sequences[0].tracks[0].sample_rate = 48000;
+        imported.version = 2;
+        assert!(validate_import(&imported).is_err());
+        imported.version = 1;
+        imported.sequences.clear();
+        assert!(validate_import(&imported).is_err());
     }
 }

@@ -17,6 +17,7 @@ hound.workspace = true
 ltc.workspace = true
 sha2.workspace = true
 blake3.workspace = true
+tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", default-features = false, features = ["std", "alloc"] }
