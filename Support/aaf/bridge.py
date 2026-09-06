@@ -185,6 +185,14 @@ def read_timeline(path, audio_only=False):
                 segment = choice
             return segment
 
+        def components(segment):
+            segment = selected(segment)
+            if isinstance(segment, aaf2.components.Sequence):
+                for part in segment.components:
+                    yield from components(part)
+            else:
+                yield segment
+
         def resolve(clip, rate, visited, offset=0, length=None):
             length = int(clip.length) if length is None else length
             source_start = int(clip.start) + offset
@@ -220,8 +228,7 @@ def read_timeline(path, audio_only=False):
                     if physical < 1:
                         raise ValueError('Invalid AAF physical channel')
                     return [(locator_path(urls[0]), source_start, int(physical) - 1, length)]
-            segment = selected(slot.segment)
-            parts = list(segment.components) if isinstance(segment, aaf2.components.Sequence) else [segment]
+            parts = components(slot.segment)
             output = []
             cursor = 0
             covered = 0
@@ -256,8 +263,7 @@ def read_timeline(path, audio_only=False):
                 rate = Fraction(str(slot.edit_rate))
                 if rate <= 0 or (slot.media_kind == 'Sound' and rate.denominator != 1):
                     raise ValueError('Unsupported AAF edit rate')
-                segment = selected(slot.segment)
-                parts = list(segment.components) if isinstance(segment, aaf2.components.Sequence) else [segment]
+                parts = components(slot.segment)
                 clips = []
                 cursor = 0
                 for part in parts:

@@ -50,8 +50,18 @@ class SourceValidation(unittest.TestCase):
             self.assertEqual(read_timeline(path)['sequences'][0]['tracks'][0]['clips'], clips)
             with aaf2.open(str(path), 'rw') as container:
                 top = next(container.content.toplevel())
+                selector = top.slots[0].segment.components[0]
+                chosen = selector['Selected'].value
+                selected_sequence = container.create.Sequence(media_kind='sound', length=120)
+                selector['Selected'].value = None
+                selected_sequence.components.append(chosen.copy())
+                selector['Selected'].value = selected_sequence
+            self.assertEqual(read_timeline(path)['sequences'][0]['tracks'][0]['clips'], clips)
+            with aaf2.open(str(path), 'rw') as container:
+                top = next(container.content.toplevel())
                 top.slots[0].segment.components[0].length = 171
                 top.slots[0].segment.components[0]['Selected'].value.length = 171
+                top.slots[0].segment.components[0]['Selected'].value.components[0].length = 171
                 top.slots[0].segment.length = 171
             with self.assertRaisesRegex(ValueError, 'exceeds'):
                 read_timeline(path)
