@@ -2627,6 +2627,11 @@ fn clip_order_section(
     panel = panel.child(menu_header(theme, "Clip order".to_string()));
     for (mode, title, row_id) in [
         (ClipOrder::Auto, "Auto", "order-auto"),
+        (
+            ClipOrder::AlternateAuto,
+            "Alternate Auto",
+            "order-alternate-auto",
+        ),
         (ClipOrder::AsImported, "As imported", "order-imported"),
         (ClipOrder::ByDateTime, "Date & time", "order-date"),
         (ClipOrder::ByFileName, "File name", "order-name"),

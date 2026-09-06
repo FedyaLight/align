@@ -15,6 +15,7 @@ use crate::model::{Clip, ClipId, ImportedTimeline, MatchEvidence};
 pub enum ClipOrder {
     #[default]
     Auto,
+    AlternateAuto,
     AsImported,
     ByDateTime,
     ByFileName,
@@ -192,7 +193,7 @@ fn date_key(clip: &Clip) -> (u8, i64, String) {
 fn rank(entry: &OrderEntry, mode: ClipOrder) -> usize {
     match mode {
         ClipOrder::Auto | ClipOrder::AsImported | ClipOrder::Ignore => entry.as_imported,
-        ClipOrder::ByDateTime => entry.by_date_time,
+        ClipOrder::AlternateAuto | ClipOrder::ByDateTime => entry.by_date_time,
         ClipOrder::ByFileName => entry.by_file_name,
     }
 }
@@ -420,6 +421,29 @@ mod tests {
             &policy,
             &context,
         );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].left, ClipId::new("a2"));
+    }
+
+    #[test]
+    fn alternate_auto_uses_metadata_order_and_match_strength() {
+        let clips = [
+            clip("a1", "/a/z.wav", 1),
+            clip("a2", "/a/a.wav", 2),
+            clip("b1", "/b/z.wav", 1),
+            clip("b2", "/b/a.wav", 2),
+        ];
+        let context = ClipOrderContext::from_clips(&clips, None);
+        let crossing = [edge("a1", "b2", 0.70), edge("a2", "b1", 0.90)];
+        assert_eq!(
+            enforce_clip_order(&crossing, &ClipOrderPolicy::default(), &context).len(),
+            2
+        );
+        let policy = ClipOrderPolicy {
+            default: ClipOrder::AlternateAuto,
+            modes: HashMap::new(),
+        };
+        let kept = enforce_clip_order(&crossing, &policy, &context);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].left, ClipId::new("a2"));
     }

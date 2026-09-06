@@ -371,6 +371,7 @@ enum MatchThreshold {
 enum ClipOrder {
     #[default]
     Auto,
+    AlternateAuto,
     AsImported,
     ByDateTime,
     ByFileName,
@@ -408,6 +409,7 @@ impl ClipOrder {
     fn core(self) -> align_core::ClipOrder {
         match self {
             Self::Auto => align_core::ClipOrder::Auto,
+            Self::AlternateAuto => align_core::ClipOrder::AlternateAuto,
             Self::AsImported => align_core::ClipOrder::AsImported,
             Self::ByDateTime => align_core::ClipOrder::ByDateTime,
             Self::ByFileName => align_core::ClipOrder::ByFileName,
