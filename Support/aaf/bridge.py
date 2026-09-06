@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 import struct
 import tempfile
+import hashlib
 from fractions import Fraction
 from urllib.parse import urlparse, unquote
 
@@ -169,9 +170,38 @@ def read_audio(path):
     return read_timeline(path, audio_only=True)
 
 
-def read_timeline(path, audio_only=False):
+def read_timeline(path, audio_only=False, extract_dir=None):
     """Read linked picture/sound edits; retain each track's rational clock."""
     with aaf2.open(str(path), 'r') as container:
+        extracted = {}
+
+        def embedded_audio(mob, rate):
+            if extract_dir is None:
+                raise ValueError('Embedded AAF audio requires an extraction directory')
+            if not isinstance(mob.descriptor, aaf2.essence.PCMDescriptor):
+                raise ValueError('Unsupported embedded AAF audio encoding')
+            descriptor = mob.descriptor
+            if descriptor['Channels'].value != 1 or Fraction(str(descriptor['SampleRate'].value)) != rate:
+                raise ValueError('Unsupported embedded AAF channel layout or sample rate')
+            key = str(mob.mob_id)
+            if key not in extracted:
+                directory = Path(extract_dir).resolve()
+                directory.mkdir(parents=True, exist_ok=True)
+                fd, temporary = tempfile.mkstemp(prefix='.aaf-audio-', suffix='.wav', dir=directory)
+                os.close(fd)
+                try:
+                    mob.export_audio(temporary)
+                    validate_wave(Path(temporary), int(rate), int(descriptor['Length'].value))
+                    with open(temporary, 'rb') as stream:
+                        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+                    destination = directory / (digest + '.wav')
+                    os.replace(temporary, destination)
+                    extracted[key] = str(destination)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+            return extracted[key]
+
         def selected(segment):
             seen = set()
             while isinstance(segment, aaf2.components.Selector):
@@ -212,6 +242,8 @@ def read_timeline(path, audio_only=False):
                 raise ValueError('Mixed-rate AAF source chain is not implemented')
             if isinstance(mob, aaf2.mobs.SourceMob):
                 descriptor = mob.descriptor
+                if slot.media_kind == 'Sound' and mob.essence is not None:
+                    return [(embedded_audio(mob, source_rate), source_start, 0, length)]
                 if descriptor is not None and 'Locator' in descriptor:
                     urls = [loc['URLString'].value for loc in descriptor['Locator'].value
                             if 'URLString' in loc]
@@ -294,8 +326,8 @@ def read_timeline(path, audio_only=False):
 
 
 def main():
-    if len(sys.argv) == 3 and sys.argv[1] == 'read-timeline':
-        print(json.dumps(read_timeline(sys.argv[2])))
+    if len(sys.argv) in (3, 4) and sys.argv[1] == 'read-timeline':
+        print(json.dumps(read_timeline(sys.argv[2], extract_dir=sys.argv[3] if len(sys.argv) == 4 else None)))
         return
     if len(sys.argv) == 3 and sys.argv[1] == 'read-audio':
         print(json.dumps(read_audio(sys.argv[2])))

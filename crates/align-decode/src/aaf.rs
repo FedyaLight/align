@@ -202,9 +202,17 @@ fn read_response(
     // A file avoids stdout pipe deadlocks on large compositions while retaining
     // cancellable process supervision and automatic temporary-file cleanup.
     let mut output = tempfile::tempfile()?;
-    let mut child = Command::new(executable)
-        .arg(operation)
-        .arg(path)
+    let mut command = Command::new(executable);
+    command.arg(operation).arg(path);
+    if operation == "read-timeline" {
+        command.arg(
+            dirs::cache_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join("Align")
+                .join("AAF Media"),
+        );
+    }
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::from(output.try_clone()?))
         .stderr(Stdio::inherit())

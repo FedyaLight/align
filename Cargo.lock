@@ -78,6 +78,7 @@ dependencies = [
  "align-core",
  "blake3",
  "block2",
+ "dirs 6.0.0",
  "hound",
  "ltc",
  "objc2",

@@ -11,6 +11,35 @@ import aaf2
 
 
 class SourceValidation(unittest.TestCase):
+    def test_embedded_pcm_extracts_exact_samples_without_external_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source.wav'
+            samples = b'\x01\x00\xff\x7f\x00\x80' * 100
+            with wave.open(str(source), 'wb') as writer:
+                writer.setparams((1, 2, 48000, 0, 'NONE', 'PCM'))
+                writer.writeframes(samples)
+            path = root / 'embedded.aaf'
+            with aaf2.open(str(path), 'w') as container:
+                master = container.create.MasterMob('Embedded')
+                container.content.mobs.append(master)
+                slot = master.import_audio_essence(str(source))
+                composition = container.create.CompositionMob('Edit')
+                composition.usage = 'Usage_TopLevel'
+                container.content.mobs.append(composition)
+                target = composition.create_sound_slot(48000)
+                target.segment.components.append(master.create_source_clip(slot_id=slot.slot_id,
+                    start=7, length=100, media_kind='sound'))
+                target.segment.length = 100
+            source.unlink()
+            result = read_timeline(path, extract_dir=root / 'extracted')
+            clip = result['sequences'][0]['tracks'][0]['clips'][0]
+            self.assertEqual((clip['source_in'], clip['length'], clip['channel']), (7, 100, 0))
+            with wave.open(clip['path'], 'rb') as reader:
+                self.assertEqual(reader.readframes(300), samples)
+            self.assertEqual(read_timeline(path, extract_dir=root / 'extracted'), result)
+            self.assertEqual(len(list((root / 'extracted').iterdir())), 1)
+
     def test_nested_source_sequence_splits_cuts_and_preserves_gaps(self):
         with tempfile.TemporaryDirectory() as directory:
             media = Path(directory) / 'mono.wav'
