@@ -799,11 +799,19 @@ pub fn read_timeline(
     path: &Path,
     sequence_index: Option<usize>,
 ) -> Result<TimelineDraft, ImportError> {
+    read_timeline_with_proxies(path, sequence_index, false)
+}
+
+pub fn read_timeline_with_proxies(
+    path: &Path,
+    sequence_index: Option<usize>,
+    prefer_proxies: bool,
+) -> Result<TimelineDraft, ImportError> {
     let text = std::fs::read_to_string(path)
         .map_err(|_| ImportError::Unreadable(ImportError::filename(path)))?;
     let doc = XmlDoc::parse(&text)?;
     if doc.root_name().eq_ignore_ascii_case("fcpxml") {
-        read_fcpxml(&doc, path, sequence_index)
+        read_fcpxml(&doc, path, sequence_index, prefer_proxies)
     } else {
         read_fcp7(&doc, path, sequence_index)
     }
@@ -2335,6 +2343,7 @@ fn read_fcpxml(
     doc: &XmlDoc,
     path: &Path,
     sequence_index: Option<usize>,
+    prefer_proxies: bool,
 ) -> Result<TimelineDraft, ImportError> {
     let filename = ImportError::filename(path);
     let sequences: Vec<usize> = doc
@@ -2410,10 +2419,21 @@ fn read_fcpxml(
                 for &c in doc.nodes[m].children.iter().rev() {
                     if doc.nodes[c].name == "asset" {
                         let representations = doc.children_named(c, "media-rep");
-                        let src = representations
-                            .iter()
-                            .filter(|&&mr| doc.attr(mr, "kind") == Some("original-media"))
-                            .find_map(|&mr| doc.attr(mr, "src"))
+                        let proxy = prefer_proxies
+                            .then(|| {
+                                representations
+                                    .iter()
+                                    .filter(|&&mr| doc.attr(mr, "kind") == Some("proxy-media"))
+                                    .find_map(|&mr| doc.attr(mr, "src"))
+                            })
+                            .flatten();
+                        let src = proxy
+                            .or_else(|| {
+                                representations
+                                    .iter()
+                                    .filter(|&&mr| doc.attr(mr, "kind") == Some("original-media"))
+                                    .find_map(|&mr| doc.attr(mr, "src"))
+                            })
                             .or_else(|| doc.attr(c, "src"))
                             .or_else(|| representations.iter().find_map(|&mr| doc.attr(mr, "src")));
                         let (Some(id), Some(src)) = (doc.attr(c, "id"), src) else {
@@ -3911,8 +3931,17 @@ mod tests {
                 </spine></sequence></project></event></library></fcpxml>"#
             );
             let doc = XmlDoc::parse(&text).unwrap();
-            let draft = read_fcpxml(&doc, Path::new("test.fcpxml"), None).unwrap();
+            let draft = read_fcpxml(&doc, Path::new("test.fcpxml"), None, false).unwrap();
             assert_eq!(draft.edits[0].url, Path::new("/original.mov"));
+            let preferred = read_fcpxml(&doc, Path::new("test.fcpxml"), None, true).unwrap();
+            assert_eq!(
+                preferred.edits[0].url,
+                Path::new(if asset.contains("proxy-media") {
+                    "/proxy.mov"
+                } else {
+                    "/original.mov"
+                })
+            );
         }
     }
 

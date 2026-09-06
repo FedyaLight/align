@@ -29,10 +29,23 @@ pub fn read(
     sequence: Option<usize>,
     cancel: &AtomicBool,
 ) -> Result<TimelineDraft, TimelineError> {
+    read_with_proxies(path, sequence, cancel, false)
+}
+
+pub fn read_with_proxies(
+    path: &Path,
+    sequence: Option<usize>,
+    cancel: &AtomicBool,
+    prefer_proxies: bool,
+) -> Result<TimelineDraft, TimelineError> {
     if is_aaf(path) {
         Ok(crate::aaf::read_timeline(path, cancel)?.into_draft(path, sequence)?)
     } else {
-        Ok(align_core::read_timeline(path, sequence)?)
+        Ok(align_core::xml::read_timeline_with_proxies(
+            path,
+            sequence,
+            prefer_proxies,
+        )?)
     }
 }
 

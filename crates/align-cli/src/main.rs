@@ -120,6 +120,9 @@ struct RelinkArgs {
     /// Timeline-referenced extensions skipped silently (comma-separated).
     #[arg(long, value_name = "EXTS")]
     omit_extensions: Option<String>,
+    /// Use FCPXML proxy media when the asset provides it.
+    #[arg(long)]
+    prefer_proxies: bool,
 }
 
 /// Resolved `--redirect` / `--relink` / `--omit-extensions`: saved
@@ -545,6 +548,7 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
             options.redirects = redirects;
             options.manual_relinks = manual;
             options.omit_extensions = omit;
+            options.prefer_proxies = relink.prefer_proxies;
             let mut result =
                 pipeline.synchronize(&inputs, &[], &options, Some(&progress), &cancel)?;
             select_stage(&mut result, settings.stage)?;
@@ -582,6 +586,7 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
             options.redirects = redirects;
             options.manual_relinks = manual;
             options.omit_extensions = omit;
+            options.prefer_proxies = relink.prefer_proxies;
             let mut result =
                 pipeline.synchronize(&inputs, &[], &options, Some(&progress), &cancel)?;
             select_stage(&mut result, settings.stage)?;
@@ -767,6 +772,7 @@ mod tests {
             "--relink",
             "a.mov=/new/a.mov",
             "--clear-redirects",
+            "--prefer-proxies",
             "--omit-extensions",
             "jpg,png",
             "/tmp/media",
@@ -778,6 +784,7 @@ mod tests {
         assert_eq!(relink.redirect, vec!["/old=/new".to_string()]);
         assert_eq!(relink.relink, vec!["a.mov=/new/a.mov".to_string()]);
         assert!(relink.clear_redirects);
+        assert!(relink.prefer_proxies);
         assert_eq!(relink.omit_extensions.as_deref(), Some("jpg,png"));
 
         let cli = Cli::try_parse_from(["align-cli", "clear-cache", "--older-than-days", "7"])

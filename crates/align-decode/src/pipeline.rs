@@ -85,6 +85,7 @@ pub struct PipelineOptions {
     pub manual_relinks: Vec<(String, PathBuf)>,
     /// Timeline-referenced extensions skipped silently (Omit extensions).
     pub omit_extensions: Vec<String>,
+    pub prefer_proxies: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -184,10 +185,11 @@ impl Pipeline {
         let draft = expanded
             .timeline
             .map(|t| {
-                crate::timeline::read(
+                crate::timeline::read_with_proxies(
                     &t.path,
                     t.sequence,
                     &std::sync::atomic::AtomicBool::new(false),
+                    options.prefer_proxies,
                 )
                 .map(|d| {
                     d.relinking_missing_media(
@@ -260,15 +262,20 @@ impl Pipeline {
         let draft = expanded
             .timeline
             .map(|t| {
-                crate::timeline::read(&t.path, t.sequence, cancel)
-                    .map(|d| {
-                        d.relinking_missing_media(
-                            &expanded.media,
-                            &options.redirects,
-                            &options.manual_relinks,
-                        )
-                    })
-                    .map_err(PipelineError::from)
+                crate::timeline::read_with_proxies(
+                    &t.path,
+                    t.sequence,
+                    cancel,
+                    options.prefer_proxies,
+                )
+                .map(|d| {
+                    d.relinking_missing_media(
+                        &expanded.media,
+                        &options.redirects,
+                        &options.manual_relinks,
+                    )
+                })
+                .map_err(PipelineError::from)
             })
             .transpose()?;
         let mut urls = expanded.media;

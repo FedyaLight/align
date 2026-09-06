@@ -196,6 +196,8 @@ pub struct AppData {
     pub redirects: Vec<align_core::redirect::PathRedirection>,
     pub manual_relinks: Vec<(String, PathBuf)>,
     pub omit_extensions: Vec<String>,
+    pub prefer_proxies: bool,
+    pub path_fixer_prefer_proxies: bool,
     pub show_path_fixer: bool,
     pub path_fixer_dir: Option<PathBuf>,
     // Export sheet state (mirrors ExportSheet @State).
@@ -271,6 +273,8 @@ impl Default for AppData {
             redirects: Vec::new(),
             manual_relinks: Vec::new(),
             omit_extensions: Vec::new(),
+            prefer_proxies: false,
+            path_fixer_prefer_proxies: false,
             show_path_fixer: false,
             path_fixer_dir: None,
             show_export: false,
@@ -1348,6 +1352,7 @@ impl AppData {
             redirects: self.redirects.clone(),
             manual_relinks: self.manual_relinks.clone(),
             omit_extensions: self.omit_extensions.clone(),
+            prefer_proxies: self.prefer_proxies,
         }
     }
 }

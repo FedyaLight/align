@@ -346,6 +346,7 @@ impl AlignApp {
 
     pub(crate) fn open_path_fixer(&mut self, cx: &mut Context<Self>) {
         self.data.discard_path_redirection_edits();
+        self.data.path_fixer_prefer_proxies = self.data.prefer_proxies;
         let omitted = self.data.omit_extensions.join(", ");
         self.path_fixer_inputs
             .omit_extensions
@@ -400,6 +401,7 @@ impl AlignApp {
     fn finish_path_fixer(&mut self, cx: &mut Context<Self>) {
         let omitted = self.path_fixer_inputs.omit_extensions.read(cx).text();
         self.data.set_omit_extensions(&omitted);
+        self.data.prefer_proxies = self.data.path_fixer_prefer_proxies;
         self.data.save_path_redirections();
         self.data.path_fixer_dir = None;
         self.data.show_path_fixer = false;
@@ -3100,6 +3102,19 @@ fn path_fixer_panel(
         |this, _, _, cx| this.add_path_redirection(cx),
     )));
     sheet = sheet.child(add);
+
+    sheet = sheet.child(check_row(
+        cx,
+        theme,
+        "prefer-proxies",
+        data.path_fixer_prefer_proxies,
+        "Prefer FCPXML proxies when available".to_string(),
+        true,
+        |this, _, _, cx| {
+            this.data.path_fixer_prefer_proxies = !this.data.path_fixer_prefer_proxies;
+            cx.notify();
+        },
+    ));
 
     sheet = sheet.child(
         div()
