@@ -234,7 +234,8 @@ pub fn export_prepared(
         .iter()
         .filter(|item| {
             (wants_script || wants_aaf)
-                && item.clip.kind == align_core::MediaKind::Audio
+                && (item.clip.kind == align_core::MediaKind::Audio
+                    || (wants_aaf && !item.clip.audio.is_empty() && item.is_enabled("audio")))
                 && (wants_aaf
                     || item.clip.audio.first().map_or(0, |a| a.channels) > 1
                     || !item.is_full_source_selection()
@@ -523,8 +524,8 @@ pub fn export_prepared(
         include_replaced_sequence,
     )?;
     if wants_aaf {
-        let manifest =
-            crate::aaf::audio_manifest(&corrected).map_err(|e| ExportError::Io(e.to_string()))?;
+        let manifest = crate::aaf::timeline_manifest(&corrected, cancel)
+            .map_err(|e| ExportError::Io(e.to_string()))?;
         static NEXT_AAF_MANIFEST: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
         let serial = NEXT_AAF_MANIFEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

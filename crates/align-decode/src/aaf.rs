@@ -65,7 +65,7 @@ pub enum ImportedKind {
     Picture,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ImportedRate {
     pub numerator: u32,
     pub denominator: u32,
@@ -429,6 +429,127 @@ pub fn audio_manifest(
         name: timeline.name.clone(),
         tracks,
     })
+}
+
+/// Assemble linked picture tracks alongside prepared mono sound tracks.
+pub fn timeline_manifest(
+    timeline: &align_core::export::ExportTimeline,
+    cancel: &AtomicBool,
+) -> Result<serde_json::Value, AafError> {
+    use serde_json::json;
+    let fail = |message: &str| AafError::Writer(message.into());
+    let mut audio = timeline.clone();
+    for island in &mut audio.islands {
+        island
+            .clips
+            .retain(|item| !item.clip.audio.is_empty() && item.is_enabled("audio"));
+        for item in &mut island.clips {
+            item.clip.video = None;
+            item.clip.kind = align_core::MediaKind::Audio;
+        }
+    }
+    let tracks = if audio.islands.iter().all(|island| island.clips.is_empty()) {
+        Vec::new()
+    } else {
+        audio_manifest(&audio)?.tracks
+    };
+    let mut pictures = Vec::new();
+    let mut metadata = std::collections::HashMap::new();
+    for item in timeline.islands.iter().flat_map(|island| &island.clips) {
+        let Some(video) = &item.clip.video else {
+            continue;
+        };
+        if item.is_retimed("video")
+            || item.transition_for("video").is_some()
+            || !item.is_enabled("video")
+            || !item.track_enabled
+        {
+            return Err(fail("AAF picture edit semantics not implemented"));
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(AafError::Cancelled);
+        }
+        let clock = video
+            .frame_duration
+            .ok_or_else(|| fail("AAF picture requires a known frame rate"))?;
+        if clock.value <= 0 || clock.timescale <= 0 {
+            return Err(fail("Invalid AAF picture rate"));
+        }
+        let frame = |seconds: f64| -> Result<u64, AafError> {
+            let value = seconds / clock.as_seconds();
+            if !value.is_finite() || value < 0.0 || value >= (1u64 << 52) as f64 {
+                return Err(fail("Invalid AAF picture frame range"));
+            }
+            Ok(value.round() as u64)
+        };
+        let start = frame(item.timeline_start("video"))?;
+        let source_in = frame(item.selected_source_in("video"))?;
+        let length = frame(item.selected_timeline_duration("video"))?;
+        if length == 0 {
+            return Err(fail("Empty AAF picture edit"));
+        }
+        if !metadata.contains_key(&item.clip.url) {
+            let probe = crate::ff::ffprobe_bin()
+                .ok_or_else(|| fail("AAF picture export requires ffprobe"))?;
+            let mut output = tempfile::tempfile()?;
+            let mut child = Command::new(probe)
+                .args([
+                    "-v",
+                    "error",
+                    "-show_format",
+                    "-show_streams",
+                    "-of",
+                    "json",
+                ])
+                .arg(&item.clip.url)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(output.try_clone()?))
+                .stderr(Stdio::inherit())
+                .spawn()?;
+            let status =
+                crate::export::wait_render_process(&mut child, cancel).map_err(|error| {
+                    if cancel.load(Ordering::Relaxed) {
+                        AafError::Cancelled
+                    } else {
+                        AafError::Writer(error.to_string())
+                    }
+                })?;
+            if !status.success() {
+                return Err(fail("AAF picture media inspection failed"));
+            }
+            use std::io::{Seek, SeekFrom};
+            output.seek(SeekFrom::Start(0))?;
+            let value: serde_json::Value = serde_json::from_reader(output)
+                .map_err(|error| AafError::Writer(error.to_string()))?;
+            metadata.insert(item.clip.url.clone(), value);
+        }
+        pictures.push(
+            json!({"name":item.preferred_source_key("video").unwrap_or("Video"),
+            "edit_rate":{"numerator":clock.timescale,"denominator":clock.value},
+            "clips":[{"path":item.clip.url,"start":start,"source_in":source_in,"length":length,
+                "metadata":metadata[&item.clip.url]}]}),
+        );
+    }
+    pictures.sort_by_key(|track| track["clips"][0]["start"].as_u64().unwrap());
+    let mut lanes: Vec<serde_json::Value> = Vec::new();
+    for mut track in pictures {
+        let start = track["clips"][0]["start"].as_u64().unwrap();
+        let lane = lanes.iter_mut().find(|lane| {
+            let last = lane["clips"].as_array().unwrap().last().unwrap();
+            lane["name"] == track["name"]
+                && lane["edit_rate"] == track["edit_rate"]
+                && last["start"].as_u64().unwrap() + last["length"].as_u64().unwrap() <= start
+        });
+        if let Some(lane) = lane {
+            lane["clips"]
+                .as_array_mut()
+                .unwrap()
+                .push(track["clips"][0].take());
+        } else {
+            lanes.push(track);
+        }
+    }
+    Ok(json!({"version":2,"name":timeline.name,"tracks":tracks,"picture_tracks":lanes}))
 }
 
 #[cfg(test)]

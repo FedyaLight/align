@@ -39,7 +39,7 @@ enum Command {
         sequence: Option<usize>,
         #[arg(long)]
         no_drift: bool,
-        /// Export AAF audio tracks (requires the bundled align-aaf module).
+        /// Export linked picture and audio AAF tracks (requires the bundled align-aaf module).
         #[arg(long)]
         aaf: bool,
         #[arg(long)]
@@ -73,7 +73,7 @@ enum Command {
         stage: Option<usize>,
         #[arg(long)]
         no_drift: bool,
-        /// Export AAF audio tracks (requires the bundled align-aaf module).
+        /// Export linked picture and audio AAF tracks (requires the bundled align-aaf module).
         #[arg(long)]
         aaf: bool,
         #[arg(long)]

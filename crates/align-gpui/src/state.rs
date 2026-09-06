@@ -132,7 +132,7 @@ impl ExportTarget {
             Self::ResolveXml => "DaVinci Resolve (.xml)",
             Self::Premiere => "Adobe Premiere Pro (.xml)",
             Self::FinalCutPro => "Final Cut Pro (.fcpxml)",
-            Self::Aaf => "AAF audio (.aaf)",
+            Self::Aaf => "AAF (.aaf)",
         }
     }
 
