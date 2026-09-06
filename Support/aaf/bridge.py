@@ -22,8 +22,8 @@ def integer(value, name, minimum=0):
     return value
 
 
-def validate_wave(path, rate, frames):
-    """Validate the real mono PCM/float source without decoding its samples."""
+def validate_wave(path, rate, frames, expected_channels=1):
+    """Validate the real PCM/float source without decoding its samples."""
     size = path.stat().st_size
     with path.open('rb') as stream:
         header = stream.read(12)
@@ -51,11 +51,11 @@ def validate_wave(path, rate, frames):
         if fmt is None or data_size is None:
             raise ValueError('WAV is missing format or audio data')
         encoding, channels, actual_rate, byte_rate, align, bits = fmt
-        if encoding not in (1, 3) or channels != 1 or actual_rate != rate:
+        if encoding not in (1, 3) or channels != expected_channels or actual_rate != rate:
             raise ValueError('WAV encoding/channels/rate differ from AAF manifest')
         if bits not in (16, 24, 32) or (encoding == 3 and bits != 32):
             raise ValueError('Unsupported WAV sample format')
-        if align != bits // 8 or byte_rate != rate * align:
+        if align != channels * (bits // 8) or byte_rate != rate * align:
             raise ValueError('Invalid WAV block alignment')
         if data_size % align or data_size // align != frames:
             raise ValueError('WAV frame count differs from AAF manifest')
@@ -181,7 +181,7 @@ def read_timeline(path, audio_only=False, extract_dir=None):
             if not isinstance(mob.descriptor, aaf2.essence.PCMDescriptor):
                 raise ValueError('Unsupported embedded AAF audio encoding')
             descriptor = mob.descriptor
-            if descriptor['Channels'].value != 1 or Fraction(str(descriptor['SampleRate'].value)) != rate:
+            if not 1 <= descriptor['Channels'].value <= 64 or Fraction(str(descriptor['SampleRate'].value)) != rate:
                 raise ValueError('Unsupported embedded AAF channel layout or sample rate')
             key = str(mob.mob_id)
             if key not in extracted:
@@ -191,7 +191,8 @@ def read_timeline(path, audio_only=False, extract_dir=None):
                 os.close(fd)
                 try:
                     mob.export_audio(temporary)
-                    validate_wave(Path(temporary), int(rate), int(descriptor['Length'].value))
+                    validate_wave(Path(temporary), int(rate), int(descriptor['Length'].value),
+                                  int(descriptor['Channels'].value))
                     with open(temporary, 'rb') as stream:
                         digest = hashlib.file_digest(stream, 'sha256').hexdigest()
                     destination = directory / (digest + '.wav')
@@ -243,7 +244,13 @@ def read_timeline(path, audio_only=False, extract_dir=None):
             if isinstance(mob, aaf2.mobs.SourceMob):
                 descriptor = mob.descriptor
                 if slot.media_kind == 'Sound' and mob.essence is not None:
-                    return [(embedded_audio(mob, source_rate), source_start, 0, length)]
+                    physical = slot['PhysicalTrackNumber'].value if 'PhysicalTrackNumber' in slot else None
+                    channels = descriptor['Channels'].value if 'Channels' in descriptor else 0
+                    if physical is None and channels == 1:
+                        physical = 1
+                    if physical is None or not 1 <= physical <= channels:
+                        raise ValueError('Ambiguous or invalid embedded AAF physical channel')
+                    return [(embedded_audio(mob, source_rate), source_start, int(physical) - 1, length)]
                 if descriptor is not None and 'Locator' in descriptor:
                     urls = [loc['URLString'].value for loc in descriptor['Locator'].value
                             if 'URLString' in loc]

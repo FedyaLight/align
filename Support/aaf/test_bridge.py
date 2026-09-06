@@ -40,6 +40,45 @@ class SourceValidation(unittest.TestCase):
             self.assertEqual(read_timeline(path, extract_dir=root / 'extracted'), result)
             self.assertEqual(len(list((root / 'extracted').iterdir())), 1)
 
+    def test_embedded_stereo_preserves_numbered_channels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'stereo.wav'
+            samples = b'\x01\x00\xff\x7f' * 300
+            with wave.open(str(source), 'wb') as writer:
+                writer.setparams((2, 2, 48000, 0, 'NONE', 'PCM'))
+                writer.writeframes(samples)
+            path = root / 'stereo.aaf'
+            with aaf2.open(str(path), 'w') as container:
+                mob = container.create.SourceMob('Stereo PCM')
+                container.content.mobs.append(mob)
+                first = mob.import_audio_essence(str(source))
+                first['PhysicalTrackNumber'].value = 1
+                second = mob.create_timeline_slot(48000)
+                second.segment = container.create.SourceClip(media_kind='sound', length=300)
+                second['PhysicalTrackNumber'].value = 2
+                composition = container.create.CompositionMob('Stereo edit')
+                composition.usage = 'Usage_TopLevel'
+                container.content.mobs.append(composition)
+                for slot in (first, second):
+                    track = composition.create_sound_slot(48000)
+                    track.segment.components.append(mob.create_source_clip(
+                        slot_id=slot.slot_id, start=7, length=100, media_kind='sound'))
+                    track.segment.length = 100
+            source.unlink()
+            result = read_timeline(path, extract_dir=root / 'extracted')
+            clips = [t['clips'][0] for t in result['sequences'][0]['tracks']]
+            self.assertEqual([c['channel'] for c in clips], [0, 1])
+            self.assertEqual(clips[0]['path'], clips[1]['path'])
+            with wave.open(clips[0]['path'], 'rb') as reader:
+                self.assertEqual(reader.getnchannels(), 2)
+                self.assertEqual(reader.readframes(300), samples)
+            with aaf2.open(str(path), 'rw') as container:
+                mob = next(m for m in container.content.sourcemobs() if m.essence is not None)
+                mob.slots[1]['PhysicalTrackNumber'].value = 3
+            with self.assertRaisesRegex(ValueError, 'physical channel'):
+                read_timeline(path, extract_dir=root / 'extracted')
+
     def test_nested_source_sequence_splits_cuts_and_preserves_gaps(self):
         with tempfile.TemporaryDirectory() as directory:
             media = Path(directory) / 'mono.wav'
