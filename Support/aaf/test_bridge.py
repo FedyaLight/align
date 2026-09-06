@@ -4,10 +4,16 @@ import unittest
 import wave
 from pathlib import Path
 
-from bridge import write_audio, read_audio
+from bridge import write_audio, read_audio, locator_path
 
 
 class SourceValidation(unittest.TestCase):
+    def test_locator_paths(self):
+        self.assertEqual(locator_path('file:///C:/Media/My%20Clip.wav'), 'C:/Media/My Clip.wav')
+        self.assertEqual(locator_path('file:///Volumes/Audio/a.wav'), '/Volumes/Audio/a.wav')
+        with self.assertRaises(ValueError):
+            locator_path('https://example.com/a.wav')
+
     def test_actual_header_mismatch_preserves_existing_output(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

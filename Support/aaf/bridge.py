@@ -109,6 +109,18 @@ def write_audio(document, destination):
             os.unlink(temporary)
 
 
+def locator_path(url):
+    parsed = urlparse(url)
+    if parsed.scheme != 'file' or parsed.netloc not in ('', 'localhost'):
+        raise ValueError('AAF source locator is not a local file')
+    path = unquote(parsed.path)
+    if len(path) >= 3 and path[0] == '/' and path[1].isalpha() and path[2] == ':':
+        path = path[1:]
+    if not path or '\x00' in path:
+        raise ValueError('Invalid AAF media path')
+    return path
+
+
 def read_audio(path):
     """Read sound compositions; unsupported graph nodes fail explicitly."""
     with aaf2.open(str(path), 'r') as container:
@@ -130,10 +142,15 @@ def read_audio(path):
                             if 'URLString' in loc]
                     if len(urls) != 1:
                         raise ValueError('AAF source requires one media locator')
-                    parsed = urlparse(urls[0])
-                    if parsed.scheme != 'file' or parsed.netloc not in ('', 'localhost'):
-                        raise ValueError('AAF source locator is not a local file')
-                    return unquote(parsed.path), int(clip.start)
+                    physical = slot['PhysicalTrackNumber'].value if 'PhysicalTrackNumber' in slot else None
+                    if physical is None:
+                        sound_slots = [s for s in mob.slots if s.media_kind == 'Sound']
+                        if len(sound_slots) != 1:
+                            raise ValueError('Ambiguous AAF source channel')
+                        physical = 1
+                    if physical < 1:
+                        raise ValueError('Invalid AAF physical channel')
+                    return locator_path(urls[0]), int(clip.start), int(physical) - 1
             segment = slot.segment
             if isinstance(segment, aaf2.components.Sequence):
                 parts = list(segment.components)
@@ -142,8 +159,8 @@ def read_audio(path):
                 segment = parts[0]
             if not isinstance(segment, aaf2.components.SourceClip):
                 raise ValueError('Unsupported AAF source component')
-            media, source_in = resolve(segment, source_rate, visited | {key})
-            return media, source_in + int(clip.start)
+            media, source_in, channel = resolve(segment, source_rate, visited | {key})
+            return media, source_in + int(clip.start), channel
 
         sequences = []
         for composition in container.content.toplevel():
@@ -163,8 +180,8 @@ def read_audio(path):
                     if length < 0:
                         raise ValueError('Negative AAF component length')
                     if isinstance(part, aaf2.components.SourceClip):
-                        media, source_in = resolve(part, rate, set())
-                        clips.append({'path': media, 'start': cursor, 'source_in': source_in, 'length': length})
+                        media, source_in, channel = resolve(part, rate, set())
+                        clips.append({'path': media, 'start': cursor, 'source_in': source_in, 'length': length, 'channel': channel})
                     elif not isinstance(part, aaf2.components.Filler):
                         raise ValueError('Unsupported AAF timeline component')
                     cursor += length
