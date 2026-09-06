@@ -238,10 +238,11 @@ pub fn export_prepared(
     // stems through its own fractional API, so its stems stay unpadded).
     let wants_pad = formats.contains(&TimelineExportFormat::PremiereXML);
     let sequence_rate_fps = sequence_fps(timeline.frame_duration);
+    let wants_fcpxml = formats.contains(&TimelineExportFormat::FinalCutProXML);
     let precision_items: Vec<&&ExportItem> = all_items
         .iter()
         .filter(|item| {
-            (wants_script || wants_aaf)
+            (wants_script || wants_aaf || wants_fcpxml)
                 && (item.clip.kind == align_core::MediaKind::Audio
                     || (wants_aaf && !item.clip.audio.is_empty() && item.is_enabled("audio")))
                 && (wants_aaf

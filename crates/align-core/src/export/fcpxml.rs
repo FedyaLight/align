@@ -57,6 +57,28 @@ fn write_island(
     include_multicam: bool,
     group_storylines: bool,
 ) -> String {
+    // Prepared precision stems contain exactly the selected source range.
+    let mut prepared_island = island.clone();
+    for item in &mut prepared_island.clips {
+        if item.clip.video.is_none() {
+            if let Some(channel) = item.selected_audio_source_channel() {
+                if let Some(path) = item.precision_audio_url(channel + 1).cloned() {
+                    let duration = item.corrected_selected_duration();
+                    item.clip.url = path;
+                    item.clip.duration = MediaTime::microseconds(duration);
+                    for audio in &mut item.clip.audio {
+                        audio.channels = 1;
+                    }
+                    item.corrected_audio_url = None;
+                    item.source_in = 0.0;
+                    item.source_out = duration;
+                    item.audio_source_channel = Some(0);
+                    item.precision_audio_urls.clear();
+                }
+            }
+        }
+    }
+    let island = &prepared_island;
     let frame_duration = timeline.frame_duration;
     let width = island
         .clips
@@ -334,8 +356,10 @@ fn write_island(
         } else {
             format!(" lane=\"{lane}\"")
         };
+        let source_start = timeline_time(item.source_in, frame_duration);
+        let source_duration = timeline_time(item.timeline_duration, frame_duration);
         *target += &format!(
-            "              <asset-clip ref=\"{asset_id}\" {lane_attribute} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{clip_name}\" srcEnable=\"video\" enabled=\"{}\"/>\n",
+            "              <clip {lane_attribute} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{clip_name}\" enabled=\"{}\"><video ref=\"{asset_id}\" offset=\"{source_start}\" start=\"{source_start}\" duration=\"{source_duration}\"/></clip>\n",
             timeline_time(item.start, frame_duration),
             timeline_time(item.timeline_duration, frame_duration),
             timeline_time(item.source_in, frame_duration),
@@ -374,7 +398,11 @@ fn write_island(
         let audio_role = item.fcpxml_audio_role().map_or_else(String::new, |role| {
             format!(" audioRole=\"{}\"", xml_text::escape(role))
         });
-        let audio_channel_end = audio_channel_end(item);
+        let source_start = timeline_time(item.source_in, frame_duration);
+        let source_duration = timeline_time(duration, frame_duration);
+        let channel_attribute = item
+            .selected_audio_source_channel()
+            .map_or_else(String::new, |channel| format!(" srcCh=\"{}\"", channel + 1));
         let target = if group_storylines {
             stories.entry(lane).or_default()
         } else {
@@ -386,7 +414,7 @@ fn write_island(
             format!(" lane=\"{lane}\"")
         };
         *target += &format!(
-            "              <asset-clip ref=\"{asset_id}\" {lane_attribute} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{clip_name}\" srcEnable=\"audio\" enabled=\"{}\"{audio_role}{audio_channel_end}\n",
+            "              <clip {lane_attribute} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{clip_name}\" enabled=\"{}\"{audio_role}><audio ref=\"{asset_id}\" offset=\"{source_start}\" start=\"{source_start}\" duration=\"{source_duration}\"{channel_attribute}/></clip>\n",
             timeline_time(item.start, frame_duration),
             timeline_time(duration, frame_duration),
             timeline_time(item.source_in, frame_duration),
@@ -496,8 +524,8 @@ mod tests {
         assert!(xml.contains("<fcpxml version=\"1.10\">"));
         assert!(xml.contains("r_multicam"));
         assert!(xml.contains("– synced"));
-        assert!(xml.contains("srcEnable=\"video\""));
-        assert!(xml.contains("srcEnable=\"audio\""));
+        assert!(xml.contains("<video ref="));
+        assert!(xml.contains("<audio ref="));
         // The output re-parses as a timeline (self-hosting check).
         let dir = std::env::temp_dir().join(format!("align-fcpxml-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
