@@ -58,6 +58,14 @@ def verify(xml_path, project_path):
             assert int(group.findtext('./TrackGroup/FrameRate')) == tick_frame, 'Wrong FPS'
         expected_tracks = seq.findall(f'./media/{kind}/track')
         actual_tracks = group.findall('./TrackGroup/Tracks/Track')
+        # Premiere inserts one empty video track for an audio-only sequence.
+        # Accept only that observed shape; added clips/transitions still fail.
+        if kind == 'video' and not expected_tracks and len(actual_tracks) == 1:
+            placeholder = deref(actual_tracks[0])
+            assert not placeholder.findall('.//TrackItem'), 'Unexpected video content'
+            assert not placeholder.findall('.//TransitionItem'), 'Unexpected video transition'
+            report['audio_only_empty_video_track'] = True
+            actual_tracks = []
         assert len(expected_tracks) == len(actual_tracks), f'{kind}: track count'
         for expected_track, track_ref in zip(expected_tracks, actual_tracks):
             track = deref(track_ref)
