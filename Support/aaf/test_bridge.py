@@ -25,6 +25,13 @@ class SourceValidation(unittest.TestCase):
                     'length': 101, 'metadata': metadata}]}]}
             output = Path(directory) / 'picture.aaf'
             write_audio(document, output)
+            with aaf2.open(str(output)) as container:
+                clocks = [slot for slot in next(container.content.toplevel()).slots
+                    if slot.media_kind == 'Timecode']
+                self.assertEqual(len(clocks), 1)
+                self.assertEqual(str(clocks[0].edit_rate), '30000/1001')
+                self.assertEqual(clocks[0].segment.start, 0)
+                self.assertEqual(clocks[0].segment.length, 108)
             track = read_timeline(output)['sequences'][0]['tracks'][0]
             self.assertEqual(track['edit_rate'], {'numerator': 30000, 'denominator': 1001})
             clip = track['clips'][0]

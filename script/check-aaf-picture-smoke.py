@@ -53,7 +53,10 @@ assert len(edits) == 4 and not result['project']['warnings']
 assert [edit.get('audioSourceChannel') for edit in edits] == [None, None, 0, 1]
 artifacts = run(['export-json', '--aaf', '--no-drift', root / 'sync.json', root / 'export'], 'export')
 with aaf2.open(artifacts[0]['url']) as container:
-    slots = list(next(container.content.toplevel()).slots)
+    all_slots = list(next(container.content.toplevel()).slots)
+    timecode = [slot for slot in all_slots if slot.media_kind == "Timecode"]
+    assert len(timecode) == 1 and str(timecode[0].edit_rate) == "30000/1001"
+    slots = [slot for slot in all_slots if slot.media_kind != "Timecode"]
     assert [slot.media_kind for slot in slots] == ['Picture', 'Sound', 'Sound']
     assert [str(slot.edit_rate) for slot in slots] == ['30000/1001', '48000', '48000']
     assert [slot.segment.length for slot in slots] == [100, 160160, 160160]

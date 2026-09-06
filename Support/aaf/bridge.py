@@ -76,6 +76,19 @@ def write_audio(document, destination):
             composition = container.create.CompositionMob(document['name'])
             composition.usage = 'Usage_TopLevel'
             container.content.mobs.append(composition)
+            if picture_tracks:
+                clock = picture_tracks[0]['edit_rate']
+                rate = Fraction(integer(clock['numerator'], 'numerator', 1),
+                    integer(clock['denominator'], 'denominator', 1))
+                duration = max((Fraction(clip['start'] + clip['length']) /
+                    Fraction(track['edit_rate']['numerator'], track['edit_rate']['denominator'])
+                    for track in picture_tracks for clip in track['clips']), default=Fraction(0))
+                frames = duration * rate
+                timecode = composition.create_timeline_slot(str(rate))
+                timecode.name = 'Timecode'
+                timecode.segment = container.create.Timecode(fps=round(rate), drop=False,
+                    length=(frames.numerator + frames.denominator - 1) // frames.denominator)
+                timecode.segment.start = 0
             for track in picture_tracks:
                 numerator = integer(track['edit_rate']['numerator'], 'edit_rate numerator', 1)
                 denominator = integer(track['edit_rate']['denominator'], 'edit_rate denominator', 1)
@@ -205,6 +218,8 @@ def read_timeline(path, audio_only=False):
         for composition in container.content.toplevel():
             tracks = []
             for slot in composition.slots:
+                if slot.media_kind == 'Timecode' and isinstance(slot.segment, aaf2.components.Timecode):
+                    continue
                 if slot.media_kind not in ('Sound', 'Picture') or (audio_only and slot.media_kind != 'Sound'):
                     raise ValueError('Unsupported AAF track kind: ' + slot.media_kind)
                 rate = Fraction(str(slot.edit_rate))
