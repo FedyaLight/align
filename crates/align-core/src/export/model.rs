@@ -880,6 +880,8 @@ fn close_common_gaps(clips: &mut [ExportItem]) {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TimelineExportFormat {
+    #[serde(rename = "aaf")]
+    Aaf,
     #[serde(rename = "resolveOTIO")]
     ResolveOTIO,
     #[serde(rename = "resolveScript")]
@@ -904,6 +906,7 @@ impl TimelineExportFormat {
     }
     pub fn file_extension(&self) -> &'static str {
         match self {
+            Self::Aaf => "aaf",
             Self::ResolveOTIO => "otio",
             Self::ResolveScript => "py",
             Self::ResolveXML => "xml",

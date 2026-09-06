@@ -30,6 +30,8 @@ pub struct ExportArtifact {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ExportArtifactFormat {
+    #[serde(rename = "aaf")]
+    Aaf,
     #[serde(rename = "resolveOTIO")]
     ResolveOTIO,
     #[serde(rename = "resolveScript")]
@@ -47,6 +49,7 @@ pub enum ExportArtifactFormat {
 impl From<TimelineExportFormat> for ExportArtifactFormat {
     fn from(format: TimelineExportFormat) -> Self {
         match format {
+            TimelineExportFormat::Aaf => Self::Aaf,
             TimelineExportFormat::ResolveOTIO => Self::ResolveOTIO,
             TimelineExportFormat::ResolveScript => Self::ResolveScript,
             TimelineExportFormat::ResolveXML => Self::ResolveXML,
@@ -208,6 +211,12 @@ pub fn export_prepared(
         .map(|item| item.clip.id.0.as_str())
         .collect();
 
+    let wants_aaf = formats.contains(&TimelineExportFormat::Aaf);
+    if wants_aaf && include_replaced_sequence {
+        return Err(ExportError::Io(
+            "AAF replaced sequence export is not implemented".into(),
+        ));
+    }
     let wants_script = formats.contains(&TimelineExportFormat::ResolveScript);
     // Placement pads are a PremiereXML-only concern: no other writer reads
     // them (OTIO/FCPXML place exactly already; the Resolve script locates
@@ -217,9 +226,10 @@ pub fn export_prepared(
     let precision_items: Vec<&&ExportItem> = all_items
         .iter()
         .filter(|item| {
-            wants_script
+            (wants_script || wants_aaf)
                 && item.clip.kind == align_core::MediaKind::Audio
-                && (item.clip.audio.first().map_or(0, |a| a.channels) > 1
+                && (wants_aaf
+                    || item.clip.audio.first().map_or(0, |a| a.channels) > 1
                     || !item.is_full_source_selection()
                     || item.precision_tail_samples > 0)
         })
@@ -494,7 +504,39 @@ pub fn export_prepared(
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(ExportError::Cancelled);
     }
-    let mut artifacts = write_artifacts(&corrected, directory, formats, include_replaced_sequence)?;
+    let standard_formats: Vec<_> = formats
+        .iter()
+        .copied()
+        .filter(|f| *f != TimelineExportFormat::Aaf)
+        .collect();
+    let mut artifacts = write_artifacts(
+        &corrected,
+        directory,
+        &standard_formats,
+        include_replaced_sequence,
+    )?;
+    if wants_aaf {
+        let manifest =
+            crate::aaf::audio_manifest(&corrected).map_err(|e| ExportError::Io(e.to_string()))?;
+        static NEXT_AAF_MANIFEST: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let serial = NEXT_AAF_MANIFEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let manifest_path =
+            directory.join(format!(".align-aaf-{}-{serial}.json", std::process::id()));
+        let bytes = serde_json::to_vec(&manifest).map_err(|e| ExportError::Io(e.to_string()))?;
+        std::fs::write(&manifest_path, bytes).map_err(|e| ExportError::Io(e.to_string()))?;
+        let url = directory.join("Align.aaf");
+        let result = crate::aaf::write_audio(&manifest_path, &url, cancel);
+        let _ = std::fs::remove_file(&manifest_path);
+        result.map_err(|e| match e {
+            crate::aaf::AafError::Cancelled => ExportError::Cancelled,
+            other => ExportError::Io(other.to_string()),
+        })?;
+        artifacts.push(ExportArtifact {
+            format: ExportArtifactFormat::Aaf,
+            url,
+        });
+    }
     if include_media_files {
         std::fs::create_dir_all(&media_dir).map_err(|e| ExportError::Io(e.to_string()))?;
         for plan in media_file_plans(&corrected, &media_dir) {
@@ -786,7 +828,11 @@ fn write_artifacts(
     combined.temporal_policy = timeline.temporal_policy.clone();
     let mut artifacts = Vec::with_capacity(formats.len());
     for format in formats {
+        if *format == TimelineExportFormat::Aaf {
+            return Err(ExportError::Io("AAF requires prepared audio export".into()));
+        }
         let application = match format {
+            TimelineExportFormat::Aaf => unreachable!(),
             TimelineExportFormat::PremiereXML => "Adobe Premiere Pro",
             TimelineExportFormat::FinalCutProXML => "Final Cut Pro",
             TimelineExportFormat::ResolveOTIO
@@ -796,6 +842,7 @@ fn write_artifacts(
         // En dash in app bundle names mirrors Swift exactly.
         let url = directory.join(format!("Align – {application}.{}", format.file_extension()));
         let bytes: Vec<u8> = match format {
+            TimelineExportFormat::Aaf => unreachable!(),
             TimelineExportFormat::ResolveOTIO => {
                 align_core::export::otio::data(&combined).map_err(ExportError::Io)?
             }
