@@ -1257,6 +1257,13 @@ mod tests {
 
     #[test]
     fn piecewise_render_preserves_independent_channels_and_bwf() {
+        verify_piecewise_render(8);
+        verify_piecewise_render(600);
+    }
+
+    fn verify_piecewise_render(duration: u32) {
+        let midpoint = f64::from(duration) / 2.0;
+        let knot = midpoint * 1.001;
         let dir = tmp("piecewise-tones");
         let src = dir.join("src.wav");
         let dst = dir.join("fixed.wav");
@@ -1272,7 +1279,7 @@ mod tests {
             0.4 * (std::f64::consts::TAU * frequency * time + [0.37, 0.83][channel]).sin()
         };
         let mut writer = hound::WavWriter::create(&src, spec).unwrap();
-        for frame in 0..8 * rate {
+        for frame in 0..duration * rate {
             for channel in 0..2 {
                 writer
                     .write_sample(tone(f64::from(frame) / f64::from(rate), channel) as f32)
@@ -1285,12 +1292,16 @@ mod tests {
             &crate::portable::PortableBackend,
             &src,
             &dst,
-            &[(0.0, 0.0), (4.0, 4.004), (8.0, 8.0)],
+            &[
+                (0.0, 0.0),
+                (midpoint, knot),
+                (f64::from(duration), f64::from(duration)),
+            ],
         )
         .unwrap();
         let reader = hound::WavReader::open(&dst).unwrap();
         assert_eq!(reader.spec(), spec);
-        assert_eq!(reader.duration(), 8 * rate);
+        assert_eq!(reader.duration(), duration * rate);
         assert_eq!(
             align_core::meta::read_bwf(&dst).unwrap().time_reference,
             Some(123456789)
@@ -1302,15 +1313,15 @@ mod tests {
         for channel in 0..2 {
             let mut squared_error = 0.0;
             let mut count = 0;
-            for frame in 0..8 * rate as usize {
+            for frame in 0..(duration * rate) as usize {
                 let time = frame as f64 / f64::from(rate);
-                if time < 0.02 || (time - 4.004).abs() < 0.02 || time > 7.98 {
+                if time < 0.02 || (time - knot).abs() < 0.02 || time > f64::from(duration) - 0.02 {
                     continue;
                 }
-                let source = if time < 4.004 {
+                let source = if time < knot {
                     time / 1.001
                 } else {
-                    4.0 + (time - 4.004) / 0.999
+                    midpoint + (time - knot) / 0.999
                 };
                 squared_error +=
                     (f64::from(samples[frame * 2 + channel]) - tone(source, channel)).powi(2);
@@ -1332,13 +1343,14 @@ mod tests {
         // allowing 0.001 for numerical filter error.
         for channel in 0..2 {
             let mut peak_error = 0.0_f64;
-            for frame in ((3.984 * f64::from(rate)) as usize)..((4.024 * f64::from(rate)) as usize)
+            for frame in (((knot - 0.02) * f64::from(rate)) as usize)
+                ..(((knot + 0.02) * f64::from(rate)) as usize)
             {
                 let time = frame as f64 / f64::from(rate);
-                let source = if time < 4.004 {
+                let source = if time < knot {
                     time / 1.001
                 } else {
-                    4.0 + (time - 4.004) / 0.999
+                    midpoint + (time - knot) / 0.999
                 };
                 peak_error = peak_error
                     .max((f64::from(samples[frame * 2 + channel]) - tone(source, channel)).abs());
