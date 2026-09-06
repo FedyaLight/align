@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Packages the Rust Align port for macOS (arm64): Align.app bundle +
-# align-cli, ad-hoc signed. FFmpeg/ffprobe are optional on macOS.
+# align-cli, AAF and FFmpeg sidecars, ad-hoc signed.
 # Usage: ./script/package-macos.sh [output-dir]   (default: ~/Downloads/Align-macOS)
 set -euo pipefail
 
@@ -8,11 +8,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${1:-$HOME/Downloads/Align-macOS}"
 APP_NAME="Align"
 BUNDLE_ID="com.align.app"
-# FFmpeg sidecars are NOT bundled by default: on macOS the Apple backend
-# (AVFoundation) covers all containers, and the portable backend picks up
-# a system ffmpeg/ffprobe from PATH. Set BUNDLE_FFMPEG=1 to embed them
-# (~190 MB for the pair, duplicated for app + CLI).
-BUNDLE_FFMPEG="${BUNDLE_FFMPEG:-0}"
+# Default sidecars support portable decoding and AAF picture metadata.
+BUNDLE_FFMPEG="${BUNDLE_FFMPEG:-1}"
+FFMPEG_DIR="${FFMPEG_DIR:-}"
 
 # Build the self-contained AAF module before touching an existing package.
 AAF_BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/align-aaf-package.XXXXXX")"
@@ -20,6 +18,18 @@ trap 'rm -rf "$AAF_BUILD_DIR"' EXIT
 python3 -m venv "$AAF_BUILD_DIR/venv"
 "$AAF_BUILD_DIR/venv/bin/python" -m pip install -r "$ROOT_DIR/Support/aaf/build-requirements.txt"
 "$AAF_BUILD_DIR/venv/bin/python" "$ROOT_DIR/script/build-aaf-sidecar.py" "$AAF_BUILD_DIR/dist"
+
+if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
+  if [[ -z "$FFMPEG_DIR" ]]; then
+    FFMPEG_DIR="$AAF_BUILD_DIR/ffmpeg"
+    "$ROOT_DIR/script/build-ffmpeg-minimal.sh" "$FFMPEG_DIR"
+  fi
+  for tool in ffmpeg ffprobe; do
+    test -x "$FFMPEG_DIR/$tool"
+    "$FFMPEG_DIR/$tool" -version >/dev/null
+  done
+  test -f "$FFMPEG_DIR/FFMPEG-LICENSE.txt"
+fi
 
 echo "==> building release"
 cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml" -p align-cli -p align-gpui
@@ -48,22 +58,15 @@ cp -R "$AAF_BUILD_DIR/dist/AAF-Licenses" "$OUT_DIR/AAF-Licenses"
 chmod +x "$APP_MACOS/align-aaf" "$OUT_DIR/align-aaf"
 
 
-# Bundled sidecars (opt-in via BUNDLE_FFMPEG=1): resolved from exe dir
-# first, so both binaries find them.
+# Both entry points discover adjacent sidecars.
 if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
   for tool in ffmpeg ffprobe; do
-    BIN="$(command -v "$tool" || true)"
-    if [[ -n "$BIN" ]]; then
-      cp -f "$BIN" "$APP_MACOS/$tool"
-      cp -f "$BIN" "$OUT_DIR/$tool"
-      chmod +x "$APP_MACOS/$tool" "$OUT_DIR/$tool"
-      echo "    bundled $tool"
-    else
-      echo "    WARNING: $tool not in PATH (container tier will need it)" >&2
-    fi
+    cp "$FFMPEG_DIR/$tool" "$APP_MACOS/$tool"
+    cp "$FFMPEG_DIR/$tool" "$OUT_DIR/$tool"
+    chmod +x "$APP_MACOS/$tool" "$OUT_DIR/$tool"
   done
-else
-  echo "    skipping ffmpeg sidecars (Apple backend + PATH fallback)"
+  cp "$FFMPEG_DIR/FFMPEG-LICENSE.txt" "$RESOURCES/FFMPEG-LICENSE.txt"
+  cp "$FFMPEG_DIR/FFMPEG-LICENSE.txt" "$OUT_DIR/FFMPEG-LICENSE.txt"
 fi
 
 cat >"$APP_CONTENTS/Info.plist" <<PLIST

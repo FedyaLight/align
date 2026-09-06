@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the two portable sidecars Align actually uses. Video is demuxed for
-# timing and audio streams only; no video decoder, network stack, or device IO.
+# timing, audio decoding, and AAF video metadata; no network or device IO.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -29,7 +29,6 @@ JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/
   --disable-network \
   --disable-avdevice \
   --disable-swscale \
-  --enable-small \
   --enable-ffmpeg \
   --enable-ffprobe \
   --enable-avcodec \
@@ -38,8 +37,8 @@ JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/
   --enable-swresample \
   --enable-protocol=file,pipe \
   --enable-demuxer=mov,mpegts,mxf,mxf_d10,r3d,avi,asf,matroska,wav,aiff,mp3,flac,ogg \
-  --enable-decoder=aac,aac_fixed,ac3,eac3,alac,mp2,mp3,mp3float,flac,opus,vorbis,"$PCM_DECODERS" \
-  --enable-parser=aac,aac_latm,ac3,mpegaudio,opus,vorbis \
+  --enable-decoder=aac,aac_fixed,ac3,eac3,alac,mp2,mp3,mp3float,flac,opus,vorbis,h264,hevc,mpeg2video,mpeg4,prores,dnxhd,mjpeg,vp8,vp9,av1,"$PCM_DECODERS" \
+  --enable-parser=aac,aac_latm,ac3,mpegaudio,opus,vorbis,h264,hevc,mpegvideo,mpeg4video,dnxhd,mjpeg,vp8,vp9,av1 \
   --enable-encoder=pcm_f32le,pcm_s32le \
   --enable-muxer=pcm_f32le,pcm_s32le \
   --enable-filter=abuffer,aformat,aresample,anull,abuffersink

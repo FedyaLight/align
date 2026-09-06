@@ -68,13 +68,11 @@ FFT специально НЕ раздваивается: 1024-pt FFT — мик
   (отдельный процесс с bundled бинарником) для видеоконтейнеров — вместо
   линковки `ffmpeg-next` под 3 ОС и адского matrix CI. Падение ffmpeg не
   роняет основной процесс, память изолирована ОС.
-- **Размер Windows/Linux:** release CI собирает pinned FFmpeg 9.0.1 через
-  `script/build-ffmpeg-minimal.sh`: только `ffmpeg`/`ffprobe`, file/pipe,
-  MOV/MP4, MPEG-TS, MXF, R3D, AVI, ASF, Matroska, WAV/AIFF и современные
-  монтажные audio codecs. Video не декодируется, network/devices отключены.
-  На arm64 macOS этот же профиль занимает 2.0 + 1.9 МБ против 47 + 47 МБ
-  полных бинарников; macOS package по-прежнему использует AVFoundation и
-  не включает sidecars.
+- **FFmpeg sidecars:** release CI и macOS package собирают FFmpeg 9.0.1
+  через `script/build-ffmpeg-minimal.sh`: file/pipe, монтажные контейнеры,
+  аудиодекодеры и видеодекодеры для метаданных AAF. Network/devices отключены.
+  На arm64 macOS бинарники занимают 6.3 + 6.1 МБ и используют только системные
+  библиотеки. В macOS package они входят по умолчанию вместе с лицензией.
 - **DSP на CPU, не на GPU:** 8 кГц mono FFT 1024 — это микросекунды на CPU;
   гонять через Metal/DX/Vulkan = PCIe-трансфер + wake GPU ради ничего.
   GPU (Blade в GPUI) только композитит UI: Metal/macOS, DirectX/Windows,
@@ -157,13 +155,13 @@ cargo build --release -p align-cli -p align-gpui
    В R20 проверены видео `30000/1001`, таймкод композиции и фактический
    рендер в Resolve. В текущем исходном коде дополнительно поддержаны
    вложенные SourceClip/Sequence/Filler, активные Selector и извлечение
-   встроенного моно PCM в кэш. Эти дополнения пока не входят в R20.
+   встроенного моно PCM в кэш. Эти дополнения включены в R21.
    Остались встроенное видео/многоканальное аудио, преобразование частот,
    эффекты, переходы и изменение скорости; неподдерживаемые конструкции
    завершаются явной ошибкой. Проверки: `script/check-aaf-smoke.py`,
    `script/check-aaf-picture-smoke.py`, `script/check-aaf-embedded-smoke.py`.
-   Для экспорта видео AAF нужен доступный `ffprobe`; стандартный macOS-пакет
-   его не включает.
+   R21 включает `ffprobe`: экспорт и повторный импорт видео AAF проверены
+   с пустым PATH, без системного FFmpeg и Python.
 
 ## Использование
 

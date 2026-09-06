@@ -10,6 +10,8 @@ import aaf2
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('cli', type=Path)
 parser.add_argument('output', type=Path)
+parser.add_argument('--isolated-runtime', action='store_true',
+    help='Run the packaged CLI with an empty PATH and no sidecar overrides')
 args = parser.parse_args()
 root = args.output.resolve()
 root.mkdir(parents=True, exist_ok=True)
@@ -37,6 +39,12 @@ with aaf2.open(str(source_aaf), 'w') as container:
         target.segment.length = length
 env = dict(os.environ, ALIGN_BACKEND='portable')
 env.pop('ALIGN_AAF', None)
+if args.isolated_runtime:
+    for name in ('ALIGN_FFMPEG', 'ALIGN_FFPROBE'):
+        env.pop(name, None)
+    empty_path = root / 'empty-bin'
+    empty_path.mkdir(exist_ok=True)
+    env['PATH'] = str(empty_path)
 
 def run(arguments, name):
     result = subprocess.run([str(args.cli.resolve()), *map(str, arguments)],
@@ -65,5 +73,6 @@ readback = run(['sync', artifacts[0]['url']], 'readback')
 assert len(readback['project']['importedTimeline']['edits']) == 4
 assert not readback['project']['warnings']
 (root / 'verification.json').write_text(json.dumps({'passed': True,
+    'isolated_runtime': args.isolated_runtime,
     'picture_rate': '30000/1001', 'picture_frames': 100, 'sound_tracks': 2,
     'sound_samples': 160160}, indent=2) + '\n')
