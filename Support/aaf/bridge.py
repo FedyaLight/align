@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import struct
 import tempfile
 
 import aaf2
@@ -16,6 +17,45 @@ def integer(value, name, minimum=0):
     if type(value) is not int or value < minimum:
         raise ValueError(f'{name} must be an integer >= {minimum}')
     return value
+
+
+def validate_wave(path, rate, frames):
+    """Validate the real mono PCM/float source without decoding its samples."""
+    size = path.stat().st_size
+    with path.open('rb') as stream:
+        header = stream.read(12)
+        if len(header) != 12 or header[:4] != b'RIFF' or header[8:] != b'WAVE':
+            raise ValueError('AAF stem must be a RIFF WAVE file')
+        limit = struct.unpack('<I', header[4:8])[0] + 8
+        if limit > size:
+            raise ValueError('Truncated WAV container')
+        fmt = None
+        data_size = None
+        while stream.tell() + 8 <= limit:
+            kind, length = struct.unpack('<4sI', stream.read(8))
+            start = stream.tell()
+            if start + length > limit:
+                raise ValueError('Truncated WAV chunk')
+            if kind == b'fmt ':
+                if fmt is not None or length < 16:
+                    raise ValueError('Invalid WAV format chunk')
+                fmt = struct.unpack('<HHIIHH', stream.read(16))
+            elif kind == b'data':
+                if data_size is not None:
+                    raise ValueError('Multiple WAV data chunks')
+                data_size = length
+            stream.seek(start + length + (length & 1))
+        if fmt is None or data_size is None:
+            raise ValueError('WAV is missing format or audio data')
+        encoding, channels, actual_rate, byte_rate, align, bits = fmt
+        if encoding not in (1, 3) or channels != 1 or actual_rate != rate:
+            raise ValueError('WAV encoding/channels/rate differ from AAF manifest')
+        if bits not in (16, 24, 32) or (encoding == 3 and bits != 32):
+            raise ValueError('Unsupported WAV sample format')
+        if align != bits // 8 or byte_rate != rate * align:
+            raise ValueError('Invalid WAV block alignment')
+        if data_size % align or data_size // align != frames:
+            raise ValueError('WAV frame count differs from AAF manifest')
 
 
 def write_audio(document, destination):
@@ -48,6 +88,7 @@ def write_audio(document, destination):
                         raise ValueError('Overlapping or out-of-bounds AAF clip')
                     if clip['channels'] != 1:
                         raise ValueError('AAF audio requires one lossless mono stem per channel')
+                    validate_wave(path, rate, frames)
                     metadata = {'format': {'format_name': 'wav'}, 'streams': [{
                         'codec_type': 'audio', 'sample_rate': str(rate),
                         'duration_ts': frames, 'channels': 1,
