@@ -61,10 +61,11 @@ def validate_wave(path, rate, frames):
 
 
 def write_audio(document, destination):
-    if document.get('version') != 1:
+    if document.get('version') not in (1, 2):
         raise ValueError('Unsupported AAF bridge protocol')
     tracks = document['tracks']
-    if not tracks:
+    picture_tracks = document.get('picture_tracks', []) if document['version'] == 2 else []
+    if not tracks and not picture_tracks:
         raise ValueError('No tracks')
     destination = Path(destination).resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -75,6 +76,35 @@ def write_audio(document, destination):
             composition = container.create.CompositionMob(document['name'])
             composition.usage = 'Usage_TopLevel'
             container.content.mobs.append(composition)
+            for track in picture_tracks:
+                numerator = integer(track['edit_rate']['numerator'], 'edit_rate numerator', 1)
+                denominator = integer(track['edit_rate']['denominator'], 'edit_rate denominator', 1)
+                rate = Fraction(numerator, denominator)
+                slot = composition.create_timeline_slot(str(rate))
+                slot.name = track['name']
+                slot.segment = container.create.Sequence(media_kind='picture')
+                cursor = 0
+                for clip in track['clips']:
+                    path = Path(clip['path']).resolve(strict=True)
+                    start = integer(clip['start'], 'start')
+                    source_in = integer(clip['source_in'], 'source_in')
+                    length = integer(clip['length'], 'length', 1)
+                    master, _, _ = container.content.create_ama_link(str(path), clip['metadata'])
+                    sources = [source for source in master.slots if source.media_kind == 'Picture']
+                    if len(sources) != 1:
+                        raise ValueError('AAF picture requires one video stream')
+                    source = sources[0]
+                    if Fraction(str(source.edit_rate)) != rate:
+                        raise ValueError('AAF picture rate conversion is not implemented')
+                    available = sum(part.length for part in source.segment.components)
+                    if start < cursor or source_in + length > available:
+                        raise ValueError('Overlapping or out-of-bounds AAF picture clip')
+                    if start > cursor:
+                        slot.segment.components.append(container.create.Filler('picture', start - cursor))
+                    slot.segment.components.append(master.create_source_clip(
+                        slot_id=source.slot_id, start=source_in, length=length, media_kind='picture'))
+                    cursor = start + length
+                slot.segment.length = cursor
             for track in tracks:
                 rate = integer(track['sample_rate'], 'sample_rate', 1)
                 slot = composition.create_sound_slot(edit_rate=rate)
@@ -213,7 +243,7 @@ def main():
     if len(sys.argv) == 3 and sys.argv[1] == 'read-audio':
         print(json.dumps(read_audio(sys.argv[2])))
         return
-    if len(sys.argv) != 4 or sys.argv[1] != 'write-audio':
+    if len(sys.argv) != 4 or sys.argv[1] not in ('write-audio', 'write-timeline'):
         raise ValueError('Usage: align-aaf write-audio manifest.json destination.aaf')
     with open(sys.argv[2], encoding='utf-8') as stream:
         write_audio(json.load(stream), sys.argv[3])

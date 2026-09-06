@@ -2,6 +2,8 @@ import copy
 import tempfile
 import unittest
 import wave
+import subprocess
+import json
 from pathlib import Path
 
 from bridge import write_audio, read_audio, read_timeline, locator_path
@@ -9,6 +11,32 @@ import aaf2
 
 
 class SourceValidation(unittest.TestCase):
+    def test_picture_export_links_real_media_and_preserves_output_on_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            media = Path(directory) / 'camera.mov'
+            subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i',
+                'color=c=blue:s=64x64:r=30000/1001', '-frames:v', '120',
+                '-c:v', 'mpeg4', str(media)], check=True, timeout=30)
+            metadata = json.loads(subprocess.check_output(['ffprobe', '-v', 'error',
+                '-show_format', '-show_streams', '-of', 'json', str(media)], timeout=30))
+            document = {'version': 2, 'name': 'Picture', 'tracks': [], 'picture_tracks': [{
+                'name': 'V1', 'edit_rate': {'numerator': 30000, 'denominator': 1001},
+                'clips': [{'path': str(media), 'start': 7, 'source_in': 11,
+                    'length': 101, 'metadata': metadata}]}]}
+            output = Path(directory) / 'picture.aaf'
+            write_audio(document, output)
+            track = read_timeline(output)['sequences'][0]['tracks'][0]
+            self.assertEqual(track['edit_rate'], {'numerator': 30000, 'denominator': 1001})
+            clip = track['clips'][0]
+            self.assertEqual((clip['start'], clip['source_in'], clip['length']), (7, 11, 101))
+            self.assertEqual(Path(clip['path']), media.resolve())
+            original = output.read_bytes()
+            document['picture_tracks'][0]['clips'][0]['length'] = 121
+            with self.assertRaises(ValueError):
+                write_audio(document, output)
+            self.assertEqual(output.read_bytes(), original)
+            self.assertFalse(list(Path(directory).glob('.align-aaf-*')))
+
     def test_linked_picture_preserves_fractional_edit_rate(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'picture.aaf'
