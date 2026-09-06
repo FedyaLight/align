@@ -10,6 +10,7 @@ import sys
 import struct
 import tempfile
 import hashlib
+import math
 from fractions import Fraction
 from urllib.parse import urlparse, unquote
 
@@ -175,13 +176,14 @@ def read_timeline(path, audio_only=False, extract_dir=None):
     with aaf2.open(str(path), 'r') as container:
         extracted = {}
 
-        def embedded_audio(mob, rate):
+        def embedded_audio(mob):
             if extract_dir is None:
                 raise ValueError('Embedded AAF audio requires an extraction directory')
             if not isinstance(mob.descriptor, aaf2.essence.PCMDescriptor):
                 raise ValueError('Unsupported embedded AAF audio encoding')
             descriptor = mob.descriptor
-            if not 1 <= descriptor['Channels'].value <= 64 or Fraction(str(descriptor['SampleRate'].value)) != rate:
+            rate = Fraction(str(descriptor['SampleRate'].value))
+            if not 1 <= descriptor['Channels'].value <= 64 or rate <= 0 or rate.denominator != 1:
                 raise ValueError('Unsupported embedded AAF channel layout or sample rate')
             key = str(mob.mob_id)
             if key not in extracted:
@@ -225,9 +227,8 @@ def read_timeline(path, audio_only=False, extract_dir=None):
                 yield segment
 
         def resolve(clip, rate, visited, offset=0, length=None):
-            length = int(clip.length) if length is None else length
-            source_start = int(clip.start) + offset
-            if source_start < 0 or length < 0:
+            length = Fraction(int(clip.length), 1) / rate if length is None else length
+            if int(clip.start) < 0 or offset < 0 or length < 0:
                 raise ValueError('Negative AAF source range')
             mob = clip.mob
             if mob is None:
@@ -239,8 +240,9 @@ def read_timeline(path, audio_only=False, extract_dir=None):
             if slot.media_kind != clip.media_kind:
                 raise ValueError('AAF source media kind mismatch')
             source_rate = Fraction(str(slot.edit_rate))
-            if source_rate != rate:
-                raise ValueError('Mixed-rate AAF source chain is not implemented')
+            if source_rate <= 0:
+                raise ValueError('Invalid AAF source edit rate')
+            source_start = Fraction(int(clip.start), 1) / source_rate + offset
             if isinstance(mob, aaf2.mobs.SourceMob):
                 descriptor = mob.descriptor
                 if slot.media_kind == 'Sound' and mob.essence is not None:
@@ -250,7 +252,7 @@ def read_timeline(path, audio_only=False, extract_dir=None):
                         physical = 1
                     if physical is None or not 1 <= physical <= channels:
                         raise ValueError('Ambiguous or invalid embedded AAF physical channel')
-                    return [(embedded_audio(mob, source_rate), source_start, int(physical) - 1, length)]
+                    return [(embedded_audio(mob), source_start, int(physical) - 1, length)]
                 if descriptor is not None and 'Locator' in descriptor:
                     urls = [loc['URLString'].value for loc in descriptor['Locator'].value
                             if 'URLString' in loc]
@@ -273,7 +275,7 @@ def read_timeline(path, audio_only=False, extract_dir=None):
             covered = 0
             for part in parts:
                 part = selected(part)
-                part_length = int(part.length)
+                part_length = Fraction(int(part.length), 1) / source_rate
                 if part_length < 0:
                     raise ValueError('Negative AAF source component length')
                 begin = max(source_start, cursor)
@@ -300,14 +302,14 @@ def read_timeline(path, audio_only=False, extract_dir=None):
                 if slot.media_kind not in ('Sound', 'Picture') or (audio_only and slot.media_kind != 'Sound'):
                     raise ValueError('Unsupported AAF track kind: ' + slot.media_kind)
                 rate = Fraction(str(slot.edit_rate))
-                if rate <= 0 or (slot.media_kind == 'Sound' and rate.denominator != 1):
+                if rate <= 0:
                     raise ValueError('Unsupported AAF edit rate')
                 parts = components(slot.segment)
                 clips = []
-                cursor = 0
+                cursor = Fraction(0)
                 for part in parts:
                     part = selected(part)
-                    length = int(part.length)
+                    length = Fraction(int(part.length), 1) / rate
                     if length < 0:
                         raise ValueError('Negative AAF component length')
                     if isinstance(part, aaf2.components.SourceClip):
@@ -320,16 +322,30 @@ def read_timeline(path, audio_only=False, extract_dir=None):
                     elif not isinstance(part, aaf2.components.Filler):
                         raise ValueError('Unsupported AAF timeline component')
                     cursor += length
+                # Keep the declared frame clock when it represents every boundary.
+                # Otherwise use an exact shared tick clock, retaining the edit rate.
+                times = [clip[field] for clip in clips for field in ('start', 'source_in', 'length')]
+                clock = rate
+                if any((value * rate).denominator != 1 for value in times):
+                    clock = Fraction(math.lcm(rate.numerator, *(value.denominator for value in times)), 1)
+                if audio_only and clock.denominator != 1:
+                    clock = Fraction(clock.numerator, 1)
+                if clock.numerator > 2147483647:
+                    raise ValueError('AAF exact clock exceeds supported precision')
+                for clip in clips:
+                    for field in ('start', 'source_in', 'length'):
+                        clip[field] = int(clip[field] * clock)
                 if audio_only:
-                    tracks.append({'name': slot.name or '', 'sample_rate': int(rate), 'clips': clips})
+                    tracks.append({'name': slot.name or '', 'sample_rate': int(clock), 'clips': clips})
                 else:
                     tracks.append({'name': slot.name or '', 'media_kind': slot.media_kind.lower(),
                         'edit_rate': {'numerator': rate.numerator, 'denominator': rate.denominator},
+                        'time_rate': {'numerator': clock.numerator, 'denominator': clock.denominator},
                         'clips': clips})
             sequences.append({'name': composition.name, 'tracks': tracks})
         if not sequences:
             raise ValueError('AAF has no top-level composition')
-        return {'version': 1 if audio_only else 2, 'sequences': sequences}
+        return {'version': 1 if audio_only else 3, 'sequences': sequences}
 
 
 def main():

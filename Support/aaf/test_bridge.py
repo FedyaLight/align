@@ -79,6 +79,50 @@ class SourceValidation(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'physical channel'):
                 read_timeline(path, extract_dir=root / 'extracted')
 
+    def test_mixed_clocks_keep_fractional_sample_boundaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'mono.wav'
+            with wave.open(str(source), 'wb') as writer:
+                writer.setparams((1, 2, 48000, 0, 'NONE', 'PCM'))
+                writer.writeframes(b'\x01\x00' * 96000)
+            path = root / 'clocks.aaf'
+            with aaf2.open(str(path), 'w') as container:
+                mob = container.create.SourceMob('PCM 48000')
+                container.content.mobs.append(mob)
+                native = mob.import_audio_essence(str(source))
+                middle = container.create.MasterMob('Edit 25')
+                container.content.mobs.append(middle)
+                middle_slot = middle.create_timeline_slot(25)
+                middle_slot.segment = mob.create_source_clip(slot_id=native.slot_id,
+                    start=48001, length=5, media_kind='sound')
+                composition = container.create.CompositionMob('Edit 29.97')
+                composition.usage = 'Usage_TopLevel'
+                container.content.mobs.append(composition)
+                track = composition.create_sound_slot('30000/1001')
+                track.segment.components.append(container.create.Filler('sound', 1))
+                track.segment.components.append(middle.create_source_clip(
+                    slot_id=middle_slot.slot_id, start=1, length=3, media_kind='sound'))
+                track.segment.length = 4
+            result = read_timeline(path, extract_dir=root / 'extracted')
+            track = result['sequences'][0]['tracks'][0]
+            self.assertEqual(track['edit_rate'], {'numerator': 30000, 'denominator': 1001})
+            self.assertEqual(track['time_rate'], {'numerator': 240000, 'denominator': 1})
+            clip = track['clips'][0]
+            self.assertEqual((clip['start'], clip['source_in'], clip['length']), (8008, 249605, 24024))
+            # Embedded PCM's sample rate can differ from its SourceMob slot clock.
+            with aaf2.open(str(path), 'rw') as container:
+                native_mob = next(container.content.sourcemobs())
+                native_mob.slots[0].edit_rate = 25
+                middle_mob = next(container.content.mastermobs())
+                middle_mob.slots[0].segment.start = 25
+            track = read_timeline(path, extract_dir=root / 'extracted')['sequences'][0]['tracks'][0]
+            clip = track['clips'][0]
+            from fractions import Fraction
+            clock = Fraction(track['time_rate']['numerator'], track['time_rate']['denominator'])
+            self.assertEqual(Fraction(clip['source_in'], 1) / clock, Fraction(26, 25))
+
+
     def test_nested_source_sequence_splits_cuts_and_preserves_gaps(self):
         with tempfile.TemporaryDirectory() as directory:
             media = Path(directory) / 'mono.wav'
@@ -197,7 +241,7 @@ class SourceValidation(unittest.TestCase):
                     slot_id=slot.slot_id, start=11, length=101, media_kind='picture'))
                 target.segment.length = 108
             result = read_timeline(path)
-            self.assertEqual(result['version'], 2)
+            self.assertEqual(result['version'], 3)
             track = result['sequences'][0]['tracks'][0]
             self.assertEqual(track['media_kind'], 'picture')
             self.assertEqual(track['edit_rate'], {'numerator': 30000, 'denominator': 1001})

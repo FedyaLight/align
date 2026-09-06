@@ -74,6 +74,7 @@ jobs:
           python script/check-aaf-picture-smoke.py "target/release/align-cli$exe" release-smoke/aaf-picture
           python script/check-aaf-embedded-smoke.py "target/release/align-cli$exe" release-smoke/aaf-embedded
           python script/check-aaf-embedded-smoke.py "target/release/align-cli$exe" release-smoke/aaf-embedded-stereo --channels 2
+          python script/check-aaf-embedded-smoke.py "target/release/align-cli$exe" release-smoke/aaf-mixed-clocks --channels 2 --mixed-clocks
       - uses: actions/upload-artifact@v4
         if: always()
         with:

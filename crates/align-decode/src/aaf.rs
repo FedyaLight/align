@@ -46,6 +46,7 @@ pub struct ImportedTrack {
     #[serde(default)]
     pub media_kind: ImportedKind,
     pub edit_rate: Option<ImportedRate>,
+    pub time_rate: Option<ImportedRate>,
     pub clips: Vec<ImportedClip>,
 }
 #[derive(Debug, Deserialize)]
@@ -73,8 +74,9 @@ pub struct ImportedRate {
 
 impl ImportedTrack {
     fn clock(&self) -> (u32, u32) {
-        self.edit_rate
+        self.time_rate
             .as_ref()
+            .or(self.edit_rate.as_ref())
             .map_or((self.sample_rate, 1), |rate| {
                 (rate.numerator, rate.denominator)
             })
@@ -125,7 +127,11 @@ impl ImportedAudio {
             let (numerator, denominator) = track.clock();
             let rate = numerator as f64 / denominator as f64;
             if track.media_kind == ImportedKind::Picture {
-                frame_duration.get_or_insert(MediaTime::new(denominator as i64, numerator as i32));
+                let picture_duration = track.edit_rate.as_ref().map_or(
+                    MediaTime::new(denominator as i64, numerator as i32),
+                    |rate| MediaTime::new(rate.denominator as i64, rate.numerator as i32),
+                );
+                frame_duration.get_or_insert(picture_duration);
             }
             for (clip_index, clip) in track.clips.into_iter().enumerate() {
                 edits.push(DraftEdit {
@@ -186,7 +192,7 @@ pub fn read_audio(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, Aaf
 }
 
 pub fn read_timeline(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, AafError> {
-    read_response(path, cancel, "read-timeline", 2)
+    read_response(path, cancel, "read-timeline", 3)
 }
 
 fn read_response(
@@ -241,7 +247,7 @@ fn read_response(
 }
 
 fn validate_import(result: &ImportedAudio) -> Result<(), AafError> {
-    if ![1, 2].contains(&result.version) || result.sequences.is_empty() {
+    if ![1, 2, 3].contains(&result.version) || result.sequences.is_empty() {
         return Err(AafError::Writer("Unsupported or empty AAF response".into()));
     }
     for sequence in &result.sequences {
@@ -256,8 +262,11 @@ fn validate_import(result: &ImportedAudio) -> Result<(), AafError> {
             if numerator == 0
                 || numerator > i32::MAX as u32
                 || denominator == 0
-                || (result.version == 2 && track.edit_rate.is_none())
-                || (track.media_kind == ImportedKind::Sound && denominator != 1)
+                || (result.version >= 2 && track.edit_rate.is_none())
+                || (result.version == 3 && track.time_rate.is_none())
+                || track.edit_rate.as_ref().is_some_and(|rate| {
+                    rate.numerator == 0 || rate.numerator > i32::MAX as u32 || rate.denominator == 0
+                })
                 || track.clips.iter().any(|clip| {
                     clip.length == 0
                         || match track.media_kind {
@@ -597,6 +606,29 @@ mod tests {
         assert_eq!(video.audio_enabled, Some(false));
         assert!(video.linked_audio_edit.is_none());
         assert_eq!(resolved.edits[1].audio_source_channel, Some(1));
+    }
+
+    #[test]
+    fn exact_tick_clock_preserves_boundaries_and_picture_frame_rate() {
+        let imported: ImportedAudio = serde_json::from_value(serde_json::json!({
+            "version":3,"sequences":[{"name":"Mixed clocks","tracks":[
+                {"name":"V1","media_kind":"picture",
+                 "edit_rate":{"numerator":30000,"denominator":1001},
+                 "time_rate":{"numerator":240000,"denominator":1},
+                 "clips":[{"path":"/camera.mov","start":8008,"source_in":249605,"length":24024}]}
+            ]}]
+        }))
+        .unwrap();
+        let draft = imported.into_draft(Path::new("mixed.aaf"), None).unwrap();
+        assert_eq!(
+            draft.frame_duration,
+            align_core::MediaTime::new(1001, 30000)
+        );
+        let edit = &draft.edits[0];
+        assert_eq!(edit.time_scale, 240000);
+        assert!((edit.timeline_start - 1001.0 / 30000.0).abs() < 1e-12);
+        assert!((edit.source_in - 49921.0 / 48000.0).abs() < 1e-12);
+        assert!((edit.source_out - 273629.0 / 240000.0).abs() < 1e-12);
     }
 
     fn stereo_import() -> ImportedAudio {

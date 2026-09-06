@@ -9,12 +9,14 @@ import random
 import struct
 import subprocess
 import wave
+from fractions import Fraction
 import aaf2
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('cli', type=Path)
 parser.add_argument('output', type=Path)
 parser.add_argument('--channels', type=int, choices=(1, 2), default=1)
+parser.add_argument('--mixed-clocks', action='store_true')
 args = parser.parse_args()
 root = args.output.resolve()
 root.mkdir(parents=True, exist_ok=True)
@@ -36,10 +38,12 @@ with aaf2.open(str(root / 'embedded.aaf'), 'w') as container:
             source_slot = source_mob.create_timeline_slot(48000)
             source_slot.segment = container.create.SourceClip(media_kind='sound', length=480000)
         source_slot['PhysicalTrackNumber'].value = channel + 1
-        track = composition.create_sound_slot(48000)
+        track = composition.create_sound_slot('30000/1001' if args.mixed_clocks else 48000)
+        if args.mixed_clocks:
+            track.segment.components.append(container.create.Filler('sound', 1))
         track.segment.components.append(source_mob.create_source_clip(slot_id=source_slot.slot_id,
-            start=48001, length=240003, media_kind='sound'))
-        track.segment.length = 240003
+            start=48001, length=3 if args.mixed_clocks else 240003, media_kind='sound'))
+        track.segment.length = 4 if args.mixed_clocks else 240003
 
 source.unlink()
 env = dict(os.environ, ALIGN_BACKEND='portable')
@@ -49,6 +53,7 @@ result = subprocess.run([str(args.cli.resolve()), 'sync', str(root / 'embedded.a
 (root / 'sync.stderr').write_text(result.stderr, encoding='utf-8')
 if result.returncode:
     raise RuntimeError(result.stderr)
+(root / 'sync.json').write_text(result.stdout, encoding='utf-8')
 value = json.loads(result.stdout)
 assert not value['project']['warnings']
 assert len(value['project']['clips']) == 1
@@ -57,10 +62,16 @@ with wave.open(value['project']['clips'][0]['url'], 'rb') as reader:
     assert reader.readframes(reader.getnframes()) == pcm
 edits = value['project']['importedTimeline']['edits']
 assert [edit['audioSourceChannel'] for edit in edits] == list(range(args.channels))
-edit = edits[0]
-assert edit['sourceIn'] == {'value': 48001, 'timescale': 48000}
-assert edit['sourceOut'] == {'value': 288004, 'timescale': 48000}
+span = Fraction(3003, 30000) if args.mixed_clocks else Fraction(240003, 48000)
+start = Fraction(1001, 30000) if args.mixed_clocks else Fraction(0)
+for edit in edits:
+    def time(field):
+        return Fraction(edit[field]['value'], edit[field]['timescale'])
+    assert time('sourceIn') == Fraction(48001, 48000)
+    assert time('sourceOut') == Fraction(48001, 48000) + span
+    assert time('timelineStart') == start
+    assert time('timelineEnd') == start + span
 (root / 'verification.json').write_text(json.dumps({'passed': True,
     'channels': args.channels,
     'pcm_sha256': hashlib.sha256(pcm).hexdigest(), 'source_in_samples': 48001,
-    'length_samples': 240003, 'source_wav_exists': source.exists()}, indent=2) + '\n')
+    'mixed_clocks': args.mixed_clocks, 'length_seconds': str(span), 'source_wav_exists': source.exists()}, indent=2) + '\n')
