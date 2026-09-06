@@ -21,6 +21,19 @@ fn audio_channel_end(item: &ExportItem) -> String {
     }
 }
 
+// Keep frame-aligned values exact instead of rounding them below a frame
+// boundary at fractional rates; retain subframe audio positions otherwise.
+fn timeline_time(seconds: f64, frame: MediaTime) -> String {
+    let frames = (seconds / frame.as_seconds()).round();
+    let exact = frames * frame.as_seconds();
+    let time = if (seconds - exact).abs() <= 0.000001 {
+        MediaTime::new(frames as i64 * frame.value, frame.timescale)
+    } else {
+        MediaTime::microseconds(seconds)
+    };
+    xml_text::fcpxml_time(time)
+}
+
 pub fn write(timeline: &ExportTimeline, include_multicam_clip: bool) -> String {
     write_with_storylines(timeline, include_multicam_clip, false)
 }
@@ -195,9 +208,9 @@ fn write_island(
                 let audio_channel_end = audio_channel_end(item);
                 xml += &format!(
                     "          <asset-clip name=\"{clip_name}\" ref=\"{asset_id}\" offset=\"{}\" duration=\"{}\" start=\"{}\" enabled=\"{}\"{audio_role}{audio_channel_end}\n",
-                    xml_text::fcpxml_time(MediaTime::microseconds(item.start)),
-                    xml_text::fcpxml_time(MediaTime::microseconds(item.timeline_duration)),
-                    xml_text::fcpxml_time(MediaTime::microseconds(item.source_in)),
+                    timeline_time(item.start, frame_duration),
+                    timeline_time(item.timeline_duration, frame_duration),
+                    timeline_time(item.source_in, frame_duration),
                     u8::from(item.is_enabled(if item.clip.video.is_some() {
                         "video"
                     } else {
@@ -323,9 +336,9 @@ fn write_island(
         };
         *target += &format!(
             "              <asset-clip ref=\"{asset_id}\" {lane_attribute} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{clip_name}\" srcEnable=\"video\" enabled=\"{}\"/>\n",
-            xml_text::fcpxml_time(MediaTime::microseconds(item.start)),
-            xml_text::fcpxml_time(MediaTime::microseconds(item.timeline_duration)),
-            xml_text::fcpxml_time(MediaTime::microseconds(item.source_in)),
+            timeline_time(item.start, frame_duration),
+            timeline_time(item.timeline_duration, frame_duration),
+            timeline_time(item.source_in, frame_duration),
             u8::from(item.is_enabled("video")),
         );
     }
@@ -374,9 +387,9 @@ fn write_island(
         };
         *target += &format!(
             "              <asset-clip ref=\"{asset_id}\" {lane_attribute} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{clip_name}\" srcEnable=\"audio\" enabled=\"{}\"{audio_role}{audio_channel_end}\n",
-            xml_text::fcpxml_time(MediaTime::microseconds(item.start)),
-            xml_text::fcpxml_time(MediaTime::microseconds(duration)),
-            xml_text::fcpxml_time(MediaTime::microseconds(item.source_in)),
+            timeline_time(item.start, frame_duration),
+            timeline_time(duration, frame_duration),
+            timeline_time(item.source_in, frame_duration),
             u8::from(item.is_enabled("audio")),
         );
     }
@@ -429,6 +442,13 @@ mod tests {
     use super::super::otio::tests::fixture_timeline;
     use super::*;
     use crate::xml::{read_timeline, timeline_sequence_summaries};
+
+    #[test]
+    fn fractional_frame_boundary_is_not_rounded_down() {
+        let frame = MediaTime::new(1001, 30000);
+        assert_eq!(timeline_time(50.0 * frame.as_seconds(), frame), "1001/600s");
+        assert_eq!(timeline_time(0.012345, frame), "2469/200000s");
+    }
 
     #[test]
     fn storylines_preserve_track_and_source_ranges() {
