@@ -2409,11 +2409,14 @@ fn read_fcpxml(
             while let Some(m) = inner.pop() {
                 for &c in doc.nodes[m].children.iter().rev() {
                     if doc.nodes[c].name == "asset" {
-                        let (Some(id), Some(src)) = (doc.attr(c, "id"), {
-                            doc.children_named(c, "media-rep")
-                                .first()
-                                .and_then(|&mr| doc.attr(mr, "src"))
-                        }) else {
+                        let representations = doc.children_named(c, "media-rep");
+                        let src = representations
+                            .iter()
+                            .filter(|&&mr| doc.attr(mr, "kind") == Some("original-media"))
+                            .find_map(|&mr| doc.attr(mr, "src"))
+                            .or_else(|| doc.attr(c, "src"))
+                            .or_else(|| representations.iter().find_map(|&mr| doc.attr(mr, "src")));
+                        let (Some(id), Some(src)) = (doc.attr(c, "id"), src) else {
                             continue;
                         };
                         assets.insert(
@@ -3889,6 +3892,28 @@ mod tests {
             "multiclip must not raise the missing-file warning"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fcpxml_prefers_original_and_reads_legacy_asset_sources() {
+        for asset in [
+            r#"<asset id="a" hasVideo="1" hasAudio="0" src="file:///original.mov"/>"#,
+            r#"<asset id="a" hasVideo="1" hasAudio="0"><media-rep kind="proxy-media" src="file:///proxy.mov"/>
+                <media-rep kind="original-media" src="file:///original.mov"/></asset>"#,
+        ] {
+            let text = format!(
+                r#"<fcpxml version="1.10"><resources>
+                <format id="f" frameDuration="1/25s"/>
+                {asset}
+                </resources><library><event name="Test"><project name="Test">
+                <sequence format="f" duration="1s"><spine>
+                <asset-clip ref="a" offset="0s" start="0s" duration="1s"/>
+                </spine></sequence></project></event></library></fcpxml>"#
+            );
+            let doc = XmlDoc::parse(&text).unwrap();
+            let draft = read_fcpxml(&doc, Path::new("test.fcpxml"), None).unwrap();
+            assert_eq!(draft.edits[0].url, Path::new("/original.mov"));
+        }
     }
 
     #[test]
