@@ -426,6 +426,8 @@ fn write_island(
             u8::from(item.is_enabled("audio")),
         );
     }
+    let mut stories = stories.into_iter().collect::<Vec<_>>();
+    stories.sort_by_key(|(lane, _)| (*lane >= 0, lane.unsigned_abs()));
     for (lane, clips) in stories {
         xml += &format!(
             "              <spine lane=\"{lane}\" offset=\"0s\">\n{clips}              </spine>\n"
@@ -494,6 +496,7 @@ mod tests {
         std::fs::write(&plain, write(&timeline, false)).unwrap();
         let xml = write_with_storylines(&timeline, false, true);
         assert!(xml.contains("<spine lane="));
+        assert!(xml.find("spine lane=\"-1\"").unwrap() < xml.find("spine lane=\"-2\"").unwrap());
         std::fs::write(&grouped, xml).unwrap();
         let plain = read_timeline(&plain, None).unwrap();
         let grouped = read_timeline(&grouped, None).unwrap();
