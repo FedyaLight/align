@@ -438,7 +438,10 @@ impl AppData {
             }
             if is_timeline(&path)
                 && !self.timeline_choices.contains_key(&path)
-                && let Ok(summaries) = align_core::timeline_sequence_summaries(&path)
+                && let Ok(summaries) = align_decode::timeline::sequences(
+                    &path,
+                    &std::sync::atomic::AtomicBool::new(false),
+                )
                 && summaries.len() > 1
             {
                 self.sequence_picker = Some(SequencePicker {
@@ -1375,10 +1378,7 @@ fn drift_of_placement(result: &SyncResult, clip_id: &ClipId) -> f64 {
 }
 
 fn is_timeline(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("xml") || e.eq_ignore_ascii_case("fcpxml"))
-        .unwrap_or(false)
+    align_decode::timeline::is_supported(path)
 }
 
 fn sorted_live_matches(map: &HashMap<String, LiveMatch>) -> Vec<LiveMatch> {
@@ -1842,7 +1842,8 @@ mod tests {
     fn export_target_mapping() {
         assert_eq!(ExportTarget::ResolveOtio.formats().len(), 2);
         assert_eq!(ExportTarget::Premiere.formats().len(), 1);
-        assert_eq!(ExportTarget::all().len(), 4);
+        assert_eq!(ExportTarget::all().len(), 5);
+        assert_eq!(ExportTarget::Aaf.formats(), vec![TimelineExportFormat::Aaf]);
     }
 
     #[test]

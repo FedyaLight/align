@@ -221,8 +221,7 @@ fn sequence(
             !i.clip.audio.is_empty() && (include_embedded_audio || i.clip.kind == MediaKind::Audio)
         })
         .flat_map(|item| {
-            let channels = item.clip.audio.first().map_or(1, |a| a.channels.max(1));
-            (1..=channels).map(|ch| TrackEntry {
+            item.audio_source_channels().map(|ch| TrackEntry {
                 item,
                 source_channel: ch,
             })
@@ -459,6 +458,7 @@ fn replaced_island(island: &ExportIsland) -> Option<ExportIsland> {
             fcp7_retime_duration: None,
             fcp7_filter_xmls: recorder.fcp7_filter_xmls.clone(),
             fcp7_labels_xml: recorder.fcp7_labels_xml.clone(),
+            audio_source_channel: recorder.audio_source_channel,
             fcpxml_audio_role: recorder.fcpxml_audio_role.clone(),
             preferred_source_key: recorder.preferred_source_key.clone(),
             preferred_audio_source_key: recorder.preferred_audio_source_key.clone(),

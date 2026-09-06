@@ -112,6 +112,9 @@ pub fn export(
     formats: &[TimelineExportFormat],
     include_replaced_sequence: bool,
 ) -> Result<Vec<ExportArtifact>, ExportError> {
+    timeline
+        .validate_audio_source_channels()
+        .map_err(ExportError::Timeline)?;
     std::fs::create_dir_all(directory).map_err(|e| ExportError::Io(e.to_string()))?;
     write_artifacts(timeline, directory, formats, include_replaced_sequence)
 }
@@ -135,6 +138,10 @@ pub fn export_prepared(
     request: ExportRequest<'_>,
     mut progress: Option<&mut dyn FnMut(ExportJobProgress)>,
 ) -> Result<Vec<ExportArtifact>, ExportError> {
+    request
+        .timeline
+        .validate_audio_source_channels()
+        .map_err(ExportError::Timeline)?;
     std::fs::create_dir_all(request.directory).map_err(|e| ExportError::Io(e.to_string()))?;
     let ExportRequest {
         backend,

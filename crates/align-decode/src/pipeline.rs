@@ -117,6 +117,15 @@ impl std::fmt::Display for PipelineError {
     }
 }
 
+impl From<crate::timeline::TimelineError> for PipelineError {
+    fn from(error: crate::timeline::TimelineError) -> Self {
+        match error {
+            crate::timeline::TimelineError::Aaf(crate::aaf::AafError::Cancelled) => Self::Cancelled,
+            error => Self::Timeline(error.to_string()),
+        }
+    }
+}
+
 fn cancelled(flag: &std::sync::atomic::AtomicBool) -> bool {
     flag.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -175,15 +184,19 @@ impl Pipeline {
         let draft = expanded
             .timeline
             .map(|t| {
-                align_core::read_timeline(&t.path, t.sequence)
-                    .map(|d| {
-                        d.relinking_missing_media(
-                            &expanded.media,
-                            &options.redirects,
-                            &options.manual_relinks,
-                        )
-                    })
-                    .map_err(|e| PipelineError::Timeline(e.to_string()))
+                crate::timeline::read(
+                    &t.path,
+                    t.sequence,
+                    &std::sync::atomic::AtomicBool::new(false),
+                )
+                .map(|d| {
+                    d.relinking_missing_media(
+                        &expanded.media,
+                        &options.redirects,
+                        &options.manual_relinks,
+                    )
+                })
+                .map_err(PipelineError::from)
             })
             .transpose()?;
         let mut urls = expanded.media;
@@ -214,6 +227,8 @@ impl Pipeline {
         if let Some(d) = &draft {
             // Import and relink findings belong to the session, not just
             // the draft: surface them next to decode warnings.
+            d.validate_source_channels(&clips)
+                .map_err(PipelineError::Timeline)?;
             warnings.extend(d.warnings.clone());
             warnings.extend(d.unresolved_warnings(&clips, &options.omit_extensions));
         }
@@ -245,7 +260,7 @@ impl Pipeline {
         let draft = expanded
             .timeline
             .map(|t| {
-                align_core::read_timeline(&t.path, t.sequence)
+                crate::timeline::read(&t.path, t.sequence, cancel)
                     .map(|d| {
                         d.relinking_missing_media(
                             &expanded.media,
@@ -253,7 +268,7 @@ impl Pipeline {
                             &options.manual_relinks,
                         )
                     })
-                    .map_err(|e| PipelineError::Timeline(e.to_string()))
+                    .map_err(PipelineError::from)
             })
             .transpose()?;
         let mut urls = expanded.media;
@@ -332,6 +347,8 @@ impl Pipeline {
             return Err(PipelineError::NoMedia);
         }
         if let Some(d) = &draft {
+            d.validate_source_channels(&clips)
+                .map_err(PipelineError::Timeline)?;
             warnings.extend(d.warnings.clone());
             warnings.extend(d.unresolved_warnings(&clips, &options.omit_extensions));
         }
@@ -1088,7 +1105,7 @@ fn expand(inputs: &[PipelineInput]) -> Result<ExpandedInputs, PipelineError> {
                     .and_then(|e| e.to_str())
                     .map(|e| e.to_lowercase())
                 {
-                    Some(e) if e == "xml" || e == "fcpxml" => {
+                    Some(e) if e == "xml" || e == "fcpxml" || e == "aaf" => {
                         if timeline.is_some() {
                             return Err(PipelineError::MultipleTimelines);
                         }

@@ -452,12 +452,7 @@ fn to_inputs(paths: &[PathBuf], sequence: Option<usize>) -> Vec<PipelineInput> {
     paths
         .iter()
         .map(|path| {
-            let is_xml = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("xml") || e.eq_ignore_ascii_case("fcpxml"))
-                .unwrap_or(false);
-            if !is_xml {
+            if !align_decode::timeline::is_supported(path) {
                 return PipelineInput::Media(path.clone());
             }
             match sequence {

@@ -146,6 +146,7 @@ pub struct ExportLinkedAudio {
     pub fcp7_retime_out: Option<i64>,
     pub fcp7_retime_duration: Option<i64>,
     pub fcp7_labels_xml: Option<String>,
+    pub audio_source_channel: Option<usize>,
     pub fcpxml_audio_role: Option<String>,
     pub preferred_source_key: String,
     pub enabled: bool,
@@ -180,6 +181,7 @@ pub struct ExportItem {
     pub fcp7_retime_out: Option<i64>,
     pub fcp7_retime_duration: Option<i64>,
     pub fcp7_labels_xml: Option<String>,
+    pub audio_source_channel: Option<usize>,
     pub fcpxml_audio_role: Option<String>,
     pub preferred_source_key: Option<String>,
     pub preferred_audio_source_key: Option<String>,
@@ -210,6 +212,22 @@ pub struct ExportItem {
 }
 
 impl ExportItem {
+    /// One-based source channels used by timeline interchange writers.
+    pub fn audio_source_channels(&self) -> std::ops::RangeInclusive<usize> {
+        match self.selected_audio_source_channel() {
+            Some(channel) => (channel + 1)..=(channel + 1),
+            None => 1..=self.clip.audio.first().map_or(1, |a| a.channels.max(1)),
+        }
+    }
+
+    pub fn selected_audio_source_channel(&self) -> Option<usize> {
+        self.linked_audio_edit
+            .as_ref()
+            .map_or(self.audio_source_channel, |audio| {
+                audio.audio_source_channel
+            })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         clip: Clip,
@@ -235,6 +253,7 @@ impl ExportItem {
             fcp7_retime_out: None,
             fcp7_retime_duration: None,
             fcp7_labels_xml: None,
+            audio_source_channel: None,
             fcpxml_audio_role: None,
             preferred_source_key: None,
             preferred_audio_source_key: None,
@@ -927,11 +946,18 @@ pub struct ExportProgress {
 pub enum TimelineExportError {
     NoSynchronizedIslands,
     NoImportedEdits,
+    InvalidAudioChannel { path: PathBuf, channel: usize },
 }
 
 impl std::fmt::Display for TimelineExportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidAudioChannel { path, channel } => write!(
+                f,
+                "Audio channel {} is unavailable in {}.",
+                channel.saturating_add(1),
+                path.display()
+            ),
             Self::NoSynchronizedIslands => {
                 write!(f, "There are no synchronized islands to export.")
             }
@@ -947,7 +973,28 @@ impl std::fmt::Display for TimelineExportError {
 
 impl std::error::Error for TimelineExportError {}
 
+fn validate_audio_channel(clip: &Clip, selected: Option<usize>) -> Result<(), TimelineExportError> {
+    if let Some(channel) = selected
+        && clip
+            .audio
+            .first()
+            .is_none_or(|audio| channel >= audio.channels)
+    {
+        return Err(TimelineExportError::InvalidAudioChannel {
+            path: clip.url.clone(),
+            channel,
+        });
+    }
+    Ok(())
+}
+
 impl ExportTimeline {
+    pub fn validate_audio_source_channels(&self) -> Result<(), TimelineExportError> {
+        for item in self.islands.iter().flat_map(|island| &island.clips) {
+            validate_audio_channel(&item.clip, item.selected_audio_source_channel())?;
+        }
+        Ok(())
+    }
     pub fn new(islands: Vec<ExportIsland>, frame_duration: MediaTime, name: &str) -> Self {
         Self {
             islands,
@@ -982,6 +1029,16 @@ impl ExportTimeline {
     ) -> Result<Self, TimelineExportError> {
         let clips_by_id: HashMap<&ClipId, &Clip> =
             result.project.clips.iter().map(|c| (&c.id, c)).collect();
+        if let Some(imported) = &result.project.imported_timeline {
+            for edit in &imported.edits {
+                if let Some(clip) = clips_by_id.get(&edit.clip_id) {
+                    validate_audio_channel(clip, edit.audio_source_channel)?;
+                    if let Some(audio) = &edit.linked_audio_edit {
+                        validate_audio_channel(clip, audio.audio_source_channel)?;
+                    }
+                }
+            }
+        }
         let unmatched_ids: HashSet<&ClipId> = result.unmatched.iter().collect();
         let mut groups: Vec<ExportIsland> = result
             .islands
@@ -1051,6 +1108,7 @@ impl ExportTimeline {
                     fcp7_retime_out: None,
                     fcp7_retime_duration: None,
                     fcp7_labels_xml: None,
+                    audio_source_channel: None,
                     fcpxml_audio_role: None,
                     preferred_source_key: None,
                     preferred_audio_source_key: None,
@@ -1219,6 +1277,7 @@ impl ExportTimeline {
                     fcp7_retime_out: audio.fcp7_retime_out,
                     fcp7_retime_duration: audio.fcp7_retime_duration,
                     fcp7_labels_xml: audio.fcp7_labels_xml.clone(),
+                    audio_source_channel: audio.audio_source_channel,
                     fcpxml_audio_role: audio.fcpxml_audio_role.clone(),
                     preferred_source_key: format!("imported-audio-{:06}", audio.track_index),
                     enabled: audio.enabled && base.enabled,
@@ -1240,7 +1299,14 @@ impl ExportTimeline {
                 } else {
                     edit.name.clone()
                 },
-                clip: base.clip.clone(),
+                clip: {
+                    let mut clip = base.clip.clone();
+                    if edit.media_type == MediaKind::Audio {
+                        clip.video = None;
+                        clip.kind = MediaKind::Audio;
+                    }
+                    clip
+                },
                 start: edit.timeline_start.as_seconds() + shift,
                 source_in: edit.source_in.as_seconds().max(0.0),
                 source_out: edit.source_out.as_seconds().min(base.source_duration()),
@@ -1255,6 +1321,7 @@ impl ExportTimeline {
                 fcp7_retime_out: edit.fcp7_retime_out,
                 fcp7_retime_duration: edit.fcp7_retime_duration,
                 fcp7_labels_xml: edit.fcp7_labels_xml.clone(),
+                audio_source_channel: edit.audio_source_channel,
                 fcpxml_audio_role: edit.fcpxml_audio_role.clone(),
                 preferred_source_key: Some(format!("imported-{media_str}-{:06}", edit.track_index)),
                 preferred_audio_source_key: edit
@@ -2045,6 +2112,7 @@ mod tests {
             fcp7_retime_out: None,
             fcp7_retime_duration: None,
             fcp7_labels_xml: None,
+            audio_source_channel: None,
             fcpxml_audio_role: None,
             preferred_source_key: "audio".to_string(),
             enabled: true,

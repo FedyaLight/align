@@ -245,12 +245,24 @@ pub struct DraftEdit {
     pub fcp7_retime_out: Option<i64>,
     pub fcp7_retime_duration: Option<i64>,
     pub fcp7_labels_xml: Option<String>,
+    /// Resolution for imported edit times; AAF uses the track sample rate.
+    pub time_scale: i32,
+    pub audio_source_channel: Option<usize>,
     pub fcpxml_audio_role: Option<String>,
     pub track_index: usize,
     pub enabled: bool,
     pub track_enabled: bool,
     pub track_locked: bool,
     pub linked_edit_ids: HashSet<String>,
+}
+
+impl DraftEdit {
+    fn media_time(&self, seconds: f64) -> MediaTime {
+        MediaTime::new(
+            (seconds * self.time_scale as f64).round() as i64,
+            self.time_scale,
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -278,6 +290,27 @@ pub struct TimelineDraft {
 }
 
 impl TimelineDraft {
+    /// Validate explicit physical channel routing after relinking and inspection.
+    pub fn validate_source_channels(&self, clips: &[Clip]) -> Result<(), String> {
+        let by_path: HashMap<&Path, &Clip> = clips.iter().map(|c| (c.url.as_path(), c)).collect();
+        for edit in &self.edits {
+            if let Some(channel) = edit.audio_source_channel
+                && let Some(clip) = by_path.get(edit.url.as_path())
+                && clip
+                    .audio
+                    .first()
+                    .is_none_or(|audio| channel >= audio.channels)
+            {
+                return Err(format!(
+                    "Audio channel {} is unavailable in {}",
+                    channel.saturating_add(1),
+                    edit.url.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn media_urls(&self) -> Vec<PathBuf> {
         let mut urls: Vec<PathBuf> = self.edits.iter().map(|e| e.url.clone()).collect();
         urls.sort();
@@ -441,6 +474,30 @@ impl TimelineDraft {
             .iter()
             .filter(|e| e.media_type == DraftMediaKind::Audio)
             .collect();
+        let mut embedded_audio_ids = HashSet::new();
+        for video in self
+            .edits
+            .iter()
+            .filter(|e| e.media_type == DraftMediaKind::Video)
+        {
+            let explicit: Vec<_> = audio_edits
+                .iter()
+                .filter(|audio| {
+                    audio.url == video.url
+                        && (video.linked_edit_ids.contains(&audio.id)
+                            || audio.linked_edit_ids.contains(&video.id))
+                })
+                .collect();
+            if explicit.is_empty() {
+                if let Some(audio) =
+                    closest_embedded_audio(video, &audio_edits, self.frame_duration.as_seconds())
+                {
+                    embedded_audio_ids.insert(audio.id.as_str());
+                }
+            } else {
+                embedded_audio_ids.extend(explicit.into_iter().map(|audio| audio.id.as_str()));
+            }
+        }
         let mut transitions_by_left: HashMap<String, &DraftTransition> = HashMap::new();
         for t in &self.transitions {
             transitions_by_left
@@ -481,29 +538,36 @@ impl TimelineDraft {
 
         let mut resolved = Vec::new();
         for edit in &self.edits {
+            if edit.media_type == DraftMediaKind::Audio
+                && embedded_audio_ids.contains(edit.id.as_str())
+            {
+                continue;
+            }
             let Some(clip) = clips_by_path.get(&edit.url.to_string_lossy().into_owned()) else {
                 continue;
             };
             let kind_ok = (clip.kind == MediaKind::Video
                 && edit.media_type == DraftMediaKind::Video)
-                || (clip.kind == MediaKind::Audio && edit.media_type == DraftMediaKind::Audio);
+                || (!clip.audio.is_empty() && edit.media_type == DraftMediaKind::Audio);
             if !kind_ok {
                 continue;
             }
-            if clip.kind == MediaKind::Audio {
+            if edit.media_type == DraftMediaKind::Audio {
                 let key = format!(
-                    "{}:{}:{}:{}:{}",
+                    "{}:{}:{}:{}:{}:{:?}",
                     clip.id.0,
                     edit.source_in,
                     edit.source_out,
                     edit.timeline_start,
-                    edit.timeline_end
+                    edit.timeline_end,
+                    edit.audio_source_channel
+                        .map(|channel| (channel, edit.track_index))
                 );
                 if !seen_audio.insert(key) {
                     continue;
                 }
             }
-            let embedded = if clip.kind == MediaKind::Video {
+            let embedded = if edit.media_type == DraftMediaKind::Video {
                 closest_embedded_audio(edit, &audio_edits, self.frame_duration.as_seconds())
             } else {
                 None
@@ -512,10 +576,10 @@ impl TimelineDraft {
                 transitions_by_left.get(&format!("{}:{}", edit.media_type.raw(), edit.id));
             let linked_audio_edit = embedded.map(|audio| TimelineLinkedAudioEdit {
                 id: audio.id.clone(),
-                source_in: MediaTime::microseconds(audio.source_in),
-                source_out: MediaTime::microseconds(audio.source_out),
-                timeline_start: MediaTime::microseconds(audio.timeline_start),
-                timeline_end: MediaTime::microseconds(audio.timeline_end),
+                source_in: audio.media_time(audio.source_in),
+                source_out: audio.media_time(audio.source_out),
+                timeline_start: audio.media_time(audio.timeline_start),
+                timeline_end: audio.media_time(audio.timeline_end),
                 playback_rate: audio.playback_rate,
                 plays_backward: audio.plays_backward,
                 fcp7_time_remap_xml: audio.fcp7_time_remap_xml.clone(),
@@ -524,6 +588,7 @@ impl TimelineDraft {
                 fcp7_retime_out: audio.fcp7_retime_out,
                 fcp7_retime_duration: audio.fcp7_retime_duration,
                 fcp7_labels_xml: audio.fcp7_labels_xml.clone(),
+                audio_source_channel: audio.audio_source_channel,
                 fcpxml_audio_role: audio.fcpxml_audio_role.clone(),
                 track_index: audio.track_index,
                 enabled: audio.enabled,
@@ -538,10 +603,10 @@ impl TimelineDraft {
                 name: edit.name.clone(),
                 clip_id: clip.id.clone(),
                 media_type: edit.media_type.as_media_kind(),
-                source_in: MediaTime::microseconds(edit.source_in),
-                source_out: MediaTime::microseconds(edit.source_out),
-                timeline_start: MediaTime::microseconds(edit.timeline_start),
-                timeline_end: MediaTime::microseconds(edit.timeline_end),
+                source_in: edit.media_time(edit.source_in),
+                source_out: edit.media_time(edit.source_out),
+                timeline_start: edit.media_time(edit.timeline_start),
+                timeline_end: edit.media_time(edit.timeline_end),
                 playback_rate: edit.playback_rate,
                 plays_backward: edit.plays_backward,
                 fcp7_time_remap_xml: edit.fcp7_time_remap_xml.clone(),
@@ -550,6 +615,7 @@ impl TimelineDraft {
                 fcp7_retime_out: edit.fcp7_retime_out,
                 fcp7_retime_duration: edit.fcp7_retime_duration,
                 fcp7_labels_xml: edit.fcp7_labels_xml.clone(),
+                audio_source_channel: edit.audio_source_channel,
                 fcpxml_audio_role: edit.fcpxml_audio_role.clone(),
                 track_index: edit.track_index,
                 audio_track_index: embedded.map(|a| a.track_index),
@@ -1375,6 +1441,17 @@ fn read_fcp7(
                         .children_named(clip_item, "labels")
                         .first()
                         .map(|&labels| ctx.doc.verbatim(labels).to_string()),
+                    time_scale: 1_000_000,
+                    audio_source_channel: if ctx.media_type == DraftMediaKind::Audio {
+                        ctx.doc
+                            .children_named(clip_item, "sourcetrack")
+                            .first()
+                            .and_then(|&source| ctx.doc.child_int(source, "trackindex"))
+                            .filter(|&channel| channel > 0)
+                            .map(|channel| channel as usize - 1)
+                    } else {
+                        None
+                    },
                     fcpxml_audio_role: None,
                     track_index: ctx.track_number,
                     enabled: ctx
@@ -2448,6 +2525,8 @@ fn read_fcpxml(
                 fcp7_retime_out: None,
                 fcp7_retime_duration: None,
                 fcp7_labels_xml: None,
+                time_scale: 1_000_000,
+                audio_source_channel: None,
                 fcpxml_audio_role: None,
                 track_index: (lane + place.lane_shift).max(0) as usize,
                 enabled,
@@ -2478,6 +2557,18 @@ fn read_fcpxml(
                 fcp7_retime_out: None,
                 fcp7_retime_duration: None,
                 fcp7_labels_xml: None,
+                time_scale: 1_000_000,
+                audio_source_channel: {
+                    let components = refs.doc.children_named(clip, "audio-channel-source");
+                    if components.len() == 1 {
+                        refs.doc
+                            .attr(components[0], "srcCh")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .and_then(|channel| channel.checked_sub(1))
+                    } else {
+                        None
+                    }
+                },
                 fcpxml_audio_role: audio_role.clone(),
                 track_index: (lane + place.lane_shift).abs().max(0) as usize,
                 enabled,
@@ -2557,6 +2648,8 @@ fn read_fcpxml(
                 fcp7_retime_out: None,
                 fcp7_retime_duration: None,
                 fcp7_labels_xml: None,
+                time_scale: 1_000_000,
+                audio_source_channel: None,
                 fcpxml_audio_role: None,
                 track_index: (lane + place.lane_shift).max(0) as usize,
                 enabled,
@@ -2598,6 +2691,8 @@ fn read_fcpxml(
                 fcp7_retime_out: None,
                 fcp7_retime_duration: None,
                 fcp7_labels_xml: None,
+                time_scale: 1_000_000,
+                audio_source_channel: None,
                 fcpxml_audio_role: refs
                     .doc
                     .attr(aud, "role")
@@ -3967,6 +4062,8 @@ mod tests {
             fcp7_retime_out: None,
             fcp7_retime_duration: None,
             fcp7_labels_xml: None,
+            time_scale: 1_000_000,
+            audio_source_channel: None,
             fcpxml_audio_role: None,
             track_index: 1,
             enabled: true,

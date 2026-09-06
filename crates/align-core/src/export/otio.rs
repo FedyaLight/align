@@ -41,8 +41,7 @@ pub fn data(timeline: &ExportTimeline) -> Result<Vec<u8>, String> {
             .iter()
             .filter(|i| !i.clip.audio.is_empty())
             .flat_map(|item| {
-                let channels = item.clip.audio.first().map_or(1, |a| a.channels.max(1));
-                (1..=channels).map(|ch| Entry {
+                item.audio_source_channels().map(|ch| Entry {
                     item,
                     source_channel: ch,
                 })

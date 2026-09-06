@@ -386,6 +386,7 @@ mod tests {
             fcp7_retime_out: None,
             fcp7_retime_duration: None,
             fcp7_labels_xml: None,
+            audio_source_channel: None,
             fcpxml_audio_role: None,
             track_index,
             audio_track_index: None,

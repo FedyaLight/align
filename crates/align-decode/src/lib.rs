@@ -23,6 +23,7 @@ pub mod portable;
 pub mod provider;
 pub mod render;
 pub mod sym;
+pub mod timeline;
 
 #[cfg(target_os = "macos")]
 pub mod apple;

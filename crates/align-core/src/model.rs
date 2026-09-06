@@ -444,6 +444,9 @@ pub struct TimelineEdit {
     pub fcp7_retime_duration: Option<i64>,
     #[serde(default)]
     pub fcp7_labels_xml: Option<String>,
+    /// Zero-based physical source channel; absent means all channels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_source_channel: Option<usize>,
     #[serde(default)]
     pub fcpxml_audio_role: Option<String>,
     pub track_index: usize,
@@ -489,6 +492,9 @@ pub struct TimelineLinkedAudioEdit {
     pub fcp7_retime_duration: Option<i64>,
     #[serde(default)]
     pub fcp7_labels_xml: Option<String>,
+    /// Zero-based physical source channel; absent means all channels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_source_channel: Option<usize>,
     #[serde(default)]
     pub fcpxml_audio_role: Option<String>,
     pub track_index: usize,

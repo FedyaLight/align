@@ -9,6 +9,18 @@ use super::model::{ExportIsland, ExportItem, ExportTimeline, xml_text};
 use crate::allocator::{TimelineTrackRequest, allocate, source_key_for_url};
 use crate::model::MediaTime;
 
+/// A single selected source channel remains mono even when its asset is stereo.
+fn audio_channel_end(item: &ExportItem) -> String {
+    match item.selected_audio_source_channel() {
+        Some(channel) => format!(
+            "><audio-channel-source srcCh=\"{}\" role=\"{}\"/></asset-clip>",
+            channel + 1,
+            xml_text::escape(item.fcpxml_audio_role().unwrap_or("dialogue")),
+        ),
+        None => "/>".into(),
+    }
+}
+
 pub fn write(timeline: &ExportTimeline, include_multicam_clip: bool) -> String {
     let island = timeline.islands.first().cloned().unwrap_or(ExportIsland {
         id: 0,
@@ -171,8 +183,9 @@ fn write_island(
                 let audio_role = item.fcpxml_audio_role().map_or_else(String::new, |role| {
                     format!(" audioRole=\"{}\"", xml_text::escape(role))
                 });
+                let audio_channel_end = audio_channel_end(item);
                 xml += &format!(
-                    "          <asset-clip name=\"{clip_name}\" ref=\"{asset_id}\" offset=\"{}\" duration=\"{}\" start=\"{}\" enabled=\"{}\"{audio_role}/>\n",
+                    "          <asset-clip name=\"{clip_name}\" ref=\"{asset_id}\" offset=\"{}\" duration=\"{}\" start=\"{}\" enabled=\"{}\"{audio_role}{audio_channel_end}\n",
                     xml_text::fcpxml_time(MediaTime::microseconds(item.start)),
                     xml_text::fcpxml_time(MediaTime::microseconds(item.timeline_duration)),
                     xml_text::fcpxml_time(MediaTime::microseconds(item.source_in)),
@@ -328,8 +341,9 @@ fn write_island(
         let audio_role = item.fcpxml_audio_role().map_or_else(String::new, |role| {
             format!(" audioRole=\"{}\"", xml_text::escape(role))
         });
+        let audio_channel_end = audio_channel_end(item);
         xml += &format!(
-            "              <asset-clip ref=\"{asset_id}\" lane=\"{lane}\" offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{clip_name}\" srcEnable=\"audio\" enabled=\"{}\"{audio_role}/>\n",
+            "              <asset-clip ref=\"{asset_id}\" lane=\"{lane}\" offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{clip_name}\" srcEnable=\"audio\" enabled=\"{}\"{audio_role}{audio_channel_end}\n",
             xml_text::fcpxml_time(MediaTime::microseconds(item.start)),
             xml_text::fcpxml_time(MediaTime::microseconds(duration)),
             xml_text::fcpxml_time(MediaTime::microseconds(item.source_in)),

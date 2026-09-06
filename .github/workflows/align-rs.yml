@@ -65,7 +65,7 @@ jobs:
           exe=""
           if [[ "${{ runner.os }}" == "Windows" ]]; then exe=".exe"; fi
           python script/check-release-smoke.py "target/release/align-cli$exe" release-smoke
-      - name: Verify bundled AAF export
+      - name: Verify bundled AAF import and export
         shell: bash
         run: |
           exe=""
@@ -99,6 +99,13 @@ jobs:
             curl diffutils make mingw-w64-x86_64-gcc nasm pkgconf tar xz
       - name: Build release
         run: cargo build --release -p align-cli -p align-gpui
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Build AAF module
+        run: |
+          python -m pip install -r Support/aaf/build-requirements.txt
+          python script/build-aaf-sidecar.py target/release
       - name: Build minimal FFmpeg sidecars (Linux)
         if: runner.os == 'Linux'
         run: ./script/build-ffmpeg-minimal.sh target/ffmpeg-minimal
@@ -113,6 +120,8 @@ jobs:
           if [[ "${{ runner.os }}" == "Windows" ]]; then exe=".exe"; fi
           mkdir -p dist-bundle
           cp "target/release/align-cli$exe" "target/release/align$exe" dist-bundle/
+          cp "target/release/align-aaf$exe" dist-bundle/
+          cp -R target/release/AAF-Licenses dist-bundle/
           cp THIRD_PARTY_NOTICES.txt dist-bundle/
           if [[ "${{ runner.os }}" != "macOS" ]]; then
             cp target/ffmpeg-minimal/* dist-bundle/

@@ -403,14 +403,12 @@ impl AlignApp {
         self.data.save_path_redirections();
         self.data.path_fixer_dir = None;
         self.data.show_path_fixer = false;
-        if self.data.inputs.iter().any(|path| {
-            path.extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| {
-                    extension.eq_ignore_ascii_case("xml")
-                        || extension.eq_ignore_ascii_case("fcpxml")
-                })
-        }) && self.data.can_synchronize()
+        if self
+            .data
+            .inputs
+            .iter()
+            .any(|path| align_decode::timeline::is_supported(path))
+            && self.data.can_synchronize()
         {
             self.start_sync(cx);
         } else {

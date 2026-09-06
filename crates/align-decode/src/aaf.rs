@@ -53,6 +53,97 @@ pub struct ImportedClip {
     pub channel: usize,
 }
 
+impl ImportedAudio {
+    pub fn summaries(&self) -> Vec<align_core::TimelineSequenceSummary> {
+        self.sequences
+            .iter()
+            .enumerate()
+            .map(|(index, sequence)| align_core::TimelineSequenceSummary {
+                index,
+                name: sequence.name.clone(),
+                clip_count: sequence.tracks.iter().map(|track| track.clips.len()).sum(),
+            })
+            .collect()
+    }
+
+    pub fn into_draft(
+        self,
+        path: &Path,
+        sequence_index: Option<usize>,
+    ) -> Result<align_core::xml::TimelineDraft, AafError> {
+        use align_core::{
+            MediaTime,
+            xml::{DraftEdit, DraftMediaKind, TimelineDraft},
+        };
+        validate_import(&self)?;
+        if sequence_index.is_none() && self.sequences.len() != 1 {
+            return Err(AafError::Writer(format!(
+                "{} contains {} sequences. Choose one explicitly",
+                path.display(),
+                self.sequences.len()
+            )));
+        }
+        let index = sequence_index.unwrap_or(0);
+        let sequence = self.sequences.into_iter().nth(index).ok_or_else(|| {
+            AafError::Writer(format!(
+                "Sequence {} does not exist in {}",
+                index + 1,
+                path.display()
+            ))
+        })?;
+        let mut edits = Vec::new();
+        for (track_index, track) in sequence.tracks.into_iter().enumerate() {
+            let rate = track.sample_rate as f64;
+            for (clip_index, clip) in track.clips.into_iter().enumerate() {
+                edits.push(DraftEdit {
+                    id: format!("aaf-{index}-{track_index}-{clip_index}"),
+                    name: clip
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned()),
+                    url: clip.path,
+                    media_type: DraftMediaKind::Audio,
+                    source_in: clip.source_in as f64 / rate,
+                    source_out: (clip.source_in + clip.length) as f64 / rate,
+                    timeline_start: clip.start as f64 / rate,
+                    timeline_end: (clip.start + clip.length) as f64 / rate,
+                    playback_rate: 1.0,
+                    plays_backward: false,
+                    fcp7_time_remap_xml: None,
+                    fcp7_filter_xmls: Vec::new(),
+                    fcp7_retime_in: None,
+                    fcp7_retime_out: None,
+                    fcp7_retime_duration: None,
+                    fcp7_labels_xml: None,
+                    time_scale: track.sample_rate as i32,
+                    audio_source_channel: Some(clip.channel),
+                    fcpxml_audio_role: None,
+                    track_index: track_index + 1,
+                    enabled: true,
+                    track_enabled: true,
+                    track_locked: false,
+                    linked_edit_ids: Default::default(),
+                });
+            }
+        }
+        if edits.is_empty() {
+            return Err(AafError::Writer(
+                "AAF sequence contains no audio clips".into(),
+            ));
+        }
+        Ok(TimelineDraft {
+            source_url: path.to_path_buf(),
+            name: sequence.name,
+            // Audio AAF has no picture edit rate. Use the application's default
+            // picture rate while retaining each edit's native sample clock.
+            frame_duration: MediaTime::new(1, 25),
+            edits,
+            transitions: Vec::new(),
+            warnings: Vec::new(),
+        })
+    }
+}
+
 pub fn read_audio(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, AafError> {
     if cancel.load(Ordering::Relaxed) {
         return Err(AafError::Cancelled);
@@ -93,10 +184,18 @@ fn validate_import(result: &ImportedAudio) -> Result<(), AafError> {
     for sequence in &result.sequences {
         for track in &sequence.tracks {
             if track.sample_rate == 0
+                || track.sample_rate > i32::MAX as u32
                 || track.clips.iter().any(|clip| {
                     clip.length == 0
-                        || clip.start.checked_add(clip.length).is_none()
-                        || clip.source_in.checked_add(clip.length).is_none()
+                        || clip.channel == usize::MAX
+                        || clip
+                            .start
+                            .checked_add(clip.length)
+                            .is_none_or(|end| end > (1u64 << 53) - 1)
+                        || clip
+                            .source_in
+                            .checked_add(clip.length)
+                            .is_none_or(|end| end > (1u64 << 53) - 1)
                 })
             {
                 return Err(AafError::Writer("Invalid AAF sample range".into()));
@@ -210,6 +309,12 @@ pub fn audio_manifest(
                     )
                 });
             for (channel, path) in item.precision_audio_urls.iter().enumerate() {
+                if item
+                    .selected_audio_source_channel()
+                    .is_some_and(|selected| selected != channel)
+                {
+                    continue;
+                }
                 groups
                     .entry((source.clone(), rate as u32, channel))
                     .or_default()
@@ -265,6 +370,145 @@ pub fn audio_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stereo_import() -> ImportedAudio {
+        serde_json::from_value(serde_json::json!({
+            "version":1, "sequences":[{"name":"Stereo edit", "tracks":
+                (0..2).map(|channel| serde_json::json!({
+                    "name":format!("Channel {channel}"), "sample_rate":48000,
+                    "clips":[{"path":"/media/stereo.wav", "start":96001,
+                        "source_in":24001, "length":48001, "channel":channel}]
+                })).collect::<Vec<_>>()
+            }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn imported_stereo_edits_remain_discrete_through_resolve_and_export() {
+        use align_core::{
+            Clip, MediaTime, SyncResult,
+            export::{ExportTimeline, TimelineExportFormat, fcpxml, otio, premiere},
+        };
+        let clip: Clip = serde_json::from_value(serde_json::json!({
+            "id":"stereo", "url":"/media/stereo.wav", "kind":"audio",
+            "duration":{"value":10,"timescale":1},
+            "audio":[{"sampleRate":48000.0,"channels":2,"bitDepth":24}]
+        }))
+        .unwrap();
+        let draft = stereo_import()
+            .into_draft(Path::new("edit.aaf"), None)
+            .unwrap();
+        draft
+            .validate_source_channels(std::slice::from_ref(&clip))
+            .unwrap();
+        let imported = draft.resolve(std::slice::from_ref(&clip));
+        assert_eq!(
+            imported.edits.len(),
+            2,
+            "coincident source channels must not collapse"
+        );
+        for (channel, edit) in imported.edits.iter().enumerate() {
+            assert_eq!(edit.audio_source_channel, Some(channel));
+            assert_eq!(edit.source_in, MediaTime::new(24001, 48000));
+            assert_eq!(edit.source_out, MediaTime::new(72002, 48000));
+            assert_eq!(edit.timeline_start, MediaTime::new(96001, 48000));
+            assert_eq!(edit.timeline_end, MediaTime::new(144002, 48000));
+        }
+        let result: SyncResult = serde_json::from_value(serde_json::json!({
+            "project":{"clips":[clip], "warnings":[], "importedTimeline": imported},
+            "islands":[], "unmatched":["stereo"], "matches":[]
+        }))
+        .unwrap();
+        let mut timeline = ExportTimeline::from_result(&result, true).unwrap();
+        assert_eq!(timeline.islands[0].clips.len(), 2);
+        assert_eq!(
+            timeline.islands[0].clips[1]
+                .audio_source_channels()
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        let temp = tempfile::tempdir().unwrap();
+        for (extension, xml) in [
+            (
+                "xml",
+                premiere::write(&timeline, TimelineExportFormat::PremiereXML, false),
+            ),
+            ("fcpxml", fcpxml::write(&timeline, false)),
+        ] {
+            let path = temp.path().join(format!("roundtrip.{extension}"));
+            std::fs::write(&path, xml).unwrap();
+            let restored = align_core::read_timeline(&path, None).unwrap();
+            assert_eq!(restored.edits.len(), 2, "{extension}");
+            let mut channels: Vec<_> = restored
+                .edits
+                .iter()
+                .map(|edit| edit.audio_source_channel)
+                .collect();
+            channels.sort();
+            assert_eq!(channels, vec![Some(0), Some(1)], "{extension}");
+        }
+        let otio: serde_json::Value =
+            serde_json::from_slice(&otio::data(&timeline).unwrap()).unwrap();
+        let mut channels: Vec<_> = otio["tracks"]["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|track| track["kind"] == "Audio")
+            .flat_map(|track| track["children"].as_array().unwrap())
+            .filter_map(|clip| {
+                clip["metadata"]["Resolve_OTIO"]["Channels"][0]["Source Channel ID"].as_i64()
+            })
+            .collect();
+        channels.sort();
+        assert_eq!(channels, vec![0, 1]);
+        for item in &mut timeline.islands[0].clips {
+            item.precision_audio_urls = vec!["/stems/left.wav".into(), "/stems/right.wav".into()];
+        }
+        let manifest = audio_manifest(&timeline).unwrap();
+        assert_eq!(manifest.tracks.len(), 2);
+        let mut paths: Vec<_> = manifest
+            .tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .map(|clip| clip.path.clone())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/stems/left.wav"),
+                PathBuf::from("/stems/right.wav")
+            ]
+        );
+        let mut invalid_clip = result.project.clips[0].clone();
+        invalid_clip.audio[0].channels = 1;
+        assert!(draft.validate_source_channels(&[invalid_clip]).is_err());
+    }
+
+    #[test]
+    fn aaf_sequence_selection_is_explicit() {
+        let mut imported = stereo_import();
+        imported.sequences.push(ImportedSequence {
+            name: "Empty".into(),
+            tracks: vec![],
+        });
+        let summaries = imported.summaries();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].clip_count, 2);
+        assert_eq!(summaries[1].name, "Empty");
+        assert!(imported.into_draft(Path::new("edit.aaf"), None).is_err());
+        assert!(
+            stereo_import()
+                .into_draft(Path::new("edit.aaf"), Some(1))
+                .is_err()
+        );
+        assert!(
+            stereo_import()
+                .into_draft(Path::new("edit.aaf"), Some(0))
+                .is_ok()
+        );
+    }
     #[test]
     fn manifest_preserves_subframe_placement_and_splits_overlaps() {
         use align_core::export::{ExportIsland, ExportItem, ExportTimeline};
