@@ -150,10 +150,88 @@ impl ExportTarget {
     }
 }
 
-pub struct AppData {
+/// Concrete defaults used by every sequence unless that sequence replaces a
+/// field. Track settings then replace the effective sequence value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SyncDefaults {
     pub search_accuracy: align_core::SearchAccuracy,
-    pub search_overrides: HashMap<ClipId, align_core::SearchAccuracy>,
-    pub search_override_keys: HashMap<String, align_core::SearchAccuracy>,
+    pub audio_source: AudioAnalysisSource,
+    pub temporal_mode: TemporalMode,
+    pub match_threshold: MatchThreshold,
+    pub clip_order: ClipOrder,
+    pub track_content: TrackContent,
+}
+
+/// `None` means that the current sequence inherits the corresponding common
+/// value. Keeping each field optional preserves inheritance when Common is
+/// edited later.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SequenceDefaults {
+    pub search_accuracy: Option<align_core::SearchAccuracy>,
+    pub audio_source: Option<AudioAnalysisSource>,
+    pub temporal_mode: Option<TemporalMode>,
+    pub match_threshold: Option<MatchThreshold>,
+    pub clip_order: Option<ClipOrder>,
+    pub track_content: Option<TrackContent>,
+}
+
+impl SequenceDefaults {
+    fn resolve(self, common: SyncDefaults) -> SyncDefaults {
+        SyncDefaults {
+            search_accuracy: self.search_accuracy.unwrap_or(common.search_accuracy),
+            audio_source: self.audio_source.unwrap_or(common.audio_source),
+            temporal_mode: self.temporal_mode.unwrap_or(common.temporal_mode),
+            match_threshold: self.match_threshold.unwrap_or(common.match_threshold),
+            clip_order: self.clip_order.unwrap_or(common.clip_order),
+            track_content: self.track_content.unwrap_or(common.track_content),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SettingsScope {
+    #[default]
+    Common,
+    CurrentSequence,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TrackOverrides {
+    search: HashMap<ClipId, align_core::SearchAccuracy>,
+    search_keys: HashMap<String, align_core::SearchAccuracy>,
+    audio: HashMap<ClipId, AudioAnalysisSource>,
+    audio_keys: HashMap<String, AudioAnalysisSource>,
+    temporal: HashMap<ClipId, TemporalMode>,
+    temporal_keys: HashMap<String, TemporalMode>,
+    thresholds: HashMap<ClipId, MatchThreshold>,
+    threshold_keys: HashMap<String, MatchThreshold>,
+    orders: HashMap<ClipId, ClipOrder>,
+    order_keys: HashMap<String, ClipOrder>,
+    contents: HashMap<ClipId, TrackContent>,
+    content_keys: HashMap<String, TrackContent>,
+}
+
+impl TrackOverrides {
+    fn count(&self) -> usize {
+        self.search.len()
+            + self.audio.len()
+            + self.temporal.len()
+            + self.thresholds.len()
+            + self.orders.len()
+            + self.contents.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.count() == 0
+    }
+}
+
+pub struct AppData {
+    pub common_settings: SyncDefaults,
+    pub sequence_settings: HashMap<usize, SequenceDefaults>,
+    pub settings_scope: SettingsScope,
+    pub settings_changed: bool,
+    track_overrides: HashMap<usize, TrackOverrides>,
     pub show_search_settings: bool,
     pub show_stage_settings: bool,
     pub show_sequence_results: bool,
@@ -177,20 +255,7 @@ pub struct AppData {
     /// visible member so existing timeline/correction code stays single-view.
     pub sequence_results: Vec<SyncResult>,
     pub active_sequence_result: usize,
-    pub constraints: Vec<SyncConstraint>,
-    pub audio_sources: HashMap<ClipId, AudioAnalysisSource>,
-    pub analysis_source_keys: HashMap<String, AudioAnalysisSource>,
-    /// Time-source overrides per clip + per lane key (mirrors the audio
-    /// source seam; absent = Automatic). Re-runs sync like other
-    /// corrections and round-trips inside the stored result.
-    pub temporal_modes: HashMap<ClipId, TemporalMode>,
-    pub temporal_mode_keys: HashMap<String, TemporalMode>,
-    pub match_thresholds: HashMap<ClipId, MatchThreshold>,
-    pub match_threshold_keys: HashMap<String, MatchThreshold>,
-    pub clip_orders: HashMap<ClipId, ClipOrder>,
-    pub clip_order_keys: HashMap<String, ClipOrder>,
-    pub track_contents: HashMap<ClipId, TrackContent>,
-    pub track_content_keys: HashMap<String, TrackContent>,
+    sequence_constraints: HashMap<usize, Vec<SyncConstraint>>,
     pub audio_stream_channels: HashMap<ClipId, Vec<usize>>,
     pub pending_count: usize,
     pub menu: Option<MenuTarget>,
@@ -241,9 +306,11 @@ impl Default for AppData {
         Self {
             inputs: Vec::new(),
             appearance: Some(crate::theme::ThemeMode::Light),
-            search_accuracy: align_core::SearchAccuracy::default(),
-            search_overrides: HashMap::new(),
-            search_override_keys: HashMap::new(),
+            common_settings: Default::default(),
+            sequence_settings: HashMap::new(),
+            settings_scope: Default::default(),
+            settings_changed: false,
+            track_overrides: HashMap::new(),
             show_search_settings: false,
             show_stage_settings: false,
             show_sequence_results: false,
@@ -263,17 +330,7 @@ impl Default for AppData {
             result: None,
             sequence_results: Vec::new(),
             active_sequence_result: 0,
-            constraints: Vec::new(),
-            audio_sources: HashMap::new(),
-            analysis_source_keys: HashMap::new(),
-            temporal_modes: HashMap::new(),
-            temporal_mode_keys: HashMap::new(),
-            match_thresholds: HashMap::new(),
-            match_threshold_keys: HashMap::new(),
-            clip_orders: HashMap::new(),
-            clip_order_keys: HashMap::new(),
-            track_contents: HashMap::new(),
-            track_content_keys: HashMap::new(),
+            sequence_constraints: HashMap::new(),
             audio_stream_channels: HashMap::new(),
             pending_count: 0,
             menu: None,
@@ -322,6 +379,128 @@ impl AppData {
         }
     }
 
+    fn selected_sequence_indices(&self) -> Vec<usize> {
+        self.inputs
+            .iter()
+            .find_map(|path| self.timeline_choices.get(path).cloned())
+            .unwrap_or_default()
+    }
+
+    pub fn sequence_key_for_position(&self, position: usize) -> usize {
+        self.selected_sequence_indices()
+            .get(position)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn current_sequence_key(&self) -> usize {
+        self.sequence_key_for_position(self.active_sequence_result)
+    }
+
+    pub fn effective_settings_for(&self, sequence_key: usize) -> SyncDefaults {
+        self.sequence_settings
+            .get(&sequence_key)
+            .copied()
+            .unwrap_or_default()
+            .resolve(self.common_settings)
+    }
+
+    pub fn current_effective_settings(&self) -> SyncDefaults {
+        self.effective_settings_for(self.current_sequence_key())
+    }
+
+    pub fn current_sequence_settings(&self) -> SequenceDefaults {
+        self.sequence_settings
+            .get(&self.current_sequence_key())
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn current_track_overrides(&self) -> Option<&TrackOverrides> {
+        self.track_overrides.get(&self.current_sequence_key())
+    }
+
+    pub fn set_scoped_search_accuracy(
+        &mut self,
+        value: Option<align_core::SearchAccuracy>,
+    ) -> bool {
+        match self.settings_scope {
+            SettingsScope::Common => value.is_some_and(|value| {
+                std::mem::replace(&mut self.common_settings.search_accuracy, value) != value
+            }),
+            SettingsScope::CurrentSequence => {
+                let key = self.current_sequence_key();
+                let settings = self.sequence_settings.entry(key).or_default();
+                std::mem::replace(&mut settings.search_accuracy, value) != value
+            }
+        }
+    }
+
+    pub fn set_scoped_audio_source(&mut self, value: Option<AudioAnalysisSource>) -> bool {
+        match self.settings_scope {
+            SettingsScope::Common => value.is_some_and(|value| {
+                std::mem::replace(&mut self.common_settings.audio_source, value) != value
+            }),
+            SettingsScope::CurrentSequence => {
+                let key = self.current_sequence_key();
+                let settings = self.sequence_settings.entry(key).or_default();
+                std::mem::replace(&mut settings.audio_source, value) != value
+            }
+        }
+    }
+
+    pub fn set_scoped_temporal_mode(&mut self, value: Option<TemporalMode>) -> bool {
+        match self.settings_scope {
+            SettingsScope::Common => value.is_some_and(|value| {
+                std::mem::replace(&mut self.common_settings.temporal_mode, value) != value
+            }),
+            SettingsScope::CurrentSequence => {
+                let key = self.current_sequence_key();
+                let settings = self.sequence_settings.entry(key).or_default();
+                std::mem::replace(&mut settings.temporal_mode, value) != value
+            }
+        }
+    }
+
+    pub fn set_scoped_match_threshold(&mut self, value: Option<MatchThreshold>) -> bool {
+        match self.settings_scope {
+            SettingsScope::Common => value.is_some_and(|value| {
+                std::mem::replace(&mut self.common_settings.match_threshold, value) != value
+            }),
+            SettingsScope::CurrentSequence => {
+                let key = self.current_sequence_key();
+                let settings = self.sequence_settings.entry(key).or_default();
+                std::mem::replace(&mut settings.match_threshold, value) != value
+            }
+        }
+    }
+
+    pub fn set_scoped_clip_order(&mut self, value: Option<ClipOrder>) -> bool {
+        match self.settings_scope {
+            SettingsScope::Common => value.is_some_and(|value| {
+                std::mem::replace(&mut self.common_settings.clip_order, value) != value
+            }),
+            SettingsScope::CurrentSequence => {
+                let key = self.current_sequence_key();
+                let settings = self.sequence_settings.entry(key).or_default();
+                std::mem::replace(&mut settings.clip_order, value) != value
+            }
+        }
+    }
+
+    pub fn set_scoped_track_content(&mut self, value: Option<TrackContent>) -> bool {
+        match self.settings_scope {
+            SettingsScope::Common => value.is_some_and(|value| {
+                std::mem::replace(&mut self.common_settings.track_content, value) != value
+            }),
+            SettingsScope::CurrentSequence => {
+                let key = self.current_sequence_key();
+                let settings = self.sequence_settings.entry(key).or_default();
+                std::mem::replace(&mut settings.track_content, value) != value
+            }
+        }
+    }
+
     pub fn has_result(&self) -> bool {
         self.result.is_some()
     }
@@ -356,13 +535,11 @@ impl AppData {
     }
 
     pub fn correction_count(&self) -> usize {
-        self.constraints.len()
-            + self.audio_sources.len()
-            + self.temporal_modes.len()
-            + self.match_thresholds.len()
-            + self.search_overrides.len()
-            + self.clip_orders.len()
-            + self.track_contents.len()
+        self.current_constraints().len()
+            + self
+                .track_overrides
+                .get(&self.current_sequence_key())
+                .map_or(0, TrackOverrides::count)
     }
 
     pub fn unmatched_count(&self) -> usize {
@@ -617,19 +794,37 @@ impl AppData {
         self.error = None;
         self.exported_files.clear();
         self.island_count = 0;
-        self.lanes.clear();
-        self.ruler_timecode = None;
-        self.visible_matches.clear();
         self.warnings.clear();
-        self.live_matches.clear();
+        self.begin_sequence_progress();
         self.selection.clear();
         self.menu = None;
         self.show_export = false;
         self.show_stage_settings = false;
         self.show_search_settings = false;
+        self.settings_changed = false;
         self.show_sequence_results = false;
         self.status = "Inspecting media…".to_string();
         true
+    }
+
+    pub fn begin_sequence_progress(&mut self) {
+        self.clips = self
+            .inputs
+            .iter()
+            .map(|url| ClipRow {
+                clip_id: None,
+                url: url.clone(),
+                name: file_name(url),
+                kind: None,
+                duration: None,
+                timecode: None,
+                state: ClipState::Queued,
+            })
+            .collect();
+        self.lanes.clear();
+        self.ruler_timecode = None;
+        self.visible_matches.clear();
+        self.live_matches.clear();
     }
 
     pub fn restore_after_sync_cancel(&mut self) {
@@ -805,11 +1000,7 @@ impl AppData {
                 acc
             });
         let bars = lane::provisional_bars(&clips, &self.live_matches, &confidences);
-        self.lanes = lane::layout_bars(
-            bars,
-            &self.audio_stream_channels,
-            &self.analysis_source_keys,
-        );
+        self.lanes = lane::layout_bars(bars, &self.audio_stream_channels);
     }
 
     pub fn select_sync_stage(&mut self, index: usize) -> bool {
@@ -843,17 +1034,22 @@ impl AppData {
             self.apply_result(results.pop().expect("one result"));
             return;
         }
-        let Some(first) = results.first().cloned() else {
+        if results.is_empty() {
             self.operation = Operation::Idle;
             self.error = Some("No sequence results were produced.".into());
             return;
-        };
+        }
         let count = results.len();
+        let active = self.active_sequence_result.min(count - 1);
+        let visible = results[active].clone();
         self.sequence_results = results;
-        self.active_sequence_result = 0;
-        self.apply_visible_result(first);
+        self.active_sequence_result = active;
+        self.apply_visible_result(visible);
         if count > 1 {
-            self.status = format!("Synchronized {count} sequences. Showing sequence 1 of {count}.");
+            self.status = format!(
+                "Synchronized {count} sequences. Showing sequence {} of {count}.",
+                active + 1
+            );
         }
     }
 
@@ -882,7 +1078,6 @@ impl AppData {
     }
 
     fn apply_visible_result(&mut self, result: SyncResult) {
-        self.search_accuracy = result.search_accuracy;
         for clip in &result.project.clips {
             self.audio_stream_channels.insert(
                 clip.id.clone(),
@@ -975,11 +1170,7 @@ impl AppData {
             })
             .collect();
         self.visible_matches = sorted_live_matches(&self.live_matches);
-        self.lanes = lane::layout_bars(
-            bars,
-            &self.audio_stream_channels,
-            &self.analysis_source_keys,
-        );
+        self.lanes = lane::layout_bars(bars, &self.audio_stream_channels);
         self.pending_count = 0;
         let stopped = result.stopped;
         self.result = Some(result);
@@ -1013,10 +1204,12 @@ impl AppData {
 
     pub fn reject_pair(&mut self, target: &CorrectionOption) -> bool {
         let constraint = SyncConstraint::rejecting_pair(target.left.clone(), target.right.clone());
-        if self.constraints.contains(&constraint) {
+        let sequence_key = self.current_sequence_key();
+        let constraints = self.sequence_constraints.entry(sequence_key).or_default();
+        if constraints.contains(&constraint) {
             return false;
         }
-        self.constraints.push(constraint);
+        constraints.push(constraint);
         true
     }
 
@@ -1026,11 +1219,27 @@ impl AppData {
             target.right.clone(),
             target.offset,
         );
-        if self.constraints.contains(&constraint) {
+        let sequence_key = self.current_sequence_key();
+        let constraints = self.sequence_constraints.entry(sequence_key).or_default();
+        if constraints.contains(&constraint) {
             return false;
         }
-        self.constraints.push(constraint);
+        constraints.push(constraint);
         true
+    }
+
+    pub fn constraints_for_sequence(&self, sequence_key: usize) -> Vec<SyncConstraint> {
+        self.sequence_constraints
+            .get(&sequence_key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn current_constraints(&self) -> &[SyncConstraint] {
+        self.sequence_constraints
+            .get(&self.current_sequence_key())
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     /// Clips sharing the lane's source track, even when the compact preview
@@ -1053,64 +1262,88 @@ impl AppData {
         Some((key, ids))
     }
 
-    /// Lane-level audio source override (mirrors `setAnalysisSource`):
-    /// applies to every clip sharing the lane's kind+sourceKey.
-    pub fn set_analysis_source(&mut self, source: AudioAnalysisSource, lane_id: &str) -> bool {
+    /// Lane-level audio source override. `None` explicitly inherits the
+    /// current sequence; `Some(Automatic)` remains a real override.
+    pub fn set_analysis_source(
+        &mut self,
+        source: Option<AudioAnalysisSource>,
+        lane_id: &str,
+    ) -> bool {
         let Some((key, ids)) = self.lane_group(lane_id) else {
             return false;
         };
         if ids.is_empty() {
             return false;
         }
-        if source == AudioAnalysisSource::Automatic {
-            self.analysis_source_keys.remove(&key);
+        let sequence_key = self.current_sequence_key();
+        let overrides = self.track_overrides.entry(sequence_key).or_default();
+        if let Some(source) = source {
+            overrides.audio_keys.insert(key, source);
             for id in ids {
-                self.audio_sources.remove(&id);
+                overrides.audio.insert(id, source);
             }
         } else {
-            self.analysis_source_keys.insert(key, source);
+            overrides.audio_keys.remove(&key);
             for id in ids {
-                self.audio_sources.insert(id, source);
+                overrides.audio.remove(&id);
             }
         }
         true
     }
 
-    /// Lane-level time-source override (same scope as above): Automatic
-    /// removes the override, anything else re-runs sync via the caller.
-    pub fn set_temporal_mode(&mut self, mode: TemporalMode, lane_id: &str) -> bool {
+    pub fn lane_analysis_source(&self, lane_id: &str) -> Option<AudioAnalysisSource> {
+        self.lane_group(lane_id).and_then(|(key, _)| {
+            self.current_track_overrides()?
+                .audio_keys
+                .get(&key)
+                .copied()
+        })
+    }
+
+    pub fn effective_lane_analysis_source(&self, lane_id: &str) -> AudioAnalysisSource {
+        self.lane_analysis_source(lane_id)
+            .unwrap_or(self.current_effective_settings().audio_source)
+    }
+
+    pub fn set_temporal_mode(&mut self, mode: Option<TemporalMode>, lane_id: &str) -> bool {
         let Some((key, ids)) = self.lane_group(lane_id) else {
             return false;
         };
         if ids.is_empty() {
             return false;
         }
-        if mode == TemporalMode::Auto {
-            self.temporal_mode_keys.remove(&key);
+        let sequence_key = self.current_sequence_key();
+        let overrides = self.track_overrides.entry(sequence_key).or_default();
+        if let Some(mode) = mode {
+            overrides.temporal_keys.insert(key, mode);
             for id in ids {
-                self.temporal_modes.remove(&id);
+                overrides.temporal.insert(id, mode);
             }
         } else {
-            self.temporal_mode_keys.insert(key, mode);
+            overrides.temporal_keys.remove(&key);
             for id in ids {
-                self.temporal_modes.insert(id, mode);
+                overrides.temporal.remove(&id);
             }
         }
         true
     }
 
-    /// Lane's current time-source mode (lane key, else Automatic).
-    pub fn lane_temporal_mode(&self, lane_id: &str) -> TemporalMode {
-        self.lane_group(lane_id)
-            .and_then(|(key, _)| self.temporal_mode_keys.get(&key).copied())
-            .unwrap_or_default()
+    pub fn lane_temporal_mode(&self, lane_id: &str) -> Option<TemporalMode> {
+        self.lane_group(lane_id).and_then(|(key, _)| {
+            self.current_track_overrides()?
+                .temporal_keys
+                .get(&key)
+                .copied()
+        })
     }
 
     /// Current lane mode + whether any grouped clip offers its evidence.
     /// The menu shows an explicit "no data — stable order" note when
     /// false; sync itself never blocks on it.
     pub fn temporal_availability(&self, lane_id: &str) -> (TemporalMode, bool) {
-        let mode = self.lane_temporal_mode(lane_id);
+        let mode = self
+            .lane_temporal_mode(lane_id)
+            .unwrap_or(self.current_effective_settings().temporal_mode);
         let Some(result) = &self.result else {
             return (mode, true);
         };
@@ -1138,129 +1371,144 @@ impl AppData {
             return false;
         }
         if let Some(accuracy) = accuracy {
-            self.search_override_keys.insert(key, accuracy);
+            let sequence_key = self.current_sequence_key();
+            let overrides = self.track_overrides.entry(sequence_key).or_default();
+            overrides.search_keys.insert(key, accuracy);
             for id in ids {
-                self.search_overrides.insert(id, accuracy);
+                overrides.search.insert(id, accuracy);
             }
         } else {
-            self.search_override_keys.remove(&key);
+            let sequence_key = self.current_sequence_key();
+            let overrides = self.track_overrides.entry(sequence_key).or_default();
+            overrides.search_keys.remove(&key);
             for id in ids {
-                self.search_overrides.remove(&id);
+                overrides.search.remove(&id);
             }
         }
         true
     }
 
     pub fn lane_search_accuracy(&self, lane_id: &str) -> Option<align_core::SearchAccuracy> {
-        self.lane_group(lane_id)
-            .and_then(|(key, _)| self.search_override_keys.get(&key).copied())
+        self.lane_group(lane_id).and_then(|(key, _)| {
+            self.current_track_overrides()?
+                .search_keys
+                .get(&key)
+                .copied()
+        })
     }
 
-    pub fn set_match_threshold(&mut self, threshold: MatchThreshold, lane_id: &str) -> bool {
+    pub fn set_match_threshold(
+        &mut self,
+        threshold: Option<MatchThreshold>,
+        lane_id: &str,
+    ) -> bool {
         let Some((key, ids)) = self.lane_group(lane_id) else {
             return false;
         };
         if ids.is_empty() {
             return false;
         }
-        if threshold == MatchThreshold::Balanced {
-            self.match_threshold_keys.remove(&key);
+        let sequence_key = self.current_sequence_key();
+        let overrides = self.track_overrides.entry(sequence_key).or_default();
+        if let Some(threshold) = threshold {
+            overrides.threshold_keys.insert(key, threshold);
             for id in ids {
-                self.match_thresholds.remove(&id);
+                overrides.thresholds.insert(id, threshold);
             }
         } else {
-            self.match_threshold_keys.insert(key, threshold);
+            overrides.threshold_keys.remove(&key);
             for id in ids {
-                self.match_thresholds.insert(id, threshold);
+                overrides.thresholds.remove(&id);
             }
         }
         true
     }
 
-    pub fn lane_match_threshold(&self, lane_id: &str) -> MatchThreshold {
-        self.lane_group(lane_id)
-            .and_then(|(key, _)| self.match_threshold_keys.get(&key).copied())
-            .unwrap_or_default()
+    pub fn lane_match_threshold(&self, lane_id: &str) -> Option<MatchThreshold> {
+        self.lane_group(lane_id).and_then(|(key, _)| {
+            self.current_track_overrides()?
+                .threshold_keys
+                .get(&key)
+                .copied()
+        })
     }
 
-    pub fn set_clip_order(&mut self, mode: ClipOrder, lane_id: &str) -> bool {
+    pub fn set_clip_order(&mut self, mode: Option<ClipOrder>, lane_id: &str) -> bool {
         let Some((key, ids)) = self.lane_group(lane_id) else {
             return false;
         };
         if ids.is_empty() {
             return false;
         }
-        if mode == ClipOrder::Auto {
-            self.clip_order_keys.remove(&key);
+        let sequence_key = self.current_sequence_key();
+        let overrides = self.track_overrides.entry(sequence_key).or_default();
+        if let Some(mode) = mode {
+            overrides.order_keys.insert(key, mode);
             for id in ids {
-                self.clip_orders.remove(&id);
+                overrides.orders.insert(id, mode);
             }
         } else {
-            self.clip_order_keys.insert(key, mode);
+            overrides.order_keys.remove(&key);
             for id in ids {
-                self.clip_orders.insert(id, mode);
+                overrides.orders.remove(&id);
             }
         }
         true
     }
 
-    pub fn lane_clip_order(&self, lane_id: &str) -> ClipOrder {
-        self.lane_group(lane_id)
-            .and_then(|(key, _)| self.clip_order_keys.get(&key).copied())
-            .unwrap_or_default()
+    pub fn lane_clip_order(&self, lane_id: &str) -> Option<ClipOrder> {
+        self.lane_group(lane_id).and_then(|(key, _)| {
+            self.current_track_overrides()?
+                .order_keys
+                .get(&key)
+                .copied()
+        })
     }
 
-    pub fn set_track_content(&mut self, mode: TrackContent, lane_id: &str) -> bool {
+    pub fn set_track_content(&mut self, mode: Option<TrackContent>, lane_id: &str) -> bool {
         let Some((key, ids)) = self.lane_group(lane_id) else {
             return false;
         };
         if ids.is_empty() {
             return false;
         }
-        if mode == TrackContent::Auto {
-            self.track_content_keys.remove(&key);
+        let sequence_key = self.current_sequence_key();
+        let overrides = self.track_overrides.entry(sequence_key).or_default();
+        if let Some(mode) = mode {
+            overrides.content_keys.insert(key, mode);
             for id in ids {
-                self.track_contents.remove(&id);
+                overrides.contents.insert(id, mode);
             }
         } else {
-            self.track_content_keys.insert(key, mode);
+            overrides.content_keys.remove(&key);
             for id in ids {
-                self.track_contents.insert(id, mode);
+                overrides.contents.remove(&id);
             }
         }
         true
     }
 
-    pub fn lane_track_content(&self, lane_id: &str) -> TrackContent {
-        self.lane_group(lane_id)
-            .and_then(|(key, _)| self.track_content_keys.get(&key).copied())
-            .unwrap_or_default()
+    pub fn lane_track_content(&self, lane_id: &str) -> Option<TrackContent> {
+        self.lane_group(lane_id).and_then(|(key, _)| {
+            self.current_track_overrides()?
+                .content_keys
+                .get(&key)
+                .copied()
+        })
     }
 
     pub fn reset_corrections(&mut self) -> bool {
-        if self.constraints.is_empty()
-            && self.audio_sources.is_empty()
-            && self.temporal_modes.is_empty()
-            && self.match_thresholds.is_empty()
-            && self.search_overrides.is_empty()
-            && self.clip_orders.is_empty()
-            && self.track_contents.is_empty()
+        let sequence_key = self.current_sequence_key();
+        if self.current_constraints().is_empty()
+            && self
+                .track_overrides
+                .get(&sequence_key)
+                .is_none_or(TrackOverrides::is_empty)
         {
             return false;
         }
-        self.constraints.clear();
-        self.audio_sources.clear();
-        self.analysis_source_keys.clear();
-        self.temporal_modes.clear();
-        self.temporal_mode_keys.clear();
-        self.search_overrides.clear();
-        self.search_override_keys.clear();
-        self.match_thresholds.clear();
-        self.match_threshold_keys.clear();
-        self.clip_orders.clear();
-        self.clip_order_keys.clear();
-        self.track_contents.clear();
-        self.track_content_keys.clear();
+        self.sequence_constraints.remove(&sequence_key);
+        self.track_overrides.remove(&sequence_key);
         true
     }
 
@@ -1415,11 +1663,7 @@ impl AppData {
     }
 
     pub fn pipeline_input_sets(&self) -> Vec<Vec<PipelineInput>> {
-        let selected: Vec<usize> = self
-            .inputs
-            .iter()
-            .find_map(|path| self.timeline_choices.get(path).cloned())
-            .unwrap_or_default();
+        let selected = self.selected_sequence_indices();
         if selected.len() > 1 {
             return selected
                 .into_iter()
@@ -1448,27 +1692,39 @@ impl AppData {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn pipeline_options(&self) -> PipelineOptions {
+        self.pipeline_options_for_sequence(self.current_sequence_key())
+    }
+
+    pub fn pipeline_options_for_sequence(&self, sequence_key: usize) -> PipelineOptions {
+        let defaults = self.effective_settings_for(sequence_key);
+        let overrides = self
+            .track_overrides
+            .get(&sequence_key)
+            .cloned()
+            .unwrap_or_default();
         PipelineOptions {
-            search_accuracy: self.search_accuracy,
-            search_overrides: self.search_overrides.clone(),
-            source_search_overrides: self.search_override_keys.clone(),
-            audio_sources: self.audio_sources.clone(),
+            search_accuracy: defaults.search_accuracy,
+            search_overrides: overrides.search,
+            source_search_overrides: overrides.search_keys,
+            audio_source: defaults.audio_source,
+            audio_sources: overrides.audio,
             match_policy: align_core::MatchPolicy {
-                default: MatchThreshold::Balanced,
-                thresholds: self.match_thresholds.clone(),
+                default: defaults.match_threshold,
+                thresholds: overrides.thresholds,
             },
             clip_order: align_core::ClipOrderPolicy {
-                default: ClipOrder::Auto,
-                modes: self.clip_orders.clone(),
+                default: defaults.clip_order,
+                modes: overrides.orders,
             },
             track_content: align_core::TrackContentPolicy {
-                default: TrackContent::Auto,
-                modes: self.track_contents.clone(),
+                default: defaults.track_content,
+                modes: overrides.contents,
             },
             temporal: align_core::TemporalPolicy {
-                default: TemporalMode::Auto,
-                modes: self.temporal_modes.clone(),
+                default: defaults.temporal_mode,
+                modes: overrides.temporal,
             },
             redirects: self.redirects.clone(),
             manual_relinks: self.manual_relinks.clone(),
@@ -1668,6 +1924,33 @@ mod tests {
                 .name,
             "Evening"
         );
+
+        data.sequence_constraints.insert(
+            1,
+            vec![SyncConstraint::rejecting_pair(
+                ClipId::new("a"),
+                ClipId::new("b"),
+            )],
+        );
+        assert!(data.constraints_for_sequence(0).is_empty());
+        assert_eq!(data.constraints_for_sequence(1).len(), 1);
+
+        data.apply_results(vec![
+            empty_sequence_result("Morning rerun"),
+            empty_sequence_result("Evening rerun"),
+        ]);
+        assert_eq!(data.active_sequence_result, 1);
+        assert_eq!(
+            data.result
+                .as_ref()
+                .unwrap()
+                .project
+                .imported_timeline
+                .as_ref()
+                .unwrap()
+                .name,
+            "Evening rerun"
+        );
     }
 
     /// Synthetic result fixture (no corpus, no pipeline): one island of
@@ -1826,16 +2109,19 @@ mod tests {
         }
         data.exported_files
             .push(PathBuf::from("/tmp/previous-stage.xml"));
-        data.constraints.push(SyncConstraint::rejecting_pair(
-            ClipId::new("x"),
-            ClipId::new("y"),
-        ));
-        let constraints = data.constraints.clone();
+        data.sequence_constraints.insert(
+            0,
+            vec![SyncConstraint::rejecting_pair(
+                ClipId::new("x"),
+                ClipId::new("y"),
+            )],
+        );
+        let constraints = data.current_constraints().to_vec();
         assert!(data.select_sync_stage(0));
         assert_eq!(data.unmatched_count(), 3);
         assert!(data.live_matches.is_empty());
         assert!(data.exported_files.is_empty());
-        assert_eq!(data.constraints, constraints);
+        assert_eq!(data.current_constraints(), constraints);
         assert!(data.select_sync_stage(1));
         assert_eq!(data.unmatched_count(), 1);
         assert_eq!(data.live_matches.len(), 1);
@@ -1877,9 +2163,8 @@ mod tests {
     }
 
     #[test]
-    fn temporal_mode_lane_override_round_trip() {
+    fn common_sequence_and_track_settings_resolve_in_order() {
         use crate::lane::{BarMatchState, BarVisual, LaneVisual};
-        use align_core::{AudioSummary, MediaTime, RecordingTimestampSource, SyncProject};
 
         let bar = |name: &str| BarVisual {
             id: name.to_string(),
@@ -1893,28 +2178,12 @@ mod tests {
             confidence: 0.0,
             match_state: BarMatchState::Unmatched,
         };
-        let clip_row = |name: &str| Clip {
-            id: ClipId::new(name),
-            url: PathBuf::from(format!("/v/{name}")),
-            kind: MediaKind::Audio,
-            duration: MediaTime::seconds(10.0),
-            audio: vec![AudioSummary {
-                sample_rate: 48000.0,
-                channels: 1,
-                bit_depth: None,
-                is_float: None,
-                source_timecode: None,
-            }],
-            video: None,
-            recorded_at: Some(1_700_000_000),
-            recorded_at_source: Some(RecordingTimestampSource::EmbeddedMetadata),
-            source_identifier: None,
-            media_span: None,
-        };
-        let mut data = AppData::default();
-        assert!(!data.set_temporal_mode(TemporalMode::RecStart, "nope"));
         let mut packed_other_source = bar("c.wav");
         packed_other_source.source_key = "/other".to_string();
+        let mut data = AppData::default();
+        data.inputs.push(PathBuf::from("/tmp/project.xml"));
+        data.timeline_choices
+            .insert(PathBuf::from("/tmp/project.xml"), vec![3, 8]);
         data.lanes = vec![LaneVisual {
             id: "lane-1".to_string(),
             kind: MediaKind::Audio,
@@ -1922,116 +2191,95 @@ mod tests {
             source_key: "/v".to_string(),
             source_name: "src".to_string(),
             stream_channels: Vec::new(),
-            analysis_source: AudioAnalysisSource::Automatic,
             clips: vec![bar("a.wav"), bar("b.wav"), packed_other_source],
         }];
-        // Set: per-clip map + lane key agree, corrections counted.
-        assert!(data.set_temporal_mode(TemporalMode::RecStop, "lane-1"));
+
+        data.common_settings = SyncDefaults {
+            search_accuracy: align_core::SearchAccuracy::Fast,
+            audio_source: AudioAnalysisSource::AllMixed,
+            temporal_mode: TemporalMode::RecStart,
+            match_threshold: MatchThreshold::Conservative,
+            clip_order: ClipOrder::ByDateTime,
+            track_content: TrackContent::Linear,
+        };
+        assert_eq!(data.current_sequence_key(), 3);
+        assert_eq!(data.current_effective_settings(), data.common_settings);
+
+        data.settings_scope = SettingsScope::CurrentSequence;
+        assert!(data.set_scoped_search_accuracy(Some(align_core::SearchAccuracy::Exhaustive)));
+        assert!(data.set_scoped_temporal_mode(Some(TemporalMode::RecStop)));
+        assert!(data.set_scoped_track_content(Some(TrackContent::Takes)));
+        let sequence = data.pipeline_options_for_sequence(3);
+        assert_eq!(
+            sequence.search_accuracy,
+            align_core::SearchAccuracy::Exhaustive
+        );
+        assert_eq!(sequence.audio_source, AudioAnalysisSource::AllMixed);
+        assert_eq!(sequence.temporal.default, TemporalMode::RecStop);
+        assert_eq!(sequence.match_policy.default, MatchThreshold::Conservative);
+        assert_eq!(sequence.clip_order.default, ClipOrder::ByDateTime);
+        assert_eq!(sequence.track_content.default, TrackContent::Takes);
+
+        // Every enum default remains a real track override. Only `None`
+        // means inherit from the current sequence.
+        assert!(data.set_analysis_source(Some(AudioAnalysisSource::Automatic), "lane-1"));
+        assert!(data.set_temporal_mode(Some(TemporalMode::Auto), "lane-1"));
+        assert!(data.set_match_threshold(Some(MatchThreshold::Balanced), "lane-1"));
+        assert!(data.set_clip_order(Some(ClipOrder::Auto), "lane-1"));
+        assert!(data.set_track_content(Some(TrackContent::Auto), "lane-1"));
         assert!(
-            data.set_lane_search_accuracy(Some(align_core::SearchAccuracy::Exhaustive), "lane-1")
+            data.set_lane_search_accuracy(Some(align_core::SearchAccuracy::Thorough), "lane-1")
         );
         assert_eq!(
-            data.lane_search_accuracy("lane-1"),
-            Some(align_core::SearchAccuracy::Exhaustive)
+            data.lane_analysis_source("lane-1"),
+            Some(AudioAnalysisSource::Automatic)
         );
-        assert_eq!(data.pipeline_options().search_overrides.len(), 2);
-        assert!(!data.search_overrides.contains_key(&ClipId::new("c.wav")));
-        data.search_accuracy = align_core::SearchAccuracy::Fast;
-        assert_eq!(
-            data.lane_search_accuracy("lane-1"),
-            Some(align_core::SearchAccuracy::Exhaustive)
-        );
-        assert!(data.set_lane_search_accuracy(None, "lane-1"));
-        assert!(data.search_overrides.is_empty());
-        assert_eq!(data.lane_temporal_mode("lane-1"), TemporalMode::RecStop);
-        assert_eq!(
-            data.temporal_modes.get(&ClipId::new("a.wav")),
-            Some(&TemporalMode::RecStop)
-        );
-        assert!(!data.temporal_modes.contains_key(&ClipId::new("c.wav")));
-        assert_eq!(data.correction_count(), 2);
-        // Options carry the policy; unset clips stay Automatic.
-        let options = data.pipeline_options();
-        assert_eq!(
-            options.temporal.resolve(&ClipId::new("a.wav")),
-            TemporalMode::RecStop
-        );
-        assert_eq!(
-            options.temporal.resolve(&ClipId::new("other")),
-            TemporalMode::Auto
-        );
-        // No result yet: availability unknown, no warning.
-        assert_eq!(
-            data.temporal_availability("lane-1"),
-            (TemporalMode::RecStop, true)
-        );
-        // Result without stamps: explicit missing-evidence status.
-        data.result = Some(SyncResult {
-            search_overrides: Default::default(),
-            stopped: false,
-            stages: Vec::new(),
-            selected_stage: None,
-            search_accuracy: Default::default(),
-            project: SyncProject {
-                clips: vec![clip_row("a.wav"), clip_row("b.wav")],
-                warnings: Vec::new(),
-                imported_timeline: None,
-            },
-            islands: Vec::new(),
-            unmatched: vec![ClipId::new("a.wav"), ClipId::new("b.wav")],
-            matches: Vec::new(),
-            temporal_policy: align_core::TemporalPolicy::default(),
-        });
-        // Clips above have embedded stamps → evidence present.
-        assert_eq!(
-            data.temporal_availability("lane-1"),
-            (TemporalMode::RecStop, true)
-        );
-        assert!(data.set_temporal_mode(TemporalMode::Timecode, "lane-1"));
-        // No timecodes → explicit fallback status, sync unblocked.
-        assert_eq!(
-            data.temporal_availability("lane-1"),
-            (TemporalMode::Timecode, false)
-        );
-        // Automatic removes the override; reset clears the rest.
-        assert!(data.set_temporal_mode(TemporalMode::Auto, "lane-1"));
-        assert_eq!(data.lane_temporal_mode("lane-1"), TemporalMode::Auto);
-        assert!(data.temporal_modes.is_empty());
-        assert!(data.set_match_threshold(MatchThreshold::Conservative, "lane-1"));
+        assert_eq!(data.lane_temporal_mode("lane-1"), Some(TemporalMode::Auto));
         assert_eq!(
             data.lane_match_threshold("lane-1"),
+            Some(MatchThreshold::Balanced)
+        );
+        assert_eq!(data.lane_clip_order("lane-1"), Some(ClipOrder::Auto));
+        assert_eq!(data.lane_track_content("lane-1"), Some(TrackContent::Auto));
+        let track = data.pipeline_options_for_sequence(3);
+        let a = ClipId::new("a.wav");
+        assert_eq!(track.audio_sources[&a], AudioAnalysisSource::Automatic);
+        assert_eq!(track.temporal.resolve(&a), TemporalMode::Auto);
+        assert_eq!(track.match_policy.resolve(&a), MatchThreshold::Balanced);
+        assert_eq!(track.clip_order.resolve(&a), ClipOrder::Auto);
+        assert_eq!(track.track_content.resolve(&a), TrackContent::Auto);
+        assert_eq!(
+            track.search_overrides[&a],
+            align_core::SearchAccuracy::Thorough
+        );
+        assert!(!track.audio_sources.contains_key(&ClipId::new("c.wav")));
+
+        // A second sequence keeps independent defaults and track overrides.
+        data.active_sequence_result = 1;
+        assert_eq!(data.current_sequence_key(), 8);
+        let second = data.pipeline_options_for_sequence(8);
+        assert_eq!(second.search_accuracy, align_core::SearchAccuracy::Fast);
+        assert_eq!(second.audio_source, AudioAnalysisSource::AllMixed);
+        assert!(second.audio_sources.is_empty());
+        assert_eq!(data.lane_analysis_source("lane-1"), None);
+
+        data.active_sequence_result = 0;
+        assert!(data.set_analysis_source(None, "lane-1"));
+        assert!(data.set_temporal_mode(None, "lane-1"));
+        assert!(data.set_match_threshold(None, "lane-1"));
+        assert!(data.set_clip_order(None, "lane-1"));
+        assert!(data.set_track_content(None, "lane-1"));
+        assert!(data.set_lane_search_accuracy(None, "lane-1"));
+        let inherited = data.pipeline_options_for_sequence(3);
+        assert!(inherited.audio_sources.is_empty());
+        assert_eq!(inherited.temporal.resolve(&a), TemporalMode::RecStop);
+        assert_eq!(
+            inherited.match_policy.resolve(&a),
             MatchThreshold::Conservative
         );
-        assert_eq!(
-            data.pipeline_options()
-                .match_policy
-                .resolve(&ClipId::new("a.wav")),
-            MatchThreshold::Conservative
-        );
-        assert_eq!(data.correction_count(), 2);
-        assert!(data.set_match_threshold(MatchThreshold::Balanced, "lane-1"));
-        assert!(data.match_thresholds.is_empty());
-        assert!(data.set_clip_order(ClipOrder::ByFileName, "lane-1"));
-        assert_eq!(data.lane_clip_order("lane-1"), ClipOrder::ByFileName);
-        assert_eq!(
-            data.pipeline_options()
-                .clip_order
-                .resolve(&ClipId::new("a.wav")),
-            ClipOrder::ByFileName
-        );
-        assert!(data.set_clip_order(ClipOrder::Auto, "lane-1"));
-        assert!(data.clip_orders.is_empty());
-        assert!(data.set_track_content(TrackContent::Linear, "lane-1"));
-        assert_eq!(data.lane_track_content("lane-1"), TrackContent::Linear);
-        assert_eq!(
-            data.pipeline_options()
-                .track_content
-                .resolve(&ClipId::new("a.wav")),
-            TrackContent::Linear
-        );
-        assert!(data.set_track_content(TrackContent::Auto, "lane-1"));
-        assert!(data.track_contents.is_empty());
-        assert!(!data.reset_corrections());
+        assert_eq!(inherited.clip_order.resolve(&a), ClipOrder::ByDateTime);
+        assert_eq!(inherited.track_content.resolve(&a), TrackContent::Takes);
+        assert!(inherited.search_overrides.is_empty());
     }
 
     #[test]

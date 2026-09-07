@@ -26,7 +26,7 @@ use gpui::{
 
 use super::icons::{icons, kind_badge, svg_icon};
 use super::lane::CorrectionOption;
-use super::state::{AppData, ClipState, MenuTarget, Operation, SequencePicker};
+use super::state::{AppData, ClipState, MenuTarget, Operation, SequencePicker, SettingsScope};
 use super::text_input::TextInput;
 use super::theme::{Theme, ThemeMode};
 use crate::{MinimizeWindow, ToggleFullscreen, ZoomWindow};
@@ -102,6 +102,10 @@ mod motion_tests {
 }
 
 enum SyncMsg {
+    SequenceStart {
+        sequence_index: usize,
+        sequence_count: usize,
+    },
     Progress(Box<SyncProgress>),
     Done(Box<Result<Vec<SyncResult>, String>>),
 }
@@ -236,14 +240,27 @@ impl AlignApp {
         let generation = self.data.generation;
         let cancel = self.data.cancel.clone();
         let input_sets = self.data.pipeline_input_sets();
-        let constraints = self.data.constraints.clone();
-        let options = self.data.pipeline_options();
+        let run_settings: Vec<_> = (0..input_sets.len())
+            .map(|position| {
+                let sequence_key = self.data.sequence_key_for_position(position);
+                (
+                    self.data.constraints_for_sequence(sequence_key),
+                    self.data.pipeline_options_for_sequence(sequence_key),
+                )
+            })
+            .collect();
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<SyncMsg>();
         std::thread::spawn(move || {
             let pipeline = Pipeline::default_backend();
             let sequence_count = input_sets.len();
             let mut results = Vec::with_capacity(sequence_count);
-            for (sequence_index, inputs) in input_sets.into_iter().enumerate() {
+            for (sequence_index, (inputs, (constraints, options))) in
+                input_sets.into_iter().zip(run_settings).enumerate()
+            {
+                let _ = tx.unbounded_send(SyncMsg::SequenceStart {
+                    sequence_index,
+                    sequence_count,
+                });
                 let progress = |p: align_decode::pipeline::PipelineProgress| {
                     let _ = tx.unbounded_send(SyncMsg::Progress(Box::new(SyncProgress {
                         phase: p.phase,
@@ -315,6 +332,18 @@ impl AlignApp {
 
     fn apply_sync_msg(&mut self, msg: SyncMsg) {
         match msg {
+            SyncMsg::SequenceStart {
+                sequence_index,
+                sequence_count,
+            } => {
+                self.data.begin_sequence_progress();
+                self.data.status = format!(
+                    "Sequence {}/{} · Reading metadata…",
+                    sequence_index + 1,
+                    sequence_count
+                );
+                self.data.progress = sequence_index as f32 / sequence_count as f32;
+            }
             SyncMsg::Progress(event) => {
                 let phase_name = match event.phase {
                     Phase::Inspect => "inspect",
@@ -648,7 +677,7 @@ impl AlignApp {
         }
     }
 
-    fn set_stream_source(&mut self, source: AudioAnalysisSource, cx: &mut Context<Self>) {
+    fn set_stream_source(&mut self, source: Option<AudioAnalysisSource>, cx: &mut Context<Self>) {
         let lane_id = self.data.menu.clone().and_then(|m| m.lane_id.clone());
         let changed = match lane_id {
             Some(id) => self.data.set_analysis_source(source, &id),
@@ -660,7 +689,7 @@ impl AlignApp {
         }
     }
 
-    fn set_temporal_mode(&mut self, mode: TemporalMode, cx: &mut Context<Self>) {
+    fn set_temporal_mode(&mut self, mode: Option<TemporalMode>, cx: &mut Context<Self>) {
         let lane_id = self.data.menu.clone().and_then(|m| m.lane_id.clone());
         let changed = match lane_id {
             Some(id) => self.data.set_temporal_mode(mode, &id),
@@ -672,7 +701,7 @@ impl AlignApp {
         }
     }
 
-    fn set_match_threshold(&mut self, threshold: MatchThreshold, cx: &mut Context<Self>) {
+    fn set_match_threshold(&mut self, threshold: Option<MatchThreshold>, cx: &mut Context<Self>) {
         let lane_id = self.data.menu.clone().and_then(|m| m.lane_id.clone());
         let changed = match lane_id {
             Some(id) => self.data.set_match_threshold(threshold, &id),
@@ -684,7 +713,7 @@ impl AlignApp {
         }
     }
 
-    fn set_clip_order(&mut self, mode: ClipOrder, cx: &mut Context<Self>) {
+    fn set_clip_order(&mut self, mode: Option<ClipOrder>, cx: &mut Context<Self>) {
         let lane_id = self.data.menu.clone().and_then(|m| m.lane_id.clone());
         let changed = match lane_id {
             Some(id) => self.data.set_clip_order(mode, &id),
@@ -696,7 +725,7 @@ impl AlignApp {
         }
     }
 
-    fn set_track_content(&mut self, mode: TrackContent, cx: &mut Context<Self>) {
+    fn set_track_content(&mut self, mode: Option<TrackContent>, cx: &mut Context<Self>) {
         let lane_id = self.data.menu.clone().and_then(|m| m.lane_id.clone());
         let changed = match lane_id {
             Some(id) => self.data.set_track_content(mode, &id),
@@ -1673,7 +1702,7 @@ fn timeline_lanes(
         // Hover tooltip keeps the source behind the number discoverable
         // (mirrors the native `.help` on the label cell), including an
         // active stream/channel override.
-        let override_suffix = match lane.analysis_source {
+        let override_suffix = match data.effective_lane_analysis_source(&lane_id) {
             AudioAnalysisSource::Automatic => String::new(),
             AudioAnalysisSource::AllMixed => " · All Mix".to_string(),
             AudioAnalysisSource::Channel(index) => format!(" · Ch {}", index + 1),
@@ -2067,10 +2096,14 @@ fn operation_bar(
             cx,
             theme,
             "btn-search-settings",
-            format!("Search: {}", data.search_accuracy.label()),
+            format!(
+                "Sync settings: {}",
+                data.current_effective_settings().search_accuracy.label()
+            ),
             true,
             |this, _, _, cx| {
                 this.data.show_search_settings = true;
+                this.data.settings_changed = false;
                 cx.notify();
             },
         ));
@@ -2282,50 +2315,327 @@ fn sequence_results_panel(
     ))
 }
 
+fn audio_source_label(source: AudioAnalysisSource) -> &'static str {
+    match source {
+        AudioAnalysisSource::Automatic => "Automatic",
+        AudioAnalysisSource::AllMixed => "All streams mixed",
+        AudioAnalysisSource::Channel(0) => "First channel",
+        AudioAnalysisSource::MixedStream(0) => "First stream mixed",
+        AudioAnalysisSource::Channel(_) => "Channel",
+        AudioAnalysisSource::MixedStream(_) => "Stream mixed",
+        AudioAnalysisSource::Stream { .. } => "Stream channel",
+    }
+}
+
+fn match_threshold_label(value: MatchThreshold) -> &'static str {
+    match value {
+        MatchThreshold::Permissive => "More matches",
+        MatchThreshold::Balanced => "Balanced",
+        MatchThreshold::Conservative => "Fewer false matches",
+    }
+}
+
+fn clip_order_label(value: ClipOrder) -> &'static str {
+    match value {
+        ClipOrder::Auto => "Auto",
+        ClipOrder::AlternateAuto => "Alternate Auto",
+        ClipOrder::AsImported => "As imported",
+        ClipOrder::ByDateTime => "Date & time",
+        ClipOrder::ByFileName => "File name",
+        ClipOrder::Ignore => "Ignore",
+    }
+}
+
+fn track_content_label(value: TrackContent) -> &'static str {
+    match value {
+        TrackContent::Auto => "Automatic",
+        TrackContent::Linear => "Linear",
+        TrackContent::Takes => "Takes",
+    }
+}
+
+fn next_setting<T: Copy + PartialEq>(current: Option<T>, values: &[T], inherit: bool) -> Option<T> {
+    match current {
+        None => values.first().copied(),
+        Some(value) => values
+            .iter()
+            .position(|candidate| *candidate == value)
+            .and_then(|index| values.get(index + 1).copied())
+            .or_else(|| (!inherit).then(|| values[0])),
+    }
+}
+
+fn settings_value_row(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    id: &'static str,
+    title: &'static str,
+    value: String,
+    action: impl Fn(&mut AlignApp, &ClickEvent, &mut Window, &mut Context<AlignApp>) + 'static,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(div().text_size(px(12.)).child(title))
+        .child(button(cx, theme, id, value, true, action))
+}
+
+fn scoped_label<T: Copy>(value: Option<T>, common: T, label: impl Fn(T) -> &'static str) -> String {
+    value.map_or_else(
+        || format!("Inherit ({})", label(common)),
+        |value| label(value).to_string(),
+    )
+}
+
 fn search_settings_panel(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &super::state::AppData,
 ) -> impl IntoElement {
-    let mut panel = div().id("search-settings").w(px(360.)).p_4().flex().flex_col()
-        .gap_2().rounded_lg().bg(rgb(theme.panel)).border_1().border_color(rgb(theme.border))
-        .child(div().text_size(px(16.)).child("Search accuracy"))
-        .child(div().text_size(px(12.)).text_color(rgb(theme.dim))
-            .child("Deeper levels search more sound detail and use more time and memory. Changing the level runs synchronization again."));
-    for (index, accuracy) in align_core::SearchAccuracy::ALL.into_iter().enumerate() {
-        let title = if accuracy == data.search_accuracy {
-            format!("✓ {}", accuracy.label())
-        } else {
-            accuracy.label().to_string()
-        };
-        panel = panel.child(button(
+    let sequence = data.current_sequence_settings();
+    let common = data.common_settings;
+    let current_scope = data.settings_scope == SettingsScope::CurrentSequence;
+    let search = if current_scope {
+        sequence.search_accuracy
+    } else {
+        Some(common.search_accuracy)
+    };
+    let audio = if current_scope {
+        sequence.audio_source
+    } else {
+        Some(common.audio_source)
+    };
+    let temporal = if current_scope {
+        sequence.temporal_mode
+    } else {
+        Some(common.temporal_mode)
+    };
+    let threshold = if current_scope {
+        sequence.match_threshold
+    } else {
+        Some(common.match_threshold)
+    };
+    let order = if current_scope {
+        sequence.clip_order
+    } else {
+        Some(common.clip_order)
+    };
+    let content = if current_scope {
+        sequence.track_content
+    } else {
+        Some(common.track_content)
+    };
+    let scope_row = div()
+        .flex()
+        .flex_row()
+        .gap_2()
+        .child(button(
             cx,
             theme,
-            format!("search-level-{index}"),
-            title,
+            "settings-scope-common",
+            if current_scope {
+                "Common"
+            } else {
+                "✓ Common"
+            },
             true,
-            move |this, _, _, cx| {
+            |this, _, _, cx| {
+                this.data.settings_scope = SettingsScope::Common;
+                cx.notify();
+            },
+        ))
+        .child(button(
+            cx,
+            theme,
+            "settings-scope-sequence",
+            if current_scope {
+                "✓ Current sequence"
+            } else {
+                "Current sequence"
+            },
+            true,
+            |this, _, _, cx| {
+                this.data.settings_scope = SettingsScope::CurrentSequence;
+                cx.notify();
+            },
+        ));
+    div()
+        .id("search-settings")
+        .w(px(520.))
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .rounded_lg()
+        .bg(rgb(theme.panel))
+        .border_1()
+        .border_color(rgb(theme.border))
+        .child(div().text_size(px(16.)).child("Synchronization settings"))
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(rgb(theme.dim))
+                .child("Choose defaults for every sequence or replace them for the current sequence. Track menus inherit these values."),
+        )
+        .child(scope_row)
+        .child(settings_value_row(
+            cx,
+            theme,
+            "settings-search",
+            "Search accuracy",
+            scoped_label(search, common.search_accuracy, |value| value.label()),
+            |this, _, _, cx| {
+                let sequence = this.data.current_sequence_settings();
+                let inherit = this.data.settings_scope == SettingsScope::CurrentSequence;
+                let current = if inherit {
+                    sequence.search_accuracy
+                } else {
+                    Some(this.data.common_settings.search_accuracy)
+                };
+                let value = next_setting(current, &align_core::SearchAccuracy::ALL, inherit);
+                this.data.settings_changed |= this.data.set_scoped_search_accuracy(value);
+                cx.notify();
+            },
+        ))
+        .child(settings_value_row(
+            cx,
+            theme,
+            "settings-audio",
+            "Wave source",
+            scoped_label(audio, common.audio_source, audio_source_label),
+            |this, _, _, cx| {
+                const VALUES: [AudioAnalysisSource; 4] = [
+                    AudioAnalysisSource::Automatic,
+                    AudioAnalysisSource::AllMixed,
+                    AudioAnalysisSource::MixedStream(0),
+                    AudioAnalysisSource::Channel(0),
+                ];
+                let inherit = this.data.settings_scope == SettingsScope::CurrentSequence;
+                let current = if inherit {
+                    this.data.current_sequence_settings().audio_source
+                } else {
+                    Some(this.data.common_settings.audio_source)
+                };
+                let value = next_setting(current, &VALUES, inherit);
+                this.data.settings_changed |= this.data.set_scoped_audio_source(value);
+                cx.notify();
+            },
+        ))
+        .child(settings_value_row(
+            cx,
+            theme,
+            "settings-temporal",
+            "Time source",
+            scoped_label(temporal, common.temporal_mode, |value| value.title()),
+            |this, _, _, cx| {
+                const VALUES: [TemporalMode; 4] = [
+                    TemporalMode::Auto,
+                    TemporalMode::RecStart,
+                    TemporalMode::RecStop,
+                    TemporalMode::Timecode,
+                ];
+                let inherit = this.data.settings_scope == SettingsScope::CurrentSequence;
+                let current = if inherit {
+                    this.data.current_sequence_settings().temporal_mode
+                } else {
+                    Some(this.data.common_settings.temporal_mode)
+                };
+                let value = next_setting(current, &VALUES, inherit);
+                this.data.settings_changed |= this.data.set_scoped_temporal_mode(value);
+                cx.notify();
+            },
+        ))
+        .child(settings_value_row(
+            cx,
+            theme,
+            "settings-threshold",
+            "Match threshold",
+            scoped_label(threshold, common.match_threshold, match_threshold_label),
+            |this, _, _, cx| {
+                const VALUES: [MatchThreshold; 3] = [
+                    MatchThreshold::Permissive,
+                    MatchThreshold::Balanced,
+                    MatchThreshold::Conservative,
+                ];
+                let inherit = this.data.settings_scope == SettingsScope::CurrentSequence;
+                let current = if inherit {
+                    this.data.current_sequence_settings().match_threshold
+                } else {
+                    Some(this.data.common_settings.match_threshold)
+                };
+                let value = next_setting(current, &VALUES, inherit);
+                this.data.settings_changed |= this.data.set_scoped_match_threshold(value);
+                cx.notify();
+            },
+        ))
+        .child(settings_value_row(
+            cx,
+            theme,
+            "settings-order",
+            "Clip order",
+            scoped_label(order, common.clip_order, clip_order_label),
+            |this, _, _, cx| {
+                const VALUES: [ClipOrder; 6] = [
+                    ClipOrder::Auto,
+                    ClipOrder::AlternateAuto,
+                    ClipOrder::AsImported,
+                    ClipOrder::ByDateTime,
+                    ClipOrder::ByFileName,
+                    ClipOrder::Ignore,
+                ];
+                let inherit = this.data.settings_scope == SettingsScope::CurrentSequence;
+                let current = if inherit {
+                    this.data.current_sequence_settings().clip_order
+                } else {
+                    Some(this.data.common_settings.clip_order)
+                };
+                let value = next_setting(current, &VALUES, inherit);
+                this.data.settings_changed |= this.data.set_scoped_clip_order(value);
+                cx.notify();
+            },
+        ))
+        .child(settings_value_row(
+            cx,
+            theme,
+            "settings-content",
+            "Track content",
+            scoped_label(content, common.track_content, track_content_label),
+            |this, _, _, cx| {
+                const VALUES: [TrackContent; 3] = [
+                    TrackContent::Auto,
+                    TrackContent::Linear,
+                    TrackContent::Takes,
+                ];
+                let inherit = this.data.settings_scope == SettingsScope::CurrentSequence;
+                let current = if inherit {
+                    this.data.current_sequence_settings().track_content
+                } else {
+                    Some(this.data.common_settings.track_content)
+                };
+                let value = next_setting(current, &VALUES, inherit);
+                this.data.settings_changed |= this.data.set_scoped_track_content(value);
+                cx.notify();
+            },
+        ))
+        .child(button(
+            cx,
+            theme,
+            "settings-apply",
+            if data.settings_changed { "Apply settings" } else { "Close" },
+            true,
+            |this, _, _, cx| {
                 this.data.show_search_settings = false;
-                if this.data.search_accuracy != accuracy {
-                    this.data.search_accuracy = accuracy;
+                let changed = std::mem::take(&mut this.data.settings_changed);
+                if changed && this.data.can_synchronize() {
                     this.start_sync(cx);
                 } else {
                     cx.notify();
                 }
             },
-        ));
-    }
-    panel.child(button(
-        cx,
-        theme,
-        "search-close",
-        "Close",
-        true,
-        |this, _, _, cx| {
-            this.data.show_search_settings = false;
-            cx.notify();
-        },
-    ))
+        ))
 }
 
 // ---------------- diagnostics popover (mirrors DiagnosticsButton)
@@ -2531,11 +2841,9 @@ fn stream_menu_section(
     let current = menu
         .lane_id
         .as_deref()
-        .and_then(|lane_id| data.lanes.iter().find(|lane| lane.id == lane_id))
-        .map(|lane| lane.analysis_source)
-        .unwrap_or(AudioAnalysisSource::Automatic);
+        .and_then(|lane_id| data.lane_analysis_source(lane_id));
     let label = move |source, title: String| {
-        if current == source {
+        if current == Some(source) {
             format!("✓ {title}")
         } else {
             title
@@ -2563,13 +2871,26 @@ fn stream_menu_section(
     let mut indices: Vec<usize> = counts.keys().copied().collect();
     indices.sort_unstable();
     panel = panel.child(menu_header(theme, "Analysis source".to_string()));
+    let inherited = data.current_effective_settings().audio_source;
+    panel = panel.child(menu_row(
+        cx,
+        theme,
+        "stream-inherit",
+        if current.is_none() {
+            format!("✓ Inherit ({})", audio_source_label(inherited))
+        } else {
+            format!("Inherit ({})", audio_source_label(inherited))
+        },
+        false,
+        |this, _, _, cx| this.set_stream_source(None, cx),
+    ));
     panel = panel.child(menu_row(
         cx,
         theme,
         "stream-auto",
         label(AudioAnalysisSource::Automatic, "Automatic".to_string()),
         false,
-        |this, _, _, cx| this.set_stream_source(AudioAnalysisSource::Automatic, cx),
+        |this, _, _, cx| this.set_stream_source(Some(AudioAnalysisSource::Automatic), cx),
     ));
     if counts.len() > 1 {
         panel = panel.child(menu_row(
@@ -2581,7 +2902,7 @@ fn stream_menu_section(
                 "Mix all audio streams".to_string(),
             ),
             false,
-            |this, _, _, cx| this.set_stream_source(AudioAnalysisSource::AllMixed, cx),
+            |this, _, _, cx| this.set_stream_source(Some(AudioAnalysisSource::AllMixed), cx),
         ));
     }
     for index in indices {
@@ -2600,7 +2921,7 @@ fn stream_menu_section(
                 ),
                 false,
                 move |this, _, _, cx| {
-                    this.set_stream_source(AudioAnalysisSource::MixedStream(index), cx)
+                    this.set_stream_source(Some(AudioAnalysisSource::MixedStream(index)), cx)
                 },
             ));
             for ch in 0..channels {
@@ -2614,7 +2935,7 @@ fn stream_menu_section(
                     ),
                     false,
                     move |this, _, _, cx| {
-                        this.set_stream_source(AudioAnalysisSource::Channel(ch), cx)
+                        this.set_stream_source(Some(AudioAnalysisSource::Channel(ch)), cx)
                     },
                 ));
             }
@@ -2633,10 +2954,10 @@ fn stream_menu_section(
                 false,
                 move |this, _, _, cx| {
                     this.set_stream_source(
-                        AudioAnalysisSource::Stream {
+                        Some(AudioAnalysisSource::Stream {
                             index,
                             channel: None,
-                        },
+                        }),
                         cx,
                     )
                 },
@@ -2653,7 +2974,7 @@ fn stream_menu_section(
                 ),
                 false,
                 move |this, _, _, cx| {
-                    this.set_stream_source(AudioAnalysisSource::MixedStream(index), cx)
+                    this.set_stream_source(Some(AudioAnalysisSource::MixedStream(index)), cx)
                 },
             ));
             panel = panel.child(menu_row(
@@ -2670,10 +2991,10 @@ fn stream_menu_section(
                 false,
                 move |this, _, _, cx| {
                     this.set_stream_source(
-                        AudioAnalysisSource::Stream {
+                        Some(AudioAnalysisSource::Stream {
                             index,
                             channel: None,
-                        },
+                        }),
                         cx,
                     )
                 },
@@ -2693,10 +3014,10 @@ fn stream_menu_section(
                     false,
                     move |this, _, _, cx| {
                         this.set_stream_source(
-                            AudioAnalysisSource::Stream {
+                            Some(AudioAnalysisSource::Stream {
                                 index,
                                 channel: Some(ch),
-                            },
+                            }),
                             cx,
                         )
                     },
@@ -2714,7 +3035,12 @@ fn stream_menu_section(
         {
             let title = accuracy
                 .map(|value| value.label().to_string())
-                .unwrap_or_else(|| format!("Inherit ({})", data.search_accuracy.label()));
+                .unwrap_or_else(|| {
+                    format!(
+                        "Inherit ({})",
+                        data.current_effective_settings().search_accuracy.label()
+                    )
+                });
             let title = if current == accuracy {
                 format!("✓ {title}")
             } else {
@@ -2753,17 +3079,27 @@ fn track_content_section(
         .lane_id
         .as_deref()
         .map(|id| data.lane_track_content(id))
-        .unwrap_or_default();
+        .unwrap_or(None);
     panel = panel.child(menu_header(theme, "Track content".to_string()));
+    let inherited = data.current_effective_settings().track_content;
     for (mode, title, row_id) in [
-        (TrackContent::Auto, "Automatic", "content-auto"),
-        (TrackContent::Linear, "Linear", "content-linear"),
-        (TrackContent::Takes, "Takes", "content-takes"),
+        (
+            None,
+            format!("Inherit ({})", track_content_label(inherited)),
+            "content-inherit",
+        ),
+        (Some(TrackContent::Auto), "Automatic".into(), "content-auto"),
+        (
+            Some(TrackContent::Linear),
+            "Linear".into(),
+            "content-linear",
+        ),
+        (Some(TrackContent::Takes), "Takes".into(), "content-takes"),
     ] {
         let label = if mode == current {
             format!("✓ {title}")
         } else {
-            title.to_string()
+            title
         };
         panel = panel.child(menu_row(
             cx,
@@ -2788,24 +3124,42 @@ fn clip_order_section(
         .lane_id
         .as_deref()
         .map(|id| data.lane_clip_order(id))
-        .unwrap_or_default();
+        .unwrap_or(None);
     panel = panel.child(menu_header(theme, "Clip order".to_string()));
+    let inherited = data.current_effective_settings().clip_order;
     for (mode, title, row_id) in [
-        (ClipOrder::Auto, "Auto", "order-auto"),
         (
-            ClipOrder::AlternateAuto,
-            "Alternate Auto",
+            None,
+            format!("Inherit ({})", clip_order_label(inherited)),
+            "order-inherit",
+        ),
+        (Some(ClipOrder::Auto), "Auto".into(), "order-auto"),
+        (
+            Some(ClipOrder::AlternateAuto),
+            "Alternate Auto".into(),
             "order-alternate-auto",
         ),
-        (ClipOrder::AsImported, "As imported", "order-imported"),
-        (ClipOrder::ByDateTime, "Date & time", "order-date"),
-        (ClipOrder::ByFileName, "File name", "order-name"),
-        (ClipOrder::Ignore, "Ignore", "order-ignore"),
+        (
+            Some(ClipOrder::AsImported),
+            "As imported".into(),
+            "order-imported",
+        ),
+        (
+            Some(ClipOrder::ByDateTime),
+            "Date & time".into(),
+            "order-date",
+        ),
+        (
+            Some(ClipOrder::ByFileName),
+            "File name".into(),
+            "order-name",
+        ),
+        (Some(ClipOrder::Ignore), "Ignore".into(), "order-ignore"),
     ] {
         let label = if mode == current {
             format!("✓ {title}")
         } else {
-            title.to_string()
+            title
         };
         panel = panel.child(menu_row(
             cx,
@@ -2831,7 +3185,7 @@ fn time_source_section(
     mut panel: Stateful<Div>,
 ) -> Stateful<Div> {
     use TemporalMode as M;
-    let (current, available) = menu
+    let (effective, available) = menu
         .lane_id
         .as_deref()
         .map(|id| data.temporal_availability(id))
@@ -2839,7 +3193,7 @@ fn time_source_section(
     let header = if available {
         "Time source".to_string()
     } else {
-        let missing = match current {
+        let missing = match effective {
             M::Timecode => "timecode",
             M::RecStart | M::RecStop => "timestamps",
             M::Auto => "evidence",
@@ -2847,17 +3201,37 @@ fn time_source_section(
         format!("Time source — no {missing}, stable order")
     };
     panel = panel.child(menu_header(theme, header));
-    for mode in [M::Auto, M::RecStart, M::RecStop, M::Timecode] {
+    let current = menu
+        .lane_id
+        .as_deref()
+        .and_then(|id| data.lane_temporal_mode(id));
+    for mode in [
+        None,
+        Some(M::Auto),
+        Some(M::RecStart),
+        Some(M::RecStop),
+        Some(M::Timecode),
+    ] {
+        let title = mode.map_or_else(
+            || {
+                format!(
+                    "Inherit ({})",
+                    data.current_effective_settings().temporal_mode.title()
+                )
+            },
+            |mode| mode.title().to_string(),
+        );
         let label = if mode == current {
-            format!("✓ {}", mode.title())
+            format!("✓ {title}")
         } else {
-            mode.title().to_string()
+            title
         };
         let row_id = match mode {
-            M::Auto => "time-auto",
-            M::RecStart => "time-rec-start",
-            M::RecStop => "time-rec-stop",
-            M::Timecode => "time-timecode",
+            None => "time-inherit",
+            Some(M::Auto) => "time-auto",
+            Some(M::RecStart) => "time-rec-start",
+            Some(M::RecStop) => "time-rec-stop",
+            Some(M::Timecode) => "time-timecode",
         };
         panel = panel.child(menu_row(
             cx,
@@ -2884,21 +3258,35 @@ fn match_threshold_section(
         .lane_id
         .as_deref()
         .map(|id| data.lane_match_threshold(id))
-        .unwrap_or_default();
+        .unwrap_or(None);
     panel = panel.child(menu_header(theme, "Match threshold".to_string()));
+    let inherited = data.current_effective_settings().match_threshold;
     for (threshold, title, row_id) in [
-        (MatchThreshold::Permissive, "More matches", "match-more"),
-        (MatchThreshold::Balanced, "Balanced", "match-balanced"),
         (
-            MatchThreshold::Conservative,
-            "Fewer false matches",
+            None,
+            format!("Inherit ({})", match_threshold_label(inherited)),
+            "match-inherit",
+        ),
+        (
+            Some(MatchThreshold::Permissive),
+            "More matches".into(),
+            "match-more",
+        ),
+        (
+            Some(MatchThreshold::Balanced),
+            "Balanced".into(),
+            "match-balanced",
+        ),
+        (
+            Some(MatchThreshold::Conservative),
+            "Fewer false matches".into(),
             "match-fewer",
         ),
     ] {
         let label = if threshold == current {
             format!("✓ {title}")
         } else {
-            title.to_string()
+            title
         };
         panel = panel.child(menu_row(
             cx,

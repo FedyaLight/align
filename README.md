@@ -4,6 +4,7 @@ Cargo workspace с 4 крейтами (`crates/`). Статус: **sync + мет
 XML + экспорт + drift-render + CLI + GPUI + metadata/LTC timecode, параллелизм
 ×4 с бит-идентичными результатами, cooperative cancel, sequence picker
 + сохранённые результаты всех sequences и совместный XML/FCPXML/AAF export
++ Common → current sequence → track наследование всех sync-настроек
 + форматы + drag&drop в GUI, системные меню с шорткатами, единый
 тулбар, timeline preview с линейкой/зумом/навигацией/V-A дорожками,
 контекстные меню у курсора, export sheet, quit-time cleanup следов**

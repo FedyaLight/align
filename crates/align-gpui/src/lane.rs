@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use align_core::{
-    AudioAnalysisSource, ClipId, MatchEvidence, MatchPreview, MatchPreviewStage, MediaKind,
+    ClipId, MatchEvidence, MatchPreview, MatchPreviewStage, MediaKind,
     allocator::{TimelineTrackRequest, allocate, source_key_for_url},
     export_model::ExportTimeline,
     model::file_name,
@@ -42,7 +42,6 @@ pub struct LaneVisual {
     pub source_key: String,
     pub source_name: String,
     pub stream_channels: Vec<usize>,
-    pub analysis_source: AudioAnalysisSource,
     pub clips: Vec<BarVisual>,
 }
 
@@ -247,7 +246,6 @@ pub fn final_bars(result: &align_core::SyncResult) -> FinalTimeline {
 pub fn layout_bars(
     bars: Vec<BarVisual>,
     stream_channels: &HashMap<ClipId, Vec<usize>>,
-    overrides: &HashMap<String, AudioAnalysisSource>,
 ) -> Vec<LaneVisual> {
     let mut lanes = Vec::new();
     for kind in [MediaKind::Video, MediaKind::Audio] {
@@ -305,7 +303,6 @@ pub fn layout_bars(
                 MediaKind::Video => "video",
                 MediaKind::Audio => "audio",
             };
-            let override_key = format!("{kind_name}:{source_key}");
             lanes.push(LaneVisual {
                 id: format!("{kind_name}-{index}"),
                 kind,
@@ -313,10 +310,6 @@ pub fn layout_bars(
                 source_key,
                 source_name,
                 stream_channels: channels,
-                analysis_source: overrides
-                    .get(&override_key)
-                    .copied()
-                    .unwrap_or(AudioAnalysisSource::Automatic),
                 clips: sorted,
             });
         }
@@ -541,7 +534,7 @@ mod tests {
                 match_state: BarMatchState::Matched,
             },
         ];
-        let lanes = layout_bars(bars, &HashMap::new(), &HashMap::new());
+        let lanes = layout_bars(bars, &HashMap::new());
         assert_eq!(lanes.len(), 1);
         assert_eq!(lanes[0].clips.len(), 2);
         assert_eq!(lanes[0].source_name, "v");

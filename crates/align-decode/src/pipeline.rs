@@ -72,6 +72,8 @@ pub struct PipelineOptions {
     pub search_accuracy: align_core::SearchAccuracy,
     pub search_overrides: HashMap<ClipId, align_core::SearchAccuracy>,
     pub source_search_overrides: HashMap<String, align_core::SearchAccuracy>,
+    /// Default wave source before per-track/per-clip overrides.
+    pub audio_source: AudioAnalysisSource,
     pub audio_sources: HashMap<ClipId, AudioAnalysisSource>,
     pub match_policy: align_core::MatchPolicy,
     pub clip_order: align_core::ClipOrderPolicy,
@@ -410,15 +412,21 @@ impl Pipeline {
 
         // ---- fingerprints (multi-stream variants + shared-hash selection)
         let usable: Vec<&Clip> = clips.iter().filter(|c| !c.audio.is_empty()).collect();
+        let mut audio_sources = options.audio_sources.clone();
+        for clip in &clips {
+            audio_sources
+                .entry(clip.id.clone())
+                .or_insert(options.audio_source);
+        }
         let (features, selected_sources) = self.fingerprints(
             &usable,
-            &options.audio_sources,
+            &audio_sources,
             options.search_accuracy,
             &search_overrides,
             progress,
             cancel,
         )?;
-        let mut source_map: HashMap<ClipId, AudioAnalysisSource> = options.audio_sources.clone();
+        let mut source_map = audio_sources;
         source_map.extend(selected_sources);
 
         // ---- coarse match

@@ -689,8 +689,9 @@ pub struct TimelineSequenceSummary {
 /// Which audio to analyse. Automatic and discrete-channel modes mirror the
 /// original engine; the mixed modes add the explicit all-channel and
 /// all-stream rescues used by modern synchronization tools.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AudioAnalysisSource {
+    #[default]
     Automatic,
     AllMixed,
     Channel(usize),
