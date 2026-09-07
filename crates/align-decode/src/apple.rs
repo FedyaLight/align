@@ -535,6 +535,10 @@ impl MediaBackend for AppleNativeBackend {
         source: AudioAnalysisSource,
         consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
     ) -> Result<(), DecodeError> {
+        if source == AudioAnalysisSource::AllMixed {
+            let stream_count = self.inspect(path)?.audio_streams.len();
+            return crate::mix::decode_all_streams_mono_8k(self, path, stream_count, consume);
+        }
         let (session, sample_rate) = open_reader(path, source.stream_index(), None, false)?;
         let mut pipe = crate::mono::MonoPipe::new(
             sample_rate,
@@ -559,6 +563,16 @@ impl MediaBackend for AppleNativeBackend {
         duration_seconds: f64,
         source: AudioAnalysisSource,
     ) -> Result<(f64, Vec<f32>), DecodeError> {
+        if source == AudioAnalysisSource::AllMixed {
+            let stream_count = self.inspect(path)?.audio_streams.len();
+            return crate::mix::decode_all_streams_window_16k(
+                self,
+                path,
+                stream_count,
+                start_seconds,
+                duration_seconds,
+            );
+        }
         // AVAssetReader startup dominates sparse refinement windows. PCM/BWF
         // WAV is accurately seekable in-process through Symphonia and still
         // uses the identical shared mono/resample chain. Keep AVFoundation as

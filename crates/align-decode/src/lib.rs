@@ -17,6 +17,7 @@ pub mod backend;
 pub mod export;
 pub mod ff;
 mod ltc;
+mod mix;
 pub mod mono;
 pub mod pipeline;
 pub mod portable;

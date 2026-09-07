@@ -687,11 +687,12 @@ pub struct TimelineSequenceSummary {
 // ------------------------------------------------------------- Sync control
 
 /// Which audio to analyse. Automatic and discrete-channel modes mirror the
-/// original engine; `MixedStream` adds the explicit all-channel rescue used
-/// by modern synchronization tools.
+/// original engine; the mixed modes add the explicit all-channel and
+/// all-stream rescues used by modern synchronization tools.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AudioAnalysisSource {
     Automatic,
+    AllMixed,
     Channel(usize),
     MixedStream(usize),
     Stream {
@@ -704,6 +705,7 @@ impl AudioAnalysisSource {
     pub fn cache_key(&self) -> String {
         match *self {
             AudioAnalysisSource::Automatic => "automatic".to_string(),
+            AudioAnalysisSource::AllMixed => "all-streams-mixed".to_string(),
             AudioAnalysisSource::Channel(i) => format!("channel-{i}"),
             AudioAnalysisSource::MixedStream(index) => format!("stream-{index}-mixed"),
             AudioAnalysisSource::Stream { index, channel } => match channel {
@@ -717,7 +719,7 @@ impl AudioAnalysisSource {
     /// channel or explicit mixing; [`Self::mixes_channels`] distinguishes them.
     pub fn selected_channel(&self) -> Option<usize> {
         match *self {
-            AudioAnalysisSource::Automatic => None,
+            AudioAnalysisSource::Automatic | AudioAnalysisSource::AllMixed => None,
             AudioAnalysisSource::Channel(i) => Some(i),
             AudioAnalysisSource::MixedStream(_) => None,
             AudioAnalysisSource::Stream { channel, .. } => channel,
@@ -725,12 +727,17 @@ impl AudioAnalysisSource {
     }
 
     pub fn mixes_channels(&self) -> bool {
-        matches!(self, AudioAnalysisSource::MixedStream(_))
+        matches!(
+            self,
+            AudioAnalysisSource::AllMixed | AudioAnalysisSource::MixedStream(_)
+        )
     }
 
     pub fn stream_index(&self) -> usize {
         match *self {
-            AudioAnalysisSource::Automatic | AudioAnalysisSource::Channel(_) => 0,
+            AudioAnalysisSource::Automatic
+            | AudioAnalysisSource::AllMixed
+            | AudioAnalysisSource::Channel(_) => 0,
             AudioAnalysisSource::MixedStream(index) => index,
             AudioAnalysisSource::Stream { index, .. } => index,
         }
@@ -1076,6 +1083,11 @@ mod tests {
     #[test]
     fn audio_source_cache_keys_are_stable() {
         assert_eq!(AudioAnalysisSource::Automatic.cache_key(), "automatic");
+        assert_eq!(
+            AudioAnalysisSource::AllMixed.cache_key(),
+            "all-streams-mixed"
+        );
+        assert!(AudioAnalysisSource::AllMixed.mixes_channels());
         assert_eq!(AudioAnalysisSource::Channel(2).cache_key(), "channel-2");
         assert_eq!(
             AudioAnalysisSource::MixedStream(1).cache_key(),

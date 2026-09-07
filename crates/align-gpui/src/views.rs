@@ -1617,6 +1617,7 @@ fn timeline_lanes(
         // active stream/channel override.
         let override_suffix = match lane.analysis_source {
             AudioAnalysisSource::Automatic => String::new(),
+            AudioAnalysisSource::AllMixed => " · All Mix".to_string(),
             AudioAnalysisSource::Channel(index) => format!(" · Ch {}", index + 1),
             AudioAnalysisSource::MixedStream(index) => format!(" · S{} Mix", index + 1),
             AudioAnalysisSource::Stream { index, channel } => match channel {
@@ -2323,6 +2324,7 @@ fn context_menu(
         .border_color(rgb(theme.border))
         .bg(rgb(theme.panel))
         .shadow_md()
+        .occlude()
         .min_w(px(280.))
         .max_w(px(420.))
         .max_h(px(380.))
@@ -2419,6 +2421,19 @@ fn stream_menu_section(
         false,
         |this, _, _, cx| this.set_stream_source(AudioAnalysisSource::Automatic, cx),
     ));
+    if counts.len() > 1 {
+        panel = panel.child(menu_row(
+            cx,
+            theme,
+            "all-streams-mix",
+            label(
+                AudioAnalysisSource::AllMixed,
+                "Mix all audio streams".to_string(),
+            ),
+            false,
+            |this, _, _, cx| this.set_stream_source(AudioAnalysisSource::AllMixed, cx),
+        ));
+    }
     for index in indices {
         let channels = counts.get(&index).copied().unwrap_or(0);
         if counts.len() == 1 && channels <= 1 {

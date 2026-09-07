@@ -2726,7 +2726,11 @@ fn read_fcpxml(
                 fcp7_labels_xml: None,
                 time_scale: 1_000_000,
                 include_embedded_audio: true,
-                audio_source_channel: None,
+                audio_source_channel: refs
+                    .doc
+                    .attr(aud, "srcCh")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .and_then(|channel| channel.checked_sub(1)),
                 fcpxml_audio_role: refs
                     .doc
                     .attr(aud, "role")
