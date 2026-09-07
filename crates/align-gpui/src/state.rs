@@ -1309,6 +1309,26 @@ impl AppData {
         align_core::redirect::save_to(&align_core::redirect::config_file(), &self.redirects);
     }
 
+    /// Media represented by the current session/result, for project-only
+    /// analysis-cache cleanup. Timeline containers themselves have no
+    /// fingerprint entry.
+    pub fn current_cache_media(&self) -> Vec<PathBuf> {
+        let mut media: Vec<PathBuf> = self
+            .result
+            .iter()
+            .flat_map(|result| result.project.clips.iter().map(|clip| clip.url.clone()))
+            .chain(
+                self.clips
+                    .iter()
+                    .filter(|clip| !is_timeline(&clip.url))
+                    .map(|clip| clip.url.clone()),
+            )
+            .collect();
+        media.sort();
+        media.dedup();
+        media
+    }
+
     pub fn discard_path_redirection_edits(&mut self) {
         self.redirects = align_core::redirect::load_from(&align_core::redirect::config_file());
         self.path_fixer_dir = None;
@@ -1964,6 +1984,19 @@ mod tests {
         data.clear();
         assert_eq!(data.redirects.len(), 1);
         assert!(data.manual_relinks.is_empty());
+    }
+
+    #[test]
+    fn current_cache_media_excludes_timeline_containers() {
+        let mut data = AppData::default();
+        data.add_paths(vec![
+            PathBuf::from("/v/edit.fcpxml"),
+            PathBuf::from("/v/recorder.wav"),
+        ]);
+        assert_eq!(
+            data.current_cache_media(),
+            vec![PathBuf::from("/v/recorder.wav")]
+        );
     }
 
     #[test]

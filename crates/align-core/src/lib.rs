@@ -34,7 +34,9 @@ pub mod wav;
 pub mod xml;
 
 pub use allocator::{TimelineTrackRequest, allocate, source_key_for_clip, source_key_for_url};
-pub use cache::{CACHE_MAX_AGE_DAYS, CACHE_VERSION, CacheStatistics, FingerprintCache};
+pub use cache::{
+    CACHE_MAX_AGE_DAYS, CACHE_VERSION, CacheSettings, CacheStatistics, FingerprintCache,
+};
 pub use export::model as export_model;
 pub use fine::{
     AudioWindow, FINE_SAMPLE_RATE, RefineEvent, RefineStage, WindowProvider, refine_forest,

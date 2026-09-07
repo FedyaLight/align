@@ -9,6 +9,8 @@ XML + экспорт + drift-render + CLI + GPUI + metadata/LTC timecode, пар
 (сохранённые Path Fixer redirections применяются автоматически и редактируются
 в `Align → Path Fixer…`, там же задаются игнорируемые расширения; неразрешённые
 timeline media можно выбрать через `Relink…` в GUI;
+`File → Analysis Cache` очищает текущий проект или весь cache и сохраняет
+срок хранения 7/30/90 дней либо до ручной очистки;
 custom sequence name и unmatched symbol/color/role доступны в Export)
 (Swift-реализация удалена; исследование и история — в `work/`).
 Rust edition 2024 / `cargo fmt` чист, тесты зелёные,
@@ -21,7 +23,7 @@ Rust edition 2024 / `cargo fmt` чист, тесты зелёные,
 | `Model.swift` | `align-core/src/model.rs` — те же поля, serde-ключи = Swift JSON (`clipID`, `sourceIn`…) | ✅ |
 | `Fingerprint.swift` (Accelerate/vDSP FFT, Hann) | `fingerprint.rs` (realfft, тот же frame 1024/hop 512, bands, top-2, score ≥ 2.5, deltas [8,20,36]) | ✅ |
 | `GCCPHAT.swift` (vDSP DFT) | `gccphat.rs` (rustfft, те же пороги 16k/128k, peak/RMS ≥ 4, prominence ≥ 1.015, параболическая интерполяция) | ✅ |
-| `FingerprintCache.swift` (CryptoKit SHA256 + plist) | `cache.rs` (BLAKE3 + bincode, v5 + тег движка, head+tail 1 МБ, atomic write) | ✅ |
+| `FingerprintCache.swift` (CryptoKit SHA256 + plist) | `cache.rs` (BLAKE3 + bincode, v6 + media identity/тег движка, project-only clear, retention, head+tail 1 МБ, atomic write) | ✅ |
 | `AudioDecoder.swift` (AVAssetReader + AVAudioConverter, gate, hysteresis 0.9) | `decode/mono.rs` + `sym.rs` + `ff.rs` + `apple.rs` за `MediaBackend` (adaptive channel + явный multichannel mix, выбор тира до первого сэмпла) | ✅ |
 | `inspect` (AVURLAsset, AVSampleCursor VFR, Sony meta, BWF) | `align-decode`: ffprobe/AVFoundation timing + Sony + BWF/iXML + LTC-audio | ✅ |
 | `FingerprintMatcher` + `MatchGraph` + `FineMatcher` + drift/piecewise | `align-core`: coarse/fine/graph + per-track Linear/Takes, threshold и strict clip order, drift 10 мин/50 якорей | ✅ |

@@ -4,10 +4,10 @@
 //! Differences (deliberate, documented):
 //! - format: bincode instead of binary plist (plist has no stable Rust
 //!   writer; bincode is smaller and faster on all 3 OSes);
-//! - hash: BLAKE3 over (version, variant, size, mtime, head+tail 1 MiB)
-//!   instead of SHA256 (same security margin for cache keys, ~8x faster,
-//!   less CPU wake on laptops);
-//! - version bumped to 4 so Swift plist entries are never misread.
+//! - hash: BLAKE3 over (version, backend, variant, normalized path, size,
+//!   mtime, head+tail 1 MiB) instead of SHA256 (same security margin for
+//!   cache keys, ~8x faster, less CPU wake on laptops);
+//! - version bumped so Swift plist and older Rust entries are never misread.
 //! - location: OS cache dir via `dirs` (`~/Library/Caches`,
 //!   `%LOCALAPPDATA%`, `~/.cache`), same semantics as Swift.
 
@@ -15,7 +15,7 @@ use crate::fingerprint::Fingerprint;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub const CACHE_VERSION: u32 = 5;
+pub const CACHE_VERSION: u32 = 6;
 pub const CACHE_MAX_AGE_DAYS: u64 = 30;
 const HEAD_TAIL_BYTES: u64 = 1_048_576;
 
@@ -23,7 +23,48 @@ const HEAD_TAIL_BYTES: u64 = 1_048_576;
 struct Payload {
     version: u32,
     backend_tag: String,
+    media_path: PathBuf,
     fingerprints: Vec<Fingerprint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheSettings {
+    /// `None` keeps cached analysis until the user clears it.
+    pub retention_days: Option<u64>,
+}
+
+impl Default for CacheSettings {
+    fn default() -> Self {
+        Self {
+            retention_days: Some(CACHE_MAX_AGE_DAYS),
+        }
+    }
+}
+
+impl CacheSettings {
+    pub fn load() -> Self {
+        Self::load_from(&settings_file())
+    }
+
+    pub fn save(self) {
+        self.save_to(&settings_file());
+    }
+
+    pub fn load_from(path: &Path) -> Self {
+        std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save_to(self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(&self) {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -71,6 +112,39 @@ impl FingerprintCache {
 
     pub fn clear(&self) {
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+
+    /// Remove all backend and analysis variants belonging to `media`.
+    pub fn clear_media(&self, media: &[PathBuf]) -> CacheStatistics {
+        let media: std::collections::HashSet<PathBuf> =
+            media.iter().map(|path| normalized_path(path)).collect();
+        let mut removed = CacheStatistics::default();
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return removed;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("bin") {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let Some(payload) = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| bincode::deserialize::<Payload>(&bytes).ok())
+            else {
+                continue;
+            };
+            if payload.version == CACHE_VERSION
+                && media.contains(&normalized_path(&payload.media_path))
+                && std::fs::remove_file(path).is_ok()
+            {
+                removed.file_count += 1;
+                removed.total_bytes += metadata.len();
+            }
+        }
+        removed
     }
 
     /// Remove expired fingerprint payloads without touching any other file
@@ -125,6 +199,7 @@ impl FingerprintCache {
         let payload = Payload {
             version: CACHE_VERSION,
             backend_tag: self.backend_tag.clone(),
+            media_path: normalized_path(media),
             fingerprints: fingerprints.to_vec(),
         };
         let Ok(bytes) = bincode::serialize(&payload) else {
@@ -146,10 +221,12 @@ impl FingerprintCache {
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
         let mut hasher = blake3::Hasher::new();
+        let normalized = normalized_path(media);
         hasher.update(
             format!(
-                "fingerprints-{CACHE_VERSION}\0{}\0{variant}\0{size}\0{mtime}",
-                self.backend_tag
+                "fingerprints-{CACHE_VERSION}\0{}\0{variant}\0{}\0{size}\0{mtime}",
+                self.backend_tag,
+                normalized.to_string_lossy()
             )
             .as_bytes(),
         );
@@ -178,6 +255,17 @@ fn default_dir() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
         .join("Align")
         .join("Fingerprints")
+}
+
+fn settings_file() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Align")
+        .join("cache.json")
+}
+
+fn normalized_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -215,6 +303,55 @@ mod tests {
         // mtime granularity may be coarse on some FS; size change path:
         std::fs::write(&media, vec![2u8; 8192]).unwrap();
         assert!(cache.load(&media, "automatic").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_media_only_removes_matching_payloads() {
+        let dir =
+            std::env::temp_dir().join(format!("align-cache-current-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("first.wav");
+        let second = dir.join("second.wav");
+        let same_content = dir.join("first-copy.wav");
+        std::fs::write(&first, vec![1u8; 128]).unwrap();
+        std::fs::write(&second, vec![2u8; 128]).unwrap();
+        std::fs::hard_link(&first, &same_content).unwrap();
+        let cache = FingerprintCache::new(Some(dir.join("cache")));
+        cache.save(&[Fingerprint { hash: 1, frame: 1 }], &first, "automatic");
+        cache.save(
+            &[Fingerprint { hash: 1, frame: 1 }],
+            &same_content,
+            "automatic",
+        );
+        cache.save(&[Fingerprint { hash: 2, frame: 2 }], &second, "automatic");
+
+        let removed = cache.clear_media(std::slice::from_ref(&first));
+        assert_eq!(removed.file_count, 1);
+        assert!(cache.load(&first, "automatic").is_none());
+        assert!(cache.load(&same_content, "automatic").is_some());
+        assert!(cache.load(&second, "automatic").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_settings_roundtrip_and_default() {
+        let dir =
+            std::env::temp_dir().join(format!("align-cache-settings-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("cache.json");
+        assert_eq!(CacheSettings::load_from(&path), CacheSettings::default());
+        CacheSettings {
+            retention_days: None,
+        }
+        .save_to(&path);
+        assert_eq!(
+            CacheSettings::load_from(&path),
+            CacheSettings {
+                retention_days: None
+            }
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

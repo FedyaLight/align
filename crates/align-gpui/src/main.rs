@@ -27,7 +27,12 @@ actions!(
         ReloadAndSynchronize,
         ExportTimeline,
         OpenPathFixer,
+        ClearCurrentAnalysisCache,
         ClearAnalysisCache,
+        KeepAnalysisCache7Days,
+        KeepAnalysisCache30Days,
+        KeepAnalysisCache90Days,
+        KeepAnalysisCacheForever,
         QuitApp,
         HideApp,
         HideOthersApp,
@@ -61,10 +66,18 @@ fn clear_analysis_cache(cx: &mut App) {
     let Some(view) = cx.try_global::<AppView>().map(|app| app.0.clone()) else {
         return;
     };
-    let cache = align_core::FingerprintCache::new(None);
-    let statistics = cache.statistics();
-    cache.clear();
     view.update(cx, |this, cx| {
+        if matches!(
+            this.data.operation,
+            state::Operation::Synchronizing | state::Operation::Exporting
+        ) {
+            this.data.status = "Wait for the current operation before clearing the cache.".into();
+            cx.notify();
+            return;
+        }
+        let cache = align_core::FingerprintCache::new(None);
+        let statistics = cache.statistics();
+        cache.clear();
         this.data.status = if statistics.file_count == 0 {
             "Analysis cache is already empty.".into()
         } else {
@@ -74,6 +87,48 @@ fn clear_analysis_cache(cx: &mut App) {
                 if statistics.file_count == 1 { "" } else { "s" },
                 statistics.total_bytes as f64 / 1_048_576.0
             )
+        };
+        cx.notify();
+    });
+}
+
+fn clear_current_analysis_cache(cx: &mut App) {
+    update_view(cx, |this, cx| {
+        if matches!(
+            this.data.operation,
+            state::Operation::Synchronizing | state::Operation::Exporting
+        ) {
+            this.data.status = "Wait for the current operation before clearing the cache.".into();
+            cx.notify();
+            return;
+        }
+        let media = this.data.current_cache_media();
+        let removed = align_core::FingerprintCache::new(None).clear_media(&media);
+        this.data.status = if media.is_empty() {
+            "Analyze this project before clearing its cache.".into()
+        } else if removed.file_count == 0 {
+            "Current project analysis cache is already empty.".into()
+        } else {
+            format!(
+                "Cleared {} cached analysis file{} for this project ({:.1} MB).",
+                removed.file_count,
+                if removed.file_count == 1 { "" } else { "s" },
+                removed.total_bytes as f64 / 1_048_576.0
+            )
+        };
+        cx.notify();
+    });
+}
+
+fn set_cache_retention(days: Option<u64>, cx: &mut App) {
+    align_core::CacheSettings {
+        retention_days: days,
+    }
+    .save();
+    update_view(cx, |this, cx| {
+        this.data.status = match days {
+            Some(days) => format!("Cached analysis will be removed after {days} days."),
+            None => "Cached analysis will be kept until you clear it.".into(),
         };
         cx.notify();
     });
@@ -116,6 +171,11 @@ fn main() {
                 })
             });
             cx.on_action(|_: &ClearAnalysisCache, cx| clear_analysis_cache(cx));
+            cx.on_action(|_: &ClearCurrentAnalysisCache, cx| clear_current_analysis_cache(cx));
+            cx.on_action(|_: &KeepAnalysisCache7Days, cx| set_cache_retention(Some(7), cx));
+            cx.on_action(|_: &KeepAnalysisCache30Days, cx| set_cache_retention(Some(30), cx));
+            cx.on_action(|_: &KeepAnalysisCache90Days, cx| set_cache_retention(Some(90), cx));
+            cx.on_action(|_: &KeepAnalysisCacheForever, cx| set_cache_retention(None, cx));
             cx.on_action(|_: &AddMedia, cx| update_view(cx, |this, cx| this.add_media(cx)));
             cx.on_action(|_: &ReloadAndSynchronize, cx| {
                 update_view(cx, |this, cx| this.start_sync(cx));
@@ -169,7 +229,21 @@ fn main() {
                         MenuItem::action("Export…", ExportTimeline),
                         MenuItem::separator(),
                         MenuItem::action("Path Fixer…", OpenPathFixer),
-                        MenuItem::action("Clear Analysis Cache", ClearAnalysisCache),
+                        MenuItem::submenu(Menu {
+                            name: "Analysis Cache".into(),
+                            items: vec![
+                                MenuItem::action(
+                                    "Clear Current Project",
+                                    ClearCurrentAnalysisCache,
+                                ),
+                                MenuItem::action("Clear All", ClearAnalysisCache),
+                                MenuItem::separator(),
+                                MenuItem::action("Keep for 7 Days", KeepAnalysisCache7Days),
+                                MenuItem::action("Keep for 30 Days", KeepAnalysisCache30Days),
+                                MenuItem::action("Keep for 90 Days", KeepAnalysisCache90Days),
+                                MenuItem::action("Keep Until Cleared", KeepAnalysisCacheForever),
+                            ],
+                        }),
                     ],
                 },
                 Menu {

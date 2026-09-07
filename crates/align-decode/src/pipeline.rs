@@ -154,9 +154,11 @@ impl Pipeline {
     pub fn default_backend() -> Self {
         let backend = default_backend();
         let cache = FingerprintCache::with_backend(None, backend.kind().cache_tag());
-        cache.prune_older_than(std::time::Duration::from_secs(
-            align_core::CACHE_MAX_AGE_DAYS * 24 * 60 * 60,
-        ));
+        if let Some(days) = align_core::CacheSettings::load().retention_days {
+            cache.prune_older_than(std::time::Duration::from_secs(
+                days.saturating_mul(24 * 60 * 60),
+            ));
+        }
         Self { backend, cache }
     }
 
