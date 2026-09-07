@@ -3,6 +3,7 @@
 Cargo workspace с 4 крейтами (`crates/`). Статус: **sync + метаданные +
 XML + экспорт + drift-render + CLI + GPUI + metadata/LTC timecode, параллелизм
 ×4 с бит-идентичными результатами, cooperative cancel, sequence picker
++ сохранённые результаты всех sequences и совместный XML/FCPXML/AAF export
 + форматы + drag&drop в GUI, системные меню с шорткатами, единый
 тулбар, timeline preview с линейкой/зумом/навигацией/V-A дорожками,
 контекстные меню у курсора, export sheet, quit-time cleanup следов**
@@ -107,6 +108,8 @@ FFT специально НЕ раздваивается: 1024-pt FFT — мик
 cargo test -p align-core
 cargo run -p align-cli
 cargo run -p align-gpui
+# timeline path can also be passed at launch
+cargo run -p align-gpui -- /path/to/project.xml
 ```
 
 Релиз под 3 ОС:
@@ -180,7 +183,9 @@ cargo run --release -p align-gpui
 ./target/release/align-cli sync --match-threshold conservative /path/to/media > result.json
 ./target/release/align-cli sync --clip-order by-file-name /path/to/media > result.json
 ./target/release/align-cli sync --track-content linear /path/to/media > result.json
+./target/release/align-cli sync --all-sequences /path/to/project.xml > results.json
 ./target/release/align-cli export /path/to/output /path/to/media
+./target/release/align-cli export --all-sequences /path/to/output /path/to/project.xml
 ./target/release/align-cli export --unmatched order-only --disable-unmatched --prevent-group-overlaps /path/to/output /path/to/media
 ./target/release/align-cli export --time-source timecode --match-threshold conservative --clip-order by-file-name /path/to/output /path/to/media
 ./target/release/align-cli export --no-drift --replaced-audio /path/to/output /path/to/media

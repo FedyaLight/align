@@ -103,7 +103,7 @@ mod motion_tests {
 
 enum SyncMsg {
     Progress(Box<SyncProgress>),
-    Done(Box<Result<SyncResult, String>>),
+    Done(Box<Result<Vec<SyncResult>, String>>),
 }
 
 struct SyncProgress {
@@ -113,6 +113,8 @@ struct SyncProgress {
     current: Option<PathBuf>,
     discovered: Option<Clip>,
     preview: Option<MatchPreview>,
+    sequence_index: usize,
+    sequence_count: usize,
 }
 
 enum ExportMsg {
@@ -233,25 +235,42 @@ impl AlignApp {
 
         let generation = self.data.generation;
         let cancel = self.data.cancel.clone();
-        let inputs = self.data.pipeline_inputs();
+        let input_sets = self.data.pipeline_input_sets();
         let constraints = self.data.constraints.clone();
         let options = self.data.pipeline_options();
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<SyncMsg>();
         std::thread::spawn(move || {
             let pipeline = Pipeline::default_backend();
-            let progress = |p: align_decode::pipeline::PipelineProgress| {
-                let _ = tx.unbounded_send(SyncMsg::Progress(Box::new(SyncProgress {
-                    phase: p.phase,
-                    completed: p.completed,
-                    total: p.total,
-                    current: p.current,
-                    discovered: p.discovered,
-                    preview: p.preview,
-                })));
-            };
-            let result =
-                pipeline.synchronize(&inputs, &constraints, &options, Some(&progress), &cancel);
-            let _ = tx.unbounded_send(SyncMsg::Done(Box::new(result.map_err(|e| e.to_string()))));
+            let sequence_count = input_sets.len();
+            let mut results = Vec::with_capacity(sequence_count);
+            for (sequence_index, inputs) in input_sets.into_iter().enumerate() {
+                let progress = |p: align_decode::pipeline::PipelineProgress| {
+                    let _ = tx.unbounded_send(SyncMsg::Progress(Box::new(SyncProgress {
+                        phase: p.phase,
+                        completed: p.completed,
+                        total: p.total,
+                        current: p.current,
+                        discovered: p.discovered,
+                        preview: p.preview,
+                        sequence_index,
+                        sequence_count,
+                    })));
+                };
+                match pipeline.synchronize(
+                    &inputs,
+                    &constraints,
+                    &options,
+                    Some(&progress),
+                    &cancel,
+                ) {
+                    Ok(result) => results.push(result),
+                    Err(error) => {
+                        let _ = tx.unbounded_send(SyncMsg::Done(Box::new(Err(error.to_string()))));
+                        return;
+                    }
+                }
+            }
+            let _ = tx.unbounded_send(SyncMsg::Done(Box::new(Ok(results))));
         });
         let view = cx.entity();
         cx.spawn(async move |_, cx| {
@@ -318,9 +337,19 @@ impl AlignApp {
                     event.discovered.as_ref(),
                     event.preview.as_ref(),
                 );
+                if event.sequence_count > 1 {
+                    self.data.status = format!(
+                        "Sequence {}/{} · {}",
+                        event.sequence_index + 1,
+                        event.sequence_count,
+                        self.data.status
+                    );
+                    self.data.progress = (event.sequence_index as f32 + self.data.progress)
+                        / event.sequence_count as f32;
+                }
             }
             SyncMsg::Done(boxed) => match *boxed {
-                Ok(result) => self.data.apply_result(result),
+                Ok(results) => self.data.apply_results(results),
                 Err(error) => {
                     if error == "Cancelled." {
                         self.data.restore_after_sync_cancel();
@@ -457,9 +486,15 @@ impl AlignApp {
         let unmatched_symbol = ExportInputs::value(&self.export_inputs.unmatched_symbol, cx);
         let unmatched_color = ExportInputs::value(&self.export_inputs.unmatched_color, cx);
         let unmatched_role = ExportInputs::value(&self.export_inputs.unmatched_role, cx);
-        let Ok(timeline) = ExportTimeline::from_result_with_options(
-            &result,
-            ExportAssemblyOptions {
+        let results = if self.data.sequence_results.is_empty() {
+            vec![result]
+        } else {
+            self.data.sequence_results.clone()
+        };
+        let result_count = results.len();
+        let mut timelines = Vec::with_capacity(result_count);
+        for (index, result) in results.iter().enumerate() {
+            let options = ExportAssemblyOptions {
                 unmatched: self.data.export_unmatched,
                 prevent_group_overlaps: self.data.export_prevent_overlaps,
                 disable_unmatched: self.data.export_disable_unmatched,
@@ -471,17 +506,25 @@ impl AlignApp {
                     trim_starts: self.data.export_trim_starts,
                     trim_ends: self.data.export_trim_ends,
                 },
-                unmatched_symbol,
+                unmatched_symbol: unmatched_symbol.clone(),
                 unmatched_symbol_suffix: self.data.export_unmatched_symbol_suffix,
-                unmatched_color,
-                unmatched_role,
-                sequence_name,
-            },
-        ) else {
-            self.data.error = Some("Nothing to export.".to_string());
-            cx.notify();
-            return;
-        };
+                unmatched_color: unmatched_color.clone(),
+                unmatched_role: unmatched_role.clone(),
+                sequence_name: sequence_name.as_ref().map(|name| {
+                    if result_count > 1 {
+                        format!("{name} {}", index + 1)
+                    } else {
+                        name.clone()
+                    }
+                }),
+            };
+            let Ok(timeline) = ExportTimeline::from_result_with_options(result, options) else {
+                self.data.error = Some(format!("Sequence {} has nothing to export.", index + 1));
+                cx.notify();
+                return;
+            };
+            timelines.push(timeline);
+        }
         self.data.operation = Operation::Exporting;
         self.data.progress = 0.0;
         self.data.export_started = true;
@@ -490,6 +533,8 @@ impl AlignApp {
             "Preparing drift-corrected audio…".to_string()
         } else if self.data.export_media {
             "Exporting clean-audio video…".to_string()
+        } else if timelines.len() > 1 {
+            format!("Writing {} sequences…", timelines.len())
         } else {
             "Writing timelines…".to_string()
         };
@@ -521,10 +566,10 @@ impl AlignApp {
                     },
                 });
             };
-            let out = align_decode::export::export_prepared(
-                align_decode::export::ExportRequest {
+            let out = align_decode::export::export_prepared_many(
+                align_decode::export::ExportBatchRequest {
                     backend: pipeline.backend(),
-                    timeline: &timeline,
+                    timelines: &timelines,
                     directory: &dir,
                     formats: &formats,
                     correct_drift: drift,
@@ -896,7 +941,8 @@ impl Render for AlignApp {
             && self.data.sequence_picker.is_none()
             && !self.data.show_about
             && !self.data.show_search_settings
-            && !self.data.show_stage_settings;
+            && !self.data.show_stage_settings
+            && !self.data.show_sequence_results;
         let mut root = div()
             .id("app-root")
             .flex()
@@ -935,6 +981,11 @@ impl Render for AlignApp {
                 if key == "escape" && this.data.show_path_fixer {
                     this.data.discard_path_redirection_edits();
                     this.data.show_path_fixer = false;
+                    cx.notify();
+                    return;
+                }
+                if key == "escape" && this.data.show_sequence_results {
+                    this.data.show_sequence_results = false;
                     cx.notify();
                     return;
                 }
@@ -1019,6 +1070,13 @@ impl Render for AlignApp {
                 &theme,
                 "overlay-stages",
                 stage_settings_panel(cx, &theme, &self.data),
+            ));
+        }
+        if self.data.show_sequence_results {
+            root = root.child(overlay(
+                &theme,
+                "overlay-sequence-results",
+                sequence_results_panel(cx, &theme, &self.data),
             ));
         }
         if self.data.show_search_settings {
@@ -2035,6 +2093,28 @@ fn operation_bar(
                 ));
             }
         }
+        if data.sequence_results.len() > 1 {
+            let name = data
+                .result
+                .as_ref()
+                .and_then(|result| result.project.imported_timeline.as_ref())
+                .map_or("Untitled", |timeline| timeline.name.as_str());
+            bar = bar.child(button(
+                cx,
+                theme,
+                "btn-sequence-results",
+                format!(
+                    "Sequence {}/{} · {name}",
+                    data.active_sequence_result + 1,
+                    data.sequence_results.len()
+                ),
+                true,
+                |this, _, _, cx| {
+                    this.data.show_sequence_results = true;
+                    cx.notify();
+                },
+            ));
+        }
         if !data.exported_files.is_empty() {
             bar = bar.child(button(
                 cx,
@@ -2143,6 +2223,65 @@ fn stage_settings_panel(
     ))
 }
 
+fn sequence_results_panel(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    data: &super::state::AppData,
+) -> impl IntoElement {
+    let mut panel = div()
+        .id("sequence-results")
+        .w(px(420.))
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .rounded_lg()
+        .bg(rgb(theme.panel))
+        .border_1()
+        .border_color(rgb(theme.border))
+        .child(div().text_size(px(16.)).child("Synchronized sequences"))
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(rgb(theme.dim))
+                .child("Choose the result shown on the timeline. Export includes every sequence."),
+        );
+    for (index, result) in data.sequence_results.iter().enumerate() {
+        let name = result
+            .project
+            .imported_timeline
+            .as_ref()
+            .map_or("Untitled", |timeline| timeline.name.as_str());
+        let check = if index == data.active_sequence_result {
+            "✓ "
+        } else {
+            ""
+        };
+        panel = panel.child(button(
+            cx,
+            theme,
+            format!("select-sequence-result-{index}"),
+            format!("{check}{} · {name}", index + 1),
+            true,
+            move |this, _, _, cx| {
+                this.data.select_sequence_result(index);
+                cx.notify();
+            },
+        ));
+    }
+    panel.child(button(
+        cx,
+        theme,
+        "sequence-results-close",
+        "Close",
+        true,
+        |this, _, _, cx| {
+            this.data.show_sequence_results = false;
+            cx.notify();
+        },
+    ))
+}
+
 fn search_settings_panel(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
@@ -2219,6 +2358,17 @@ fn sequence_picker_panel(
                     .and_then(|n| n.to_str())
                     .unwrap_or("timeline")
             )));
+    panel = panel.child(prominent_button(
+        cx,
+        theme,
+        "seq-all",
+        format!("Import all {} sequences", picker.options.len()),
+        true,
+        |this, _, _, cx| {
+            this.data.choose_all_sequences();
+            cx.notify();
+        },
+    ));
     for option in picker.options {
         let label = format!("{} — {} clips", option.name, option.clip_count);
         let index = option.index;

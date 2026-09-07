@@ -165,6 +165,49 @@ pub fn write(
     xml
 }
 
+/// Combine self-contained Premiere project documents into one project while
+/// keeping every sequence and resource identifier unique.
+pub fn combine_project_documents(documents: &[String]) -> Result<String, String> {
+    if documents.is_empty() {
+        return Err("no Premiere documents to combine".into());
+    }
+    let mut xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE xmeml>\n<xmeml version=\"5\">\n  <project>\n    <name>Align</name>\n    <children>\n"
+            .to_string();
+    for (index, document) in documents.iter().enumerate() {
+        let start = document
+            .find("    <children>\n")
+            .map(|offset| offset + "    <children>\n".len())
+            .ok_or("Premiere document has no project children")?;
+        let end = document[start..]
+            .find("    </children>")
+            .map(|offset| start + offset)
+            .ok_or("Premiere document has unterminated project children")?;
+        xml += &prefix_document_ids(&document[start..end], &format!("s{}-", index + 1));
+    }
+    xml += "    </children>\n  </project>\n</xmeml>\n";
+    Ok(xml)
+}
+
+fn prefix_document_ids(fragment: &str, prefix: &str) -> String {
+    let mut out = fragment.replace(" id=\"", &format!(" id=\"{prefix}"));
+    let open = "<linkclipref>";
+    let close = "</linkclipref>";
+    let mut cursor = 0;
+    while let Some(start) = out[cursor..]
+        .find(open)
+        .map(|offset| cursor + offset + open.len())
+    {
+        out.insert_str(start, prefix);
+        cursor = out[start + prefix.len()..]
+            .find(close)
+            .map_or(out.len(), |offset| {
+                start + prefix.len() + offset + close.len()
+            });
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sequence(
     island: &ExportIsland,
@@ -1348,6 +1391,26 @@ mod tests {
         assert!(xml.contains("<labels><label2>Mango</label2></labels>"));
         // No replaced sequence without the flag.
         assert!(!xml.contains("sequence-2"));
+    }
+
+    #[test]
+    fn combined_project_keeps_sequences_and_scopes_identifiers() {
+        let first = write(
+            &fixture_timeline(),
+            TimelineExportFormat::PremiereXML,
+            false,
+        );
+        let mut second_timeline = fixture_timeline();
+        second_timeline.name = "Second cut".into();
+        let second = write(&second_timeline, TimelineExportFormat::PremiereXML, false);
+        let combined = combine_project_documents(&[first, second]).expect("combined project");
+
+        assert_eq!(combined.matches("<sequence id=").count(), 2);
+        assert!(combined.contains("<sequence id=\"s1-sequence-1\">"));
+        assert!(combined.contains("<sequence id=\"s2-sequence-1\">"));
+        assert!(combined.contains("<linkclipref>s1-clipitem-"));
+        assert!(combined.contains("<linkclipref>s2-clipitem-"));
+        assert!(combined.contains("<name>Second cut</name>"));
     }
 
     #[test]

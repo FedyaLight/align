@@ -25,8 +25,11 @@ struct Cli {
 enum Command {
     /// Synchronize media, print SyncResult JSON.
     Sync {
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", conflicts_with = "all_sequences")]
         sequence: Option<usize>,
+        /// Synchronize every sequence in the imported XML, FCPXML, or AAF.
+        #[arg(long)]
+        all_sequences: bool,
         #[command(flatten)]
         settings: SyncSettings,
         #[command(flatten)]
@@ -35,8 +38,11 @@ enum Command {
     },
     /// Synchronize + drift-corrected export, print artifacts JSON.
     Export {
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", conflicts_with = "all_sequences")]
         sequence: Option<usize>,
+        /// Synchronize and export every sequence in the imported project.
+        #[arg(long)]
+        all_sequences: bool,
         #[arg(long)]
         no_drift: bool,
         /// Export linked picture and audio AAF tracks (requires the bundled align-aaf module).
@@ -474,6 +480,37 @@ fn to_inputs(paths: &[PathBuf], sequence: Option<usize>) -> Vec<PipelineInput> {
         .collect()
 }
 
+fn input_sets(
+    paths: &[PathBuf],
+    sequence: Option<usize>,
+    all_sequences: bool,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<Vec<PipelineInput>>, CliError> {
+    if !all_sequences {
+        return Ok(vec![to_inputs(paths, sequence)]);
+    }
+    let timelines: Vec<&PathBuf> = paths
+        .iter()
+        .filter(|path| align_decode::timeline::is_supported(path))
+        .collect();
+    if timelines.len() != 1 {
+        return Err(CliError::Failure(
+            "--all-sequences requires exactly one XML, FCPXML, or AAF project path.".into(),
+        ));
+    }
+    let summaries = align_decode::timeline::sequences(timelines[0], cancel)
+        .map_err(|error| CliError::Failure(error.to_string()))?;
+    if summaries.is_empty() {
+        return Err(CliError::Failure(
+            "The imported project contains no sequences.".into(),
+        ));
+    }
+    Ok(summaries
+        .into_iter()
+        .map(|summary| to_inputs(paths, Some(summary.index)))
+        .collect())
+}
+
 fn progress_printer() -> impl Fn(align_decode::pipeline::PipelineProgress) + Send + Sync {
     |update| {
         let phase = match update.phase {
@@ -539,6 +576,7 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
         }
         Some(Command::Sync {
             sequence,
+            all_sequences,
             settings,
             relink,
             paths,
@@ -548,22 +586,31 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
             }
             let sequence = sequence_index(sequence)?;
             let pipeline = Pipeline::default_backend();
-            let inputs = to_inputs(&paths, sequence);
             let progress = progress_printer();
             let cancel = std::sync::atomic::AtomicBool::new(false);
+            let input_sets = input_sets(&paths, sequence, all_sequences, &cancel)?;
             let mut options = settings.pipeline_options();
             let (redirects, manual, omit) = relink_options(&relink)?;
             options.redirects = redirects;
             options.manual_relinks = manual;
             options.omit_extensions = omit;
             options.prefer_proxies = relink.prefer_proxies;
-            let mut result =
-                pipeline.synchronize(&inputs, &[], &options, Some(&progress), &cancel)?;
-            select_stage(&mut result, settings.stage)?;
-            print_json(&result)
+            let mut results = Vec::with_capacity(input_sets.len());
+            for inputs in input_sets {
+                let mut result =
+                    pipeline.synchronize(&inputs, &[], &options, Some(&progress), &cancel)?;
+                select_stage(&mut result, settings.stage)?;
+                results.push(result);
+            }
+            if all_sequences {
+                print_json(&results)
+            } else {
+                print_json(&results[0])
+            }
         }
         Some(Command::Export {
             sequence,
+            all_sequences,
             no_drift,
             aaf,
             replaced_audio,
@@ -587,45 +634,60 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
             }
             let sequence = sequence_index(sequence)?;
             let pipeline = Pipeline::default_backend();
-            let inputs = to_inputs(&paths, sequence);
             let progress = progress_printer();
             let cancel = std::sync::atomic::AtomicBool::new(false);
+            let input_sets = input_sets(&paths, sequence, all_sequences, &cancel)?;
             let mut options = settings.pipeline_options();
             let (redirects, manual, omit) = relink_options(&relink)?;
             options.redirects = redirects;
             options.manual_relinks = manual;
             options.omit_extensions = omit;
             options.prefer_proxies = relink.prefer_proxies;
-            let mut result =
-                pipeline.synchronize(&inputs, &[], &options, Some(&progress), &cancel)?;
-            select_stage(&mut result, settings.stage)?;
-            let timeline = align_core::export_model::ExportTimeline::from_result_with_options(
-                &result,
-                align_core::export_model::ExportAssemblyOptions {
-                    unmatched: unmatched.core(),
-                    prevent_group_overlaps,
-                    disable_unmatched,
-                    label_unmatched,
-                    cut_remove: cut_remove.core()?,
-                    unmatched_symbol: assign.unmatched_symbol.clone(),
-                    unmatched_symbol_suffix: assign.unmatched_symbol_suffix,
-                    unmatched_color: assign.unmatched_color.clone(),
-                    unmatched_role: assign.unmatched_role.clone(),
-                    sequence_name: assign.sequence_name.clone(),
-                },
-            )
-            .map_err(|e| CliError::Failure(e.to_string()))?;
-            let cancel = std::sync::atomic::AtomicBool::new(false);
-            let artifacts = align_decode::export::export_prepared(
-                align_decode::export::ExportRequest {
-                    backend: pipeline.backend(),
-                    timeline: &timeline,
-                    directory: &output,
-                    formats: &if aaf {
-                        vec![align_core::export_model::TimelineExportFormat::Aaf]
-                    } else {
-                        align_core::export_model::TimelineExportFormat::default_formats()
+            let mut results = Vec::with_capacity(input_sets.len());
+            for inputs in input_sets {
+                let mut result =
+                    pipeline.synchronize(&inputs, &[], &options, Some(&progress), &cancel)?;
+                select_stage(&mut result, settings.stage)?;
+                results.push(result);
+            }
+            let result_count = results.len();
+            let mut timelines = Vec::with_capacity(result_count);
+            for (index, result) in results.iter().enumerate() {
+                let timeline = align_core::export_model::ExportTimeline::from_result_with_options(
+                    result,
+                    align_core::export_model::ExportAssemblyOptions {
+                        unmatched: unmatched.core(),
+                        prevent_group_overlaps,
+                        disable_unmatched,
+                        label_unmatched,
+                        cut_remove: cut_remove.core()?,
+                        unmatched_symbol: assign.unmatched_symbol.clone(),
+                        unmatched_symbol_suffix: assign.unmatched_symbol_suffix,
+                        unmatched_color: assign.unmatched_color.clone(),
+                        unmatched_role: assign.unmatched_role.clone(),
+                        sequence_name: assign.sequence_name.as_ref().map(|name| {
+                            if result_count > 1 {
+                                format!("{name} {}", index + 1)
+                            } else {
+                                name.clone()
+                            }
+                        }),
                     },
+                )
+                .map_err(|e| CliError::Failure(e.to_string()))?;
+                timelines.push(timeline);
+            }
+            let formats = if aaf {
+                vec![align_core::export_model::TimelineExportFormat::Aaf]
+            } else {
+                align_core::export_model::TimelineExportFormat::default_formats()
+            };
+            let artifacts = align_decode::export::export_prepared_many(
+                align_decode::export::ExportBatchRequest {
+                    backend: pipeline.backend(),
+                    timelines: &timelines,
+                    directory: &output,
+                    formats: &formats,
                     correct_drift: !no_drift,
                     include_replaced_sequence: replaced_audio,
                     include_media_files: export_media,
@@ -809,5 +871,44 @@ mod tests {
                 older_than_days: Some(7)
             })
         ));
+    }
+
+    #[test]
+    fn all_sequences_conflicts_with_an_explicit_sequence() {
+        for command in ["sync", "export"] {
+            let mut arguments = vec!["align-cli", command, "--all-sequences", "--sequence", "2"];
+            if command == "export" {
+                arguments.push("/tmp/out");
+            }
+            arguments.push("/tmp/project.xml");
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn all_sequence_input_sets_keep_each_sequence_index() {
+        let dir = std::env::temp_dir().join(format!("align-cli-sequences-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = dir.join("project.xml");
+        std::fs::write(
+            &project,
+            "<xmeml><sequence><name>A</name></sequence><sequence><name>B</name></sequence></xmeml>",
+        )
+        .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let Ok(sets) = input_sets(std::slice::from_ref(&project), None, true, &cancel) else {
+            panic!("input sets")
+        };
+        assert_eq!(sets.len(), 2);
+        assert_eq!(
+            sets[0],
+            vec![PipelineInput::TimelineSequence(project.clone(), 0)]
+        );
+        assert_eq!(
+            sets[1],
+            vec![PipelineInput::TimelineSequence(project.clone(), 1)]
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

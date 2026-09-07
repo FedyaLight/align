@@ -51,6 +51,50 @@ pub fn write_with_storylines(
     write_island(timeline, &island, include_multicam_clip, group_storylines)
 }
 
+/// Combine self-contained FCPXML documents into one library. Each source
+/// keeps its own event while resource identifiers are scoped per sequence.
+pub fn combine_documents(documents: &[String]) -> Result<String, String> {
+    if documents.is_empty() {
+        return Err("no FCPXML documents to combine".into());
+    }
+    let mut resources = String::new();
+    let mut events = String::new();
+    for (index, document) in documents.iter().enumerate() {
+        let prefix = format!("s{}-", index + 1);
+        resources += &prefix_references(
+            document_section(document, "  <resources>\n", "  </resources>")?,
+            &prefix,
+        );
+        events += &prefix_references(
+            document_section(document, "  <library>\n", "  </library>")?,
+            &prefix,
+        );
+    }
+    Ok(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE fcpxml>\n<fcpxml version=\"1.10\">\n  <resources>\n{resources}  </resources>\n  <library>\n{events}  </library>\n</fcpxml>\n"
+    ))
+}
+
+fn document_section<'a>(document: &'a str, open: &str, close: &str) -> Result<&'a str, String> {
+    let start = document
+        .find(open)
+        .map(|offset| offset + open.len())
+        .ok_or_else(|| format!("FCPXML document has no {open}"))?;
+    let end = document[start..]
+        .find(close)
+        .map(|offset| start + offset)
+        .ok_or_else(|| format!("FCPXML document has no {close}"))?;
+    Ok(&document[start..end])
+}
+
+fn prefix_references(fragment: &str, prefix: &str) -> String {
+    [" id=\"", " ref=\"", " format=\"", " angleID=\""]
+        .into_iter()
+        .fold(fragment.to_string(), |text, attribute| {
+            text.replace(attribute, &format!("{attribute}{prefix}"))
+        })
+}
+
 fn write_island(
     timeline: &ExportTimeline,
     island: &ExportIsland,
@@ -561,6 +605,33 @@ mod tests {
             2
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn combined_fcpxml_keeps_each_sequence_and_scopes_resources() {
+        let first = write(&fixture_timeline(), false);
+        let mut second_timeline = fixture_timeline();
+        second_timeline.name = "Second cut".into();
+        let second = write(&second_timeline, false);
+        let combined = combine_documents(&[first, second]).expect("combined FCPXML");
+        assert!(combined.contains("id=\"s1-r_fmt_0\""));
+        assert!(combined.contains("id=\"s2-r_fmt_0\""));
+        assert!(combined.contains("ref=\"s1-r_asset_"));
+        assert!(combined.contains("ref=\"s2-r_asset_"));
+
+        let dir = std::env::temp_dir().join(format!("align-fcpxml-many-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("many.fcpxml");
+        std::fs::write(&path, combined).unwrap();
+        let summaries = timeline_sequence_summaries(&path).expect("summaries");
+        assert_eq!(summaries.len(), 2);
+        assert!(
+            summaries
+                .iter()
+                .any(|summary| summary.name.contains("Second cut"))
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

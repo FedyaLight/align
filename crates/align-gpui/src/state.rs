@@ -156,6 +156,7 @@ pub struct AppData {
     pub search_override_keys: HashMap<String, align_core::SearchAccuracy>,
     pub show_search_settings: bool,
     pub show_stage_settings: bool,
+    pub show_sequence_results: bool,
     pub appearance: Option<crate::theme::ThemeMode>,
     pub inputs: Vec<PathBuf>,
     pub clips: Vec<ClipRow>,
@@ -172,6 +173,10 @@ pub struct AppData {
     pub error: Option<String>,
     pub exported_files: Vec<PathBuf>,
     pub result: Option<SyncResult>,
+    /// Independently solved imported sequences. `result` is the currently
+    /// visible member so existing timeline/correction code stays single-view.
+    pub sequence_results: Vec<SyncResult>,
+    pub active_sequence_result: usize,
     pub constraints: Vec<SyncConstraint>,
     pub audio_sources: HashMap<ClipId, AudioAnalysisSource>,
     pub analysis_source_keys: HashMap<String, AudioAnalysisSource>,
@@ -190,7 +195,7 @@ pub struct AppData {
     pub pending_count: usize,
     pub menu: Option<MenuTarget>,
     pub sequence_picker: Option<SequencePicker>,
-    pub timeline_choices: HashMap<PathBuf, usize>,
+    pub timeline_choices: HashMap<PathBuf, Vec<usize>>,
     /// Path Fixer state. Saved prefix redirections load once when the app
     /// starts; exact file choices are session-local and survive re-syncs.
     pub redirects: Vec<align_core::redirect::PathRedirection>,
@@ -241,6 +246,7 @@ impl Default for AppData {
             search_override_keys: HashMap::new(),
             show_search_settings: false,
             show_stage_settings: false,
+            show_sequence_results: false,
             clips: Vec::new(),
             selection: HashSet::new(),
             island_count: 0,
@@ -255,6 +261,8 @@ impl Default for AppData {
             error: None,
             exported_files: Vec::new(),
             result: None,
+            sequence_results: Vec::new(),
+            active_sequence_result: 0,
             constraints: Vec::new(),
             audio_sources: HashMap::new(),
             analysis_source_keys: HashMap::new(),
@@ -560,25 +568,39 @@ impl AppData {
     pub fn choose_sequence(&mut self, index: usize) {
         if let Some(picker) = self.sequence_picker.take() {
             if picker.options.iter().any(|o| o.index == index) {
-                self.timeline_choices.insert(picker.path.clone(), index);
-                if !self.inputs.contains(&picker.path) {
-                    let url = picker.path.clone();
-                    let name = file_name(&url);
-                    self.clips.push(ClipRow {
-                        clip_id: None,
-                        url: url.clone(),
-                        name,
-                        kind: None,
-                        duration: None,
-                        timecode: None,
-                        state: ClipState::Queued,
-                    });
-                    self.clips
-                        .sort_by(|a, b| a.url.to_string_lossy().cmp(&b.url.to_string_lossy()));
-                    self.inputs.push(url);
-                    self.pending_count += 1;
-                }
+                self.queue_timeline_sequences(picker.path, vec![index]);
             }
+        }
+    }
+
+    pub fn choose_all_sequences(&mut self) {
+        if let Some(picker) = self.sequence_picker.take() {
+            let indices = picker.options.iter().map(|option| option.index).collect();
+            self.queue_timeline_sequences(picker.path, indices);
+        }
+    }
+
+    fn queue_timeline_sequences(&mut self, path: PathBuf, indices: Vec<usize>) {
+        if indices.is_empty() {
+            return;
+        }
+        self.timeline_choices.insert(path.clone(), indices);
+        if !self.inputs.contains(&path) {
+            let url = path;
+            let name = file_name(&url);
+            self.clips.push(ClipRow {
+                clip_id: None,
+                url: url.clone(),
+                name,
+                kind: None,
+                duration: None,
+                timecode: None,
+                state: ClipState::Queued,
+            });
+            self.clips
+                .sort_by(|a, b| a.url.to_string_lossy().cmp(&b.url.to_string_lossy()));
+            self.inputs.push(url);
+            self.pending_count += 1;
         }
     }
 
@@ -605,6 +627,7 @@ impl AppData {
         self.show_export = false;
         self.show_stage_settings = false;
         self.show_search_settings = false;
+        self.show_sequence_results = false;
         self.status = "Inspecting media…".to_string();
         true
     }
@@ -627,7 +650,7 @@ impl AppData {
             for row in &mut queued {
                 row.state = ClipState::Queued;
             }
-            self.apply_result(previous);
+            self.apply_visible_result(previous);
             self.clips.extend(queued);
             self.clips.sort_by(|a, b| a.url.cmp(&b.url));
             self.pending_count = pending_count;
@@ -801,12 +824,64 @@ impl AppData {
         }
         self.show_stage_settings = false;
         self.exported_files.clear();
-        self.apply_result(result);
+        if let Some(stored) = self.sequence_results.get_mut(self.active_sequence_result) {
+            *stored = result.clone();
+        }
+        self.apply_visible_result(result);
         true
     }
 
     /// Final result (mirrors `apply(SyncResult)`).
     pub fn apply_result(&mut self, result: SyncResult) {
+        self.sequence_results = vec![result.clone()];
+        self.active_sequence_result = 0;
+        self.apply_visible_result(result);
+    }
+
+    pub fn apply_results(&mut self, mut results: Vec<SyncResult>) {
+        if results.len() == 1 {
+            self.apply_result(results.pop().expect("one result"));
+            return;
+        }
+        let Some(first) = results.first().cloned() else {
+            self.operation = Operation::Idle;
+            self.error = Some("No sequence results were produced.".into());
+            return;
+        };
+        let count = results.len();
+        self.sequence_results = results;
+        self.active_sequence_result = 0;
+        self.apply_visible_result(first);
+        if count > 1 {
+            self.status = format!("Synchronized {count} sequences. Showing sequence 1 of {count}.");
+        }
+    }
+
+    pub fn select_sequence_result(&mut self, index: usize) -> bool {
+        if matches!(
+            self.operation,
+            Operation::Synchronizing | Operation::Exporting
+        ) {
+            return false;
+        }
+        let Some(result) = self.sequence_results.get(index).cloned() else {
+            return false;
+        };
+        self.active_sequence_result = index;
+        self.show_sequence_results = false;
+        self.exported_files.clear();
+        self.apply_visible_result(result);
+        let count = self.sequence_results.len();
+        let name = self
+            .result
+            .as_ref()
+            .and_then(|result| result.project.imported_timeline.as_ref())
+            .map_or("Untitled", |timeline| timeline.name.as_str());
+        self.status = format!("Sequence {} of {count}: {name}.", index + 1);
+        true
+    }
+
+    fn apply_visible_result(&mut self, result: SyncResult) {
         self.search_accuracy = result.search_accuracy;
         for clip in &result.project.clips {
             self.audio_stream_channels.insert(
@@ -1314,9 +1389,14 @@ impl AppData {
     /// fingerprint entry.
     pub fn current_cache_media(&self) -> Vec<PathBuf> {
         let mut media: Vec<PathBuf> = self
-            .result
+            .sequence_results
             .iter()
             .flat_map(|result| result.project.clips.iter().map(|clip| clip.url.clone()))
+            .chain(
+                self.result
+                    .iter()
+                    .flat_map(|result| result.project.clips.iter().map(|clip| clip.url.clone())),
+            )
             .chain(
                 self.clips
                     .iter()
@@ -1334,15 +1414,34 @@ impl AppData {
         self.path_fixer_dir = None;
     }
 
-    pub fn pipeline_inputs(&self) -> Vec<PipelineInput> {
+    pub fn pipeline_input_sets(&self) -> Vec<Vec<PipelineInput>> {
+        let selected: Vec<usize> = self
+            .inputs
+            .iter()
+            .find_map(|path| self.timeline_choices.get(path).cloned())
+            .unwrap_or_default();
+        if selected.len() > 1 {
+            return selected
+                .into_iter()
+                .map(|index| self.pipeline_inputs_for_sequence(Some(index)))
+                .collect();
+        }
+        vec![self.pipeline_inputs_for_sequence(selected.first().copied())]
+    }
+
+    fn pipeline_inputs_for_sequence(&self, selected: Option<usize>) -> Vec<PipelineInput> {
         self.inputs
             .iter()
             .map(|path| {
                 if !is_timeline(path) {
                     return PipelineInput::Media(path.clone());
                 }
-                match self.timeline_choices.get(path) {
-                    Some(index) => PipelineInput::TimelineSequence(path.clone(), *index),
+                match selected.or_else(|| {
+                    self.timeline_choices
+                        .get(path)
+                        .and_then(|indices| indices.first().copied())
+                }) {
+                    Some(index) => PipelineInput::TimelineSequence(path.clone(), index),
                     None => PipelineInput::Timeline(path.clone()),
                 }
             })
@@ -1461,6 +1560,115 @@ fn imported_preview(result: &SyncResult) -> ImportedPreview {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_sequence_result(name: &str) -> SyncResult {
+        SyncResult {
+            search_overrides: Default::default(),
+            stopped: false,
+            stages: Vec::new(),
+            selected_stage: None,
+            search_accuracy: Default::default(),
+            project: align_core::SyncProject {
+                clips: Vec::new(),
+                warnings: Vec::new(),
+                imported_timeline: Some(align_core::ImportedTimeline {
+                    name: name.into(),
+                    frame_duration: align_core::MediaTime::new(1, 25),
+                    edits: Vec::new(),
+                }),
+            },
+            islands: Vec::new(),
+            unmatched: Vec::new(),
+            matches: Vec::new(),
+            temporal_policy: Default::default(),
+        }
+    }
+
+    #[test]
+    fn import_all_sequences_builds_one_pipeline_input_set_per_sequence() {
+        let path = PathBuf::from("/tmp/project.xml");
+        let media = PathBuf::from("/tmp/extra.wav");
+        let mut data = AppData::default();
+        data.inputs.push(media.clone());
+        data.sequence_picker = Some(SequencePicker {
+            path: path.clone(),
+            options: vec![
+                TimelineSequenceSummary {
+                    index: 0,
+                    name: "Morning".into(),
+                    clip_count: 2,
+                },
+                TimelineSequenceSummary {
+                    index: 1,
+                    name: "Evening".into(),
+                    clip_count: 3,
+                },
+            ],
+        });
+
+        data.choose_all_sequences();
+
+        assert_eq!(data.timeline_choices[&path], vec![0, 1]);
+        let sets = data.pipeline_input_sets();
+        assert_eq!(sets.len(), 2);
+        assert!(sets[0].contains(&PipelineInput::Media(media.clone())));
+        assert!(sets[1].contains(&PipelineInput::Media(media)));
+        assert!(sets[0].contains(&PipelineInput::TimelineSequence(path.clone(), 0)));
+        assert!(sets[1].contains(&PipelineInput::TimelineSequence(path, 1)));
+    }
+
+    #[test]
+    fn retained_sequence_results_can_be_switched_independently() {
+        let mut data = AppData::default();
+        data.apply_results(vec![
+            empty_sequence_result("Morning"),
+            empty_sequence_result("Evening"),
+        ]);
+
+        assert_eq!(data.sequence_results.len(), 2);
+        assert_eq!(
+            data.result
+                .as_ref()
+                .unwrap()
+                .project
+                .imported_timeline
+                .as_ref()
+                .unwrap()
+                .name,
+            "Morning"
+        );
+        assert!(data.select_sequence_result(1));
+        assert_eq!(data.active_sequence_result, 1);
+        assert_eq!(
+            data.result
+                .as_ref()
+                .unwrap()
+                .project
+                .imported_timeline
+                .as_ref()
+                .unwrap()
+                .name,
+            "Evening"
+        );
+        assert_eq!(
+            data.sequence_results[0]
+                .project
+                .imported_timeline
+                .as_ref()
+                .unwrap()
+                .name,
+            "Morning"
+        );
+        assert_eq!(
+            data.sequence_results[1]
+                .project
+                .imported_timeline
+                .as_ref()
+                .unwrap()
+                .name,
+            "Evening"
+        );
+    }
 
     /// Synthetic result fixture (no corpus, no pipeline): one island of
     /// two clips plus one unmatched singleton. Guards the "all 25"

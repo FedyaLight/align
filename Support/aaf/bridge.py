@@ -62,92 +62,100 @@ def validate_wave(path, rate, frames, expected_channels=1):
             raise ValueError('WAV frame count differs from AAF manifest')
 
 
-def write_audio(document, destination):
+def write_composition(container, document):
     if document.get('version') not in (1, 2):
         raise ValueError('Unsupported AAF bridge protocol')
     tracks = document['tracks']
     picture_tracks = document.get('picture_tracks', []) if document['version'] == 2 else []
     if not tracks and not picture_tracks:
         raise ValueError('No tracks')
+    composition = container.create.CompositionMob(document['name'])
+    composition.usage = 'Usage_TopLevel'
+    container.content.mobs.append(composition)
+    if picture_tracks:
+        clock = picture_tracks[0]['edit_rate']
+        rate = Fraction(integer(clock['numerator'], 'numerator', 1),
+            integer(clock['denominator'], 'denominator', 1))
+        duration = max((Fraction(clip['start'] + clip['length']) /
+            Fraction(track['edit_rate']['numerator'], track['edit_rate']['denominator'])
+            for track in picture_tracks for clip in track['clips']), default=Fraction(0))
+        frames = duration * rate
+        timecode = composition.create_timeline_slot(str(rate))
+        timecode.name = 'Timecode'
+        timecode.segment = container.create.Timecode(fps=round(rate), drop=False,
+            length=(frames.numerator + frames.denominator - 1) // frames.denominator)
+        timecode.segment.start = 0
+    for track in picture_tracks:
+        numerator = integer(track['edit_rate']['numerator'], 'edit_rate numerator', 1)
+        denominator = integer(track['edit_rate']['denominator'], 'edit_rate denominator', 1)
+        rate = Fraction(numerator, denominator)
+        slot = composition.create_timeline_slot(str(rate))
+        slot.name = track['name']
+        slot.segment = container.create.Sequence(media_kind='picture')
+        cursor = 0
+        for clip in track['clips']:
+            path = Path(clip['path']).resolve(strict=True)
+            start = integer(clip['start'], 'start')
+            source_in = integer(clip['source_in'], 'source_in')
+            length = integer(clip['length'], 'length', 1)
+            master, _, _ = container.content.create_ama_link(str(path), clip['metadata'])
+            sources = [source for source in master.slots if source.media_kind == 'Picture']
+            if len(sources) != 1:
+                raise ValueError('AAF picture requires one video stream')
+            source = sources[0]
+            if Fraction(str(source.edit_rate)) != rate:
+                raise ValueError('AAF picture rate conversion is not implemented')
+            available = sum(part.length for part in source.segment.components)
+            if start < cursor or source_in + length > available:
+                raise ValueError('Overlapping or out-of-bounds AAF picture clip')
+            if start > cursor:
+                slot.segment.components.append(container.create.Filler('picture', start - cursor))
+            slot.segment.components.append(master.create_source_clip(
+                slot_id=source.slot_id, start=source_in, length=length, media_kind='picture'))
+            cursor = start + length
+        slot.segment.length = cursor
+    for track in tracks:
+        rate = integer(track['sample_rate'], 'sample_rate', 1)
+        slot = composition.create_sound_slot(edit_rate=rate)
+        slot.name = track['name']
+        cursor = 0
+        for clip in track['clips']:
+            path = Path(clip['path']).resolve(strict=True)
+            start = integer(clip['start'], 'start')
+            source_in = integer(clip['source_in'], 'source_in')
+            length = integer(clip['length'], 'length', 1)
+            frames = integer(clip['source_frames'], 'source_frames', 1)
+            if start < cursor or source_in + length > frames:
+                raise ValueError('Overlapping or out-of-bounds AAF clip')
+            if clip['channels'] != 1:
+                raise ValueError('AAF audio requires one lossless mono stem per channel')
+            validate_wave(path, rate, frames)
+            metadata = {'format': {'format_name': 'wav'}, 'streams': [{
+                'codec_type': 'audio', 'sample_rate': str(rate),
+                'duration_ts': frames, 'channels': 1,
+            }]}
+            master, _, _ = container.content.create_ama_link(str(path), metadata)
+            if start > cursor:
+                gap = container.create.Filler(media_kind='sound', length=start-cursor)
+                slot.segment.components.append(gap)
+            slot.segment.components.append(master.create_source_clip(
+                slot_id=1, start=source_in, length=length, media_kind='sound'))
+            cursor = start + length
+        slot.segment.length = cursor
+
+
+def write_audio(document, destination):
+    documents = document.get('sequences') if document.get('version') == 3 else [document]
+    if not isinstance(documents, list) or not documents:
+        raise ValueError('AAF batch has no sequences')
     destination = Path(destination).resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix='.align-aaf-', suffix='.aaf', dir=destination.parent)
     os.close(fd)
     try:
         with aaf2.open(temporary, 'w') as container:
-            composition = container.create.CompositionMob(document['name'])
-            composition.usage = 'Usage_TopLevel'
-            container.content.mobs.append(composition)
-            if picture_tracks:
-                clock = picture_tracks[0]['edit_rate']
-                rate = Fraction(integer(clock['numerator'], 'numerator', 1),
-                    integer(clock['denominator'], 'denominator', 1))
-                duration = max((Fraction(clip['start'] + clip['length']) /
-                    Fraction(track['edit_rate']['numerator'], track['edit_rate']['denominator'])
-                    for track in picture_tracks for clip in track['clips']), default=Fraction(0))
-                frames = duration * rate
-                timecode = composition.create_timeline_slot(str(rate))
-                timecode.name = 'Timecode'
-                timecode.segment = container.create.Timecode(fps=round(rate), drop=False,
-                    length=(frames.numerator + frames.denominator - 1) // frames.denominator)
-                timecode.segment.start = 0
-            for track in picture_tracks:
-                numerator = integer(track['edit_rate']['numerator'], 'edit_rate numerator', 1)
-                denominator = integer(track['edit_rate']['denominator'], 'edit_rate denominator', 1)
-                rate = Fraction(numerator, denominator)
-                slot = composition.create_timeline_slot(str(rate))
-                slot.name = track['name']
-                slot.segment = container.create.Sequence(media_kind='picture')
-                cursor = 0
-                for clip in track['clips']:
-                    path = Path(clip['path']).resolve(strict=True)
-                    start = integer(clip['start'], 'start')
-                    source_in = integer(clip['source_in'], 'source_in')
-                    length = integer(clip['length'], 'length', 1)
-                    master, _, _ = container.content.create_ama_link(str(path), clip['metadata'])
-                    sources = [source for source in master.slots if source.media_kind == 'Picture']
-                    if len(sources) != 1:
-                        raise ValueError('AAF picture requires one video stream')
-                    source = sources[0]
-                    if Fraction(str(source.edit_rate)) != rate:
-                        raise ValueError('AAF picture rate conversion is not implemented')
-                    available = sum(part.length for part in source.segment.components)
-                    if start < cursor or source_in + length > available:
-                        raise ValueError('Overlapping or out-of-bounds AAF picture clip')
-                    if start > cursor:
-                        slot.segment.components.append(container.create.Filler('picture', start - cursor))
-                    slot.segment.components.append(master.create_source_clip(
-                        slot_id=source.slot_id, start=source_in, length=length, media_kind='picture'))
-                    cursor = start + length
-                slot.segment.length = cursor
-            for track in tracks:
-                rate = integer(track['sample_rate'], 'sample_rate', 1)
-                slot = composition.create_sound_slot(edit_rate=rate)
-                slot.name = track['name']
-                cursor = 0
-                for clip in track['clips']:
-                    path = Path(clip['path']).resolve(strict=True)
-                    start = integer(clip['start'], 'start')
-                    source_in = integer(clip['source_in'], 'source_in')
-                    length = integer(clip['length'], 'length', 1)
-                    frames = integer(clip['source_frames'], 'source_frames', 1)
-                    if start < cursor or source_in + length > frames:
-                        raise ValueError('Overlapping or out-of-bounds AAF clip')
-                    if clip['channels'] != 1:
-                        raise ValueError('AAF audio requires one lossless mono stem per channel')
-                    validate_wave(path, rate, frames)
-                    metadata = {'format': {'format_name': 'wav'}, 'streams': [{
-                        'codec_type': 'audio', 'sample_rate': str(rate),
-                        'duration_ts': frames, 'channels': 1,
-                    }]}
-                    master, _, _ = container.content.create_ama_link(str(path), metadata)
-                    if start > cursor:
-                        gap = container.create.Filler(media_kind='sound', length=start-cursor)
-                        slot.segment.components.append(gap)
-                    slot.segment.components.append(master.create_source_clip(
-                        slot_id=1, start=source_in, length=length, media_kind='sound'))
-                    cursor = start + length
-                slot.segment.length = cursor
+            for sequence in documents:
+                write_composition(container, sequence)
         os.replace(temporary, destination)
     finally:
         if os.path.exists(temporary):

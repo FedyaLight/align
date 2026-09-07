@@ -292,6 +292,27 @@ class SourceValidation(unittest.TestCase):
                 self.assertEqual(output.read_bytes(), original)
                 self.assertFalse(list(root.glob('.align-aaf-*')))
 
+    def test_batch_manifest_writes_two_top_level_compositions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'mono.wav'
+            with wave.open(str(source), 'wb') as wav:
+                wav.setparams((1, 2, 48000, 0, 'NONE', 'not compressed'))
+                wav.writeframes(b'\0' * 960)
+            sequence = lambda name: {'version': 1, 'name': name, 'tracks': [{
+                'name': 'Mono', 'sample_rate': 48000, 'clips': [{
+                    'path': str(source), 'start': 0, 'source_in': 0,
+                    'length': 480, 'source_frames': 480, 'channels': 1,
+                }],
+            }]}
+            output = root / 'two.aaf'
+            write_audio({'version': 3, 'sequences': [
+                sequence('Morning'), sequence('Evening'),
+            ]}, output)
+            result = read_audio(output)
+            self.assertEqual([item['name'] for item in result['sequences']],
+                             ['Morning', 'Evening'])
+
 
 if __name__ == '__main__':
     unittest.main()

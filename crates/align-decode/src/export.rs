@@ -141,10 +141,176 @@ pub struct ExportRequest<'a> {
     pub cancel: &'a std::sync::atomic::AtomicBool,
 }
 
-pub fn export_prepared(
-    request: ExportRequest<'_>,
+/// One export action containing several independently synchronized sequences.
+/// Premiere receives one multi-sequence project; formats whose containers hold
+/// one timeline are written into numbered sequence folders.
+pub struct ExportBatchRequest<'a> {
+    pub backend: &'a dyn MediaBackend,
+    pub timelines: &'a [ExportTimeline],
+    pub directory: &'a Path,
+    pub formats: &'a [TimelineExportFormat],
+    pub correct_drift: bool,
+    pub include_replaced_sequence: bool,
+    pub include_media_files: bool,
+    pub group_fcpxml_storylines: bool,
+    pub cancel: &'a std::sync::atomic::AtomicBool,
+}
+
+pub fn export_prepared_many(
+    request: ExportBatchRequest<'_>,
     mut progress: Option<&mut dyn FnMut(ExportJobProgress)>,
 ) -> Result<Vec<ExportArtifact>, ExportError> {
+    if request.timelines.is_empty() {
+        return Err(ExportError::Timeline(
+            TimelineExportError::NoSynchronizedIslands,
+        ));
+    }
+    if request.timelines.len() == 1 {
+        return export_prepared(
+            ExportRequest {
+                backend: request.backend,
+                timeline: &request.timelines[0],
+                directory: request.directory,
+                formats: request.formats,
+                correct_drift: request.correct_drift,
+                include_replaced_sequence: request.include_replaced_sequence,
+                include_media_files: request.include_media_files,
+                group_fcpxml_storylines: request.group_fcpxml_storylines,
+                cancel: request.cancel,
+            },
+            progress,
+        );
+    }
+
+    std::fs::create_dir_all(request.directory).map_err(|e| ExportError::Io(e.to_string()))?;
+    let mut artifacts = Vec::new();
+    let mut premiere_documents = Vec::new();
+    let mut fcpxml_documents = Vec::new();
+    let mut aaf_manifests = Vec::new();
+    for (index, timeline) in request.timelines.iter().enumerate() {
+        if request.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(ExportError::Cancelled);
+        }
+        let sequence_dir = request
+            .directory
+            .join(sequence_folder(index, &timeline.name));
+        let (sequence_artifacts, aaf_manifest) = if let Some(callback) = progress.as_deref_mut() {
+            export_prepared_internal(
+                ExportRequest {
+                    backend: request.backend,
+                    timeline,
+                    directory: &sequence_dir,
+                    formats: request.formats,
+                    correct_drift: request.correct_drift,
+                    include_replaced_sequence: request.include_replaced_sequence,
+                    include_media_files: request.include_media_files,
+                    group_fcpxml_storylines: request.group_fcpxml_storylines,
+                    cancel: request.cancel,
+                },
+                Some(callback),
+                true,
+            )?
+        } else {
+            export_prepared_internal(
+                ExportRequest {
+                    backend: request.backend,
+                    timeline,
+                    directory: &sequence_dir,
+                    formats: request.formats,
+                    correct_drift: request.correct_drift,
+                    include_replaced_sequence: request.include_replaced_sequence,
+                    include_media_files: request.include_media_files,
+                    group_fcpxml_storylines: request.group_fcpxml_storylines,
+                    cancel: request.cancel,
+                },
+                None,
+                true,
+            )?
+        };
+        aaf_manifests.extend(aaf_manifest);
+        for artifact in sequence_artifacts {
+            match artifact.format {
+                ExportArtifactFormat::PremiereXML => premiere_documents.push(
+                    std::fs::read_to_string(&artifact.url)
+                        .map_err(|e| ExportError::Io(e.to_string()))?,
+                ),
+                ExportArtifactFormat::FinalCutProXML => fcpxml_documents.push(
+                    std::fs::read_to_string(&artifact.url)
+                        .map_err(|e| ExportError::Io(e.to_string()))?,
+                ),
+                _ => {
+                    artifacts.push(artifact);
+                    continue;
+                }
+            }
+            let _ = std::fs::remove_file(artifact.url);
+        }
+    }
+    if !premiere_documents.is_empty() {
+        let xml = align_core::export::premiere::combine_project_documents(&premiere_documents)
+            .map_err(ExportError::Io)?;
+        let url = request.directory.join("Align – Adobe Premiere Pro.xml");
+        let tmp = url.with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::write(&tmp, xml).map_err(|e| ExportError::Io(e.to_string()))?;
+        std::fs::rename(&tmp, &url).map_err(|e| ExportError::Io(e.to_string()))?;
+        artifacts.push(ExportArtifact {
+            format: ExportArtifactFormat::PremiereXML,
+            url,
+        });
+    }
+    if !fcpxml_documents.is_empty() {
+        let xml = align_core::export::fcpxml::combine_documents(&fcpxml_documents)
+            .map_err(ExportError::Io)?;
+        let url = request.directory.join("Align – Final Cut Pro.fcpxml");
+        let tmp = url.with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::write(&tmp, xml).map_err(|e| ExportError::Io(e.to_string()))?;
+        std::fs::rename(&tmp, &url).map_err(|e| ExportError::Io(e.to_string()))?;
+        artifacts.push(ExportArtifact {
+            format: ExportArtifactFormat::FinalCutProXML,
+            url,
+        });
+    }
+    if !aaf_manifests.is_empty() {
+        let manifest = serde_json::json!({"version": 3, "sequences": aaf_manifests});
+        let url = request.directory.join("Align.aaf");
+        write_aaf_manifest(&manifest, request.directory, &url, request.cancel)?;
+        artifacts.push(ExportArtifact {
+            format: ExportArtifactFormat::Aaf,
+            url,
+        });
+    }
+    Ok(artifacts)
+}
+
+fn sequence_folder(index: usize, name: &str) -> String {
+    let safe: String = name
+        .chars()
+        .map(|character| match character {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | '\0' => '_',
+            other => other,
+        })
+        .take(80)
+        .collect();
+    let safe = safe.trim().trim_end_matches('.').trim();
+    format!(
+        "Sequence {:02} – {}",
+        index + 1,
+        if safe.is_empty() { "Untitled" } else { safe }
+    )
+}
+
+pub fn export_prepared(
+    request: ExportRequest<'_>,
+    progress: Option<&mut dyn FnMut(ExportJobProgress)>,
+) -> Result<Vec<ExportArtifact>, ExportError> {
+    export_prepared_internal(request, progress, false).map(|(artifacts, _)| artifacts)
+}
+
+fn export_prepared_internal(
+    request: ExportRequest<'_>,
+    mut progress: Option<&mut dyn FnMut(ExportJobProgress)>,
+    defer_aaf: bool,
+) -> Result<(Vec<ExportArtifact>, Option<serde_json::Value>), ExportError> {
     request
         .timeline
         .validate_audio_source_channels()
@@ -533,27 +699,20 @@ pub fn export_prepared(
         include_replaced_sequence,
         group_fcpxml_storylines,
     )?;
+    let mut deferred_aaf = None;
     if wants_aaf {
         let manifest = crate::aaf::timeline_manifest(&corrected, cancel)
             .map_err(|e| ExportError::Io(e.to_string()))?;
-        static NEXT_AAF_MANIFEST: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
-        let serial = NEXT_AAF_MANIFEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let manifest_path =
-            directory.join(format!(".align-aaf-{}-{serial}.json", std::process::id()));
-        let bytes = serde_json::to_vec(&manifest).map_err(|e| ExportError::Io(e.to_string()))?;
-        std::fs::write(&manifest_path, bytes).map_err(|e| ExportError::Io(e.to_string()))?;
-        let url = directory.join("Align.aaf");
-        let result = crate::aaf::write_audio(&manifest_path, &url, cancel);
-        let _ = std::fs::remove_file(&manifest_path);
-        result.map_err(|e| match e {
-            crate::aaf::AafError::Cancelled => ExportError::Cancelled,
-            other => ExportError::Io(other.to_string()),
-        })?;
-        artifacts.push(ExportArtifact {
-            format: ExportArtifactFormat::Aaf,
-            url,
-        });
+        if defer_aaf {
+            deferred_aaf = Some(manifest);
+        } else {
+            let url = directory.join("Align.aaf");
+            write_aaf_manifest(&manifest, directory, &url, cancel)?;
+            artifacts.push(ExportArtifact {
+                format: ExportArtifactFormat::Aaf,
+                url,
+            });
+        }
     }
     if include_media_files {
         std::fs::create_dir_all(&media_dir).map_err(|e| ExportError::Io(e.to_string()))?;
@@ -580,7 +739,26 @@ pub fn export_prepared(
             });
         }
     }
-    Ok(artifacts)
+    Ok((artifacts, deferred_aaf))
+}
+
+fn write_aaf_manifest(
+    manifest: &serde_json::Value,
+    directory: &Path,
+    url: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), ExportError> {
+    static NEXT_AAF_MANIFEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = NEXT_AAF_MANIFEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let manifest_path = directory.join(format!(".align-aaf-{}-{serial}.json", std::process::id()));
+    let bytes = serde_json::to_vec(manifest).map_err(|e| ExportError::Io(e.to_string()))?;
+    std::fs::write(&manifest_path, bytes).map_err(|e| ExportError::Io(e.to_string()))?;
+    let result = crate::aaf::write_audio(&manifest_path, url, cancel);
+    let _ = std::fs::remove_file(&manifest_path);
+    result.map_err(|e| match e {
+        crate::aaf::AafError::Cancelled => ExportError::Cancelled,
+        other => ExportError::Io(other.to_string()),
+    })
 }
 
 /// Placement-pad sidecar plan for one timeline item: `Some((samples, path))`
@@ -1074,6 +1252,71 @@ mod tests {
             .collect();
         assert!((samples[(192 + 4800) * 2] - 8000.0 / 32768.0).abs() < 1e-6);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn batch_export_combines_premiere_and_keeps_other_files_per_sequence() {
+        let dir = std::env::temp_dir().join(format!("align-multi-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let timeline = |name: &str, id: &str| {
+            ExportTimeline::new(
+                vec![ExportIsland {
+                    id: 0,
+                    clips: vec![item(id, MediaKind::Video, 0.0, 1.0)],
+                    duration: 1.0,
+                }],
+                MediaTime::new(1, 25),
+                name,
+            )
+        };
+        let timelines = [
+            timeline("First/cut", "first"),
+            timeline("Second cut", "second"),
+        ];
+        let artifacts = export_prepared_many(
+            ExportBatchRequest {
+                backend: &crate::portable::PortableBackend,
+                timelines: &timelines,
+                directory: &dir,
+                formats: &[
+                    TimelineExportFormat::PremiereXML,
+                    TimelineExportFormat::FinalCutProXML,
+                    TimelineExportFormat::ResolveOTIO,
+                ],
+                correct_drift: false,
+                include_replaced_sequence: false,
+                include_media_files: false,
+                group_fcpxml_storylines: false,
+                cancel: &std::sync::atomic::AtomicBool::new(false),
+            },
+            None,
+        )
+        .expect("batch export");
+
+        let premiere = artifacts
+            .iter()
+            .find(|artifact| artifact.format == ExportArtifactFormat::PremiereXML)
+            .expect("combined Premiere project");
+        let xml = std::fs::read_to_string(&premiere.url).unwrap();
+        assert_eq!(xml.matches("<sequence id=").count(), 2);
+        assert!(xml.contains("<name>First/cut</name>"));
+        assert!(xml.contains("<name>Second cut</name>"));
+        let fcpxml = artifacts
+            .iter()
+            .find(|artifact| artifact.format == ExportArtifactFormat::FinalCutProXML)
+            .expect("combined Final Cut project");
+        let summaries = align_core::timeline_sequence_summaries(&fcpxml.url).unwrap();
+        assert_eq!(summaries.len(), 4, "synced + multicam per source sequence");
+        assert_eq!(
+            artifacts
+                .iter()
+                .filter(|artifact| artifact.format == ExportArtifactFormat::ResolveOTIO)
+                .count(),
+            2
+        );
+        assert!(dir.join("Sequence 01 – First_cut").is_dir());
+        assert!(dir.join("Sequence 02 – Second cut").is_dir());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

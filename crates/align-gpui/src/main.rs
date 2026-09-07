@@ -145,9 +145,14 @@ fn update_view(
 }
 
 fn main() {
+    let initial_paths: Vec<std::path::PathBuf> = std::env::args_os()
+        .skip(1)
+        .map(std::path::PathBuf::from)
+        .filter(|path| !path.as_os_str().to_string_lossy().starts_with('-'))
+        .collect();
     Application::new()
         .with_assets(icons::FileAssets)
-        .run(|cx: &mut App| {
+        .run(move |cx: &mut App| {
             text_input::init(cx);
             // System commands: without registered actions + bindings + menus
             // macOS swallows keys like Cmd+Q and the menu bar stays empty.
@@ -266,7 +271,11 @@ fn main() {
             ]);
 
             let bounds = Bounds::centered(None, size(px(880.), px(540.)), cx);
-            let view = cx.new(views::AlignApp::new);
+            let view = cx.new(move |cx| {
+                let mut app = views::AlignApp::new(cx);
+                app.data.add_paths(initial_paths);
+                app
+            });
             cx.set_global(AppView(view.clone()));
             let window = match cx.open_window(
                 WindowOptions {
