@@ -25,6 +25,7 @@ pub enum Operation {
     Ready,
     Exporting,
     Exported,
+    Repairing,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -513,7 +514,7 @@ impl AppData {
         !self.clips.is_empty()
             && !matches!(
                 self.operation,
-                Operation::Synchronizing | Operation::Exporting
+                Operation::Synchronizing | Operation::Exporting | Operation::Repairing
             )
     }
 
@@ -522,7 +523,7 @@ impl AppData {
             && !self.is_stale()
             && !matches!(
                 self.operation,
-                Operation::Synchronizing | Operation::Exporting
+                Operation::Synchronizing | Operation::Exporting | Operation::Repairing
             )
     }
 
@@ -678,7 +679,7 @@ impl AppData {
     pub fn remove_selection(&mut self) {
         if matches!(
             self.operation,
-            Operation::Synchronizing | Operation::Exporting
+            Operation::Synchronizing | Operation::Exporting | Operation::Repairing
         ) {
             return;
         }
@@ -871,6 +872,22 @@ impl AppData {
         self.generation = self.generation.wrapping_add(1);
     }
 
+    pub fn begin_path_repair(&mut self) -> bool {
+        if matches!(
+            self.operation,
+            Operation::Synchronizing | Operation::Exporting | Operation::Repairing
+        ) {
+            return false;
+        }
+        self.cancel_run();
+        self.operation = Operation::Repairing;
+        self.progress = 0.0;
+        self.error = None;
+        self.exported_files.clear();
+        self.status = "Writing fixed project copy…".into();
+        true
+    }
+
     /// Phase-weighted progress + status (mirrors `apply(SyncProgress)`).
     pub fn apply_progress(
         &mut self,
@@ -1056,7 +1073,7 @@ impl AppData {
     pub fn select_sequence_result(&mut self, index: usize) -> bool {
         if matches!(
             self.operation,
-            Operation::Synchronizing | Operation::Exporting
+            Operation::Synchronizing | Operation::Exporting | Operation::Repairing
         ) {
             return false;
         }
@@ -1660,6 +1677,30 @@ impl AppData {
     pub fn discard_path_redirection_edits(&mut self) {
         self.redirects = align_core::redirect::load_from(&align_core::redirect::config_file());
         self.path_fixer_dir = None;
+    }
+
+    pub fn path_repair_source(&self) -> Option<&std::path::Path> {
+        self.inputs
+            .iter()
+            .find(|path| align_decode::timeline::is_supported(path))
+            .map(PathBuf::as_path)
+    }
+
+    pub fn path_repair_inputs(&self) -> Vec<PipelineInput> {
+        self.inputs
+            .iter()
+            .cloned()
+            .map(PipelineInput::Media)
+            .collect()
+    }
+
+    pub fn path_repair_options(&self) -> PipelineOptions {
+        PipelineOptions {
+            redirects: self.redirects.clone(),
+            manual_relinks: self.manual_relinks.clone(),
+            prefer_proxies: self.prefer_proxies,
+            ..Default::default()
+        }
     }
 
     pub fn pipeline_input_sets(&self) -> Vec<Vec<PipelineInput>> {
@@ -2436,6 +2477,18 @@ mod tests {
             data.pipeline_options().omit_extensions,
             vec!["jpg", "png", "wav"]
         );
+        data.inputs.insert(0, PathBuf::from("/v/edit.fcpxml"));
+        assert_eq!(
+            data.path_repair_source(),
+            Some(std::path::Path::new("/v/edit.fcpxml"))
+        );
+        assert_eq!(data.path_repair_options().redirects, data.redirects);
+        assert_eq!(data.path_repair_inputs().len(), data.inputs.len());
+        data.add_paths(vec![PathBuf::from("/v/recorder.wav")]);
+        assert!(data.can_synchronize());
+        assert!(data.begin_path_repair());
+        assert_eq!(data.operation, Operation::Repairing);
+        assert!(!data.can_synchronize());
 
         data.clear();
         assert_eq!(data.redirects.len(), 1);

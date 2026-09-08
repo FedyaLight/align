@@ -126,6 +126,13 @@ enum ExportMsg {
     Done(Result<Vec<ExportArtifact>, String>),
 }
 
+enum PathRepairMsg {
+    Done {
+        destination: PathBuf,
+        result: Result<usize, String>,
+    },
+}
+
 // ------------------------------------------------------------ view
 
 #[derive(Clone)]
@@ -456,11 +463,111 @@ impl AlignApp {
         cx.notify();
     }
 
-    fn finish_path_fixer(&mut self, cx: &mut Context<Self>) {
+    fn apply_path_fixer_settings(&mut self, cx: &App) {
         let omitted = self.path_fixer_inputs.omit_extensions.read(cx).text();
         self.data.set_omit_extensions(&omitted);
         self.data.prefer_proxies = self.data.path_fixer_prefer_proxies;
         self.data.save_path_redirections();
+    }
+
+    fn save_fixed_project_copy(&mut self, cx: &mut Context<Self>) {
+        let Some(source) = self.data.path_repair_source().map(PathBuf::from) else {
+            self.data.error = Some("Add an XML, FCPXML, or AAF project first.".into());
+            cx.notify();
+            return;
+        };
+        self.apply_path_fixer_settings(cx);
+        let stem = source
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("project");
+        let extension = source
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("xml")
+            .to_string();
+        let suggested = format!("{stem}-fixed.{extension}");
+        let directory = source.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let receiver = cx.prompt_for_new_path(directory, Some(&suggested));
+        let view = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(mut destination))) = receiver.await else {
+                return;
+            };
+            if destination.extension().is_none() {
+                destination.set_extension(extension);
+            }
+            let _ = view.update(cx, |this, cx| {
+                this.begin_fixed_project_copy(destination, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn begin_fixed_project_copy(&mut self, destination: PathBuf, cx: &mut Context<Self>) {
+        if !self.data.begin_path_repair() {
+            return;
+        }
+        self.data.path_fixer_dir = None;
+        self.data.show_path_fixer = false;
+        let inputs = self.data.path_repair_inputs();
+        let options = self.data.path_repair_options();
+        let generation = self.data.generation;
+        let cancel = self.data.cancel.clone();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<PathRepairMsg>();
+        std::thread::spawn(move || {
+            let pipeline = Pipeline::default_backend();
+            let result = pipeline
+                .write_fixed_timeline_copy(&inputs, &options, &destination, &cancel)
+                .map_err(|error| error.to_string());
+            let _ = tx.unbounded_send(PathRepairMsg::Done {
+                destination,
+                result,
+            });
+        });
+        let view = cx.entity();
+        cx.spawn(async move |_, cx| {
+            if let Some(PathRepairMsg::Done {
+                destination,
+                result,
+            }) = rx.next().await
+            {
+                let _ = view.update(cx, |this, cx| {
+                    if this.data.generation != generation {
+                        return;
+                    }
+                    this.data.operation = if this.data.has_result() {
+                        Operation::Ready
+                    } else {
+                        Operation::Idle
+                    };
+                    match result {
+                        Ok(count) => {
+                            this.data.exported_files = vec![destination];
+                            this.data.progress = 1.0;
+                            this.data.status = format!(
+                                "Fixed project copy saved with {count} repaired media path{}.",
+                                if count == 1 { "" } else { "s" }
+                            );
+                        }
+                        Err(error) if error == "Cancelled." => {
+                            this.data.status = "Project repair cancelled.".into();
+                        }
+                        Err(error) => {
+                            this.data.error = Some(error);
+                            this.data.status = "Project repair failed.".into();
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_path_fixer(&mut self, cx: &mut Context<Self>) {
+        self.apply_path_fixer_settings(cx);
         self.data.path_fixer_dir = None;
         self.data.show_path_fixer = false;
         if self
@@ -2025,7 +2132,7 @@ fn operation_bar(
     use super::state::Operation;
     let busy = matches!(
         data.operation,
-        Operation::Synchronizing | Operation::Exporting
+        Operation::Synchronizing | Operation::Exporting | Operation::Repairing
     );
     let mut bar = div()
         .flex()
@@ -3707,13 +3814,21 @@ fn path_fixer_panel(
                 },
             ))
             .child(div().flex_1())
-            .child(prominent_button(
+            .child(button(
                 cx,
                 theme,
                 "path-apply",
                 "Apply",
                 true,
                 |this, _, _, cx| this.finish_path_fixer(cx),
+            ))
+            .child(prominent_button(
+                cx,
+                theme,
+                "path-save-fixed-copy",
+                "Save Fixed Copy…",
+                data.path_repair_source().is_some(),
+                |this, _, _, cx| this.save_fixed_project_copy(cx),
             )),
     )
 }

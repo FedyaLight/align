@@ -69,7 +69,9 @@ fn clear_analysis_cache(cx: &mut App) {
     view.update(cx, |this, cx| {
         if matches!(
             this.data.operation,
-            state::Operation::Synchronizing | state::Operation::Exporting
+            state::Operation::Synchronizing
+                | state::Operation::Exporting
+                | state::Operation::Repairing
         ) {
             this.data.status = "Wait for the current operation before clearing the cache.".into();
             cx.notify();
@@ -96,7 +98,9 @@ fn clear_current_analysis_cache(cx: &mut App) {
     update_view(cx, |this, cx| {
         if matches!(
             this.data.operation,
-            state::Operation::Synchronizing | state::Operation::Exporting
+            state::Operation::Synchronizing
+                | state::Operation::Exporting
+                | state::Operation::Repairing
         ) {
             this.data.status = "Wait for the current operation before clearing the cache.".into();
             cx.notify();

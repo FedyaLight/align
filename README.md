@@ -5,12 +5,14 @@ XML + экспорт + drift-render + CLI + GPUI + metadata/LTC timecode, пар
 ×4 с бит-идентичными результатами, cooperative cancel, sequence picker
 + сохранённые результаты всех sequences и совместный XML/FCPXML/AAF export
 + Common → current sequence → track наследование всех sync-настроек
++ сохранение исправленных media paths в отдельную копию XML/FCPXML/AAF
 + форматы + drag&drop в GUI, системные меню с шорткатами, единый
 тулбар, timeline preview с линейкой/зумом/навигацией/V-A дорожками,
 контекстные меню у курсора, export sheet, quit-time cleanup следов**
 (сохранённые Path Fixer redirections применяются автоматически и редактируются
-в `Align → Path Fixer…`, там же задаются игнорируемые расширения; неразрешённые
-timeline media можно выбрать через `Relink…` в GUI;
+в `Align → Path Fixer…`, там же задаются игнорируемые расширения и через
+`Save Fixed Copy…` сохраняется отдельная копия XML/FCPXML/AAF с исправленными
+media paths; неразрешённые timeline media можно выбрать через `Relink…` в GUI;
 `File → Analysis Cache` очищает текущий проект или весь cache и сохраняет
 срок хранения 7/30/90 дней либо до ручной очистки;
 custom sequence name и unmatched symbol/color/role доступны в Export)
@@ -185,8 +187,10 @@ cargo run --release -p align-gpui
 ./target/release/align-cli sync --clip-order by-file-name /path/to/media > result.json
 ./target/release/align-cli sync --track-content linear /path/to/media > result.json
 ./target/release/align-cli sync --all-sequences /path/to/project.xml > results.json
+./target/release/align-cli sync --write-fixed-project /path/to/project-fixed.xml /path/to/project.xml /path/to/media > result.json
 ./target/release/align-cli export /path/to/output /path/to/media
 ./target/release/align-cli export --all-sequences /path/to/output /path/to/project.xml
+./target/release/align-cli export --write-fixed-project /path/to/project-fixed.aaf /path/to/output /path/to/project.aaf /path/to/media
 ./target/release/align-cli export --unmatched order-only --disable-unmatched --prevent-group-overlaps /path/to/output /path/to/media
 ./target/release/align-cli export --time-source timecode --match-threshold conservative --clip-order by-file-name /path/to/output /path/to/media
 ./target/release/align-cli export --no-drift --replaced-audio /path/to/output /path/to/media

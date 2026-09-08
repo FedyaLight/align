@@ -124,6 +124,7 @@ impl From<crate::timeline::TimelineError> for PipelineError {
     fn from(error: crate::timeline::TimelineError) -> Self {
         match error {
             crate::timeline::TimelineError::Aaf(crate::aaf::AafError::Cancelled) => Self::Cancelled,
+            crate::timeline::TimelineError::Cancelled => Self::Cancelled,
             error => Self::Timeline(error.to_string()),
         }
     }
@@ -170,6 +171,44 @@ impl Pipeline {
 
     pub fn backend(&self) -> &dyn MediaBackend {
         &*self.backend
+    }
+
+    /// Apply this run's relink choices to every sequence in the imported
+    /// project, then save those locations into a new XML, FCPXML, or AAF.
+    pub fn write_fixed_timeline_copy(
+        &self,
+        inputs: &[PipelineInput],
+        options: &PipelineOptions,
+        destination: &Path,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<usize, PipelineError> {
+        let expanded = expand(inputs)?;
+        let timeline = expanded
+            .timeline
+            .ok_or_else(|| PipelineError::Timeline("No imported project was provided".into()))?;
+        let summaries = crate::timeline::sequences(&timeline.path, cancel)?;
+        let mut replacements = Vec::new();
+        for summary in summaries {
+            if cancelled(cancel) {
+                return Err(PipelineError::Cancelled);
+            }
+            let draft = crate::timeline::read_with_proxies(
+                &timeline.path,
+                Some(summary.index),
+                cancel,
+                options.prefer_proxies,
+            )?;
+            let (_, paths) = draft.relinking_missing_media_with_replacements(
+                &expanded.media,
+                &options.redirects,
+                &options.manual_relinks,
+            );
+            replacements.extend(paths);
+        }
+        replacements.sort();
+        replacements.dedup();
+        crate::timeline::write_relinked_copy(&timeline.path, destination, &replacements, cancel)?;
+        Ok(replacements.len())
     }
 
     /// Inspect-only open (mirrors `SyncEngine.open`): expand, inspect,
@@ -1349,6 +1388,46 @@ mod tests {
                 None
             }
         }
+    }
+
+    #[test]
+    fn fixed_project_copy_repairs_every_sequence_and_preserves_source() {
+        let dir = fixture_dir("fixed-project-copy");
+        let media = dir.join("found");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::write(media.join("A.wav"), b"a").unwrap();
+        std::fs::write(media.join("B.wav"), b"b").unwrap();
+        let source = dir.join("edit.xml");
+        let sequence = |name: &str, id: &str, path: &str| {
+            format!(
+                r#"<sequence><name>{name}</name><rate><timebase>25</timebase><ntsc>FALSE</ntsc></rate><media><audio><track><enabled>TRUE</enabled><locked>FALSE</locked><clipitem id="{id}"><name>{name}</name><in>0</in><out>25</out><start>0</start><end>25</end><file id="f{id}"><pathurl>file://{path}</pathurl><rate><timebase>25</timebase><ntsc>FALSE</ntsc></rate><duration>25</duration></file></clipitem></track></audio></media></sequence>"#
+            )
+        };
+        let original = format!(
+            "<?xml version=\"1.0\"?><xmeml>{}{}</xmeml>",
+            sequence("One", "a", "/gone/A.wav"),
+            sequence("Two", "b", "/gone/B.wav")
+        );
+        std::fs::write(&source, &original).unwrap();
+        let destination = dir.join("edit-fixed.xml");
+        let pipeline = Pipeline::new_in(BackendKind::Portable, Some(dir.join(".cache")));
+        let count = pipeline
+            .write_fixed_timeline_copy(
+                &[
+                    PipelineInput::Timeline(source.clone()),
+                    PipelineInput::Media(media.clone()),
+                ],
+                &PipelineOptions::default(),
+                &destination,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
+        let fixed = std::fs::read_to_string(destination).unwrap();
+        assert!(fixed.contains(&format!("file://{}", media.join("A.wav").display())));
+        assert!(fixed.contains(&format!("file://{}", media.join("B.wav").display())));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

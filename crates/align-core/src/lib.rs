@@ -62,5 +62,5 @@ pub use timecode::analyze_timecodes;
 pub use timing::{RangeAccumulator, VideoTimingInspection, canonical_frame_duration, classify};
 pub use xml::{
     DraftEdit, DraftMediaKind, DraftTransition, ImportError, TimelineDraft, XmlDoc, read_timeline,
-    timeline_sequence_summaries,
+    rewrite_media_paths, timeline_sequence_summaries,
 };

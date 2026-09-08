@@ -6,6 +6,7 @@ module writes their validated sample ranges to an AAF object graph.
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import struct
 import tempfile
@@ -172,6 +173,58 @@ def locator_path(url):
     if not path or '\x00' in path:
         raise ValueError('Invalid AAF media path')
     return path
+
+
+def repair_paths(document, source, destination):
+    """Copy an AAF and rewrite matching NetworkLocator URLs atomically."""
+    if document.get('version') != 1 or not isinstance(document.get('replacements'), list):
+        raise ValueError('Unsupported AAF path repair manifest')
+    source = Path(source).resolve(strict=True)
+    destination = Path(destination).resolve()
+    if source == destination:
+        raise ValueError('AAF path repair destination must be a copy')
+    mapping = {}
+    for replacement in document['replacements']:
+        if not isinstance(replacement, dict) or set(replacement) != {'from', 'to'}:
+            raise ValueError('Invalid AAF path replacement')
+        old = replacement['from']
+        new = replacement['to']
+        if not isinstance(old, str) or not isinstance(new, str):
+            raise ValueError('Invalid AAF path replacement')
+        target = Path(new).resolve(strict=True)
+        if not target.is_file():
+            raise ValueError('AAF replacement target is not a file')
+        mapping[os.path.normcase(os.path.normpath(old))] = target.as_uri()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.align-aaf-repair-', suffix='.aaf',
+                                     dir=destination.parent)
+    os.close(fd)
+    changed = 0
+    try:
+        shutil.copyfile(source, temporary)
+        with aaf2.open(temporary, 'rw') as container:
+            for mob in container.content.mobs:
+                if not isinstance(mob, aaf2.mobs.SourceMob) or mob.descriptor is None:
+                    continue
+                descriptor = mob.descriptor
+                if 'Locator' not in descriptor:
+                    continue
+                for locator in descriptor['Locator'].value:
+                    if 'URLString' not in locator:
+                        continue
+                    try:
+                        old = os.path.normcase(os.path.normpath(locator_path(
+                            locator['URLString'].value)))
+                    except ValueError:
+                        continue
+                    if old in mapping:
+                        locator['URLString'].value = mapping[old]
+                        changed += 1
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return changed
 
 
 def read_audio(path):
@@ -357,6 +410,13 @@ def read_timeline(path, audio_only=False, extract_dir=None):
 
 
 def main():
+    if len(sys.argv) == 5 and sys.argv[1] == 'repair-paths':
+        with open(sys.argv[2], encoding='utf-8') as stream:
+            document = json.load(stream)
+        changed = repair_paths(document, sys.argv[3], sys.argv[4])
+        print(json.dumps({'version': 1, 'path': str(Path(sys.argv[4]).resolve()),
+                          'replacements': changed}))
+        return
     if len(sys.argv) in (3, 4) and sys.argv[1] == 'read-timeline':
         print(json.dumps(read_timeline(sys.argv[2], extract_dir=sys.argv[3] if len(sys.argv) == 4 else None)))
         return
@@ -364,7 +424,7 @@ def main():
         print(json.dumps(read_audio(sys.argv[2])))
         return
     if len(sys.argv) != 4 or sys.argv[1] not in ('write-audio', 'write-timeline'):
-        raise ValueError('Usage: align-aaf write-audio manifest.json destination.aaf')
+        raise ValueError('Usage: align-aaf COMMAND [arguments]')
     with open(sys.argv[2], encoding='utf-8') as stream:
         write_audio(json.load(stream), sys.argv[3])
     print(json.dumps({'version': 1, 'path': str(Path(sys.argv[3]).resolve())}))

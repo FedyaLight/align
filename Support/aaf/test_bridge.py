@@ -6,11 +6,46 @@ import subprocess
 import json
 from pathlib import Path
 
-from bridge import write_audio, read_audio, read_timeline, locator_path
+from bridge import write_audio, read_audio, read_timeline, locator_path, repair_paths
 import aaf2
 
 
 class SourceValidation(unittest.TestCase):
+    def test_path_repair_writes_copy_and_preserves_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old = root / 'missing clip.mov'
+            replacement = root / 'found clip.mov'
+            replacement.write_bytes(b'media')
+            source = root / 'source.aaf'
+            output = root / 'fixed.aaf'
+            with aaf2.open(str(source), 'w') as container:
+                mob = container.create.SourceMob('Missing')
+                container.content.mobs.append(mob)
+                descriptor = container.create.CDCIDescriptor()
+                descriptor['SampleRate'].value = '25'
+                descriptor['Length'].value = 25
+                for key, value in {'ComponentWidth': 8, 'HorizontalSubsampling': 2,
+                    'StoredHeight': 1080, 'StoredWidth': 1920, 'FrameLayout': 'FullFrame',
+                    'VideoLineMap': [0, 0], 'ImageAspectRatio': '16/9'}.items():
+                    descriptor[key].value = value
+                locator = container.create.NetworkLocator()
+                locator['URLString'].value = old.resolve().as_uri()
+                descriptor['Locator'].append(locator)
+                mob.descriptor = descriptor
+
+            changed = repair_paths({'version': 1, 'replacements': [{
+                'from': str(old.resolve()), 'to': str(replacement.resolve()),
+            }]}, source, output)
+            self.assertEqual(changed, 1)
+            with aaf2.open(str(source), 'r') as container:
+                locator = next(iter(container.content.sourcemobs())).descriptor['Locator'].value[0]
+                self.assertEqual(locator_path(locator['URLString'].value), str(old.resolve()))
+            with aaf2.open(str(output), 'r') as container:
+                locator = next(iter(container.content.sourcemobs())).descriptor['Locator'].value[0]
+                self.assertEqual(locator_path(locator['URLString'].value),
+                                 str(replacement.resolve()))
+
     def test_embedded_pcm_extracts_exact_samples_without_external_source(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

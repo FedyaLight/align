@@ -135,6 +135,9 @@ struct RelinkArgs {
     /// Use FCPXML proxy media when the asset provides it.
     #[arg(long)]
     prefer_proxies: bool,
+    /// Save relinked media locations into a copy of the imported XML or AAF.
+    #[arg(long, value_name = "PATH")]
+    write_fixed_project: Option<PathBuf>,
 }
 
 /// Resolved `--redirect` / `--relink` / `--omit-extensions`: saved
@@ -183,6 +186,26 @@ fn relink_options(args: &RelinkArgs) -> Result<RelinkOptions, CliError> {
         })
         .collect();
     Ok((redirects, manual, omit))
+}
+
+fn write_fixed_project(
+    pipeline: &Pipeline,
+    input_sets: &[Vec<PipelineInput>],
+    options: &PipelineOptions,
+    destination: Option<&std::path::Path>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), CliError> {
+    let Some(destination) = destination else {
+        return Ok(());
+    };
+    let inputs = input_sets.first().ok_or(CliError::Usage)?;
+    let count = pipeline.write_fixed_timeline_copy(inputs, options, destination, cancel)?;
+    eprintln!(
+        "Wrote {} with {count} repaired media path{}.",
+        destination.display(),
+        if count == 1 { "" } else { "s" }
+    );
+    Ok(())
 }
 
 /// Post-sync Cut / Remove (Syncaila Extra options). All default to off.
@@ -595,6 +618,13 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
             options.manual_relinks = manual;
             options.omit_extensions = omit;
             options.prefer_proxies = relink.prefer_proxies;
+            write_fixed_project(
+                &pipeline,
+                &input_sets,
+                &options,
+                relink.write_fixed_project.as_deref(),
+                &cancel,
+            )?;
             let mut results = Vec::with_capacity(input_sets.len());
             for inputs in input_sets {
                 let mut result =
@@ -643,6 +673,13 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
             options.manual_relinks = manual;
             options.omit_extensions = omit;
             options.prefer_proxies = relink.prefer_proxies;
+            write_fixed_project(
+                &pipeline,
+                &input_sets,
+                &options,
+                relink.write_fixed_project.as_deref(),
+                &cancel,
+            )?;
             let mut results = Vec::with_capacity(input_sets.len());
             for inputs in input_sets {
                 let mut result =
@@ -851,6 +888,8 @@ mod tests {
             "--prefer-proxies",
             "--omit-extensions",
             "jpg,png",
+            "--write-fixed-project",
+            "/tmp/fixed.xml",
             "/tmp/media",
         ])
         .expect("sync arguments");
@@ -862,6 +901,10 @@ mod tests {
         assert!(relink.clear_redirects);
         assert!(relink.prefer_proxies);
         assert_eq!(relink.omit_extensions.as_deref(), Some("jpg,png"));
+        assert_eq!(
+            relink.write_fixed_project.as_deref(),
+            Some(std::path::Path::new("/tmp/fixed.xml"))
+        );
 
         let cli = Cli::try_parse_from(["align-cli", "clear-cache", "--older-than-days", "7"])
             .expect("clear-cache arguments");

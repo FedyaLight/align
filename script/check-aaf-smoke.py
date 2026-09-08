@@ -5,9 +5,11 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import wave
 import hashlib
 import struct
+from urllib.parse import unquote, urlparse
 import aaf2
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -28,6 +30,12 @@ def run_cli(arguments, name):
     if proc.returncode:
         raise RuntimeError(proc.stderr)
     return json.loads(proc.stdout)
+
+def locator_file(url):
+    path = unquote(urlparse(url).path)
+    if os.name == 'nt' and len(path) >= 3 and path[0] == '/' and path[2] == ':':
+        path = path[1:]
+    return Path(path)
 
 artifacts = run_cli(['export-json', '--aaf', args.smoke.resolve() / 'sync.json', output], 'export')
 assert len(artifacts) == 1 and artifacts[0]['format'] == 'aaf'
@@ -66,6 +74,58 @@ with aaf2.open(str(linked), 'w') as container:
             target.segment.components.append(master.create_source_clip(slot_id=slot.slot_id,
                 start=1, length=671999, media_kind='sound'))
             target.segment.length = position + 671999
+
+# A fixed-project write must repair the external locators in a separate AAF,
+# leave the imported AAF byte-for-byte untouched, and remain discoverable by
+# the bundled sidecar on every release platform.
+repair_source = output / 'repair-source.aaf'
+repair_fixed = output / 'repair-fixed.aaf'
+repair_found = output / 'repair-found'
+repair_found.mkdir(exist_ok=True)
+shutil.copyfile(linked, repair_source)
+missing_urls = set()
+with aaf2.open(str(repair_source), 'rw') as container:
+    for mob in container.content.mobs:
+        if not isinstance(mob, aaf2.mobs.SourceMob) or mob.descriptor is None:
+            continue
+        descriptor = mob.descriptor
+        if 'Locator' not in descriptor:
+            continue
+        for locator in descriptor['Locator'].value:
+            if 'URLString' not in locator:
+                continue
+            name = locator_file(locator['URLString'].value).name
+            if name not in ('a.wav', 'b.wav'):
+                continue
+            found = repair_found / name
+            if not found.exists():
+                shutil.copyfile(args.smoke.resolve() / 'media' / name, found)
+            missing = (output / 'missing' / name).resolve()
+            locator['URLString'].value = missing.as_uri()
+            missing_urls.add(missing.as_uri())
+assert len(missing_urls) == 2
+source_hash = hashlib.sha256(repair_source.read_bytes()).hexdigest()
+run_cli(['sync', '--write-fixed-project', repair_fixed, repair_source, repair_found],
+        'repair')
+assert hashlib.sha256(repair_source.read_bytes()).hexdigest() == source_hash, (
+    'AAF path repair modified the imported source')
+with aaf2.open(str(repair_source)) as container:
+    retained = {locator['URLString'].value
+        for mob in container.content.mobs
+        if isinstance(mob, aaf2.mobs.SourceMob) and mob.descriptor is not None
+        and 'Locator' in mob.descriptor
+        for locator in mob.descriptor['Locator'].value
+        if 'URLString' in locator}
+assert missing_urls.issubset(retained)
+with aaf2.open(str(repair_fixed)) as container:
+    repaired = {locator['URLString'].value
+        for mob in container.content.mobs
+        if isinstance(mob, aaf2.mobs.SourceMob) and mob.descriptor is not None
+        and 'Locator' in mob.descriptor
+        for locator in mob.descriptor['Locator'].value
+        if 'URLString' in locator}
+assert {(repair_found / name).resolve().as_uri() for name in ('a.wav', 'b.wav')} <= repaired
+
 stereo = run_cli(['sync', linked], 'stereo-import')
 edits = stereo['project']['importedTimeline']['edits']
 assert len(stereo['project']['clips']) == 2 and len(edits) == 4
@@ -91,11 +151,8 @@ with aaf2.open(artifacts[0]['url']) as container:
         source_mob = master_segment.components[0].mob
         locator = source_mob.descriptor['Locator'].value[0]['URLString'].value
         # The re-export uses rendered mono stems. Decode the file URL with the
-        # same standard URL rules on Windows and POSIX, without importing the helper.
-        from urllib.parse import urlparse, unquote
-        stem = unquote(urlparse(locator).path)
-        if os.name == 'nt' and len(stem) >= 3 and stem[0] == '/' and stem[2] == ':':
-            stem = stem[1:]
+        # same standard URL rules on Windows and POSIX.
+        stem = locator_file(locator)
         source = args.smoke.resolve() / 'media' / ('a.wav' if index < 2 else 'b.wav')
         channel = index % 2
         with wave.open(str(source), 'rb') as reader:
@@ -113,4 +170,6 @@ with aaf2.open(artifacts[0]['url']) as container:
             'frames': 671999, 'pcm_f32le_sha256': hashlib.sha256(actual).hexdigest()})
 (output / 'verification.json').write_text(json.dumps({
     'tracks': 4, 'imported_edits': 4, 'discrete_stereo_channels': channel_evidence,
+    'path_writeback': {'replacements': 2, 'source_sha256': source_hash,
+        'fixed_locators': sorted(repaired)},
     'passed': True}, indent=2) + '\n')

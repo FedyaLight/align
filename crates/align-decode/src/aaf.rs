@@ -333,6 +333,71 @@ pub fn write_audio(
     Ok(())
 }
 
+/// Write an AAF copy whose external media locators use the supplied paths.
+pub fn repair_paths(
+    source: &Path,
+    destination: &Path,
+    replacements: &[(PathBuf, PathBuf)],
+    cancel: &AtomicBool,
+) -> Result<usize, AafError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(AafError::Cancelled);
+    }
+    let canonical_source = source.canonicalize().ok();
+    let canonical_destination = destination.canonicalize().ok();
+    let same_file = source == destination
+        || (canonical_source.is_some() && canonical_source == canonical_destination);
+    if same_file {
+        return Err(AafError::Writer(
+            "path repair destination must be a copy".into(),
+        ));
+    }
+    let executable = crate::ff::resolve_bin("ALIGN_AAF", "align-aaf").ok_or(AafError::Missing)?;
+    let mut manifest = tempfile::NamedTempFile::new()?;
+    let document = serde_json::json!({
+        "version": 1,
+        "replacements": replacements.iter().map(|(from, to)| serde_json::json!({
+            "from": from,
+            "to": to,
+        })).collect::<Vec<_>>(),
+    });
+    serde_json::to_writer(manifest.as_file_mut(), &document)
+        .map_err(|error| AafError::Writer(error.to_string()))?;
+    let mut output = tempfile::tempfile()?;
+    let mut child = Command::new(executable)
+        .arg("repair-paths")
+        .arg(manifest.path())
+        .arg(source)
+        .arg(destination)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(output.try_clone()?))
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let status = crate::export::wait_render_process(&mut child, cancel).map_err(|error| {
+        if cancel.load(Ordering::Relaxed) {
+            AafError::Cancelled
+        } else {
+            AafError::Writer(error.to_string())
+        }
+    })?;
+    if !status.success() {
+        return Err(AafError::Writer(status.to_string()));
+    }
+    use std::io::{Seek, SeekFrom};
+    output.seek(SeekFrom::Start(0))?;
+    #[derive(Deserialize)]
+    struct Response {
+        version: u32,
+        replacements: usize,
+    }
+    let response: Response =
+        serde_json::from_reader(output).map_err(|error| AafError::Writer(error.to_string()))?;
+    if response.version != 1 || !destination.is_file() {
+        return Err(AafError::Writer("invalid AAF path repair response".into()));
+    }
+    Ok(response.replacements)
+}
+
 /// Assemble already-rendered mono stems. Reject unsupported edit semantics
 /// rather than silently dropping them while the AAF implementation expands.
 pub fn audio_manifest(

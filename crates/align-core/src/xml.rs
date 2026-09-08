@@ -16,8 +16,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use quick_xml::Reader;
-use quick_xml::events::Event;
+use quick_xml::events::{BytesCData, BytesText, Event};
+use quick_xml::{Reader, Writer};
 
 use crate::model::{
     Clip, ImportedTimeline, MediaKind, MediaTime, SyncWarning, TimelineEdit,
@@ -330,6 +330,19 @@ impl TimelineDraft {
         redirects: &[crate::redirect::PathRedirection],
         manual: &[(String, PathBuf)],
     ) -> Self {
+        self.relinking_missing_media_with_replacements(candidates, redirects, manual)
+            .0
+    }
+
+    /// Relink missing media and return the exact source-path replacements.
+    /// The mapping is suitable for writing the same fixes back to a copy of
+    /// the imported project.
+    pub fn relinking_missing_media_with_replacements(
+        &self,
+        candidates: &[PathBuf],
+        redirects: &[crate::redirect::PathRedirection],
+        manual: &[(String, PathBuf)],
+    ) -> (Self, Vec<(PathBuf, PathBuf)>) {
         let available: Vec<&PathBuf> = candidates.iter().filter(|p| p.is_file()).collect();
         let mut by_filename: HashMap<String, Vec<PathBuf>> = HashMap::new();
         for p in available {
@@ -340,7 +353,7 @@ impl TimelineDraft {
                     .push((*p).clone());
             }
         }
-        let mut replacements: HashMap<String, PathBuf> = HashMap::new();
+        let mut replacements: HashMap<PathBuf, PathBuf> = HashMap::new();
         let mut relink_warnings = Vec::new();
         for missing in self.media_urls() {
             if missing.is_file() {
@@ -357,7 +370,7 @@ impl TimelineDraft {
                 .map(|(_, path)| path)
             {
                 if choice.is_file() {
-                    replacements.insert(missing.to_string_lossy().into_owned(), choice.clone());
+                    replacements.insert(missing.clone(), choice.clone());
                     relink_warnings.push(SyncWarning {
                         url: self.source_url.clone(),
                         message: format!("Relinked {display} to {} (manual).", choice.display()),
@@ -375,7 +388,7 @@ impl TimelineDraft {
             }
             if let Some(rewritten) = crate::redirect::rewrite(&missing, redirects) {
                 if rewritten.is_file() {
-                    replacements.insert(missing.to_string_lossy().into_owned(), rewritten.clone());
+                    replacements.insert(missing.clone(), rewritten.clone());
                     relink_warnings.push(SyncWarning {
                         url: self.source_url.clone(),
                         message: format!(
@@ -395,7 +408,7 @@ impl TimelineDraft {
             matches.sort();
             matches.dedup();
             if matches.len() == 1 {
-                replacements.insert(missing.to_string_lossy().into_owned(), matches[0].clone());
+                replacements.insert(missing.clone(), matches[0].clone());
                 relink_warnings.push(SyncWarning {
                     url: self.source_url.clone(),
                     message: format!("Relinked {display} to {}.", matches[0].display()),
@@ -414,10 +427,7 @@ impl TimelineDraft {
                     })
                     .collect();
                 if winners.len() == 1 {
-                    replacements.insert(
-                        missing.to_string_lossy().into_owned(),
-                        (*winners[0]).clone(),
-                    );
+                    replacements.insert(missing.clone(), (*winners[0]).clone());
                     relink_warnings.push(SyncWarning {
                         url: self.source_url.clone(),
                         message: format!(
@@ -438,29 +448,30 @@ impl TimelineDraft {
             }
         }
         if replacements.is_empty() && relink_warnings.is_empty() {
-            return self.clone();
+            return (self.clone(), Vec::new());
         }
         let edits = self
             .edits
             .iter()
             .map(|edit| {
                 let mut edit = edit.clone();
-                if let Some(replacement) =
-                    replacements.get(&edit.url.to_string_lossy().into_owned())
-                {
+                if let Some(replacement) = replacements.get(&edit.url) {
                     edit.url = replacement.clone();
                 }
                 edit
             })
             .collect();
-        Self {
+        let draft = Self {
             source_url: self.source_url.clone(),
             name: self.name.clone(),
             frame_duration: self.frame_duration,
             edits,
             transitions: self.transitions.clone(),
             warnings: [self.warnings.clone(), relink_warnings].concat(),
-        }
+        };
+        let mut replacements: Vec<_> = replacements.into_iter().collect();
+        replacements.sort();
+        (draft, replacements)
     }
 
     /// Resolve draft edits against inspected clips (mirror Swift `resolve`).
@@ -830,6 +841,182 @@ pub fn timeline_sequence_summaries(
     }
 }
 
+/// Rewrite only media locations in FCP 7 XML or FCPXML. Unchanged events are
+/// copied verbatim by quick-xml; elements containing a changed location are
+/// re-escaped without rebuilding the timeline document.
+pub fn rewrite_media_paths(
+    source: &[u8],
+    replacements: &[(PathBuf, PathBuf)],
+) -> Result<Vec<u8>, ImportError> {
+    if replacements.is_empty() {
+        return Ok(source.to_vec());
+    }
+    let replacement_for = |value: &str, file_url_only: bool| {
+        let value = value.trim();
+        let path = if file_url_only {
+            local_file_path(value)?
+        } else {
+            fcpxml_url(value)
+        };
+        replacements
+            .iter()
+            .find_map(|(old, new)| (old == &path).then(|| local_file_url(new)))
+    };
+    let mut reader = Reader::from_reader(source);
+    reader.config_mut().trim_text(false);
+    let mut writer = Writer::new(Vec::with_capacity(source.len()));
+    let mut in_pathurl = false;
+    let mut buf = Vec::new();
+    loop {
+        let event = reader
+            .read_event_into(&mut buf)
+            .map_err(|_| ImportError::Unreadable(String::new()))?;
+        match event {
+            Event::Start(start) => {
+                let local = String::from_utf8_lossy(start.local_name().as_ref()).into_owned();
+                in_pathurl = local == "pathurl";
+                if matches!(local.as_str(), "asset" | "media-rep") {
+                    write_rewritten_location_tag(
+                        &mut writer,
+                        &reader,
+                        start,
+                        false,
+                        &replacement_for,
+                    )?;
+                } else {
+                    writer
+                        .write_event(Event::Start(start))
+                        .map_err(|_| ImportError::Unreadable(String::new()))?;
+                }
+            }
+            Event::Empty(empty) => {
+                let local = String::from_utf8_lossy(empty.local_name().as_ref()).into_owned();
+                if matches!(local.as_str(), "asset" | "media-rep") {
+                    write_rewritten_location_tag(
+                        &mut writer,
+                        &reader,
+                        empty,
+                        true,
+                        &replacement_for,
+                    )?;
+                } else {
+                    writer
+                        .write_event(Event::Empty(empty))
+                        .map_err(|_| ImportError::Unreadable(String::new()))?;
+                }
+            }
+            Event::Text(text) if in_pathurl => {
+                let value = text
+                    .unescape()
+                    .map_err(|_| ImportError::Unreadable(String::new()))?;
+                if let Some(new) = replacement_for(&value, true) {
+                    writer
+                        .write_event(Event::Text(BytesText::new(&new)))
+                        .map_err(|_| ImportError::Unreadable(String::new()))?;
+                } else {
+                    writer
+                        .write_event(Event::Text(text))
+                        .map_err(|_| ImportError::Unreadable(String::new()))?;
+                }
+            }
+            Event::CData(text) if in_pathurl => {
+                let value = String::from_utf8_lossy(text.as_ref());
+                if let Some(new) = replacement_for(&value, true) {
+                    writer
+                        .write_event(Event::CData(BytesCData::new(&new)))
+                        .map_err(|_| ImportError::Unreadable(String::new()))?;
+                } else {
+                    writer
+                        .write_event(Event::CData(text))
+                        .map_err(|_| ImportError::Unreadable(String::new()))?;
+                }
+            }
+            Event::End(end) => {
+                if end.local_name().as_ref() == b"pathurl" {
+                    in_pathurl = false;
+                }
+                writer
+                    .write_event(Event::End(end))
+                    .map_err(|_| ImportError::Unreadable(String::new()))?;
+            }
+            Event::Eof => break,
+            other => writer
+                .write_event(other)
+                .map_err(|_| ImportError::Unreadable(String::new()))?,
+        }
+        buf.clear();
+    }
+    Ok(writer.into_inner())
+}
+
+fn write_rewritten_location_tag<F>(
+    writer: &mut Writer<Vec<u8>>,
+    reader: &Reader<&[u8]>,
+    tag: quick_xml::events::BytesStart<'_>,
+    empty: bool,
+    replacement_for: &F,
+) -> Result<(), ImportError>
+where
+    F: Fn(&str, bool) -> Option<String>,
+{
+    let mut attributes = Vec::new();
+    let mut changed = false;
+    for attribute in tag.attributes() {
+        let attribute = attribute.map_err(|_| ImportError::Unreadable(String::new()))?;
+        let key = String::from_utf8_lossy(attribute.key.as_ref()).into_owned();
+        let mut value = attribute
+            .decode_and_unescape_value(reader.decoder())
+            .map_err(|_| ImportError::Unreadable(String::new()))?
+            .into_owned();
+        if key == "src"
+            && let Some(new) = replacement_for(&value, false)
+        {
+            value = new;
+            changed = true;
+        }
+        attributes.push((key, value));
+    }
+    if changed {
+        let mut rewritten = tag.into_owned();
+        rewritten.clear_attributes();
+        for (key, value) in &attributes {
+            rewritten.push_attribute((key.as_str(), value.as_str()));
+        }
+        writer
+            .write_event(if empty {
+                Event::Empty(rewritten)
+            } else {
+                Event::Start(rewritten)
+            })
+            .map_err(|_| ImportError::Unreadable(String::new()))
+    } else {
+        writer
+            .write_event(if empty {
+                Event::Empty(tag)
+            } else {
+                Event::Start(tag)
+            })
+            .map_err(|_| ImportError::Unreadable(String::new()))
+    }
+}
+
+fn local_file_url(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/:".contains(&byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    if encoded.starts_with('/') {
+        format!("file://{encoded}")
+    } else {
+        format!("file:///{encoded}")
+    }
+}
+
 // ------------------------------------------------------------ FCP7
 
 fn fcp7_rate(doc: &XmlDoc, idx: usize, fallback: MediaTime) -> MediaTime {
@@ -926,7 +1113,22 @@ fn local_file_path(value: &str) -> Option<PathBuf> {
         .strip_prefix("localhost/")
         .or_else(|| rest.strip_prefix("localhost"))
         .unwrap_or(rest);
-    Some(PathBuf::from(percent_decode(rest)))
+    Some(decoded_file_url_path(rest))
+}
+
+fn decoded_file_url_path(value: &str) -> PathBuf {
+    let decoded = percent_decode(value);
+    #[cfg(windows)]
+    if decoded.as_bytes().get(0) == Some(&b'/')
+        && decoded
+            .as_bytes()
+            .get(1)
+            .is_some_and(u8::is_ascii_alphabetic)
+        && decoded.as_bytes().get(2) == Some(&b':')
+    {
+        return PathBuf::from(&decoded[1..]);
+    }
+    PathBuf::from(decoded)
 }
 
 fn percent_decode(s: &str) -> String {
@@ -2333,7 +2535,7 @@ fn fcpxml_url(src: &str) -> PathBuf {
             .strip_prefix("localhost/")
             .or_else(|| rest.strip_prefix("localhost"))
             .unwrap_or(rest);
-        PathBuf::from(percent_decode(rest))
+        decoded_file_url_path(rest)
     } else {
         PathBuf::from(src)
     }
@@ -3393,6 +3595,41 @@ mod tests {
         assert_eq!(local_file_path("https://x/y.mov"), None);
         assert_eq!(local_file_path("/tmp/plain.mov"), None);
         assert_eq!(percent_decode("a%20b%2Fc"), "a b/c");
+        #[cfg(windows)]
+        assert_eq!(
+            local_file_path("file:///C:/Media/My%20Clip.wav"),
+            Some(PathBuf::from("C:/Media/My Clip.wav"))
+        );
+    }
+
+    #[test]
+    fn rewrites_only_matching_fcp7_and_fcpxml_media_paths() {
+        let fcp7 = br#"<?xml version="1.0"?><xmeml><sequence><media><video><track>
+<clipitem><file><pathurl>file:///old/A%20Clip.mov</pathurl><name>Keep &amp; Me</name></file></clipitem>
+<clipitem><file><pathurl><![CDATA[file:///old/rec.wav]]></pathurl></file></clipitem>
+</track></video></media></sequence></xmeml>"#;
+        let replacements = vec![
+            (
+                PathBuf::from("/old/A Clip.mov"),
+                PathBuf::from("/new/A Clip.mov"),
+            ),
+            (PathBuf::from("/old/rec.wav"), PathBuf::from("/new/rec.wav")),
+        ];
+        let fixed = String::from_utf8(rewrite_media_paths(fcp7, &replacements).unwrap()).unwrap();
+        assert!(fixed.contains("<pathurl>file:///new/A%20Clip.mov</pathurl>"));
+        assert!(fixed.contains("<![CDATA[file:///new/rec.wav]]>"));
+        assert!(fixed.contains("<name>Keep &amp; Me</name>"));
+
+        let fcpxml = br#"<fcpxml><resources>
+<asset id="a" src="file:///old/A%20Clip.mov" name="Keep &amp; Me"/>
+<asset id="b"><media-rep kind="original-media" src="file:///old/rec.wav"/></asset>
+<asset id="c" src="file:///unchanged.mov"/>
+</resources></fcpxml>"#;
+        let fixed = String::from_utf8(rewrite_media_paths(fcpxml, &replacements).unwrap()).unwrap();
+        assert!(fixed.contains("src=\"file:///new/A%20Clip.mov\""));
+        assert!(fixed.contains("src=\"file:///new/rec.wav\""));
+        assert!(fixed.contains("<asset id=\"c\" src=\"file:///unchanged.mov\"/>"));
+        assert!(fixed.contains("name=\"Keep &amp; Me\""));
     }
 
     #[test]
@@ -3470,8 +3707,10 @@ mod tests {
         std::fs::create_dir_all(&media).unwrap();
         let cand = media.join("a.mov");
         std::fs::write(&cand, b"fake").unwrap();
-        let relinked = draft.relinking_missing_media(std::slice::from_ref(&cand), &[], &[]);
+        let (relinked, replacements) =
+            draft.relinking_missing_media_with_replacements(std::slice::from_ref(&cand), &[], &[]);
         assert!(relinked.edits.iter().any(|e| e.url == cand));
+        assert!(replacements.contains(&(PathBuf::from("/tmp/a.mov"), cand.clone())));
         assert!(
             relinked
                 .warnings
