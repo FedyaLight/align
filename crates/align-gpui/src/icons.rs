@@ -42,6 +42,15 @@ const ZOOM_OUT: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1
 /// Magnifier with plus (zoom in).
 const ZOOM_IN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g stroke="white" stroke-width="1.35" fill="none" stroke-linecap="round"><circle cx="6.75" cy="6.75" r="4.5"/><path d="M10.1 10.1l4.15 4.15M6.75 4.9v3.7M4.9 6.75h3.7"/></g></svg>"#;
 
+/// Compact disclosure chevron for popup controls.
+const CHEVRON_DOWN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3.5 5.75L8 10.25l4.5-4.5" stroke="white" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+
+/// Collapse a right-side panel.
+const CHEVRON_RIGHT: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M6.25 3.75L10.25 8l-4 4.25" stroke="white" stroke-width="1.25" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+
+/// Close affordance used in modal title rows.
+const CLOSE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3.75 3.75l8.5 8.5m0-8.5l-8.5 8.5" stroke="white" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg>"#;
+
 /// Trash (clear session).
 const TRASH: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g stroke="white" stroke-width="1.35" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.25h10M6 2.25h4M4.25 4.25l.55 9.5h6.4l.55-9.5M6.5 6.5v5M9.5 6.5v5"/></g></svg>"#;
 
@@ -57,6 +66,9 @@ pub struct IconPaths {
     pub fit: String,
     pub zoom_in: String,
     pub zoom_out: String,
+    pub chevron_down: String,
+    pub chevron_right: String,
+    pub close: String,
     pub trash: String,
     pub drop: String,
 }
@@ -114,6 +126,9 @@ fn paths_for(dir: &std::path::Path) -> IconPaths {
         fit: path("fit.svg"),
         zoom_in: path("zoom-in.svg"),
         zoom_out: path("zoom-out.svg"),
+        chevron_down: path("chevron-down.svg"),
+        chevron_right: path("chevron-right.svg"),
+        close: path("close.svg"),
         trash: path("trash.svg"),
         drop: path("drop.svg"),
     }
@@ -136,6 +151,9 @@ fn write_all(dir: &std::path::Path) {
     write("fit.svg", FIT);
     write("zoom-in.svg", ZOOM_IN);
     write("zoom-out.svg", ZOOM_OUT);
+    write("chevron-down.svg", CHEVRON_DOWN);
+    write("chevron-right.svg", CHEVRON_RIGHT);
+    write("close.svg", CLOSE);
     write("trash.svg", TRASH);
     write("drop.svg", DROP);
 }
@@ -218,6 +236,9 @@ mod tests {
             &icons().fit,
             &icons().zoom_in,
             &icons().zoom_out,
+            &icons().chevron_down,
+            &icons().chevron_right,
+            &icons().close,
             &icons().trash,
             &icons().drop,
         ] {
@@ -245,6 +266,9 @@ mod tests {
             &icons().fit,
             &icons().zoom_in,
             &icons().zoom_out,
+            &icons().chevron_down,
+            &icons().chevron_right,
+            &icons().close,
             &icons().trash,
             &icons().drop,
         ];

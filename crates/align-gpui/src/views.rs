@@ -17,10 +17,11 @@ use align_decode::export::ExportArtifact;
 use align_decode::pipeline::{Phase, Pipeline};
 use futures::StreamExt;
 use gpui::{
-    Animation, AnimationExt, AnyView, App, ClickEvent, Context, Corner, Div, DragMoveEvent, Entity,
-    FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, PathPromptOptions, Pixels, Point, Render, SharedString, Stateful, Styled,
-    Window, anchored, deferred, div, prelude::*, px, rgb, rgba,
+    AnchoredPositionMode, Animation, AnimationExt, AnyView, App, ClickEvent, Context, Corner, Div,
+    DragMoveEvent, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, ParentElement, PathPromptOptions, Pixels, Point, Render,
+    ScrollHandle, SharedString, Stateful, Styled, Window, anchored, deferred, div, point,
+    prelude::*, px, rgb, rgba,
 };
 
 use super::icons::{icons, kind_badge, svg_icon};
@@ -86,21 +87,89 @@ fn slide_in_from_right<E: IntoElement + Styled + 'static>(
     child: E,
     id: impl Into<gpui::ElementId>,
     distance: f32,
+    closing: bool,
 ) -> impl IntoElement {
     let reduced = super::motion::reduced_motion();
-    super::motion::Slide {
-        child: Some(child),
-        x: distance,
-        y: 0.,
-    }
-    .with_animation(id, entrance(280), move |mut el, progress| {
-        el.x = if reduced {
-            0.
-        } else {
-            distance * (1. - progress)
-        };
-        el
-    })
+    div()
+        .h_full()
+        .flex_shrink_0()
+        .overflow_hidden()
+        // Put the shadow on the animated viewport. A shadow on the panel
+        // itself is clipped by this viewport and never reaches the timeline.
+        .shadow_md()
+        .child(child)
+        .with_animation(
+            id,
+            entrance(if closing { 180 } else { 280 }),
+            move |el, progress| {
+                let visible = if closing { 1. - progress } else { progress };
+                let visible = if reduced {
+                    if closing { 0. } else { 1. }
+                } else {
+                    visible
+                };
+                el.w(px(distance * visible))
+            },
+        )
+}
+
+fn quality_dropdown_motion<E: IntoElement + Styled + 'static>(
+    child: E,
+    closing: bool,
+) -> impl IntoElement {
+    const MENU_HEIGHT: f32 = 188.;
+    let reduced = super::motion::reduced_motion();
+    div()
+        .w(px(160.))
+        .overflow_hidden()
+        .rounded_lg()
+        .shadow_md()
+        .child(child)
+        .with_animation(
+            if closing {
+                "search-quality-dropdown-out"
+            } else {
+                "search-quality-dropdown-in"
+            },
+            entrance(if closing { 150 } else { 180 }),
+            move |el, progress| {
+                let visible = if reduced {
+                    if closing { 0. } else { 1. }
+                } else if closing {
+                    1. - progress
+                } else {
+                    progress
+                };
+                el.h(px(MENU_HEIGHT * visible)).opacity(visible)
+            },
+        )
+}
+
+fn selection_control_motion<E: IntoElement + Styled + 'static>(
+    child: E,
+    id: SharedString,
+    closing: bool,
+) -> impl IntoElement {
+    let reduced = super::motion::reduced_motion();
+    div()
+        .h(px(16.))
+        .flex_shrink_0()
+        .overflow_hidden()
+        .child(child)
+        .with_animation(
+            id,
+            entrance(if closing { 130 } else { 160 }),
+            move |el, progress| {
+                let visible = if reduced {
+                    if closing { 0. } else { 1. }
+                } else if closing {
+                    1. - progress
+                } else {
+                    progress
+                };
+                el.w(px(28. * visible)).opacity(visible)
+            },
+        )
 }
 
 #[cfg(test)]
@@ -227,6 +296,11 @@ pub struct AlignApp {
     export_inputs: ExportInputs,
     path_fixer_inputs: PathFixerInputs,
     pan_origin: Option<Point<Pixels>>,
+    export_scroll: ScrollHandle,
+    export_scroll_drag: Option<(f32, f32)>,
+    export_sidebar_closing: bool,
+    search_quality_closing: bool,
+    selection_controls_closing: bool,
 }
 
 impl Focusable for AlignApp {
@@ -243,6 +317,11 @@ impl AlignApp {
             export_inputs: ExportInputs::new(cx),
             path_fixer_inputs: PathFixerInputs::new(cx),
             pan_origin: None,
+            export_scroll: ScrollHandle::new(),
+            export_scroll_drag: None,
+            export_sidebar_closing: false,
+            search_quality_closing: false,
+            selection_controls_closing: false,
         }
     }
 
@@ -269,6 +348,9 @@ impl AlignApp {
     }
 
     pub(crate) fn start_sync(&mut self, cx: &mut Context<Self>) {
+        self.search_quality_closing = false;
+        self.selection_controls_closing = false;
+        self.export_sidebar_closing = false;
         if !self.data.begin_sync_run() {
             return;
         }
@@ -282,7 +364,9 @@ impl AlignApp {
                 let sequence_key = self.data.sequence_key_for_position(position);
                 (
                     self.data.constraints_for_sequence(sequence_key),
-                    self.data.pipeline_options_for_sequence(sequence_key),
+                    self.data.pipeline_options_for_run(position),
+                    self.data.quality_retry_targets_for_position(position),
+                    self.data.quality_retry_urls_for_position(position),
                 )
             })
             .collect();
@@ -291,14 +375,25 @@ impl AlignApp {
             let pipeline = Pipeline::default_backend();
             let sequence_count = input_sets.len();
             let mut results = Vec::with_capacity(sequence_count);
-            for (sequence_index, (inputs, (constraints, options))) in
+            for (sequence_index, (inputs, (constraints, options, targets, target_urls))) in
                 input_sets.into_iter().zip(run_settings).enumerate()
             {
                 let _ = tx.unbounded_send(SyncMsg::SequenceStart {
                     sequence_index,
                     sequence_count,
                 });
-                let progress = |p: align_decode::pipeline::PipelineProgress| {
+                let progress = |mut p: align_decode::pipeline::PipelineProgress| {
+                    if targets.is_some() {
+                        p.discovered = None;
+                        if matches!(p.phase, Phase::Inspect | Phase::Fingerprint)
+                            && p.current
+                                .as_ref()
+                                .is_some_and(|url| !target_urls.contains(url))
+                        {
+                            p.current = None;
+                        }
+                        p.preview = None;
+                    }
                     let _ = tx.unbounded_send(SyncMsg::Progress(Box::new(SyncProgress {
                         phase: p.phase,
                         completed: p.completed,
@@ -434,9 +529,83 @@ impl AlignApp {
             return;
         }
         self.data.show_export = true;
+        self.export_sidebar_closing = false;
+        self.data.show_search_quality = false;
+        self.search_quality_closing = false;
         self.data.export_started = false;
         self.data.error = None;
+        self.export_scroll.set_offset(point(px(0.), px(0.)));
         cx.notify();
+    }
+
+    fn close_search_quality(&mut self, cx: &mut Context<Self>) {
+        if !self.data.show_search_quality {
+            return;
+        }
+        self.data.show_search_quality = false;
+        self.search_quality_closing = true;
+        cx.notify();
+
+        let timer = cx.background_executor().timer(Duration::from_millis(150));
+        cx.spawn(async move |view, cx| {
+            timer.await;
+            let _ = view.update(cx, |this, cx| {
+                if this.search_quality_closing {
+                    this.search_quality_closing = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn close_export_sidebar(&mut self, cx: &mut Context<Self>) {
+        if !self.data.show_export || self.export_sidebar_closing {
+            return;
+        }
+        self.export_sidebar_closing = true;
+        cx.notify();
+
+        let timer = cx.background_executor().timer(Duration::from_millis(180));
+        cx.spawn(async move |view, cx| {
+            timer.await;
+            let _ = view.update(cx, |this, cx| {
+                if this.export_sidebar_closing {
+                    this.data.show_export = false;
+                    this.export_sidebar_closing = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn close_selection_controls(&mut self, cx: &mut Context<Self>) {
+        self.selection_controls_closing = true;
+        cx.notify();
+
+        let timer = cx.background_executor().timer(Duration::from_millis(130));
+        cx.spawn(async move |view, cx| {
+            timer.await;
+            let _ = view.update(cx, |this, cx| {
+                if this.selection_controls_closing {
+                    this.selection_controls_closing = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn finish_search_settings(&mut self, cx: &mut Context<Self>) {
+        self.data.show_search_settings = false;
+        let changed = std::mem::take(&mut self.data.settings_changed);
+        if changed {
+            self.data.mark_sync_dirty();
+            self.start_sync(cx);
+        } else {
+            cx.notify();
+        }
     }
 
     pub(crate) fn open_path_fixer(&mut self, cx: &mut Context<Self>) {
@@ -447,6 +616,7 @@ impl AlignApp {
             .omit_extensions
             .update(cx, |input, cx| input.set_text(omitted, cx));
         self.data.show_export = false;
+        self.export_sidebar_closing = false;
         self.data.show_path_fixer = true;
         self.data.error = None;
         self.data.menu = None;
@@ -1089,6 +1259,68 @@ fn icon_button(
     el.child(svg_icon(icon, 13.0, tint))
 }
 
+fn modal_header(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    title: &'static str,
+    close_id: &'static str,
+    close: impl Fn(&mut AlignApp, &ClickEvent, &mut Window, &mut Context<AlignApp>) + 'static,
+) -> Div {
+    div()
+        .w_full()
+        .h(px(30.))
+        .flex_shrink_0()
+        .flex()
+        .flex_row()
+        .items_center()
+        .child(
+            div()
+                .text_size(px(16.))
+                .font_weight(gpui::FontWeight(600.0))
+                .child(title),
+        )
+        .child(div().flex_1())
+        .child(icon_button(
+            cx,
+            theme,
+            close_id,
+            icons().close.clone(),
+            "Close",
+            true,
+            close,
+        ))
+}
+
+fn sidebar_scrim(theme: &Theme, closing: bool) -> impl IntoElement {
+    let dim = match theme.mode {
+        ThemeMode::Light => rgba(0x1D1D1F33),
+        ThemeMode::Dark => rgba(0x00000080),
+    };
+    div()
+        .id("export-sidebar-scrim")
+        .absolute()
+        .top(px(0.))
+        .left(px(0.))
+        .size_full()
+        .bg(dim)
+        .cursor_default()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
+        .on_mouse_move(|_, _, cx| cx.stop_propagation())
+        .on_click(|_, _, cx| cx.stop_propagation())
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .with_animation(
+            if closing {
+                "export-sidebar-scrim-out"
+            } else {
+                "export-sidebar-scrim-in"
+            },
+            entrance(if closing { 180 } else { 280 }),
+            move |el, progress| el.opacity(if closing { 1. - progress } else { progress }),
+        )
+}
+
 /// Text button with a leading icon (toolbar actions like Add Media).
 fn fmt_duration(seconds: f64) -> String {
     let total = seconds.max(0.0).round() as i64;
@@ -1131,11 +1363,13 @@ impl Render for AlignApp {
             && !self.data.show_search_quality
             && !self.data.show_search_settings
             && !self.data.show_stage_settings
-            && !self.data.show_sequence_results;
+            && !self.data.show_sequence_results
+            && !self.data.show_export;
         let mut root = div()
             .id("app-root")
+            .relative()
             .flex()
-            .flex_col()
+            .flex_row()
             .size_full()
             .bg(rgb(theme.bg))
             .text_color(rgb(theme.text))
@@ -1163,13 +1397,11 @@ impl Render for AlignApp {
                     && this.data.show_export
                     && !matches!(this.data.operation, Operation::Exporting)
                 {
-                    this.data.show_export = false;
-                    cx.notify();
+                    this.close_export_sidebar(cx);
                     return;
                 }
                 if key == "escape" && this.data.show_search_quality {
-                    this.data.show_search_quality = false;
-                    cx.notify();
+                    this.close_search_quality(cx);
                     return;
                 }
                 if key == "escape" && this.data.show_path_fixer {
@@ -1215,26 +1447,57 @@ impl Render for AlignApp {
                 this.data.add_paths(paths.paths().to_vec());
                 cx.notify();
             }));
+        let mut content = div()
+            .id("primary-content")
+            .relative()
+            .h_full()
+            .min_w(px(0.))
+            .flex_1()
+            .flex()
+            .flex_col();
         // No toolbar over the empty drop zone: nothing to act on yet.
         if !(self.data.lanes.is_empty() && self.data.clips.is_empty()) {
-            root = root.child(toolbar(cx, &theme, &self.data, content_active));
+            content = content.child(toolbar(
+                cx,
+                &theme,
+                &self.data,
+                content_active,
+                self.search_quality_closing,
+            ));
         }
-        root = root.child(main_content(
+        content = content.child(main_content(
             cx,
             &theme,
             &self.data,
             fit_width,
             content_active,
+            self.selection_controls_closing,
         ));
         if !self.data.warnings.is_empty() {
-            root = root.child(warning_banner(cx, &theme, &self.data));
+            content = content.child(warning_banner(cx, &theme, &self.data));
             if self.data.show_warning_details {
-                root = root.child(warning_details(&theme, &self.data));
+                content = content.child(warning_details(&theme, &self.data));
             }
         }
         // No bottom bar over the empty drop zone either.
         if !self.data.clips.is_empty() {
-            root = root.child(operation_bar(cx, &theme, &self.data, content_active));
+            content = content.child(operation_bar(cx, &theme, &self.data, content_active));
+        }
+        if self.data.show_export {
+            content = content.child(sidebar_scrim(&theme, self.export_sidebar_closing));
+        }
+        root = root.child(content);
+        if self.data.show_export {
+            root = root
+                .child(export_sidebar(
+                    cx,
+                    &theme,
+                    &self.data,
+                    &self.export_inputs,
+                    &self.export_scroll,
+                    self.export_sidebar_closing,
+                ))
+                .child(export_sidebar_action(cx, &theme, &self.data));
         }
         if let Some(picker) = self.data.sequence_picker.clone() {
             root = root.child(overlay(
@@ -1259,18 +1522,8 @@ impl Render for AlignApp {
                     .child(context_menu(cx, &theme, &self.data, menu)),
             ));
         }
-        if self.data.show_export {
-            root = root.child(export_sidebar(export_sheet(
-                cx,
-                &theme,
-                &self.data,
-                &self.export_inputs,
-                (f32::from(window.viewport_size().height) - 96.).max(200.),
-            )));
-        }
         if self.data.show_search_quality {
             root = root.child(search_quality_dismiss_layer(cx));
-            root = root.child(search_quality_menu(cx, &theme, &self.data));
         }
         if self.data.show_stage_settings {
             root = root.child(overlay(
@@ -1327,6 +1580,7 @@ fn toolbar(
     theme: &Theme,
     data: &super::state::AppData,
     active: bool,
+    quality_closing: bool,
 ) -> impl IntoElement {
     let live = matches!(data.operation, super::state::Operation::Synchronizing);
     let busy = matches!(
@@ -1335,6 +1589,7 @@ fn toolbar(
     );
     let has_timeline = !data.lanes.is_empty();
     let mut bar = div()
+        .relative()
         .flex()
         .flex_row()
         .items_center()
@@ -1390,55 +1645,54 @@ fn toolbar(
     } else {
         bar = bar.child(div().font_weight(gpui::FontWeight(600.0)).child("Sources"));
         bar = bar.child(div().flex_1());
-        bar = bar.child(div().text_color(rgb(theme.dim)).child(format!(
-            "{} item{}",
-            data.clips.len(),
-            if data.clips.len() == 1 { "" } else { "s" }
-        )));
     }
-    bar = bar.child(div().w(px(8.)).flex_shrink_0());
-    bar = bar.child(button(
-        cx,
-        theme,
-        "btn-search-quality",
-        format!(
-            "Quality: {}  ▾",
-            data.current_effective_settings().search_accuracy.label()
-        ),
-        active && !busy,
-        |this, _, _, cx| {
-            this.data.show_search_quality = !this.data.show_search_quality;
-            cx.notify();
-        },
-    ));
-    bar = bar.child(button(
-        cx,
-        theme,
-        "btn-sync-bar",
-        "Synchronize",
-        active && data.can_synchronize(),
-        |this, _, _, cx| this.start_sync(cx),
-    ));
-    if data.has_result() && !data.is_stale() {
-        let enabled = active
-            && if data.show_export {
-                data.can_begin_export()
-            } else {
-                data.can_export()
-            };
+    if !data.show_export {
+        bar = bar.child(div().w(px(8.)).flex_shrink_0());
+        let mut quality = div()
+            .relative()
+            .w(px(160.))
+            .h(px(28.))
+            .flex_shrink_0()
+            .child(search_quality_button(cx, theme, data, active && !busy));
+        if data.show_search_quality || quality_closing {
+            quality = quality.child(deferred(
+                anchored()
+                    .position_mode(AnchoredPositionMode::Local)
+                    .offset(point(px(0.), px(4.)))
+                    .snap_to_window_with_margin(px(8.))
+                    .child(quality_dropdown_motion(
+                        search_quality_menu(cx, theme, data),
+                        quality_closing,
+                    )),
+            ));
+        }
+        bar = bar.child(quality);
+        bar = bar.child(
+            div()
+                .absolute()
+                .left(gpui::relative(0.5))
+                .ml(px(-56.))
+                .w(px(112.))
+                .flex()
+                .justify_center()
+                .child(prominent_button(
+                    cx,
+                    theme,
+                    "btn-sync-bar",
+                    "Synchronize",
+                    active && data.can_synchronize(),
+                    |this, _, _, cx| this.start_sync(cx),
+                )),
+        );
+    }
+    if !data.show_export {
         bar = bar.child(prominent_button(
             cx,
             theme,
             "btn-export-bar",
             "Export",
-            enabled,
-            |this, _, _, cx| {
-                if this.data.show_export {
-                    this.begin_export(cx);
-                } else {
-                    this.start_export_sheet(cx);
-                }
-            },
+            active && data.can_export(),
+            |this, _, _, cx| this.start_export_sheet(cx),
         ));
     }
     bar
@@ -1519,6 +1773,7 @@ fn main_content(
     data: &super::state::AppData,
     fit_width: f32,
     active: bool,
+    selection_controls_closing: bool,
 ) -> impl IntoElement {
     let mut content = div()
         .id("main")
@@ -1529,15 +1784,23 @@ fn main_content(
         .bg(rgb(theme.bg));
     if active && data.lanes.is_empty() {
         content = content.on_click(cx.listener(|this, _, _, cx| {
-            this.data.selection.clear();
-            cx.notify();
+            if !this.data.selection.is_empty() {
+                this.data.selection.clear();
+                this.close_selection_controls(cx);
+            }
         }));
     }
     if data.lanes.is_empty() {
         if data.clips.is_empty() {
             content = content.child(drop_zone(cx, theme, data, active));
         } else {
-            content = content.child(file_list(cx, theme, data, active));
+            content = content.child(file_list(
+                cx,
+                theme,
+                data,
+                active,
+                selection_controls_closing,
+            ));
         }
     } else {
         content = content.child(timeline_preview(cx, theme, data, fit_width, active));
@@ -1605,22 +1868,29 @@ fn drop_zone(
         )
 }
 
-// ---------------- source list (selectable rows; header lives in the toolbar)
+// ---------------- source list (selectable rows with a stable header slot)
 
 fn file_list(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &super::state::AppData,
     active: bool,
+    selection_controls_closing: bool,
 ) -> impl IntoElement {
     let mut list = div().flex().flex_col().m_4().gap_2();
     let selecting = !data.selection.is_empty();
+    let mut header = div()
+        .id("source-list-header")
+        .h(px(28.))
+        .flex_shrink_0()
+        .flex()
+        .items_center();
     if selecting {
         let all = data
             .clips
             .iter()
             .all(|clip| data.selection.contains(&clip.url));
-        list = list.child(check_row(
+        header = header.child(check_row(
             cx,
             theme,
             "select-all-sources",
@@ -1631,6 +1901,7 @@ fn file_list(
                 cx.stop_propagation();
                 if all {
                     this.data.selection.clear();
+                    this.close_selection_controls(cx);
                 } else {
                     this.data.selection = this
                         .data
@@ -1638,11 +1909,25 @@ fn file_list(
                         .iter()
                         .map(|clip| clip.url.clone())
                         .collect();
+                    this.selection_controls_closing = false;
+                    cx.notify();
                 }
-                cx.notify();
             },
         ));
+    } else {
+        header = header.child(
+            div()
+                .px_2()
+                .text_size(px(12.))
+                .text_color(rgb(theme.dim))
+                .child(format!(
+                    "{} item{}",
+                    data.clips.len(),
+                    if data.clips.len() == 1 { "" } else { "s" }
+                )),
+        );
     }
+    list = list.child(header);
     for (index, clip) in data.clips.iter().enumerate() {
         let selected = data.selection.contains(&clip.url);
         let url = clip.url.clone();
@@ -1679,7 +1964,6 @@ fn file_list(
             .flex()
             .flex_row()
             .items_center()
-            .gap_3()
             .px_4()
             .py_3()
             .rounded_xl()
@@ -1694,10 +1978,16 @@ fn file_list(
                 }
                 if this.data.selection.contains(&url) {
                     this.data.selection.remove(&url);
+                    if this.data.selection.is_empty() {
+                        this.close_selection_controls(cx);
+                    } else {
+                        cx.notify();
+                    }
                 } else {
                     this.data.selection.insert(url.clone());
+                    this.selection_controls_closing = false;
+                    cx.notify();
                 }
-                cx.notify();
             }));
         if active {
             row = row.cursor_pointer();
@@ -1709,27 +1999,39 @@ fn file_list(
         } else if active {
             row = row.hover(|this| this.bg(rgb(theme.button_hover)));
         }
-        if selecting {
-            row = row.child(
-                div()
-                    .size(px(16.))
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(if selected { theme.accent } else { theme.border }))
-                    .bg(rgb(if selected { theme.accent } else { theme.panel }))
-                    .when(selected, |el| {
-                        el.child(svg_icon(icons().check.clone(), 10., theme.on_accent))
-                    }),
-            );
+        if selecting || selection_controls_closing {
+            let indicator = div()
+                .size(px(16.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(if selected { theme.accent } else { theme.border }))
+                .bg(rgb(if selected { theme.accent } else { theme.panel }))
+                .when(selected, |el| {
+                    el.child(svg_icon(icons().check.clone(), 10., theme.on_accent))
+                });
+            row = row.child(selection_control_motion(
+                indicator,
+                SharedString::from(format!(
+                    "selection-control-{}-{}",
+                    if selection_controls_closing {
+                        "out"
+                    } else {
+                        "in"
+                    },
+                    clip.url.display()
+                )),
+                selection_controls_closing,
+            ));
         }
         row = row
             .child(
                 div()
                     .w(px(18.))
+                    .mr_3()
                     .flex_shrink_0()
                     .flex()
                     .items_center()
@@ -2293,17 +2595,30 @@ fn operation_bar(
         }
         bar = bar.child(status);
     }
-    if data.is_stale() {
-        bar = bar.child(
-            div()
-                .text_color(rgb(theme.orange))
-                .child(format!("＋ {} new", data.pending_count)),
-        );
-        bar = bar.child(
-            div()
-                .text_color(rgb(theme.dim))
-                .child("Synchronize to include them."),
-        );
+    if data.is_stale() && !busy {
+        if data.pending_count > 0 {
+            bar = bar.child(
+                div()
+                    .text_color(rgb(theme.orange))
+                    .child(format!("＋ {} new", data.pending_count)),
+            );
+            bar = bar.child(
+                div()
+                    .text_color(rgb(theme.dim))
+                    .child("Synchronize to include them."),
+            );
+        } else {
+            bar = bar.child(
+                div()
+                    .text_color(rgb(theme.orange))
+                    .child("Settings changed"),
+            );
+            bar = bar.child(
+                div()
+                    .text_color(rgb(theme.dim))
+                    .child("Synchronize to apply them."),
+            );
+        }
     }
     bar = bar.child(div().flex_1());
     if busy {
@@ -2388,7 +2703,7 @@ fn operation_bar(
             ));
         }
     }
-    if !data.lanes.is_empty() {
+    if !data.show_export && !data.lanes.is_empty() {
         bar = bar.child(timeline_zoom_controls(cx, theme, data, active && !busy));
     }
     bar
@@ -2401,7 +2716,10 @@ fn stage_settings_panel(
 ) -> impl IntoElement {
     let mut panel = div().id("stage-settings").w(px(400.)).p_4().flex().flex_col()
         .gap_2().rounded_lg().bg(rgb(theme.panel)).border_1().border_color(rgb(theme.border))
-        .child(div().text_size(px(16.)).child("Synchronization stages"))
+        .child(modal_header(cx, theme, "Synchronization stages", "stage-close", |this, _, _, cx| {
+            this.data.show_stage_settings = false;
+            cx.notify();
+        }))
         .child(div().text_size(px(12.)).text_color(rgb(theme.dim))
             .child("Compare completed results. The selected stage is shown on the timeline and used for export."));
     if let Some(result) = &data.result {
@@ -2428,17 +2746,7 @@ fn stage_settings_panel(
             ));
         }
     }
-    panel.child(button(
-        cx,
-        theme,
-        "stage-close",
-        "Close",
-        true,
-        |this, _, _, cx| {
-            this.data.show_stage_settings = false;
-            cx.notify();
-        },
-    ))
+    panel
 }
 
 fn sequence_results_panel(
@@ -2457,7 +2765,16 @@ fn sequence_results_panel(
         .bg(rgb(theme.panel))
         .border_1()
         .border_color(rgb(theme.border))
-        .child(div().text_size(px(16.)).child("Synchronized sequences"))
+        .child(modal_header(
+            cx,
+            theme,
+            "Synchronized sequences",
+            "sequence-results-close",
+            |this, _, _, cx| {
+                this.data.show_sequence_results = false;
+                cx.notify();
+            },
+        ))
         .child(
             div()
                 .text_size(px(12.))
@@ -2487,17 +2804,7 @@ fn sequence_results_panel(
             },
         ));
     }
-    panel.child(button(
-        cx,
-        theme,
-        "sequence-results-close",
-        "Close",
-        true,
-        |this, _, _, cx| {
-            this.data.show_sequence_results = false;
-            cx.notify();
-        },
-    ))
+    panel
 }
 
 fn audio_source_label(source: AudioAnalysisSource) -> &'static str {
@@ -2584,10 +2891,110 @@ fn search_quality_dismiss_layer(cx: &mut Context<AlignApp>) -> impl IntoElement 
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
-                this.data.show_search_quality = false;
-                cx.notify();
+                this.close_search_quality(cx);
                 cx.stop_propagation();
             }),
+        )
+}
+
+fn search_quality_button(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    data: &super::state::AppData,
+    enabled: bool,
+) -> impl IntoElement {
+    let label = if data.show_search_quality {
+        "Sync quality".to_string()
+    } else {
+        format!(
+            "Quality: {}",
+            data.current_effective_settings().search_accuracy.label()
+        )
+    };
+    let mut control = div()
+        .id("btn-search-quality")
+        .w_full()
+        .h_full()
+        .px_3()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .rounded_lg()
+        .bg(rgb(if data.show_search_quality {
+            theme.border
+        } else {
+            theme.button_hover
+        }))
+        .text_size(px(12.))
+        .child(div().min_w(px(0.)).truncate().child(label))
+        .child(div().w(px(12.)).h(px(12.)).flex_shrink_0().child(svg_icon(
+            icons().chevron_down.clone(),
+            12.,
+            theme.icon,
+        )));
+    if enabled {
+        control = control
+            .text_color(rgb(theme.icon))
+            .cursor_pointer()
+            .hover(|this| this.bg(rgb(theme.border)))
+            .active(|this| this.opacity(0.62))
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.data.show_search_quality {
+                    this.close_search_quality(cx);
+                } else {
+                    this.search_quality_closing = false;
+                    this.data.show_search_quality = true;
+                    cx.notify();
+                }
+            }));
+    } else {
+        control = control.text_color(rgb(theme.dim)).opacity(0.42);
+    }
+    control
+}
+
+fn search_quality_row(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    id: impl Into<SharedString>,
+    label: &'static str,
+    selected: bool,
+    accuracy: align_core::SearchAccuracy,
+) -> impl IntoElement {
+    div()
+        .id(id.into())
+        .h(px(28.))
+        .px_3()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .rounded_md()
+        .text_size(px(12.))
+        .text_color(rgb(theme.text))
+        .cursor_pointer()
+        .hover(|this| this.bg(rgb(theme.button_hover)))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if this.data.set_scoped_search_accuracy(Some(accuracy)) {
+                this.data.mark_quality_dirty();
+            }
+            this.close_search_quality(cx);
+        }))
+        .child(div().min_w(px(0.)).truncate().child(label))
+        .child(
+            div()
+                .w(px(16.))
+                .h(px(16.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(selected, |slot| {
+                    slot.child(svg_icon(icons().check.clone(), 12., theme.accent))
+                }),
         )
 }
 
@@ -2595,19 +3002,11 @@ fn search_quality_menu(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &super::state::AppData,
-) -> impl IntoElement {
+) -> Stateful<Div> {
     let selected = data.current_effective_settings().search_accuracy;
-    let right = if data.has_result() && !data.is_stale() {
-        177.
-    } else {
-        110.
-    };
     let mut menu = div()
         .id("search-quality-menu")
-        .absolute()
-        .top(px(43.))
-        .right(px(right))
-        .w(px(196.))
+        .w(px(160.))
         .flex()
         .flex_col()
         .p_1()
@@ -2616,24 +3015,15 @@ fn search_quality_menu(
         .border_color(rgb(theme.border))
         .bg(rgb(theme.panel))
         .shadow_md()
-        .child(menu_header(theme, "Synchronization quality".to_string()));
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
     for (index, accuracy) in align_core::SearchAccuracy::ALL.into_iter().enumerate() {
-        let label = if accuracy == selected {
-            format!("✓ {}", accuracy.label())
-        } else {
-            accuracy.label().to_string()
-        };
-        menu = menu.child(menu_row(
+        menu = menu.child(search_quality_row(
             cx,
             theme,
             format!("search-quality-{index}"),
-            label,
-            false,
-            move |this, _, _, cx| {
-                this.data.set_scoped_search_accuracy(Some(accuracy));
-                this.data.show_search_quality = false;
-                cx.notify();
-            },
+            accuracy.label(),
+            accuracy == selected,
+            accuracy,
         ));
     }
     menu.child(
@@ -2649,7 +3039,7 @@ fn search_quality_menu(
                 "More settings…",
                 false,
                 |this, _, _, cx| {
-                    this.data.show_search_quality = false;
+                    this.close_search_quality(cx);
                     this.data.show_search_settings = true;
                     this.data.settings_changed = false;
                     cx.notify();
@@ -2741,7 +3131,13 @@ fn search_settings_panel(
         .bg(rgb(theme.panel))
         .border_1()
         .border_color(rgb(theme.border))
-        .child(div().text_size(px(16.)).child("Synchronization settings"))
+        .child(modal_header(
+            cx,
+            theme,
+            "Synchronization settings",
+            "settings-close",
+            |this, _, _, cx| this.finish_search_settings(cx),
+        ))
         .child(
             div()
                 .text_size(px(12.))
@@ -2888,22 +3284,16 @@ fn search_settings_panel(
                 cx.notify();
             },
         ))
-        .child(button(
-            cx,
-            theme,
-            "settings-apply",
-            if data.settings_changed { "Apply settings" } else { "Close" },
-            true,
-            |this, _, _, cx| {
-                this.data.show_search_settings = false;
-                let changed = std::mem::take(&mut this.data.settings_changed);
-                if changed && this.data.can_synchronize() {
-                    this.start_sync(cx);
-                } else {
-                    cx.notify();
-                }
-            },
-        ))
+        .when(data.settings_changed, |panel| {
+            panel.child(prominent_button(
+                cx,
+                theme,
+                "settings-apply",
+                "Apply settings",
+                true,
+                |this, _, _, cx| this.finish_search_settings(cx),
+            ))
+        })
 }
 
 // ---------------- diagnostics popover (mirrors DiagnosticsButton)
@@ -2927,7 +3317,16 @@ fn sequence_picker_panel(
         .border_color(rgb(theme.border))
         .bg(rgb(theme.panel))
         .shadow_md()
-        .child("Choose a sequence")
+        .child(modal_header(
+            cx,
+            theme,
+            "Choose a sequence",
+            "seq-cancel",
+            |this, _, _, cx| {
+                this.data.sequence_picker = None;
+                cx.notify();
+            },
+        ))
         .child(div().text_color(rgb(theme.dim)).child(format!(
                 "{} contains multiple timelines.",
                 picker
@@ -2962,17 +3361,6 @@ fn sequence_picker_panel(
             },
         ));
     }
-    panel = panel.child(button(
-        cx,
-        theme,
-        "seq-cancel",
-        "Cancel",
-        true,
-        |this, _, _, cx| {
-            this.data.sequence_picker = None;
-            cx.notify();
-        },
-    ));
     panel
 }
 
@@ -3829,12 +4217,17 @@ fn path_fixer_panel(
         .border_color(rgb(theme.separator))
         .bg(rgb(theme.panel))
         .shadow_md()
-        .child(
-            div()
-                .text_lg()
-                .font_weight(gpui::FontWeight(600.0))
-                .child("Path Fixer"),
-        );
+        .child(modal_header(
+            cx,
+            theme,
+            "Path Fixer",
+            "path-cancel",
+            |this, _, _, cx| {
+                this.data.discard_path_redirection_edits();
+                this.data.show_path_fixer = false;
+                cx.notify();
+            },
+        ));
 
     let mut saved = div()
         .flex()
@@ -3992,18 +4385,6 @@ fn path_fixer_panel(
             .flex()
             .flex_row()
             .gap_2()
-            .child(button(
-                cx,
-                theme,
-                "path-cancel",
-                "Cancel",
-                true,
-                |this, _, _, cx| {
-                    this.data.discard_path_redirection_edits();
-                    this.data.show_path_fixer = false;
-                    cx.notify();
-                },
-            ))
             .child(div().flex_1())
             .child(button(
                 cx,
@@ -4024,20 +4405,200 @@ fn path_fixer_panel(
     )
 }
 
-fn export_sidebar(panel: Stateful<Div>) -> impl IntoElement {
+fn export_scrollbar(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    scroll: &ScrollHandle,
+) -> impl IntoElement {
+    let viewport_height = f32::from(scroll.bounds().size.height).max(1.);
+    let max_scroll = f32::from(scroll.max_offset().height).max(0.);
+    let content_height = viewport_height + max_scroll;
+    let thumb_height = if max_scroll > 0. {
+        (viewport_height * viewport_height / content_height).clamp(36., viewport_height)
+    } else {
+        48_f32.min(viewport_height)
+    };
+    let travel = (viewport_height - thumb_height).max(1.);
+    let progress = if max_scroll > 0. {
+        (-f32::from(scroll.offset().y) / max_scroll).clamp(0., 1.)
+    } else {
+        0.
+    };
+    let thumb_top = progress * travel;
+
     div()
-        .id("export-sidebar")
-        .absolute()
-        .top(px(48.))
-        .right(px(0.))
-        .bottom(px(48.))
+        .id("export-scrollbar")
+        .relative()
+        .w(px(10.))
+        .h_full()
+        .ml_2()
+        .flex_shrink_0()
+        .rounded_full()
+        .bg(rgb(theme.separator))
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                let bounds = this.export_scroll.bounds();
+                let viewport_height = f32::from(bounds.size.height).max(1.);
+                let max_scroll = f32::from(this.export_scroll.max_offset().height).max(0.);
+                let content_height = viewport_height + max_scroll;
+                let thumb_height = if max_scroll > 0. {
+                    (viewport_height * viewport_height / content_height).clamp(36., viewport_height)
+                } else {
+                    viewport_height
+                };
+                let travel = (viewport_height - thumb_height).max(1.);
+                let current_offset = f32::from(this.export_scroll.offset().y);
+                let current_top = if max_scroll > 0. {
+                    (-current_offset / max_scroll).clamp(0., 1.) * travel
+                } else {
+                    0.
+                };
+                let local_y = f32::from(event.position.y - bounds.origin.y);
+                let start_offset = if local_y < current_top || local_y > current_top + thumb_height
+                {
+                    let progress = ((local_y - thumb_height * 0.5) / travel).clamp(0., 1.);
+                    let offset = -max_scroll * progress;
+                    this.export_scroll.set_offset(point(px(0.), px(offset)));
+                    offset
+                } else {
+                    current_offset
+                };
+                this.export_scroll_drag = Some((f32::from(event.position.y), start_offset));
+                cx.stop_propagation();
+                cx.notify();
+            }),
+        )
+        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+            if !event.dragging() {
+                this.export_scroll_drag = None;
+                return;
+            }
+            let Some((pointer_start, offset_start)) = this.export_scroll_drag else {
+                return;
+            };
+            let viewport_height = f32::from(this.export_scroll.bounds().size.height).max(1.);
+            let max_scroll = f32::from(this.export_scroll.max_offset().height).max(0.);
+            let content_height = viewport_height + max_scroll;
+            let thumb_height = if max_scroll > 0. {
+                (viewport_height * viewport_height / content_height).clamp(36., viewport_height)
+            } else {
+                viewport_height
+            };
+            let travel = (viewport_height - thumb_height).max(1.);
+            let delta = f32::from(event.position.y) - pointer_start;
+            let offset = (offset_start - delta * max_scroll / travel).clamp(-max_scroll, 0.);
+            this.export_scroll.set_offset(point(px(0.), px(offset)));
+            cx.stop_propagation();
+            cx.notify();
+        }))
+        .capture_any_mouse_up(cx.listener(|this, _, _, _| {
+            this.export_scroll_drag = None;
+        }))
+        .child(
+            div()
+                .absolute()
+                .top(px(thumb_top))
+                .left(px(1.))
+                .right(px(1.))
+                .h(px(thumb_height))
+                .rounded_full()
+                .bg(rgb(theme.dim))
+                .hover(|this| this.bg(rgb(theme.icon))),
+        )
+}
+
+fn export_sidebar(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    data: &super::state::AppData,
+    inputs: &ExportInputs,
+    scroll: &ScrollHandle,
+    closing: bool,
+) -> impl IntoElement {
+    let can_close = !matches!(data.operation, Operation::Exporting);
+    let panel = div()
         .w(px(440.))
+        .h_full()
+        .flex()
+        .flex_col()
+        .border_l_1()
+        .border_color(rgb(theme.separator))
+        .bg(rgb(theme.panel))
+        .child(
+            div()
+                .h(px(48.))
+                .px_3()
+                .flex_shrink_0()
+                .flex()
+                .flex_row()
+                .items_center()
+                .border_b_1()
+                .border_color(rgb(theme.separator))
+                .child({
+                    let mut close = div()
+                        .id("btn-close-export-sidebar")
+                        .w(px(30.))
+                        .h(px(28.))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(theme.separator));
+                    if can_close {
+                        close = close
+                            .cursor_pointer()
+                            .hover(|this| this.bg(rgb(theme.button_hover)))
+                            .active(|this| this.opacity(0.62))
+                            .tooltip(hover_tip("Close export panel".to_string(), theme))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_export_sidebar(cx);
+                            }));
+                    } else {
+                        close = close.opacity(0.32);
+                    }
+                    close.child(svg_icon(icons().chevron_right.clone(), 12., theme.icon))
+                })
+                .child(div().flex_1()),
+        )
+        .child(export_sheet(cx, theme, data, inputs, scroll))
         .cursor_default()
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
         .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
-        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-        .child(slide_in_from_right(panel, "export-sidebar-slide", 440.))
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation());
+    slide_in_from_right(
+        panel,
+        if closing {
+            "export-sidebar-slide-out"
+        } else {
+            "export-sidebar-slide-in"
+        },
+        440.,
+        closing,
+    )
+}
+
+fn export_sidebar_action(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    data: &super::state::AppData,
+) -> impl IntoElement {
+    div()
+        .absolute()
+        .top(px(10.))
+        .right(px(12.))
+        .child(prominent_button(
+            cx,
+            theme,
+            "btn-export-sidebar",
+            "Export",
+            data.can_begin_export(),
+            |this, _, _, cx| this.begin_export(cx),
+        ))
 }
 
 fn export_sheet(
@@ -4045,7 +4606,7 @@ fn export_sheet(
     theme: &Theme,
     data: &super::state::AppData,
     inputs: &ExportInputs,
-    max_height: f32,
+    scroll: &ScrollHandle,
 ) -> Stateful<Div> {
     use super::state::{ExportTarget, Operation};
     let busy = matches!(data.operation, Operation::Exporting);
@@ -4056,20 +4617,11 @@ fn export_sheet(
         .flex_col()
         .gap_3()
         .p_4()
-        .w(px(440.))
-        .h(px(max_height))
+        .w_full()
+        .flex_1()
+        .min_h(px(0.))
         .flex_shrink_0()
-        .overflow_hidden()
-        .border_l_1()
-        .border_color(rgb(theme.separator))
-        .bg(rgb(theme.panel))
-        .shadow_md();
-    sheet = sheet.child(
-        div()
-            .text_size(px(18.))
-            .font_weight(gpui::FontWeight(600.0))
-            .child("Export"),
-    );
+        .overflow_hidden();
     // Destination.
     {
         let mut row = div().flex().flex_row().items_center().gap_3().h(px(32.));
@@ -4109,6 +4661,8 @@ fn export_sheet(
         .flex_1()
         .min_h(px(0.))
         .overflow_y_scroll()
+        .track_scroll(scroll)
+        .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
         .pb_2();
     let mut settings = div().flex().flex_col().gap_3();
     // Formats.
@@ -4516,7 +5070,15 @@ fn export_sheet(
         settings = settings.child(group);
     }
     columns = columns.child(div().id("export-settings").min_w(px(0.)).child(settings));
-    sheet = sheet.child(columns);
+    sheet = sheet.child(
+        div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h(px(0.))
+            .child(columns)
+            .child(export_scrollbar(cx, theme, scroll)),
+    );
     // Progress / completion.
     if data.export_started && busy {
         sheet = sheet.child(data.status.clone());
@@ -4550,7 +5112,7 @@ fn export_sheet(
     }
     // Sidebar actions. In-flight cancellation stays in the persistent
     // operation bar so it is not duplicated here.
-    if !busy {
+    if done && !busy {
         let mut row = div()
             .flex()
             .flex_row()
@@ -4559,44 +5121,28 @@ fn export_sheet(
             .pt_3()
             .border_t_1()
             .border_color(rgb(theme.separator));
-        if !done {
-            row = row.child(button(
-                cx,
-                theme,
-                "exp-dismiss",
-                "Close",
-                true,
-                |this, _, _, cx| {
-                    this.data.show_export = false;
-                    cx.notify();
-                },
-            ));
-        }
         row = row.child(div().flex_1());
-        if done {
-            row = row.child(button(
-                cx,
-                theme,
-                "exp-reveal",
-                "Show in Finder",
-                true,
-                |this, _, _, cx| {
-                    this.data.reveal_export();
-                    cx.notify();
-                },
-            ));
-            row = row.child(prominent_button(
-                cx,
-                theme,
-                "exp-done",
-                "Done",
-                true,
-                |this, _, _, cx| {
-                    this.data.show_export = false;
-                    cx.notify();
-                },
-            ));
-        }
+        row = row.child(button(
+            cx,
+            theme,
+            "exp-reveal",
+            "Show in Finder",
+            true,
+            |this, _, _, cx| {
+                this.data.reveal_export();
+                cx.notify();
+            },
+        ));
+        row = row.child(prominent_button(
+            cx,
+            theme,
+            "exp-done",
+            "Done",
+            true,
+            |this, _, _, cx| {
+                this.close_export_sidebar(cx);
+            },
+        ));
         sheet = sheet.child(row);
     }
     sheet
@@ -4617,24 +5163,22 @@ fn about_panel(cx: &mut Context<AlignApp>, theme: &Theme) -> impl IntoElement {
         .border_1()
         .border_color(rgb(theme.border))
         .bg(rgb(theme.panel))
-        .child(div().text_lg().child("Align"))
+        .child(modal_header(
+            cx,
+            theme,
+            "Align",
+            "btn-about-close",
+            |this, _, _, cx| {
+                this.data.show_about = false;
+                cx.notify();
+            },
+        ))
         .child(
             div()
                 .text_color(rgb(theme.dim))
                 .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
         )
         .child(div().child("Cross-platform media synchronizer"))
-        .child(button(
-            cx,
-            theme,
-            "btn-about-ok",
-            "OK",
-            true,
-            |this, _, _, cx| {
-                this.data.show_about = false;
-                cx.notify();
-            },
-        ))
 }
 
 // ---------------- error alert (mirrors .alert)
@@ -4656,18 +5200,22 @@ fn error_alert(
         .border_color(rgb(theme.border))
         .bg(rgb(theme.panel))
         .shadow_md()
-        .child(
-            div()
-                .text_size(px(18.))
-                .font_weight(gpui::FontWeight(600.0))
-                .child("Align could not finish"),
-        )
+        .child(modal_header(
+            cx,
+            theme,
+            "Align could not finish",
+            "btn-alert-close",
+            |this, _, _, cx| {
+                this.data.dismiss_error();
+                cx.notify();
+            },
+        ))
         .child(
             data.error
                 .clone()
                 .unwrap_or_else(|| "Unknown error".to_string()),
         );
-    let panel = if data.can_locate_timeline_media() {
+    if data.can_locate_timeline_media() {
         panel.child(button(
             cx,
             theme,
@@ -4678,16 +5226,5 @@ fn error_alert(
         ))
     } else {
         panel
-    };
-    panel.child(button(
-        cx,
-        theme,
-        "btn-alert-ok",
-        "OK",
-        true,
-        |this, _, _, cx| {
-            this.data.dismiss_error();
-            cx.notify();
-        },
-    ))
+    }
 }

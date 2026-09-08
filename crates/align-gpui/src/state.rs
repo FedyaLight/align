@@ -234,6 +234,9 @@ pub struct AppData {
     pub sequence_settings: HashMap<usize, SequenceDefaults>,
     pub settings_scope: SettingsScope,
     pub settings_changed: bool,
+    sync_dirty: bool,
+    quality_only_dirty: bool,
+    incremental_quality_run: bool,
     track_overrides: HashMap<usize, TrackOverrides>,
     pub show_search_quality: bool,
     pub show_search_settings: bool,
@@ -319,6 +322,9 @@ impl Default for AppData {
             sequence_settings: HashMap::new(),
             settings_scope: Default::default(),
             settings_changed: false,
+            sync_dirty: false,
+            quality_only_dirty: false,
+            incremental_quality_run: false,
             track_overrides: HashMap::new(),
             show_search_quality: false,
             show_search_settings: false,
@@ -521,15 +527,42 @@ impl AppData {
     }
 
     pub fn is_stale(&self) -> bool {
-        self.result.is_some() && self.pending_count > 0
+        self.result.is_some() && (self.pending_count > 0 || self.sync_dirty)
     }
 
     pub fn can_synchronize(&self) -> bool {
+        self.can_run_sync() && (self.result.is_none() || self.pending_count > 0 || self.sync_dirty)
+    }
+
+    fn can_run_sync(&self) -> bool {
         !self.clips.is_empty()
             && !matches!(
                 self.operation,
                 Operation::Synchronizing | Operation::Exporting | Operation::Repairing
             )
+    }
+
+    pub fn mark_sync_dirty(&mut self) {
+        self.sync_dirty = true;
+        self.quality_only_dirty = false;
+    }
+
+    pub fn mark_quality_dirty(&mut self) {
+        let has_unmatched = self
+            .sequence_results
+            .iter()
+            .any(|result| !result.unmatched.is_empty())
+            || self
+                .result
+                .as_ref()
+                .is_some_and(|result| !result.unmatched.is_empty());
+        if !has_unmatched {
+            return;
+        }
+        if !self.sync_dirty {
+            self.quality_only_dirty = true;
+        }
+        self.sync_dirty = true;
     }
 
     pub fn can_export(&self) -> bool {
@@ -800,9 +833,23 @@ impl AppData {
 
     /// Reset per-run state before a sync pass (mirrors `synchronize()`).
     pub fn begin_sync_run(&mut self) -> bool {
-        if !self.can_synchronize() {
+        if !self.can_run_sync() {
             return false;
         }
+        self.incremental_quality_run = self.quality_only_dirty
+            && self.pending_count == 0
+            && (self
+                .sequence_results
+                .iter()
+                .any(|result| !result.unmatched.is_empty())
+                || self
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| !result.unmatched.is_empty()));
+        if !self.sync_dirty {
+            self.quality_only_dirty = false;
+        }
+        self.sync_dirty = true;
         self.cancel_run();
         self.operation = Operation::Synchronizing;
         self.progress = 0.0;
@@ -810,7 +857,30 @@ impl AppData {
         self.exported_files.clear();
         self.island_count = 0;
         self.warnings.clear();
-        self.begin_sequence_progress();
+        if self.incremental_quality_run {
+            let targets: HashSet<ClipId> = self
+                .sequence_results
+                .iter()
+                .flat_map(|result| result.unmatched.iter().cloned())
+                .chain(
+                    self.result
+                        .iter()
+                        .flat_map(|result| result.unmatched.iter().cloned()),
+                )
+                .collect();
+            for clip in &mut self.clips {
+                if clip.clip_id.as_ref().is_some_and(|id| targets.contains(id)) {
+                    clip.state = ClipState::Analyzing;
+                }
+            }
+            for bar in self.lanes.iter_mut().flat_map(|lane| &mut lane.clips) {
+                if targets.contains(&bar.clip_id) {
+                    bar.match_state = lane::BarMatchState::Pending;
+                }
+            }
+        } else {
+            self.begin_sequence_progress();
+        }
         self.selection.clear();
         self.menu = None;
         self.show_export = false;
@@ -824,6 +894,9 @@ impl AppData {
     }
 
     pub fn begin_sequence_progress(&mut self) {
+        if self.incremental_quality_run {
+            return;
+        }
         self.clips = self
             .inputs
             .iter()
@@ -844,6 +917,7 @@ impl AppData {
     }
 
     pub fn restore_after_sync_cancel(&mut self) {
+        self.incremental_quality_run = false;
         if let Some(previous) = self.result.clone() {
             let pending_count = self.pending_count;
             let known: HashSet<PathBuf> = previous
@@ -1059,6 +1133,9 @@ impl AppData {
         self.sequence_results = vec![result.clone()];
         self.active_sequence_result = 0;
         self.apply_visible_result(result);
+        self.sync_dirty = false;
+        self.quality_only_dirty = false;
+        self.incremental_quality_run = false;
     }
 
     pub fn apply_results(&mut self, mut results: Vec<SyncResult>) {
@@ -1069,6 +1146,7 @@ impl AppData {
         if results.is_empty() {
             self.operation = Operation::Idle;
             self.error = Some("No sequence results were produced.".into());
+            self.incremental_quality_run = false;
             return;
         }
         let count = results.len();
@@ -1077,6 +1155,9 @@ impl AppData {
         self.sequence_results = results;
         self.active_sequence_result = active;
         self.apply_visible_result(visible);
+        self.sync_dirty = false;
+        self.quality_only_dirty = false;
+        self.incremental_quality_run = false;
         if count > 1 {
             self.status = format!(
                 "Synchronized {count} sequences. Showing sequence {} of {count}.",
@@ -1772,6 +1853,37 @@ impl AppData {
         vec![self.pipeline_inputs_for_sequence(selected.first().copied())]
     }
 
+    fn previous_result_for_position(&self, position: usize) -> Option<&SyncResult> {
+        self.sequence_results
+            .get(position)
+            .or_else(|| (position == 0).then_some(self.result.as_ref()).flatten())
+    }
+
+    pub fn quality_retry_targets_for_position(&self, position: usize) -> Option<HashSet<ClipId>> {
+        if !self.incremental_quality_run {
+            return None;
+        }
+        let targets: HashSet<ClipId> = self
+            .previous_result_for_position(position)?
+            .unmatched
+            .iter()
+            .cloned()
+            .collect();
+        (!targets.is_empty()).then_some(targets)
+    }
+
+    pub fn quality_retry_urls_for_position(&self, position: usize) -> HashSet<PathBuf> {
+        let Some(targets) = self.quality_retry_targets_for_position(position) else {
+            return HashSet::new();
+        };
+        self.previous_result_for_position(position)
+            .into_iter()
+            .flat_map(|result| result.project.clips.iter())
+            .filter(|clip| targets.contains(&clip.id))
+            .map(|clip| clip.url.clone())
+            .collect()
+    }
+
     fn pipeline_inputs_for_sequence(&self, selected: Option<usize>) -> Vec<PipelineInput> {
         self.inputs
             .iter()
@@ -1831,6 +1943,33 @@ impl AppData {
             omit_extensions: self.omit_extensions.clone(),
             prefer_proxies: self.prefer_proxies,
         }
+    }
+
+    pub fn pipeline_options_for_run(&self, position: usize) -> PipelineOptions {
+        let sequence_key = self.sequence_key_for_position(position);
+        let mut options = self.pipeline_options_for_sequence(sequence_key);
+        let Some(targets) = self.quality_retry_targets_for_position(position) else {
+            return options;
+        };
+        let Some(previous) = self.previous_result_for_position(position) else {
+            return options;
+        };
+
+        let requested = options.search_accuracy;
+        let current_overrides = std::mem::take(&mut options.search_overrides);
+        options.search_accuracy = previous.search_accuracy;
+        options.search_overrides = previous.search_overrides.clone();
+        for target in targets {
+            options.search_overrides.insert(
+                target.clone(),
+                current_overrides.get(&target).copied().unwrap_or(requested),
+            );
+        }
+        // The previous result already resolved source-level values into
+        // per-clip overrides. Reapplying source defaults would upgrade
+        // stable clips along with the unmatched retry targets.
+        options.source_search_overrides.clear();
+        options
     }
 }
 
@@ -2555,6 +2694,83 @@ mod tests {
         assert_eq!(data.clips.len(), 1);
         assert!(data.selection.is_empty());
         assert_eq!(data.inputs, vec![PathBuf::from("/v/b.wav")]);
+    }
+
+    #[test]
+    fn synchronize_requires_new_inputs_or_changed_settings_after_a_result() {
+        let mut data = AppData::default();
+        data.add_paths(vec![PathBuf::from("/v/a.wav")]);
+        data.result = Some(empty_sequence_result("Finished"));
+        data.operation = Operation::Ready;
+
+        assert!(!data.can_synchronize());
+        assert!(data.can_export());
+        data.mark_sync_dirty();
+        assert!(data.can_synchronize());
+        assert!(!data.can_export());
+        assert!(data.begin_sync_run());
+        assert!(data.sync_dirty);
+
+        data.operation = Operation::Ready;
+        data.apply_result(empty_sequence_result("Rerun"));
+        assert!(!data.sync_dirty);
+        assert!(!data.can_synchronize());
+
+        data.add_paths(vec![PathBuf::from("/v/b.wav")]);
+        assert!(data.can_synchronize());
+    }
+
+    #[test]
+    fn quality_retry_upgrades_only_unmatched_fingerprints() {
+        let mut data = AppData::default();
+        data.add_paths(vec![PathBuf::from("/v/a.wav")]);
+        let unmatched = ClipId::new("unmatched");
+        let matched = ClipId::new("matched");
+        let mut previous = empty_sequence_result("Previous");
+        previous.search_accuracy = align_core::SearchAccuracy::Balanced;
+        previous.unmatched = vec![unmatched.clone()];
+        previous
+            .search_overrides
+            .insert(matched.clone(), align_core::SearchAccuracy::Fast);
+        data.result = Some(previous.clone());
+        data.sequence_results = vec![previous];
+        data.operation = Operation::Ready;
+        data.common_settings.search_accuracy = align_core::SearchAccuracy::Deep;
+        data.mark_quality_dirty();
+
+        assert!(data.can_synchronize());
+        assert!(data.begin_sync_run());
+        assert_eq!(
+            data.quality_retry_targets_for_position(0),
+            Some([unmatched.clone()].into_iter().collect())
+        );
+        let options = data.pipeline_options_for_run(0);
+        assert_eq!(
+            options.search_accuracy,
+            align_core::SearchAccuracy::Balanced
+        );
+        assert_eq!(
+            options.search_overrides.get(&matched),
+            Some(&align_core::SearchAccuracy::Fast)
+        );
+        assert_eq!(
+            options.search_overrides.get(&unmatched),
+            Some(&align_core::SearchAccuracy::Deep)
+        );
+    }
+
+    #[test]
+    fn quality_change_does_not_stale_a_fully_matched_result() {
+        let mut data = AppData::default();
+        data.add_paths(vec![PathBuf::from("/v/a.wav")]);
+        let result = empty_sequence_result("Complete");
+        data.result = Some(result.clone());
+        data.sequence_results = vec![result];
+        data.operation = Operation::Ready;
+
+        data.mark_quality_dirty();
+        assert!(!data.can_synchronize());
+        assert!(data.can_export());
     }
 
     #[test]
