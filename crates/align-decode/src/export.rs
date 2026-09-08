@@ -139,6 +139,9 @@ pub struct ExportRequest<'a> {
     pub correct_drift: bool,
     pub include_replaced_sequence: bool,
     pub include_media_files: bool,
+    /// Override the AAF composition timecode rate used by Resolve. Picture
+    /// source slots retain their native edit rates.
+    pub aaf_frame_duration: Option<align_core::MediaTime>,
     pub include_fcpxml_timeline: bool,
     pub include_fcpxml_multicam: bool,
     pub group_fcpxml_storylines: bool,
@@ -156,6 +159,7 @@ pub struct ExportBatchRequest<'a> {
     pub correct_drift: bool,
     pub include_replaced_sequence: bool,
     pub include_media_files: bool,
+    pub aaf_frame_duration: Option<align_core::MediaTime>,
     pub include_fcpxml_timeline: bool,
     pub include_fcpxml_multicam: bool,
     pub group_fcpxml_storylines: bool,
@@ -181,6 +185,7 @@ pub fn export_prepared_many(
                 correct_drift: request.correct_drift,
                 include_replaced_sequence: request.include_replaced_sequence,
                 include_media_files: request.include_media_files,
+                aaf_frame_duration: request.aaf_frame_duration,
                 include_fcpxml_timeline: request.include_fcpxml_timeline,
                 include_fcpxml_multicam: request.include_fcpxml_multicam,
                 group_fcpxml_storylines: request.group_fcpxml_storylines,
@@ -212,6 +217,7 @@ pub fn export_prepared_many(
                     correct_drift: request.correct_drift,
                     include_replaced_sequence: request.include_replaced_sequence,
                     include_media_files: request.include_media_files,
+                    aaf_frame_duration: request.aaf_frame_duration,
                     include_fcpxml_timeline: request.include_fcpxml_timeline,
                     include_fcpxml_multicam: request.include_fcpxml_multicam,
                     group_fcpxml_storylines: request.group_fcpxml_storylines,
@@ -230,6 +236,7 @@ pub fn export_prepared_many(
                     correct_drift: request.correct_drift,
                     include_replaced_sequence: request.include_replaced_sequence,
                     include_media_files: request.include_media_files,
+                    aaf_frame_duration: request.aaf_frame_duration,
                     include_fcpxml_timeline: request.include_fcpxml_timeline,
                     include_fcpxml_multicam: request.include_fcpxml_multicam,
                     group_fcpxml_storylines: request.group_fcpxml_storylines,
@@ -336,6 +343,7 @@ fn export_prepared_internal(
         correct_drift,
         include_replaced_sequence,
         include_media_files,
+        aaf_frame_duration,
         include_fcpxml_timeline,
         include_fcpxml_multicam,
         group_fcpxml_storylines,
@@ -717,8 +725,9 @@ fn export_prepared_internal(
     )?;
     let mut deferred_aaf = None;
     if wants_aaf {
-        let manifest = crate::aaf::timeline_manifest(&corrected, cancel)
-            .map_err(|e| ExportError::Io(e.to_string()))?;
+        let manifest =
+            crate::aaf::timeline_manifest_with_frame_rate(&corrected, aaf_frame_duration, cancel)
+                .map_err(|e| ExportError::Io(e.to_string()))?;
         if defer_aaf {
             deferred_aaf = Some(manifest);
         } else {
@@ -1205,6 +1214,7 @@ mod tests {
                     correct_drift: false,
                     include_replaced_sequence: false,
                     include_media_files: false,
+                    aaf_frame_duration: None,
                     include_fcpxml_timeline: true,
                     include_fcpxml_multicam: true,
                     group_fcpxml_storylines: false,
@@ -1305,6 +1315,7 @@ mod tests {
                 correct_drift: false,
                 include_replaced_sequence: false,
                 include_media_files: false,
+                aaf_frame_duration: None,
                 include_fcpxml_timeline: true,
                 include_fcpxml_multicam: true,
                 group_fcpxml_storylines: false,
@@ -1391,6 +1402,7 @@ mod tests {
                 correct_drift: false,
                 include_replaced_sequence: false,
                 include_media_files: false,
+                aaf_frame_duration: None,
                 include_fcpxml_timeline: true,
                 include_fcpxml_multicam: true,
                 group_fcpxml_storylines: false,

@@ -700,6 +700,7 @@ impl AlignApp {
         let storylines = self.data.export_storylines;
         let fcpxml_timeline = self.data.export_fcpxml_timeline;
         let fcpxml_multicam = self.data.export_fcpxml_multicam;
+        let aaf_frame_duration = self.data.export_aaf_frame_duration;
         let media = self.data.export_media;
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<ExportMsg>();
         std::thread::spawn(move || {
@@ -730,6 +731,7 @@ impl AlignApp {
                     correct_drift: drift,
                     include_replaced_sequence: replaced,
                     include_media_files: media,
+                    aaf_frame_duration,
                     include_fcpxml_timeline: fcpxml_timeline,
                     include_fcpxml_multicam: fcpxml_multicam,
                     group_fcpxml_storylines: storylines,
@@ -4040,6 +4042,47 @@ fn export_sheet(
                     cx.notify();
                 },
             ));
+            settings = settings.child(group);
+        }
+        if data.export_selected.contains(&ExportTarget::Aaf) {
+            let mut group = div().flex().flex_col().gap_1();
+            group = group.child(export_section_title(theme, "Resolve AAF frame rate"));
+            for (id, frame_duration, title) in [
+                ("auto", None, "Automatic"),
+                (
+                    "23976",
+                    Some(align_core::MediaTime::new(1001, 24_000)),
+                    "23.976",
+                ),
+                ("24", Some(align_core::MediaTime::new(1, 24)), "24"),
+                ("25", Some(align_core::MediaTime::new(1, 25)), "25"),
+                (
+                    "2997",
+                    Some(align_core::MediaTime::new(1001, 30_000)),
+                    "29.97",
+                ),
+                ("30", Some(align_core::MediaTime::new(1, 30)), "30"),
+                ("50", Some(align_core::MediaTime::new(1, 50)), "50"),
+                (
+                    "5994",
+                    Some(align_core::MediaTime::new(1001, 60_000)),
+                    "59.94",
+                ),
+                ("60", Some(align_core::MediaTime::new(1, 60)), "60"),
+            ] {
+                group = group.child(choice_row(
+                    cx,
+                    theme,
+                    format!("exp-aaf-fps-{id}"),
+                    data.export_aaf_frame_duration == frame_duration,
+                    title.to_string(),
+                    !busy,
+                    move |this, _, _, cx| {
+                        this.data.export_aaf_frame_duration = frame_duration;
+                        cx.notify();
+                    },
+                ));
+            }
             settings = settings.child(group);
         }
         // Timeline assembly.

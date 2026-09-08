@@ -175,6 +175,10 @@ cargo build --release -p align-cli -p align-gpui
    эффекты, переходы и изменение скорости; неподдерживаемые конструкции
    завершаются явной ошибкой. Проверки: `script/check-aaf-smoke.py`,
    `script/check-aaf-picture-smoke.py`, `script/check-aaf-embedded-smoke.py`.
+   Для неоднозначных проектов Resolve GUI и CLI предлагают Automatic либо
+   явный AAF timeline FPS: 23.976, 24, 25, 29.97, 30, 50, 59.94 или 60.
+   Override меняет только composition timecode; исходные picture edit rates
+   сохраняются без retime (см. work/AAF-FPS-OVERRIDE-ACCEPTANCE.md).
    R21 включает `ffprobe`: экспорт и повторный импорт видео AAF проверены
    с пустым PATH, без системного FFmpeg и Python.
 
@@ -197,6 +201,7 @@ cargo run --release -p align-gpui
 ./target/release/align-cli export --unmatched order-only --disable-unmatched --prevent-group-overlaps /path/to/output /path/to/media
 ./target/release/align-cli export --time-source timecode --match-threshold conservative --clip-order by-file-name /path/to/output /path/to/media
 ./target/release/align-cli export --no-drift --replaced-audio /path/to/output /path/to/media
+./target/release/align-cli export --aaf --aaf-fps 25 /path/to/output /path/to/project.aaf
 ./target/release/align-cli export --no-fcpxml-multicam --label-synced --synced-symbol '[SYNCED]' --synced-color Iris --synced-role dialogue /path/to/output /path/to/media
 ./target/release/align-cli export --no-fcpxml-timeline /path/to/output /path/to/media
 ./target/release/align-cli export --export-media /path/to/output /path/to/media

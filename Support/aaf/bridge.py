@@ -73,13 +73,19 @@ def write_composition(container, document):
     composition = container.create.CompositionMob(document['name'])
     composition.usage = 'Usage_TopLevel'
     container.content.mobs.append(composition)
-    if picture_tracks:
+    clock = document.get('composition_edit_rate')
+    if clock is None and picture_tracks:
         clock = picture_tracks[0]['edit_rate']
+    if clock is not None:
         rate = Fraction(integer(clock['numerator'], 'numerator', 1),
             integer(clock['denominator'], 'denominator', 1))
-        duration = max((Fraction(clip['start'] + clip['length']) /
+        picture_ends = (Fraction(clip['start'] + clip['length']) /
             Fraction(track['edit_rate']['numerator'], track['edit_rate']['denominator'])
-            for track in picture_tracks for clip in track['clips']), default=Fraction(0))
+            for track in picture_tracks for clip in track['clips'])
+        sound_ends = (Fraction(clip['start'] + clip['length'], track['sample_rate'])
+            for track in tracks for clip in track['clips'])
+        duration = max(max(picture_ends, default=Fraction(0)),
+            max(sound_ends, default=Fraction(0)))
         frames = duration * rate
         timecode = composition.create_timeline_slot(str(rate))
         timecode.name = 'Timecode'

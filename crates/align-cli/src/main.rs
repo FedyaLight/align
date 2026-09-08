@@ -48,6 +48,9 @@ enum Command {
         /// Export linked picture and audio AAF tracks (requires the bundled align-aaf module).
         #[arg(long)]
         aaf: bool,
+        /// Override the Resolve timeline frame rate stored in AAF timecode.
+        #[arg(long, value_enum, default_value_t = AafFps::Auto)]
+        aaf_fps: AafFps,
         #[arg(long)]
         replaced_audio: bool,
         /// Group FCPXML tracks into separate storylines.
@@ -93,6 +96,9 @@ enum Command {
         /// Export linked picture and audio AAF tracks (requires the bundled align-aaf module).
         #[arg(long)]
         aaf: bool,
+        /// Override the Resolve timeline frame rate stored in AAF timecode.
+        #[arg(long, value_enum, default_value_t = AafFps::Auto)]
+        aaf_fps: AafFps,
         #[arg(long)]
         replaced_audio: bool,
         /// Group FCPXML tracks into separate storylines.
@@ -444,6 +450,45 @@ enum TrackContent {
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum AafFps {
+    #[default]
+    Auto,
+    #[value(name = "23.976")]
+    Fps23976,
+    #[value(name = "24")]
+    Fps24,
+    #[value(name = "25")]
+    Fps25,
+    #[value(name = "29.97")]
+    Fps2997,
+    #[value(name = "30")]
+    Fps30,
+    #[value(name = "50")]
+    Fps50,
+    #[value(name = "59.94")]
+    Fps5994,
+    #[value(name = "60")]
+    Fps60,
+}
+
+impl AafFps {
+    fn frame_duration(self) -> Option<align_core::MediaTime> {
+        let (value, timescale) = match self {
+            Self::Auto => return None,
+            Self::Fps23976 => (1001, 24_000),
+            Self::Fps24 => (1, 24),
+            Self::Fps25 => (1, 25),
+            Self::Fps2997 => (1001, 30_000),
+            Self::Fps30 => (1, 30),
+            Self::Fps50 => (1, 50),
+            Self::Fps5994 => (1001, 60_000),
+            Self::Fps60 => (1, 60),
+        };
+        Some(align_core::MediaTime::new(value, timescale))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
 enum Unmatched {
     #[default]
     OrderTime,
@@ -671,6 +716,7 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
             all_sequences,
             no_drift,
             aaf,
+            aaf_fps,
             replaced_audio,
             fcpxml_storylines,
             no_fcpxml_timeline,
@@ -769,6 +815,7 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
                     correct_drift: !no_drift,
                     include_replaced_sequence: replaced_audio,
                     include_media_files: export_media,
+                    aaf_frame_duration: aaf_fps.frame_duration(),
                     include_fcpxml_timeline: !no_fcpxml_timeline,
                     include_fcpxml_multicam: !no_fcpxml_multicam,
                     group_fcpxml_storylines: fcpxml_storylines,
@@ -782,6 +829,7 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
             stage,
             no_drift,
             aaf,
+            aaf_fps,
             replaced_audio,
             fcpxml_storylines,
             no_fcpxml_timeline,
@@ -844,6 +892,7 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
                     correct_drift: !no_drift,
                     include_replaced_sequence: replaced_audio,
                     include_media_files: export_media,
+                    aaf_frame_duration: aaf_fps.frame_duration(),
                     include_fcpxml_timeline: !no_fcpxml_timeline,
                     include_fcpxml_multicam: !no_fcpxml_multicam,
                     group_fcpxml_storylines: fcpxml_storylines,
@@ -910,6 +959,7 @@ mod tests {
             settings,
             no_drift,
             aaf,
+            aaf_fps,
             replaced_audio,
             fcpxml_storylines,
             no_fcpxml_timeline,
@@ -939,6 +989,7 @@ mod tests {
             align_core::TrackContent::Linear
         );
         assert!(!aaf);
+        assert_eq!(aaf_fps.frame_duration(), None);
         assert!(no_drift);
         assert!(replaced_audio);
         assert!(!fcpxml_storylines);
@@ -950,6 +1001,39 @@ mod tests {
         assert_eq!(assign.synced_symbol.as_deref(), Some("✓"));
         assert_eq!(assign.synced_color.as_deref(), Some("Iris"));
         assert_eq!(assign.synced_role.as_deref(), Some("dialogue.interview"));
+    }
+
+    #[test]
+    fn aaf_frame_rate_values_are_exact() {
+        assert_eq!(
+            AafFps::Fps23976.frame_duration(),
+            Some(align_core::MediaTime::new(1001, 24_000))
+        );
+        assert_eq!(
+            AafFps::Fps2997.frame_duration(),
+            Some(align_core::MediaTime::new(1001, 30_000))
+        );
+        assert_eq!(
+            AafFps::Fps5994.frame_duration(),
+            Some(align_core::MediaTime::new(1001, 60_000))
+        );
+        let cli = Cli::try_parse_from([
+            "align-cli",
+            "export-json",
+            "--aaf",
+            "--aaf-fps",
+            "29.97",
+            "/tmp/result.json",
+            "/tmp/out",
+        ])
+        .expect("AAF frame rate");
+        assert!(matches!(
+            cli.command,
+            Some(Command::ExportJson {
+                aaf_fps: AafFps::Fps2997,
+                ..
+            })
+        ));
     }
 
     #[test]

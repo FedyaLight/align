@@ -518,8 +518,27 @@ pub fn timeline_manifest(
     timeline: &align_core::export::ExportTimeline,
     cancel: &AtomicBool,
 ) -> Result<serde_json::Value, AafError> {
+    timeline_manifest_with_frame_rate(timeline, None, cancel)
+}
+
+/// Assemble an AAF manifest with an optional composition timecode rate.
+/// Picture tracks keep their native edit rates; the override only supplies
+/// the top-level clock Resolve uses when creating its timeline.
+pub fn timeline_manifest_with_frame_rate(
+    timeline: &align_core::export::ExportTimeline,
+    frame_duration: Option<align_core::MediaTime>,
+    cancel: &AtomicBool,
+) -> Result<serde_json::Value, AafError> {
     use serde_json::json;
     let fail = |message: &str| AafError::Writer(message.into());
+    let composition_edit_rate = frame_duration
+        .map(|frame| {
+            if frame.value <= 0 || frame.timescale <= 0 {
+                return Err(fail("Invalid AAF frame-rate override"));
+            }
+            Ok(json!({"numerator":frame.timescale,"denominator":frame.value}))
+        })
+        .transpose()?;
     let mut audio = timeline.clone();
     for island in &mut audio.islands {
         island
@@ -631,7 +650,10 @@ pub fn timeline_manifest(
             lanes.push(track);
         }
     }
-    Ok(json!({"version":2,"name":timeline.name,"tracks":tracks,"picture_tracks":lanes}))
+    Ok(
+        json!({"version":2,"name":timeline.name,"tracks":tracks,"picture_tracks":lanes,
+        "composition_edit_rate":composition_edit_rate}),
+    )
 }
 
 #[cfg(test)]
@@ -866,6 +888,16 @@ mod tests {
         assert_eq!(
             manifest.tracks[2].clips[0].path,
             PathBuf::from("/stems/right.wav")
+        );
+        let overridden = timeline_manifest_with_frame_rate(
+            &timeline,
+            Some(MediaTime::new(1001, 30000)),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            overridden["composition_edit_rate"],
+            serde_json::json!({"numerator":30000,"denominator":1001})
         );
     }
     #[test]

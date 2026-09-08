@@ -69,10 +69,19 @@ with aaf2.open(artifacts[0]['url']) as container:
     assert [str(slot.edit_rate) for slot in slots] == ['30000/1001', '48000', '48000']
     assert [slot.segment.length for slot in slots] == [100, 160160, 160160]
     assert len(slots[0].segment.components) == 2
+override = run(['export-json', '--aaf', '--aaf-fps', '25', '--no-drift',
+    root / 'sync.json', root / 'export-25'], 'export-25')
+with aaf2.open(override[0]['url']) as container:
+    all_slots = list(next(container.content.toplevel()).slots)
+    timecode = next(slot for slot in all_slots if slot.media_kind == 'Timecode')
+    picture = next(slot for slot in all_slots if slot.media_kind == 'Picture')
+    assert str(timecode.edit_rate) == '25' and timecode.segment.length == 84
+    assert str(picture.edit_rate) == '30000/1001' and picture.segment.length == 100
 readback = run(['sync', artifacts[0]['url']], 'readback')
 assert len(readback['project']['importedTimeline']['edits']) == 4
 assert not readback['project']['warnings']
 (root / 'verification.json').write_text(json.dumps({'passed': True,
     'isolated_runtime': args.isolated_runtime,
     'picture_rate': '30000/1001', 'picture_frames': 100, 'sound_tracks': 2,
-    'sound_samples': 160160}, indent=2) + '\n')
+    'sound_samples': 160160, 'override_timecode_rate': '25',
+    'override_picture_rate': '30000/1001'}, indent=2) + '\n')

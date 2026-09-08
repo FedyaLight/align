@@ -1425,8 +1425,11 @@ mod tests {
         assert_eq!(count, 2);
         assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
         let fixed = std::fs::read_to_string(destination).unwrap();
-        assert!(fixed.contains(&format!("file://{}", media.join("A.wav").display())));
-        assert!(fixed.contains(&format!("file://{}", media.join("B.wav").display())));
+        // Rewritten file URLs use URL separators and the RFC form
+        // `file:///C:/...` on Windows, rather than Path::display's `C:\\...`.
+        assert!(fixed.contains("/found/A.wav</pathurl>"));
+        assert!(fixed.contains("/found/B.wav</pathurl>"));
+        assert!(!fixed.contains("/gone/"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1858,6 +1861,7 @@ mod tests {
                     correct_drift: true,
                     include_replaced_sequence: false,
                     include_media_files: false,
+                    aaf_frame_duration: None,
                     include_fcpxml_timeline: true,
                     include_fcpxml_multicam: true,
                     group_fcpxml_storylines: false,

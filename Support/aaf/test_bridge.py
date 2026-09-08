@@ -239,6 +239,17 @@ class SourceValidation(unittest.TestCase):
             clip = track['clips'][0]
             self.assertEqual((clip['start'], clip['source_in'], clip['length']), (7, 11, 101))
             self.assertEqual(Path(clip['path']), media.resolve())
+            overridden = copy.deepcopy(document)
+            overridden['composition_edit_rate'] = {'numerator': 25, 'denominator': 1}
+            override_output = Path(directory) / 'picture-25.aaf'
+            write_audio(overridden, override_output)
+            with aaf2.open(str(override_output)) as container:
+                top = next(container.content.toplevel())
+                timecode = next(slot for slot in top.slots if slot.media_kind == 'Timecode')
+                picture = next(slot for slot in top.slots if slot.media_kind == 'Picture')
+                self.assertEqual(str(timecode.edit_rate), '25')
+                self.assertEqual(timecode.segment.length, 91)
+                self.assertEqual(str(picture.edit_rate), '30000/1001')
             original = output.read_bytes()
             document['picture_tracks'][0]['clips'][0]['length'] = 121
             with self.assertRaises(ValueError):
