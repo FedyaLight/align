@@ -1,9 +1,8 @@
 //! GPUI views: faithful layout port of the SwiftUI app.
 //!
-//! Structure mirrors `ContentView`: toolbar (Add / Delete / diagnostics),
-//! diagnostics), main content (drop zone → source list → timeline
-//! preview), warning banner, bottom operation bar, plus overlays for the
-//! export sheet, alert, diagnostics, warning details and sequence picker.
+//! Structure mirrors `ContentView`: top actions, main content (drop zone →
+//! source list → timeline preview), warning banner, bottom status/zoom bar,
+//! the export sidebar, and modal alerts and settings.
 //! Interactive elements carry `.id()` and dispatch via `cx.listener`.
 
 use std::collections::HashMap;
@@ -66,6 +65,7 @@ fn slide_in<E: IntoElement + Styled + 'static>(
     let reduced = super::motion::reduced_motion();
     super::motion::Slide {
         child: Some(child),
+        x: 0.,
         y: 0.,
     }
     .with_animation(
@@ -80,6 +80,27 @@ fn slide_in<E: IntoElement + Styled + 'static>(
             el
         },
     )
+}
+
+fn slide_in_from_right<E: IntoElement + Styled + 'static>(
+    child: E,
+    id: impl Into<gpui::ElementId>,
+    distance: f32,
+) -> impl IntoElement {
+    let reduced = super::motion::reduced_motion();
+    super::motion::Slide {
+        child: Some(child),
+        x: distance,
+        y: 0.,
+    }
+    .with_animation(id, entrance(280), move |mut el, progress| {
+        el.x = if reduced {
+            0.
+        } else {
+            distance * (1. - progress)
+        };
+        el
+    })
 }
 
 #[cfg(test)]
@@ -1103,11 +1124,11 @@ impl Render for AlignApp {
         // its layout but loses hover/cursor feedback (clicks are already
         // swallowed by the overlay layers).
         let content_active = self.data.menu.is_none()
-            && !self.data.show_export
             && !self.data.show_path_fixer
             && self.data.error.is_none()
             && self.data.sequence_picker.is_none()
             && !self.data.show_about
+            && !self.data.show_search_quality
             && !self.data.show_search_settings
             && !self.data.show_stage_settings
             && !self.data.show_sequence_results;
@@ -1143,6 +1164,11 @@ impl Render for AlignApp {
                     && !matches!(this.data.operation, Operation::Exporting)
                 {
                     this.data.show_export = false;
+                    cx.notify();
+                    return;
+                }
+                if key == "escape" && this.data.show_search_quality {
+                    this.data.show_search_quality = false;
                     cx.notify();
                     return;
                 }
@@ -1208,7 +1234,7 @@ impl Render for AlignApp {
         }
         // No bottom bar over the empty drop zone either.
         if !self.data.clips.is_empty() {
-            root = root.child(operation_bar(cx, &theme, &self.data));
+            root = root.child(operation_bar(cx, &theme, &self.data, content_active));
         }
         if let Some(picker) = self.data.sequence_picker.clone() {
             root = root.child(overlay(
@@ -1233,6 +1259,19 @@ impl Render for AlignApp {
                     .child(context_menu(cx, &theme, &self.data, menu)),
             ));
         }
+        if self.data.show_export {
+            root = root.child(export_sidebar(export_sheet(
+                cx,
+                &theme,
+                &self.data,
+                &self.export_inputs,
+                (f32::from(window.viewport_size().height) - 96.).max(200.),
+            )));
+        }
+        if self.data.show_search_quality {
+            root = root.child(search_quality_dismiss_layer(cx));
+            root = root.child(search_quality_menu(cx, &theme, &self.data));
+        }
         if self.data.show_stage_settings {
             root = root.child(overlay(
                 &theme,
@@ -1252,19 +1291,6 @@ impl Render for AlignApp {
                 &theme,
                 "overlay-search",
                 search_settings_panel(cx, &theme, &self.data),
-            ));
-        }
-        if self.data.show_export {
-            root = root.child(overlay(
-                &theme,
-                "overlay-export",
-                export_sheet(
-                    cx,
-                    &theme,
-                    &self.data,
-                    &self.export_inputs,
-                    (f32::from(window.viewport_size().height) - 64.).max(200.),
-                ),
             ));
         }
         if self.data.show_path_fixer {
@@ -1294,7 +1320,7 @@ impl Render for AlignApp {
     }
 }
 
-// ---------------- toolbar (Add / Delete / diagnostics)
+// ---------------- top toolbar (sources / sync / export)
 
 fn toolbar(
     cx: &mut Context<AlignApp>,
@@ -1303,6 +1329,10 @@ fn toolbar(
     active: bool,
 ) -> impl IntoElement {
     let live = matches!(data.operation, super::state::Operation::Synchronizing);
+    let busy = matches!(
+        data.operation,
+        Operation::Synchronizing | Operation::Exporting | Operation::Repairing
+    );
     let has_timeline = !data.lanes.is_empty();
     let mut bar = div()
         .flex()
@@ -1366,28 +1396,85 @@ fn toolbar(
             if data.clips.len() == 1 { "" } else { "s" }
         )));
     }
-    // Timeline section (only once there is something to preview).
-    if has_timeline {
-        bar = bar.child(icon_button(
+    bar = bar.child(div().w(px(8.)).flex_shrink_0());
+    bar = bar.child(button(
+        cx,
+        theme,
+        "btn-search-quality",
+        format!(
+            "Quality: {}  ▾",
+            data.current_effective_settings().search_accuracy.label()
+        ),
+        active && !busy,
+        |this, _, _, cx| {
+            this.data.show_search_quality = !this.data.show_search_quality;
+            cx.notify();
+        },
+    ));
+    bar = bar.child(button(
+        cx,
+        theme,
+        "btn-sync-bar",
+        "Synchronize",
+        active && data.can_synchronize(),
+        |this, _, _, cx| this.start_sync(cx),
+    ));
+    if data.has_result() && !data.is_stale() {
+        let enabled = active
+            && if data.show_export {
+                data.can_begin_export()
+            } else {
+                data.can_export()
+            };
+        bar = bar.child(prominent_button(
+            cx,
+            theme,
+            "btn-export-bar",
+            "Export",
+            enabled,
+            |this, _, _, cx| {
+                if this.data.show_export {
+                    this.begin_export(cx);
+                } else {
+                    this.start_export_sheet(cx);
+                }
+            },
+        ));
+    }
+    bar
+}
+
+fn timeline_zoom_controls(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    data: &super::state::AppData,
+    active: bool,
+) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .child(icon_button(
             cx,
             theme,
             "zoom-fit",
             icons().fit.clone(),
             "Zoom to fit",
-            data.zoom_level > 0.001,
+            active && data.zoom_level > 0.001,
             |this, _, _, cx| {
                 this.data.zoom_at(0.0, 0.0);
                 this.data.pan_to(Some(0.0), None);
                 cx.notify();
             },
-        ));
-        bar = bar.child(icon_button(
+        ))
+        .child(icon_button(
             cx,
             theme,
             "zoom-out",
             icons().zoom_out.clone(),
             "Zoom out",
-            data.zoom_level > 0.0,
+            active && data.zoom_level > 0.0,
             |this, _, _, cx| {
                 let bounds = this.data.timeline_scroll.bounds();
                 let anchor = f32::from(bounds.size.width) * 0.5;
@@ -1395,15 +1482,15 @@ fn toolbar(
                     .zoom_at((this.data.zoom_level - 0.2).max(0.0), anchor);
                 cx.notify();
             },
-        ));
-        bar = bar.child(zoom_slider(cx, theme, data, active));
-        bar = bar.child(icon_button(
+        ))
+        .child(zoom_slider(cx, theme, data, active))
+        .child(icon_button(
             cx,
             theme,
             "zoom-in",
             icons().zoom_in.clone(),
             "Zoom in",
-            data.zoom_level < 1.0,
+            active && data.zoom_level < 1.0,
             |this, _, _, cx| {
                 let bounds = this.data.timeline_scroll.bounds();
                 let anchor = f32::from(bounds.size.width) * 0.5;
@@ -1411,9 +1498,8 @@ fn toolbar(
                     .zoom_at((this.data.zoom_level + 0.2).min(1.0), anchor);
                 cx.notify();
             },
-        ));
-        // Fixed width: the percent must not reflow the toolbar while zooming.
-        bar = bar.child(
+        ))
+        .child(
             div()
                 .w(px(48.))
                 .flex_shrink_0()
@@ -1422,9 +1508,7 @@ fn toolbar(
                 .justify_end()
                 .text_color(rgb(theme.dim))
                 .child(data.zoom_label()),
-        );
-    }
-    bar
+        )
 }
 
 // ---------------- main content (drop zone → file list → timeline)
@@ -2160,6 +2244,7 @@ fn operation_bar(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &super::state::AppData,
+    active: bool,
 ) -> impl IntoElement {
     use super::state::Operation;
     let busy = matches!(
@@ -2231,21 +2316,6 @@ fn operation_bar(
             |this, _, _, cx| this.cancel_current(cx),
         ));
     } else {
-        bar = bar.child(button(
-            cx,
-            theme,
-            "btn-search-settings",
-            format!(
-                "Sync settings: {}",
-                data.current_effective_settings().search_accuracy.label()
-            ),
-            true,
-            |this, _, _, cx| {
-                this.data.show_search_settings = true;
-                this.data.settings_changed = false;
-                cx.notify();
-            },
-        ));
         if let Some(result) = &data.result {
             if result.stages.len() > 1 {
                 bar = bar.child(button(
@@ -2287,7 +2357,7 @@ fn operation_bar(
                 },
             ));
         }
-        if !data.exported_files.is_empty() {
+        if !data.exported_files.is_empty() && !data.show_export {
             bar = bar.child(button(
                 cx,
                 theme,
@@ -2317,33 +2387,9 @@ fn operation_bar(
                 },
             ));
         }
-        if data.can_export() {
-            bar = bar.child(button(
-                cx,
-                theme,
-                "btn-sync-bar",
-                "Synchronize",
-                data.can_synchronize(),
-                |this, _, _, cx| this.start_sync(cx),
-            ));
-            bar = bar.child(prominent_button(
-                cx,
-                theme,
-                "btn-export-bar",
-                "Export",
-                true,
-                |this, _, _, cx| this.start_export_sheet(cx),
-            ));
-        } else {
-            bar = bar.child(prominent_button(
-                cx,
-                theme,
-                "btn-sync-bar",
-                "Synchronize",
-                data.can_synchronize(),
-                |this, _, _, cx| this.start_sync(cx),
-            ));
-        }
+    }
+    if !data.lanes.is_empty() {
+        bar = bar.child(timeline_zoom_controls(cx, theme, data, active && !busy));
     }
     bar
 }
@@ -2526,6 +2572,89 @@ fn scoped_label<T: Copy>(value: Option<T>, common: T, label: impl Fn(T) -> &'sta
     value.map_or_else(
         || format!("Inherit ({})", label(common)),
         |value| label(value).to_string(),
+    )
+}
+
+fn search_quality_dismiss_layer(cx: &mut Context<AlignApp>) -> impl IntoElement {
+    div()
+        .absolute()
+        .top(px(0.))
+        .left(px(0.))
+        .size_full()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                this.data.show_search_quality = false;
+                cx.notify();
+                cx.stop_propagation();
+            }),
+        )
+}
+
+fn search_quality_menu(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    data: &super::state::AppData,
+) -> impl IntoElement {
+    let selected = data.current_effective_settings().search_accuracy;
+    let right = if data.has_result() && !data.is_stale() {
+        177.
+    } else {
+        110.
+    };
+    let mut menu = div()
+        .id("search-quality-menu")
+        .absolute()
+        .top(px(43.))
+        .right(px(right))
+        .w(px(196.))
+        .flex()
+        .flex_col()
+        .p_1()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(theme.border))
+        .bg(rgb(theme.panel))
+        .shadow_md()
+        .child(menu_header(theme, "Synchronization quality".to_string()));
+    for (index, accuracy) in align_core::SearchAccuracy::ALL.into_iter().enumerate() {
+        let label = if accuracy == selected {
+            format!("✓ {}", accuracy.label())
+        } else {
+            accuracy.label().to_string()
+        };
+        menu = menu.child(menu_row(
+            cx,
+            theme,
+            format!("search-quality-{index}"),
+            label,
+            false,
+            move |this, _, _, cx| {
+                this.data.set_scoped_search_accuracy(Some(accuracy));
+                this.data.show_search_quality = false;
+                cx.notify();
+            },
+        ));
+    }
+    menu.child(
+        div()
+            .mt_1()
+            .pt_1()
+            .border_t_1()
+            .border_color(rgb(theme.separator))
+            .child(menu_row(
+                cx,
+                theme,
+                "search-settings-more",
+                "More settings…",
+                false,
+                |this, _, _, cx| {
+                    this.data.show_search_quality = false;
+                    this.data.show_search_settings = true;
+                    this.data.settings_changed = false;
+                    cx.notify();
+                },
+            )),
     )
 }
 
@@ -3895,13 +4024,29 @@ fn path_fixer_panel(
     )
 }
 
+fn export_sidebar(panel: Stateful<Div>) -> impl IntoElement {
+    div()
+        .id("export-sidebar")
+        .absolute()
+        .top(px(48.))
+        .right(px(0.))
+        .bottom(px(48.))
+        .w(px(440.))
+        .cursor_default()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .child(slide_in_from_right(panel, "export-sidebar-slide", 440.))
+}
+
 fn export_sheet(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &super::state::AppData,
     inputs: &ExportInputs,
     max_height: f32,
-) -> impl IntoElement {
+) -> Stateful<Div> {
     use super::state::{ExportTarget, Operation};
     let busy = matches!(data.operation, Operation::Exporting);
     let done = matches!(data.operation, Operation::Exported) && data.export_started;
@@ -3909,15 +4054,13 @@ fn export_sheet(
         .id("export-sheet")
         .flex()
         .flex_col()
-        .gap_4()
-        .p_5()
-        .m_4()
-        .w(px(740.))
-        .max_h(px(max_height))
+        .gap_3()
+        .p_4()
+        .w(px(440.))
+        .h(px(max_height))
         .flex_shrink_0()
         .overflow_hidden()
-        .rounded_lg()
-        .border_1()
+        .border_l_1()
         .border_color(rgb(theme.separator))
         .bg(rgb(theme.panel))
         .shadow_md();
@@ -3959,22 +4102,18 @@ fn export_sheet(
         sheet = sheet.child(row);
     }
     let mut columns = div()
+        .id("export-sidebar-scroll")
         .flex()
-        .gap_5()
-        .h(px((max_height - 180.).max(100.)))
-        .min_h(px(0.));
+        .flex_col()
+        .gap_4()
+        .flex_1()
+        .min_h(px(0.))
+        .overflow_y_scroll()
+        .pb_2();
     let mut settings = div().flex().flex_col().gap_3();
     // Formats.
     {
-        let mut group = div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .w(px(270.))
-            .flex_shrink_0()
-            .pr_4()
-            .border_r_1()
-            .border_color(rgb(theme.separator));
+        let mut group = div().flex().flex_col().gap_1().flex_shrink_0();
         group = group.child(export_section_title(theme, "Formats"));
         for target in ExportTarget::all() {
             let active = data.export_selected.contains(&target);
@@ -4376,16 +4515,7 @@ fn export_sheet(
         }
         settings = settings.child(group);
     }
-    columns = columns.child(
-        div()
-            .id("export-settings")
-            .flex_1()
-            .min_w(px(0.))
-            .h_full()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .child(settings),
-    );
+    columns = columns.child(div().id("export-settings").min_w(px(0.)).child(settings));
     sheet = sheet.child(columns);
     // Progress / completion.
     if data.export_started && busy {
@@ -4418,8 +4548,9 @@ fn export_sheet(
                 .child("Export complete"),
         );
     }
-    // Buttons.
-    {
+    // Sidebar actions. In-flight cancellation stays in the persistent
+    // operation bar so it is not duplicated here.
+    if !busy {
         let mut row = div()
             .flex()
             .flex_row()
@@ -4428,21 +4559,12 @@ fn export_sheet(
             .pt_3()
             .border_t_1()
             .border_color(rgb(theme.separator));
-        if busy {
-            row = row.child(button(
-                cx,
-                theme,
-                "exp-cancel",
-                "Cancel",
-                true,
-                |this, _, _, cx| this.cancel_current(cx),
-            ));
-        } else if !done {
+        if !done {
             row = row.child(button(
                 cx,
                 theme,
                 "exp-dismiss",
-                "Cancel",
+                "Close",
                 true,
                 |this, _, _, cx| {
                     this.data.show_export = false;
@@ -4473,16 +4595,6 @@ fn export_sheet(
                     this.data.show_export = false;
                     cx.notify();
                 },
-            ));
-        } else {
-            let can_go = data.can_begin_export();
-            row = row.child(prominent_button(
-                cx,
-                theme,
-                "exp-go",
-                "Export",
-                can_go,
-                |this, _, _, cx| this.begin_export(cx),
             ));
         }
         sheet = sheet.child(row);

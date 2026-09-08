@@ -6,6 +6,7 @@ use gpui::{
 
 pub struct Slide<E> {
     pub child: Option<E>,
+    pub x: f32,
     pub y: f32,
 }
 
@@ -48,7 +49,7 @@ impl<E: IntoElement + 'static> Element for Slide<E> {
         window: &mut Window,
         cx: &mut App,
     ) {
-        window.with_element_offset(point(px(0.), px(self.y)), |window| {
+        window.with_element_offset(point(px(self.x), px(self.y)), |window| {
             child.prepaint(window, cx);
         });
     }

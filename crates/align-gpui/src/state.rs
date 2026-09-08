@@ -235,6 +235,7 @@ pub struct AppData {
     pub settings_scope: SettingsScope,
     pub settings_changed: bool,
     track_overrides: HashMap<usize, TrackOverrides>,
+    pub show_search_quality: bool,
     pub show_search_settings: bool,
     pub show_stage_settings: bool,
     pub show_sequence_results: bool,
@@ -319,6 +320,7 @@ impl Default for AppData {
             settings_scope: Default::default(),
             settings_changed: false,
             track_overrides: HashMap::new(),
+            show_search_quality: false,
             show_search_settings: false,
             show_stage_settings: false,
             show_sequence_results: false,
@@ -813,6 +815,7 @@ impl AppData {
         self.menu = None;
         self.show_export = false;
         self.show_stage_settings = false;
+        self.show_search_quality = false;
         self.show_search_settings = false;
         self.settings_changed = false;
         self.show_sequence_results = false;
