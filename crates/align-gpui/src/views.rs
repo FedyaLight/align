@@ -7,11 +7,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use align_core::{
-    AudioAnalysisSource, Clip, ClipOrder, MatchPreview, MatchThreshold, MediaKind, SyncResult,
-    TemporalMode, TrackContent, model::file_name,
+    AudioAnalysisSource, Clip, ClipId, ClipOrder, MatchPreview, MatchThreshold, MediaKind,
+    SyncResult, TemporalMode, TrackContent, model::file_name,
 };
 use align_decode::export::ExportArtifact;
 use align_decode::pipeline::{Phase, Pipeline};
@@ -199,6 +199,52 @@ fn export_button_entrance<E: IntoElement + 'static>(child: E) -> impl IntoElemen
     )
 }
 
+fn toolbar_entrance<E: IntoElement + 'static>(child: E, id: &'static str) -> impl IntoElement {
+    let reduced = super::motion::reduced_motion();
+    div()
+        .flex_shrink_0()
+        .overflow_hidden()
+        .child(child)
+        .with_animation(id, entrance(240), move |el, progress| {
+            let height = if reduced { 1. } else { progress };
+            el.h(px(48. * height)).opacity(progress)
+        })
+}
+
+fn timeline_bar_motion<E: IntoElement + Styled + 'static>(
+    child: E,
+    clip_id: &ClipId,
+    transition: TimelineTransition,
+    target_x: f32,
+    target_width: f32,
+    timeline_width: f32,
+    target_lane: f32,
+) -> impl IntoElement {
+    let row_stride = TIMELINE_ROW_H + 1.;
+    let from_x = transition.from.x * timeline_width;
+    let from_width = (transition.from.width * timeline_width).max(2.);
+    super::motion::Slide {
+        child: Some(child),
+        x: from_x - target_x,
+        y: (transition.from.lane - target_lane) * row_stride,
+    }
+    .with_animation(
+        SharedString::from(format!(
+            "timeline-clip-{}-{}",
+            clip_id.0, transition.generation
+        )),
+        entrance(TIMELINE_MOVE_MS),
+        move |mut slide, progress| {
+            slide.x = (from_x - target_x) * (1. - progress);
+            slide.y = (transition.from.lane - target_lane) * row_stride * (1. - progress);
+            slide.child = slide
+                .child
+                .map(|child| child.w(px(from_width + (target_width - from_width) * progress)));
+            slide
+        },
+    )
+}
+
 fn export_reveal<E: IntoElement + 'static>(
     child: E,
     id: &'static str,
@@ -292,6 +338,41 @@ mod motion_tests {
         assert!(!disabled.storylines);
         assert!(!disabled.synced_xml && !disabled.synced_final_cut);
     }
+
+    #[test]
+    fn timeline_transition_reaches_the_new_position_and_size() {
+        let started = Instant::now();
+        let from = TimelinePose {
+            x: 0.8,
+            width: 0.15,
+            lane: 2.,
+        };
+        let to = TimelinePose {
+            x: 0.2,
+            width: 0.3,
+            lane: 0.,
+        };
+        let transition = TimelineTransition {
+            from,
+            to,
+            generation: 1,
+            started,
+        };
+        assert!(!poses_differ(transition.presented(started), from));
+        assert!(!poses_differ(
+            transition.presented(started + Duration::from_millis(TIMELINE_MOVE_MS)),
+            to
+        ));
+    }
+
+    #[test]
+    fn long_destination_paths_keep_both_ends() {
+        assert_eq!(
+            middle_ellipsis("/projects/client/episode/final-deliverables", 21),
+            "/projects/…liverables"
+        );
+        assert_eq!(middle_ellipsis("короткий", 21), "короткий");
+    }
 }
 
 enum SyncMsg {
@@ -365,6 +446,92 @@ struct ExportReveals {
 enum ExportSelect {
     AafFrameRate,
     UnmatchedPlacement,
+}
+
+const TIMELINE_MOVE_MS: u64 = 360;
+const TIMELINE_ROW_H: f32 = 60.;
+
+#[derive(Clone, Copy, Debug)]
+struct TimelinePose {
+    x: f32,
+    width: f32,
+    lane: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimelineTransition {
+    from: TimelinePose,
+    to: TimelinePose,
+    generation: u64,
+    started: Instant,
+}
+
+impl TimelineTransition {
+    fn presented(self, now: Instant) -> TimelinePose {
+        let progress = (now.duration_since(self.started).as_secs_f32()
+            / Duration::from_millis(TIMELINE_MOVE_MS).as_secs_f32())
+        .clamp(0., 1.);
+        let progress = motion_ease(progress);
+        TimelinePose {
+            x: self.from.x + (self.to.x - self.from.x) * progress,
+            width: self.from.width + (self.to.width - self.from.width) * progress,
+            lane: self.from.lane + (self.to.lane - self.from.lane) * progress,
+        }
+    }
+}
+
+fn timeline_duration(data: &AppData) -> f64 {
+    data.lanes
+        .iter()
+        .flat_map(|lane| lane.clips.iter())
+        .map(|clip| clip.start + clip.duration)
+        .fold(1.0f64, f64::max)
+        .max(1.0)
+}
+
+fn timeline_poses(data: &AppData) -> HashMap<ClipId, TimelinePose> {
+    let duration = timeline_duration(data);
+    let mut poses = HashMap::new();
+    for (lane_index, lane) in data.lanes.iter().enumerate() {
+        for (clip_index, clip) in lane.clips.iter().enumerate() {
+            let visible_duration = lane
+                .clips
+                .get(clip_index + 1)
+                .map_or(clip.duration, |next| {
+                    clip.duration.min((next.start - clip.start).max(0.))
+                });
+            poses.insert(
+                clip.clip_id.clone(),
+                TimelinePose {
+                    x: (clip.start / duration) as f32,
+                    width: (visible_duration / duration) as f32,
+                    lane: lane_index as f32,
+                },
+            );
+        }
+    }
+    poses
+}
+
+fn poses_differ(left: TimelinePose, right: TimelinePose) -> bool {
+    (left.x - right.x).abs() > 0.0001
+        || (left.width - right.width).abs() > 0.0001
+        || (left.lane - right.lane).abs() > 0.0001
+}
+
+fn middle_ellipsis(value: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= max_chars || max_chars < 3 {
+        return value.to_string();
+    }
+    let visible = max_chars - 1;
+    let head = visible / 2;
+    let tail = visible - head;
+    chars[..head]
+        .iter()
+        .chain(std::iter::once(&'…'))
+        .chain(chars[chars.len() - tail..].iter())
+        .collect()
 }
 
 impl ExportReveals {
@@ -475,6 +642,8 @@ pub struct AlignApp {
     selection_controls_closing: bool,
     export_reveals_closing: HashMap<&'static str, u64>,
     export_reveal_generation: u64,
+    timeline_transitions: HashMap<ClipId, TimelineTransition>,
+    timeline_motion_generation: u64,
 }
 
 impl Focusable for AlignApp {
@@ -501,6 +670,8 @@ impl AlignApp {
             selection_controls_closing: false,
             export_reveals_closing: HashMap::new(),
             export_reveal_generation: 0,
+            timeline_transitions: HashMap::new(),
+            timeline_motion_generation: 0,
         }
     }
 
@@ -533,6 +704,9 @@ impl AlignApp {
         self.export_sidebar_closing = false;
         if !self.data.begin_sync_run() {
             return;
+        }
+        if self.data.lanes.is_empty() {
+            self.timeline_transitions.clear();
         }
         cx.notify();
 
@@ -642,7 +816,50 @@ impl AlignApp {
         .detach();
     }
 
+    fn record_timeline_layout_change(&mut self, before: HashMap<ClipId, TimelinePose>) {
+        let after = timeline_poses(&self.data);
+        self.timeline_transitions
+            .retain(|clip_id, _| after.contains_key(clip_id));
+        let changes: Vec<_> = after
+            .iter()
+            .filter_map(|(clip_id, &to)| {
+                let from = before.get(clip_id).copied()?;
+                poses_differ(from, to).then(|| (clip_id.clone(), from, to))
+            })
+            .collect();
+        if changes.is_empty() || super::motion::reduced_motion() {
+            return;
+        }
+        self.timeline_motion_generation += 1;
+        let generation = self.timeline_motion_generation;
+        let now = Instant::now();
+        for (clip_id, previous, to) in changes {
+            let from = self
+                .timeline_transitions
+                .get(&clip_id)
+                .copied()
+                .map_or(previous, |transition| transition.presented(now));
+            self.timeline_transitions.insert(
+                clip_id,
+                TimelineTransition {
+                    from,
+                    to,
+                    generation,
+                    started: now,
+                },
+            );
+        }
+    }
+
+    fn update_timeline_layout<T>(&mut self, update: impl FnOnce(&mut AppData) -> T) -> T {
+        let before = timeline_poses(&self.data);
+        let result = update(&mut self.data);
+        self.record_timeline_layout_change(before);
+        result
+    }
+
     fn apply_sync_msg(&mut self, msg: SyncMsg) {
+        let before = timeline_poses(&self.data);
         match msg {
             SyncMsg::SequenceStart {
                 sequence_index,
@@ -702,6 +919,7 @@ impl AlignApp {
                 }
             },
         }
+        self.record_timeline_layout_change(before);
     }
 
     pub(crate) fn start_export_sheet(&mut self, cx: &mut Context<Self>) {
@@ -1730,18 +1948,22 @@ impl Render for AlignApp {
             .flex_col();
         // No toolbar over the empty drop zone: nothing to act on yet.
         if !(self.data.lanes.is_empty() && self.data.clips.is_empty()) {
-            content = content.child(toolbar(
-                cx,
-                &theme,
-                &self.data,
-                content_active,
-                self.search_quality_closing,
+            content = content.child(toolbar_entrance(
+                toolbar(
+                    cx,
+                    &theme,
+                    &self.data,
+                    content_active,
+                    self.search_quality_closing,
+                ),
+                "top-toolbar-entrance",
             ));
         }
         content = content.child(main_content(
             cx,
             &theme,
             &self.data,
+            &self.timeline_transitions,
             fit_width,
             content_active,
             self.selection_controls_closing,
@@ -1754,7 +1976,10 @@ impl Render for AlignApp {
         }
         // No bottom bar over the empty drop zone either.
         if !self.data.clips.is_empty() {
-            content = content.child(operation_bar(cx, &theme, &self.data, content_active));
+            content = content.child(toolbar_entrance(
+                operation_bar(cx, &theme, &self.data, content_active),
+                "bottom-toolbar-entrance",
+            ));
         }
         if self.data.show_export {
             content = content.child(sidebar_scrim(&theme, self.export_sidebar_closing));
@@ -1860,7 +2085,7 @@ fn toolbar(
     data: &super::state::AppData,
     active: bool,
     quality_closing: bool,
-) -> impl IntoElement {
+) -> Div {
     let live = matches!(data.operation, super::state::Operation::Synchronizing);
     let busy = matches!(
         data.operation,
@@ -2054,6 +2279,7 @@ fn main_content(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &super::state::AppData,
+    timeline_transitions: &HashMap<ClipId, TimelineTransition>,
     fit_width: f32,
     active: bool,
     selection_controls_closing: bool,
@@ -2086,7 +2312,14 @@ fn main_content(
             ));
         }
     } else {
-        content = content.child(timeline_preview(cx, theme, data, fit_width, active));
+        content = content.child(timeline_preview(
+            cx,
+            theme,
+            data,
+            timeline_transitions,
+            fit_width,
+            active,
+        ));
     }
     let screen = if !data.lanes.is_empty() {
         "screen-timeline"
@@ -2361,13 +2594,21 @@ fn timeline_preview(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &super::state::AppData,
+    timeline_transitions: &HashMap<ClipId, TimelineTransition>,
     fit_width: f32,
     active: bool,
 ) -> impl IntoElement {
     let mut root = div().flex().flex_col().bg(rgb(theme.bg)).overflow_hidden();
     // Lanes (the header row with zoom controls lives in the unified
     // toolbar now).
-    root = root.child(timeline_lanes(cx, theme, data, fit_width, active));
+    root = root.child(timeline_lanes(
+        cx,
+        theme,
+        data,
+        timeline_transitions,
+        fit_width,
+        active,
+    ));
     if data.is_stale() {
         // Stale dimming is applied per-lane via opacity on the container.
         root = root.opacity(0.5);
@@ -2444,22 +2685,17 @@ fn timeline_lanes(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &super::state::AppData,
+    timeline_transitions: &HashMap<ClipId, TimelineTransition>,
     fit_width: f32,
     active: bool,
 ) -> impl IntoElement {
     use super::lane::{LABEL_WIDTH, bar_row_geometry, timeline_scale};
     const RULER_H: f32 = 32.0;
-    const ROW_H: f32 = 60.0;
-    let duration = data
-        .lanes
-        .iter()
-        .flat_map(|l| l.clips.iter())
-        .map(|c| c.start + c.duration)
-        .fold(1.0f64, f64::max)
-        .max(1.0);
+    let duration = timeline_duration(data);
     let zoom = data.zoom();
     let (px_per_sec, timeline_w) = timeline_scale(duration, zoom, fit_width);
     let tick_count = ((timeline_w / 160.0).floor() as usize).max(5);
+    let target_poses = timeline_poses(data);
 
     // Labels stay fixed while only the ruler and clips scroll horizontally.
     // This also makes a normal two-finger/vertical wheel pan the timeline:
@@ -2499,7 +2735,7 @@ fn timeline_lanes(
     tracks = tracks.child(ticks);
 
     // Rows.
-    for lane in &data.lanes {
+    for (lane_index, lane) in data.lanes.iter().enumerate() {
         let kind_glyph = match lane.kind {
             MediaKind::Video => "V",
             MediaKind::Audio => "A",
@@ -2535,7 +2771,7 @@ fn timeline_lanes(
             .w(px(LABEL_WIDTH))
             .flex_shrink_0()
             .overflow_hidden()
-            .h(px(ROW_H))
+            .h(px(TIMELINE_ROW_H))
             .flex()
             .flex_col()
             .items_center()
@@ -2574,7 +2810,7 @@ fn timeline_lanes(
             let mut track = div()
                 .relative()
                 .w(px(timeline_w))
-                .h(px(ROW_H))
+                .h(px(TIMELINE_ROW_H))
                 .flex_shrink_0();
             // Vertical gridlines at ruler ticks (mirrors the Canvas).
             for i in 0..=tick_count {
@@ -2590,8 +2826,7 @@ fn timeline_lanes(
                 );
             }
             let geometry = bar_row_geometry(&lane.clips, px_per_sec);
-            for (bar_index, (bar, (x, width))) in lane.clips.iter().zip(geometry.iter()).enumerate()
-            {
+            for (bar, (x, width)) in lane.clips.iter().zip(geometry.iter()) {
                 let (x, width) = (*x, *width);
                 let color = match bar.match_state {
                     super::lane::BarMatchState::Pending => 0x007AFF,
@@ -2602,12 +2837,12 @@ fn timeline_lanes(
                 let clip_id = bar.clip_id.clone();
                 // Corner radius min(4, w/2) like Swift; square slivers.
                 let mut el = div()
-                    .id(SharedString::from(format!("bar-{}-{bar_index}", lane.id)))
+                    .id(SharedString::from(format!("bar-{}", bar.clip_id.0)))
                     .absolute()
                     .left(px(x))
                     .top(px(6.0))
                     .w(px(width))
-                    .h(px(ROW_H - 12.0));
+                    .h(px(TIMELINE_ROW_H - 12.0));
                 if width >= 8.0 {
                     el = el.rounded_md();
                 }
@@ -2679,7 +2914,32 @@ fn timeline_lanes(
                         cx.notify();
                     }),
                 );
-                track = track.child(el);
+                let transition =
+                    timeline_transitions
+                        .get(&bar.clip_id)
+                        .copied()
+                        .filter(|transition| {
+                            target_poses
+                                .get(&bar.clip_id)
+                                .is_some_and(|pose| !poses_differ(transition.to, *pose))
+                        });
+                if let Some(transition) = transition {
+                    track = track.child(timeline_bar_motion(
+                        el,
+                        &bar.clip_id,
+                        transition,
+                        x,
+                        width,
+                        timeline_w,
+                        lane_index as f32,
+                    ));
+                } else {
+                    track = track.child(el.with_animation(
+                        SharedString::from(format!("timeline-clip-enter-{}", bar.clip_id.0)),
+                        entrance(220),
+                        |el, progress| el.opacity(progress),
+                    ));
+                }
             }
             tracks = tracks.child(track);
         }
@@ -2830,7 +3090,7 @@ fn operation_bar(
     theme: &Theme,
     data: &super::state::AppData,
     active: bool,
-) -> impl IntoElement {
+) -> Div {
     use super::state::Operation;
     let busy = matches!(
         data.operation,
@@ -3023,7 +3283,7 @@ fn stage_settings_panel(
                 ),
                 true,
                 move |this, _, _, cx| {
-                    this.data.select_sync_stage(index);
+                    this.update_timeline_layout(|data| data.select_sync_stage(index));
                     cx.notify();
                 },
             ));
@@ -3082,7 +3342,7 @@ fn sequence_results_panel(
             format!("{check}{} · {name}", index + 1),
             true,
             move |this, _, _, cx| {
-                this.data.select_sequence_result(index);
+                this.update_timeline_layout(|data| data.select_sequence_result(index));
                 cx.notify();
             },
         ));
@@ -4967,12 +5227,11 @@ fn export_sidebar(
                         .items_center()
                         .justify_center()
                         .rounded_lg()
-                        .border_1()
-                        .border_color(rgb(theme.separator));
+                        .bg(rgb(theme.button_hover));
                     if can_close {
                         close = close
                             .cursor_pointer()
-                            .hover(|this| this.bg(rgb(theme.button_hover)))
+                            .hover(|this| this.bg(rgb(theme.border)))
                             .active(|this| this.opacity(0.62))
                             .tooltip(hover_tip("Close export panel".to_string(), theme))
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -5060,22 +5319,35 @@ fn export_sheet(
     {
         let mut row = div().flex().flex_row().items_center().gap_3().h(px(32.));
         row = row.child(export_section_title(theme, "Destination"));
+        let destination = data
+            .export_dir
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Not selected".to_string());
+        let destination_display = middle_ellipsis(&destination, 31);
+        let mut destination_label = div()
+            .id("export-destination-path-text")
+            .w_full()
+            .max_w_full()
+            .flex_1()
+            .min_w(px(0.))
+            .truncate()
+            .text_color(rgb(if data.export_dir.is_some() {
+                theme.text
+            } else {
+                theme.dim
+            }))
+            .child(destination_display);
+        if data.export_dir.is_some() {
+            destination_label = destination_label.tooltip(hover_tip(destination, theme));
+        }
         row = row.child(
             div()
-                .flex_1()
-                .truncate()
-                .whitespace_nowrap()
-                .text_color(rgb(if data.export_dir.is_some() {
-                    theme.text
-                } else {
-                    theme.dim
-                }))
-                .child(
-                    data.export_dir
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "Not selected".to_string()),
-                ),
+                .id("export-destination-path")
+                .w(px(232.))
+                .flex_shrink_0()
+                .overflow_hidden()
+                .child(destination_label),
         );
         row = row.child(button(
             cx,
