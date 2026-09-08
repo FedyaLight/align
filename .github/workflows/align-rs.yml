@@ -108,7 +108,7 @@ jobs:
           install: >-
             curl diffutils make mingw-w64-x86_64-gcc nasm pkgconf tar xz
       - name: Build release
-        run: cargo build --release -p align-cli -p align-gpui
+        run: cargo build --release -p align-cli -p align-mcp -p align-gpui
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
@@ -129,7 +129,7 @@ jobs:
           exe=""
           if [[ "${{ runner.os }}" == "Windows" ]]; then exe=".exe"; fi
           mkdir -p dist-bundle
-          cp "target/release/align-cli$exe" "target/release/align$exe" dist-bundle/
+          cp "target/release/align-cli$exe" "target/release/align-mcp$exe" "target/release/align$exe" dist-bundle/
           cp "target/release/align-aaf$exe" dist-bundle/
           cp -R target/release/AAF-Licenses dist-bundle/
           cp THIRD_PARTY_NOTICES.txt dist-bundle/

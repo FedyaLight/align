@@ -20,6 +20,7 @@ actions!(
     align,
     [
         AboutAlign,
+        UseWithAiAgents,
         LightAppearance,
         DarkAppearance,
         SystemAppearance,
@@ -58,6 +59,13 @@ fn show_about(cx: &mut App) {
     };
     view.update(cx, |this, cx| {
         this.data.show_about = true;
+        cx.notify();
+    });
+}
+
+fn show_agent_setup(cx: &mut App) {
+    update_view(cx, |this, cx| {
+        this.data.show_agent_setup = true;
         cx.notify();
     });
 }
@@ -148,7 +156,113 @@ fn update_view(
     view.update(cx, update);
 }
 
+fn set_appearance(appearance: theme::AppearancePreference, cx: &mut App) {
+    appearance.save();
+    cx.set_menus(app_menus(appearance));
+    update_view(cx, |this, cx| {
+        this.data.appearance = appearance;
+        cx.notify();
+    });
+}
+
+fn appearance_label(
+    label: &'static str,
+    selected: theme::AppearancePreference,
+    item: theme::AppearancePreference,
+) -> &'static str {
+    if selected == item {
+        match item {
+            theme::AppearancePreference::Auto => "✓ Auto",
+            theme::AppearancePreference::Light => "✓ Light",
+            theme::AppearancePreference::Dark => "✓ Dark",
+        }
+    } else {
+        label
+    }
+}
+
+fn app_menus(appearance: theme::AppearancePreference) -> Vec<Menu> {
+    vec![
+        Menu {
+            name: "Align".into(),
+            items: vec![
+                MenuItem::action("About Align", AboutAlign),
+                MenuItem::separator(),
+                MenuItem::action("Use with AI Agents…", UseWithAiAgents),
+                MenuItem::separator(),
+                MenuItem::os_submenu("Services", SystemMenuType::Services),
+                MenuItem::separator(),
+                MenuItem::action("Hide Align", HideApp),
+                MenuItem::action("Hide Others", HideOthersApp),
+                MenuItem::action("Show All", ShowAllApps),
+                MenuItem::separator(),
+                MenuItem::action("Quit Align", QuitApp),
+            ],
+        },
+        Menu {
+            name: "File".into(),
+            items: vec![
+                MenuItem::action("Add Media…", AddMedia),
+                MenuItem::action("Reload and Synchronize", ReloadAndSynchronize),
+                MenuItem::separator(),
+                MenuItem::action("Export…", ExportTimeline),
+                MenuItem::separator(),
+                MenuItem::action("Path Fixer…", OpenPathFixer),
+                MenuItem::submenu(Menu {
+                    name: "Analysis Cache".into(),
+                    items: vec![
+                        MenuItem::action("Clear Current Project", ClearCurrentAnalysisCache),
+                        MenuItem::action("Clear All", ClearAnalysisCache),
+                        MenuItem::separator(),
+                        MenuItem::action("Keep for 7 Days", KeepAnalysisCache7Days),
+                        MenuItem::action("Keep for 30 Days", KeepAnalysisCache30Days),
+                        MenuItem::action("Keep for 90 Days", KeepAnalysisCache90Days),
+                        MenuItem::action("Keep Until Cleared", KeepAnalysisCacheForever),
+                    ],
+                }),
+            ],
+        },
+        Menu {
+            name: "View".into(),
+            items: vec![MenuItem::submenu(Menu {
+                name: "Appearance".into(),
+                items: vec![
+                    MenuItem::action(
+                        appearance_label("Auto", appearance, theme::AppearancePreference::Auto),
+                        SystemAppearance,
+                    ),
+                    MenuItem::action(
+                        appearance_label("Light", appearance, theme::AppearancePreference::Light),
+                        LightAppearance,
+                    ),
+                    MenuItem::action(
+                        appearance_label("Dark", appearance, theme::AppearancePreference::Dark),
+                        DarkAppearance,
+                    ),
+                ],
+            })],
+        },
+        Menu {
+            name: "Window".into(),
+            items: vec![
+                MenuItem::action("Minimize", MinimizeWindow),
+                MenuItem::action("Zoom", ZoomWindow),
+                MenuItem::separator(),
+                MenuItem::action("Toggle Full Screen", ToggleFullscreen),
+            ],
+        },
+    ]
+}
+
 fn main() {
+    struct SessionCleanup;
+    impl Drop for SessionCleanup {
+        fn drop(&mut self) {
+            icons::cleanup();
+            align_decode::aaf::cleanup_session_media();
+        }
+    }
+    let _session_cleanup = SessionCleanup;
     let initial_paths: Vec<std::path::PathBuf> = std::env::args_os()
         .skip(1)
         .map(std::path::PathBuf::from)
@@ -158,26 +272,25 @@ fn main() {
         .with_assets(icons::FileAssets)
         .run(move |cx: &mut App| {
             text_input::init(cx);
+            // Covers every graceful termination path, including an OS-level
+            // quit that does not dispatch our custom QuitApp action.
+            cx.on_app_quit(|_| async {
+                icons::cleanup();
+                align_decode::aaf::cleanup_session_media();
+            })
+            .detach();
             // System commands: without registered actions + bindings + menus
             // macOS swallows keys like Cmd+Q and the menu bar stays empty.
             cx.on_action(|_: &AboutAlign, cx| show_about(cx));
+            cx.on_action(|_: &UseWithAiAgents, cx| show_agent_setup(cx));
             cx.on_action(|_: &LightAppearance, cx| {
-                update_view(cx, |this, cx| {
-                    this.data.appearance = Some(theme::ThemeMode::Light);
-                    cx.notify();
-                })
+                set_appearance(theme::AppearancePreference::Light, cx)
             });
             cx.on_action(|_: &DarkAppearance, cx| {
-                update_view(cx, |this, cx| {
-                    this.data.appearance = Some(theme::ThemeMode::Dark);
-                    cx.notify();
-                })
+                set_appearance(theme::AppearancePreference::Dark, cx)
             });
             cx.on_action(|_: &SystemAppearance, cx| {
-                update_view(cx, |this, cx| {
-                    this.data.appearance = None;
-                    cx.notify();
-                })
+                set_appearance(theme::AppearancePreference::Auto, cx)
             });
             cx.on_action(|_: &ClearAnalysisCache, cx| clear_analysis_cache(cx));
             cx.on_action(|_: &ClearCurrentAnalysisCache, cx| clear_current_analysis_cache(cx));
@@ -214,65 +327,7 @@ fn main() {
                 KeyBinding::new("cmd-e", ExportTimeline, None),
                 KeyBinding::new("ctrl-cmd-f", ToggleFullscreen, None),
             ]);
-            cx.set_menus(vec![
-                Menu {
-                    name: "Align".into(),
-                    items: vec![
-                        MenuItem::action("About Align", AboutAlign),
-                        MenuItem::separator(),
-                        MenuItem::os_submenu("Services", SystemMenuType::Services),
-                        MenuItem::separator(),
-                        MenuItem::action("Hide Align", HideApp),
-                        MenuItem::action("Hide Others", HideOthersApp),
-                        MenuItem::action("Show All", ShowAllApps),
-                        MenuItem::separator(),
-                        MenuItem::action("Quit Align", QuitApp),
-                    ],
-                },
-                Menu {
-                    name: "File".into(),
-                    items: vec![
-                        MenuItem::action("Add Media…", AddMedia),
-                        MenuItem::action("Reload and Synchronize", ReloadAndSynchronize),
-                        MenuItem::separator(),
-                        MenuItem::action("Export…", ExportTimeline),
-                        MenuItem::separator(),
-                        MenuItem::action("Path Fixer…", OpenPathFixer),
-                        MenuItem::submenu(Menu {
-                            name: "Analysis Cache".into(),
-                            items: vec![
-                                MenuItem::action(
-                                    "Clear Current Project",
-                                    ClearCurrentAnalysisCache,
-                                ),
-                                MenuItem::action("Clear All", ClearAnalysisCache),
-                                MenuItem::separator(),
-                                MenuItem::action("Keep for 7 Days", KeepAnalysisCache7Days),
-                                MenuItem::action("Keep for 30 Days", KeepAnalysisCache30Days),
-                                MenuItem::action("Keep for 90 Days", KeepAnalysisCache90Days),
-                                MenuItem::action("Keep Until Cleared", KeepAnalysisCacheForever),
-                            ],
-                        }),
-                    ],
-                },
-                Menu {
-                    name: "View".into(),
-                    items: vec![
-                        MenuItem::action("Light Appearance", LightAppearance),
-                        MenuItem::action("Dark Appearance", DarkAppearance),
-                        MenuItem::action("System Appearance", SystemAppearance),
-                    ],
-                },
-                Menu {
-                    name: "Window".into(),
-                    items: vec![
-                        MenuItem::action("Minimize", MinimizeWindow),
-                        MenuItem::action("Zoom", ZoomWindow),
-                        MenuItem::separator(),
-                        MenuItem::action("Toggle Full Screen", ToggleFullscreen),
-                    ],
-                },
-            ]);
+            cx.set_menus(app_menus(theme::AppearancePreference::load()));
 
             let bounds = Bounds::centered(None, size(px(880.), px(540.)), cx);
             let view = cx.new(move |cx| {

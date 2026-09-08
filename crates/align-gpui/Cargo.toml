@@ -16,6 +16,9 @@ align-decode.workspace = true
 gpui.workspace = true
 futures.workspace = true
 mimalloc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
 
 [dev-dependencies]
 # Same renderer the GPUI sprite atlas uses: the test below parses every

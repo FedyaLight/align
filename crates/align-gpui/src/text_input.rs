@@ -438,7 +438,7 @@ impl Element for TextElement {
         let selected = input.selected_range.clone();
         let cursor = input.cursor_offset();
         let text_style = window.text_style();
-        let theme = Theme::of(window.appearance());
+        let theme = Theme::current(window.appearance());
         let (display, color) = if content.is_empty() {
             (input.placeholder.clone(), rgb(theme.dim).into())
         } else {
@@ -555,7 +555,7 @@ impl Element for TextElement {
 
 impl gpui::Render for TextInput {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(window.appearance());
+        let theme = Theme::current(window.appearance());
         div()
             .h(px(28.))
             .w_full()

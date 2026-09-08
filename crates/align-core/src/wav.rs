@@ -245,8 +245,15 @@ fn insert_bext(payload: &[u8], target: &Path) -> Result<(), WavError> {
     drop(input);
     match result {
         Ok(()) => {
-            std::fs::remove_file(target).map_err(|_| WavError::CannotWrite)?;
-            std::fs::rename(&rewritten, target).map_err(|_| WavError::CannotWrite)?;
+            #[cfg(windows)]
+            if std::fs::remove_file(target).is_err() {
+                let _ = std::fs::remove_file(&rewritten);
+                return Err(WavError::CannotWrite);
+            }
+            if std::fs::rename(&rewritten, target).is_err() {
+                let _ = std::fs::remove_file(&rewritten);
+                return Err(WavError::CannotWrite);
+            }
             Ok(())
         }
         Err(e) => {

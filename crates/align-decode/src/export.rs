@@ -269,9 +269,7 @@ pub fn export_prepared_many(
         let xml = align_core::export::premiere::combine_project_documents(&premiere_documents)
             .map_err(ExportError::Io)?;
         let url = request.directory.join("Align – Adobe Premiere Pro.xml");
-        let tmp = url.with_extension(format!("tmp-{}", std::process::id()));
-        std::fs::write(&tmp, xml).map_err(|e| ExportError::Io(e.to_string()))?;
-        std::fs::rename(&tmp, &url).map_err(|e| ExportError::Io(e.to_string()))?;
+        write_atomic(&url, xml.as_bytes())?;
         artifacts.push(ExportArtifact {
             format: ExportArtifactFormat::PremiereXML,
             url,
@@ -281,9 +279,7 @@ pub fn export_prepared_many(
         let xml = align_core::export::fcpxml::combine_documents(&fcpxml_documents)
             .map_err(ExportError::Io)?;
         let url = request.directory.join("Align – Final Cut Pro.fcpxml");
-        let tmp = url.with_extension(format!("tmp-{}", std::process::id()));
-        std::fs::write(&tmp, xml).map_err(|e| ExportError::Io(e.to_string()))?;
-        std::fs::rename(&tmp, &url).map_err(|e| ExportError::Io(e.to_string()))?;
+        write_atomic(&url, xml.as_bytes())?;
         artifacts.push(ExportArtifact {
             format: ExportArtifactFormat::FinalCutProXML,
             url,
@@ -777,7 +773,10 @@ fn write_aaf_manifest(
     let serial = NEXT_AAF_MANIFEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let manifest_path = directory.join(format!(".align-aaf-{}-{serial}.json", std::process::id()));
     let bytes = serde_json::to_vec(manifest).map_err(|e| ExportError::Io(e.to_string()))?;
-    std::fs::write(&manifest_path, bytes).map_err(|e| ExportError::Io(e.to_string()))?;
+    if let Err(error) = std::fs::write(&manifest_path, bytes) {
+        let _ = std::fs::remove_file(&manifest_path);
+        return Err(ExportError::Io(error.to_string()));
+    }
     let result = crate::aaf::write_audio(&manifest_path, url, cancel);
     let _ = std::fs::remove_file(&manifest_path);
     result.map_err(|e| match e {
@@ -1014,7 +1013,10 @@ fn export_media_file(
     if plan.url.is_file() {
         std::fs::remove_file(&plan.url).map_err(|e| ExportError::Io(e.to_string()))?;
     }
-    std::fs::rename(&temp, &plan.url).map_err(|e| ExportError::Io(e.to_string()))?;
+    if let Err(error) = std::fs::rename(&temp, &plan.url) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(ExportError::Io(error.to_string()));
+    }
     Ok(plan.url.clone())
 }
 
@@ -1086,10 +1088,7 @@ fn write_artifacts(
             )
             .into_bytes(),
         };
-        // Atomic write: tmp + rename.
-        let tmp = url.with_extension(format!("tmp-{}", std::process::id()));
-        std::fs::write(&tmp, &bytes).map_err(|e| ExportError::Io(e.to_string()))?;
-        std::fs::rename(&tmp, &url).map_err(|e| ExportError::Io(e.to_string()))?;
+        write_atomic(&url, &bytes)?;
         #[cfg(unix)]
         if *format == TimelineExportFormat::ResolveScript {
             use std::os::unix::fs::PermissionsExt;
@@ -1101,6 +1100,19 @@ fn write_artifacts(
         });
     }
     Ok(artifacts)
+}
+
+fn write_atomic(url: &Path, bytes: &[u8]) -> Result<(), ExportError> {
+    let tmp = url.with_extension(format!("tmp-{}", std::process::id()));
+    if let Err(error) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ExportError::Io(error.to_string()));
+    }
+    if let Err(error) = std::fs::rename(&tmp, url) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ExportError::Io(error.to_string()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

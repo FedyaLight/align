@@ -51,6 +51,9 @@ const CHEVRON_RIGHT: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="
 /// Close affordance used in modal title rows.
 const CLOSE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3.75 3.75l8.5 8.5m0-8.5l-8.5 8.5" stroke="white" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg>"#;
 
+/// Circular arrow (restore defaults).
+const RESET: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3.2 5.25A5.45 5.45 0 1 1 2.7 10" stroke="white" stroke-width="1.45" fill="none" stroke-linecap="round"/><path d="M3.2 2.25v3.1H6.3" stroke="white" stroke-width="1.45" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+
 /// Trash (clear session).
 const TRASH: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g stroke="white" stroke-width="1.35" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.25h10M6 2.25h4M4.25 4.25l.55 9.5h6.4l.55-9.5M6.5 6.5v5M9.5 6.5v5"/></g></svg>"#;
 
@@ -69,6 +72,7 @@ pub struct IconPaths {
     pub chevron_down: String,
     pub chevron_right: String,
     pub close: String,
+    pub reset: String,
     pub trash: String,
     pub drop: String,
 }
@@ -129,6 +133,7 @@ fn paths_for(dir: &std::path::Path) -> IconPaths {
         chevron_down: path("chevron-down.svg"),
         chevron_right: path("chevron-right.svg"),
         close: path("close.svg"),
+        reset: path("reset.svg"),
         trash: path("trash.svg"),
         drop: path("drop.svg"),
     }
@@ -154,6 +159,7 @@ fn write_all(dir: &std::path::Path) {
     write("chevron-down.svg", CHEVRON_DOWN);
     write("chevron-right.svg", CHEVRON_RIGHT);
     write("close.svg", CLOSE);
+    write("reset.svg", RESET);
     write("trash.svg", TRASH);
     write("drop.svg", DROP);
 }
@@ -161,6 +167,8 @@ fn write_all(dir: &std::path::Path) {
 /// Remove the materialized icon assets (quit-time cleanup: no traces).
 pub fn cleanup() {
     let _ = std::fs::remove_dir_all(asset_dir());
+    // Remove the only legacy bundle used before quit cleanup was added.
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("align-icons-v1"));
 }
 
 /// A tinted monochrome icon. The tint is set on the `svg` element
@@ -198,9 +206,18 @@ mod tests {
     /// icons tests so no reader races it.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    struct TestCleanup;
+
+    impl Drop for TestCleanup {
+        fn drop(&mut self) {
+            cleanup();
+        }
+    }
+
     #[test]
     fn cleanup_removes_materialized_assets() {
         let _guard = TEST_LOCK.lock().unwrap();
+        let _cleanup = TestCleanup;
         let dir = asset_dir();
         let _ = icons();
         assert!(dir.is_dir());
@@ -213,6 +230,7 @@ mod tests {
     #[test]
     fn file_assets_serve_written_icons() {
         let _guard = TEST_LOCK.lock().unwrap();
+        let _cleanup = TestCleanup;
         let body = FileAssets
             .load(&icons().plus)
             .expect("readable")
@@ -223,6 +241,7 @@ mod tests {
     #[test]
     fn icons_parse_with_the_renderer_usvg() {
         let _guard = TEST_LOCK.lock().unwrap();
+        let _cleanup = TestCleanup;
         // `SvgRenderer::render_pixmap` calls `Tree::from_data` with default
         // options; anything failing here would paint empty in the UI.
         let _ = icons();
@@ -239,6 +258,7 @@ mod tests {
             &icons().chevron_down,
             &icons().chevron_right,
             &icons().close,
+            &icons().reset,
             &icons().trash,
             &icons().drop,
         ] {
@@ -256,6 +276,7 @@ mod tests {
     #[test]
     fn assets_materialize_and_stay_monochrome() {
         let _guard = TEST_LOCK.lock().unwrap();
+        let _cleanup = TestCleanup;
         let _ = icons();
         let paths = [
             &icons().film,
@@ -269,6 +290,7 @@ mod tests {
             &icons().chevron_down,
             &icons().chevron_right,
             &icons().close,
+            &icons().reset,
             &icons().trash,
             &icons().drop,
         ];

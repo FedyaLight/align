@@ -51,6 +51,9 @@ pub struct PipelineProgress {
     pub discovered: Option<Clip>,
     /// Match lifecycle event (match/refine/solve phases).
     pub preview: Option<align_core::MatchPreview>,
+    /// Session-only timeline waveform derived from the fingerprints already
+    /// in memory. It is never written as a separate preview cache.
+    pub waveform: Option<(ClipId, Vec<f32>)>,
 }
 
 impl PipelineProgress {
@@ -63,12 +66,74 @@ impl PipelineProgress {
             current,
             discovered: None,
             preview: None,
+            waveform: None,
         }
     }
 }
 
+const WAVEFORM_PREVIEW_BINS: usize = 512;
+
+struct WaveformPreview {
+    energy: Vec<f64>,
+    counts: Vec<u64>,
+    sample: u64,
+    total_samples: f64,
+}
+
+impl WaveformPreview {
+    fn new(duration_seconds: f64) -> Self {
+        Self {
+            energy: vec![0.0; WAVEFORM_PREVIEW_BINS],
+            counts: vec![0; WAVEFORM_PREVIEW_BINS],
+            sample: 0,
+            total_samples: (duration_seconds.max(0.0)
+                * align_core::fingerprint::SAMPLE_RATE as f64)
+                .max(1.0),
+        }
+    }
+
+    fn consume(&mut self, samples: &[f32]) {
+        for value in samples {
+            let index = ((self.sample as f64 / self.total_samples) * WAVEFORM_PREVIEW_BINS as f64)
+                .floor()
+                .clamp(0.0, (WAVEFORM_PREVIEW_BINS - 1) as f64) as usize;
+            self.energy[index] += f64::from(*value) * f64::from(*value);
+            self.counts[index] += 1;
+            self.sample += 1;
+        }
+    }
+
+    fn finish(self) -> Vec<f32> {
+        let rms: Vec<f32> = self
+            .energy
+            .into_iter()
+            .zip(self.counts)
+            .map(|(energy, count)| {
+                if count == 0 {
+                    0.0
+                } else {
+                    (energy / count as f64).sqrt() as f32
+                }
+            })
+            .collect();
+        let peak = rms.iter().copied().fold(0.0_f32, f32::max);
+        if peak == 0.0 {
+            return rms;
+        }
+        rms.into_iter().map(|value| (value / peak).sqrt()).collect()
+    }
+}
+
+struct FingerprintRunOptions<'a> {
+    accuracy: align_core::SearchAccuracy,
+    overrides: &'a HashMap<ClipId, align_core::SearchAccuracy>,
+    generate_waveform_previews: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PipelineOptions {
+    /// Emit and cache real amplitude envelopes for the interactive timeline.
+    pub generate_waveform_previews: bool,
     pub search_accuracy: align_core::SearchAccuracy,
     pub search_overrides: HashMap<ClipId, align_core::SearchAccuracy>,
     pub source_search_overrides: HashMap<String, align_core::SearchAccuracy>,
@@ -462,8 +527,11 @@ impl Pipeline {
         let (features, selected_sources) = self.fingerprints(
             &usable,
             &audio_sources,
-            options.search_accuracy,
-            &search_overrides,
+            FingerprintRunOptions {
+                accuracy: options.search_accuracy,
+                overrides: &search_overrides,
+                generate_waveform_previews: options.generate_waveform_previews,
+            },
             progress,
             cancel,
         )?;
@@ -827,8 +895,7 @@ impl Pipeline {
         &self,
         clips: &[&Clip],
         requested: &HashMap<ClipId, AudioAnalysisSource>,
-        accuracy: align_core::SearchAccuracy,
-        overrides: &HashMap<ClipId, align_core::SearchAccuracy>,
+        options: FingerprintRunOptions<'_>,
         progress: Option<&(dyn Fn(PipelineProgress) + Send + Sync)>,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<
@@ -843,9 +910,13 @@ impl Pipeline {
         struct Variant {
             source: AudioAnalysisSource,
             fingerprints: Vec<Fingerprint>,
+            waveform: Option<Vec<f32>>,
         }
         let total = clips.len();
         let done = std::sync::atomic::AtomicUsize::new(0);
+        let accuracy = options.accuracy;
+        let overrides = options.overrides;
+        let generate_waveform_previews = options.generate_waveform_previews;
         // Four streaming readers avoid saturating external media while
         // variants of one clip stay sequential and results keep input order.
         let all_variants: Vec<Result<Vec<Variant>, PipelineError>> =
@@ -873,19 +944,50 @@ impl Pipeline {
                 for source in sources {
                     let cache_key = accuracy.cache_key(&source.cache_key());
                     if let Some(cached) = self.cache.load(&clip.url, &cache_key) {
+                        let waveform = if generate_waveform_previews {
+                            if let Some(waveform) = self.cache.load_waveform(&clip.url, &cache_key)
+                            {
+                                Some(waveform)
+                            } else {
+                                let mut preview = WaveformPreview::new(clip.duration.as_seconds());
+                                self.backend
+                                    .decode_mono_8k(&clip.url, source, &mut |block| {
+                                        if cancelled(cancel) {
+                                            return Err(crate::DecodeError::Cancelled);
+                                        }
+                                        preview.consume(block);
+                                        Ok(())
+                                    })
+                                    .map_err(|error| match error {
+                                        crate::DecodeError::Cancelled => PipelineError::Cancelled,
+                                        other => PipelineError::Decode(other),
+                                    })?;
+                                let waveform = preview.finish();
+                                self.cache.save_waveform(&waveform, &clip.url, &cache_key);
+                                Some(waveform)
+                            }
+                        } else {
+                            None
+                        };
                         variants.push(Variant {
                             source,
                             fingerprints: cached,
+                            waveform,
                         });
                         continue;
                     }
                     let mut extractor = FingerprintExtractor::with_accuracy(accuracy);
+                    let mut preview = generate_waveform_previews
+                        .then(|| WaveformPreview::new(clip.duration.as_seconds()));
                     self.backend
                         .decode_mono_8k(&clip.url, source, &mut |block| {
                             if cancelled(cancel) {
                                 return Err(crate::DecodeError::Cancelled);
                             }
                             extractor.consume(block);
+                            if let Some(preview) = &mut preview {
+                                preview.consume(block);
+                            }
                             Ok(())
                         })
                         .map_err(|error| match error {
@@ -897,19 +999,37 @@ impl Pipeline {
                     }
                     let fingerprints = extractor.finish();
                     self.cache.save(&fingerprints, &clip.url, &cache_key);
+                    let waveform = preview.map(WaveformPreview::finish);
+                    if let Some(waveform) = &waveform {
+                        self.cache.save_waveform(waveform, &clip.url, &cache_key);
+                    }
                     variants.push(Variant {
                         source,
                         fingerprints,
+                        waveform,
                     });
                 }
                 if let Some(p) = &progress {
                     let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    p(PipelineProgress::basic(
+                    let mut event = PipelineProgress::basic(
                         Phase::Fingerprint,
                         completed,
                         total,
                         Some(clip.url.clone()),
-                    ));
+                    );
+                    if generate_waveform_previews {
+                        let mut waveform = vec![0.0_f32; WAVEFORM_PREVIEW_BINS];
+                        for preview in variants
+                            .iter()
+                            .filter_map(|variant| variant.waveform.as_ref())
+                        {
+                            for (combined, value) in waveform.iter_mut().zip(preview) {
+                                *combined = combined.max(*value);
+                            }
+                        }
+                        event.waveform = Some((clip.id.clone(), waveform));
+                    }
+                    p(event);
                 }
                 Ok(variants)
             });
@@ -1220,6 +1340,28 @@ fn normalize(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waveform_preview_uses_real_amplitude_and_preserves_silence() {
+        let mut accumulator = WaveformPreview::new(4.0);
+        let mut samples = vec![0.0; align_core::fingerprint::SAMPLE_RATE as usize];
+        samples.extend(vec![0.25; align_core::fingerprint::SAMPLE_RATE as usize]);
+        samples.extend(vec![1.0; align_core::fingerprint::SAMPLE_RATE as usize]);
+        samples.extend(vec![0.5; align_core::fingerprint::SAMPLE_RATE as usize]);
+        accumulator.consume(&samples);
+        let preview = accumulator.finish();
+        assert_eq!(preview.len(), WAVEFORM_PREVIEW_BINS);
+        assert!(preview.iter().all(|value| (0.0..=1.0).contains(value)));
+        assert_eq!(preview.iter().copied().fold(0.0_f32, f32::max), 1.0);
+        assert!(
+            preview[..WAVEFORM_PREVIEW_BINS / 4]
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+        assert!(preview[WAVEFORM_PREVIEW_BINS / 4] > 0.0);
+        assert!(preview[WAVEFORM_PREVIEW_BINS / 2] > preview[WAVEFORM_PREVIEW_BINS / 4]);
+        assert!(preview[WAVEFORM_PREVIEW_BINS * 3 / 4] < 1.0);
+    }
 
     /// Evaluate an island map (linear interp/extrapolation on knots).
     fn island_at(knots: &[MappingPoint], source: f64) -> f64 {

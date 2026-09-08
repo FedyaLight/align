@@ -446,7 +446,7 @@ pub fn render_drift_cancellable(
     })();
     match result {
         Ok(()) => {
-            align_core::wav::preserve_broadcast_extension(
+            if align_core::wav::preserve_broadcast_extension(
                 source,
                 &tmp,
                 sample_rate,
@@ -455,11 +455,20 @@ pub fn render_drift_cancellable(
                 "drift correction",
                 0,
             )
-            .map_err(|_| RenderError::CannotWrite)?;
-            if destination.exists() {
-                std::fs::remove_file(destination).map_err(|_| RenderError::CannotWrite)?;
+            .is_err()
+            {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(RenderError::CannotWrite);
             }
-            std::fs::rename(&tmp, destination).map_err(|_| RenderError::CannotWrite)?;
+            #[cfg(windows)]
+            if destination.exists() && std::fs::remove_file(destination).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(RenderError::CannotWrite);
+            }
+            if std::fs::rename(&tmp, destination).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(RenderError::CannotWrite);
+            }
             Ok(())
         }
         Err(e) => {
@@ -584,10 +593,15 @@ pub fn render_pad_cancellable(
         let _ = std::fs::remove_file(&tmp);
         return Err(RenderError::CannotWrite);
     }
-    if destination.exists() {
-        std::fs::remove_file(destination).map_err(|_| RenderError::CannotWrite)?;
+    #[cfg(windows)]
+    if destination.exists() && std::fs::remove_file(destination).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(RenderError::CannotWrite);
     }
-    std::fs::rename(&tmp, destination).map_err(|_| RenderError::CannotWrite)?;
+    if std::fs::rename(&tmp, destination).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(RenderError::CannotWrite);
+    }
     Ok(())
 }
 
@@ -751,7 +765,7 @@ pub fn render_channel_cancellable(
     })();
     match result {
         Ok(()) => {
-            align_core::wav::preserve_broadcast_extension(
+            if align_core::wav::preserve_broadcast_extension(
                 source,
                 &tmp,
                 sample_rate,
@@ -760,11 +774,20 @@ pub fn render_channel_cancellable(
                 &format!("channel {} extraction", channel + 1),
                 start_frame,
             )
-            .map_err(|_| RenderError::CannotWrite)?;
-            if destination.exists() {
-                std::fs::remove_file(destination).map_err(|_| RenderError::CannotWrite)?;
+            .is_err()
+            {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(RenderError::CannotWrite);
             }
-            std::fs::rename(&tmp, destination).map_err(|_| RenderError::CannotWrite)?;
+            #[cfg(windows)]
+            if destination.exists() && std::fs::remove_file(destination).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(RenderError::CannotWrite);
+            }
+            if std::fs::rename(&tmp, destination).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(RenderError::CannotWrite);
+            }
             Ok(())
         }
         Err(e) => {

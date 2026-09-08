@@ -2,8 +2,8 @@
 //! `TimelineExport.swift` (writers live in sibling modules).
 //!
 //! One timeline island becomes one NLE sequence: every sync island plus
-//! every unmatched clip lands in a single combined sequence ordered by
-//! consistent embedded timestamps (or stable fallback), never overlapping.
+//! every unmatched clip lands in a single compact sequence ordered by
+//! consistent embedded timestamps (or stable fallback).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -1567,9 +1567,9 @@ impl ExportTimeline {
     }
 
     /// Position islands with the selected clock when it is available.
-    /// Islands sharing timestamp or timecode evidence keep their true gaps
-    /// and overlaps; unknown or incompatible clock groups remain safely
-    /// packed after the last positioned group.
+    /// Clock evidence determines their order and useful overlaps. Empty time
+    /// is compacted, and successive clips from one source are kept sequential
+    /// so they can reuse the same NLE track.
     fn positioned_islands(&self, gap: f64) -> Vec<(&ExportIsland, f64)> {
         if self.preserve_origin {
             return self.islands.iter().map(|island| (island, 0.0)).collect();
@@ -1616,9 +1616,12 @@ impl ExportTimeline {
                 continue;
             }
 
+            let group_origin = order[index].1.1;
             let end = order[index..]
                 .iter()
-                .position(|(_, key)| key.0 != kind)
+                .position(|(_, key)| {
+                    key.0 != kind || (kind == 0 && (key.1 - group_origin).abs() >= 57_600.0)
+                })
                 .map_or(order.len(), |offset| index + offset);
             let baseline = order[index..end]
                 .iter()
@@ -1642,7 +1645,60 @@ impl ExportTimeline {
             cursor = group_end + gap;
             index = end;
         }
-        positioned
+        let mut compacted = Vec::with_capacity(positioned.len());
+        let mut source_ends: HashMap<String, f64> = HashMap::new();
+        let mut global_end = f64::NEG_INFINITY;
+        for (island, mut shift) in positioned {
+            let (minimum, maximum) = bounds(island);
+            if !minimum.is_finite() || !maximum.is_finite() {
+                continue;
+            }
+
+            let sources: HashSet<String> = island
+                .clips
+                .iter()
+                .map(|item| {
+                    item.preferred_source_key.clone().unwrap_or_else(|| {
+                        source_key_for_clip(
+                            &item.clip.url,
+                            item.clip.source_identifier.as_deref(),
+                            item.clip
+                                .media_span
+                                .as_ref()
+                                .map(|span| span.identifier.as_str()),
+                        )
+                    })
+                })
+                .collect();
+            let original_start = minimum + shift;
+            let mut start = original_start;
+
+            // A clock gap contains no synchronized material, so retain at
+            // most the requested edit gap instead of stretching the ruler.
+            if global_end.is_finite() {
+                start = start.min(global_end + gap);
+            }
+            for source in &sources {
+                if let Some(end) = source_ends.get(source) {
+                    start = start.max(end + gap);
+                }
+            }
+            if self.prevent_group_overlaps && global_end.is_finite() {
+                start = start.max(global_end + gap);
+            }
+
+            shift += start - original_start;
+            let end = maximum + shift;
+            for source in sources {
+                source_ends
+                    .entry(source)
+                    .and_modify(|previous| *previous = previous.max(end))
+                    .or_insert(end);
+            }
+            global_end = global_end.max(end);
+            compacted.push((island, shift));
+        }
+        compacted
     }
 
     fn chronology_key(&self, island: &ExportIsland, policy: &TemporalPolicy) -> (i32, f64) {
@@ -1886,9 +1942,13 @@ mod tests {
     }
 
     fn island_clip(name: &str, recorded: i64, tc_secs: f64) -> ExportItem {
+        island_clip_from("v", name, recorded, tc_secs)
+    }
+
+    fn island_clip_from(source: &str, name: &str, recorded: i64, tc_secs: f64) -> ExportItem {
         let clip = Clip {
             id: ClipId::new(name),
-            url: PathBuf::from(format!("/v/{name}.wav")),
+            url: PathBuf::from(format!("/{source}/{name}.wav")),
             kind: MediaKind::Audio,
             duration: MediaTime::seconds(10.0),
             audio: vec![AudioSummary {
@@ -1965,7 +2025,7 @@ mod tests {
     }
 
     #[test]
-    fn combined_island_preserves_clock_gaps_and_overlaps() {
+    fn combined_island_compacts_clock_gaps_and_serializes_one_source() {
         let islands = vec![
             ExportIsland {
                 id: 0,
@@ -1991,26 +2051,77 @@ mod tests {
             .map(|item| (item.clip.id.0.as_str(), item.start))
             .collect();
         assert_eq!(starts["first"], 0.0);
-        assert_eq!(starts["overlap"], 5.0);
-        assert_eq!(starts["in-gap"], 15.0);
+        assert_eq!(starts["overlap"], 11.0);
+        assert_eq!(starts["in-gap"], 22.0);
     }
 
     #[test]
-    fn prevent_group_overlaps_pushes_only_colliding_groups() {
+    fn combined_island_packs_incompatible_recording_dates() {
         let islands = vec![
             ExportIsland {
                 id: 0,
-                clips: vec![island_clip("first", 1_000, 100.0)],
+                clips: vec![island_clip("recorder", 1_704_075_706, 100.0)],
                 duration: 10.0,
             },
             ExportIsland {
                 id: 1,
-                clips: vec![island_clip("overlap", 1_005, 105.0)],
+                clips: vec![island_clip("camera", 1_771_769_850, 200.0)],
+                duration: 10.0,
+            },
+        ];
+        let timeline = ExportTimeline::new(islands, MediaTime::new(1, 25), "t");
+        let combined = timeline.combined_island(1.0);
+        assert_eq!(combined.clips[0].start, 0.0);
+        assert_eq!(combined.clips[1].start, 11.0);
+    }
+
+    #[test]
+    fn distinct_sources_keep_clock_overlap_but_compact_empty_time() {
+        let islands = vec![
+            ExportIsland {
+                id: 0,
+                clips: vec![island_clip_from("one", "first", 1_000, 100.0)],
+                duration: 10.0,
+            },
+            ExportIsland {
+                id: 1,
+                clips: vec![island_clip_from("two", "overlap", 1_005, 105.0)],
                 duration: 10.0,
             },
             ExportIsland {
                 id: 2,
-                clips: vec![island_clip("later", 1_030, 130.0)],
+                clips: vec![island_clip_from("three", "later", 1_030, 130.0)],
+                duration: 10.0,
+            },
+        ];
+        let timeline = ExportTimeline::new(islands, MediaTime::new(1, 25), "t");
+        let combined = timeline.combined_island(1.0);
+        let starts: HashMap<_, _> = combined
+            .clips
+            .iter()
+            .map(|item| (item.clip.id.0.as_str(), item.start))
+            .collect();
+        assert_eq!(starts["first"], 0.0);
+        assert_eq!(starts["overlap"], 5.0);
+        assert_eq!(starts["later"], 16.0);
+    }
+
+    #[test]
+    fn prevent_group_overlaps_serializes_distinct_sources() {
+        let islands = vec![
+            ExportIsland {
+                id: 0,
+                clips: vec![island_clip_from("one", "first", 1_000, 100.0)],
+                duration: 10.0,
+            },
+            ExportIsland {
+                id: 1,
+                clips: vec![island_clip_from("two", "overlap", 1_005, 105.0)],
+                duration: 10.0,
+            },
+            ExportIsland {
+                id: 2,
+                clips: vec![island_clip_from("three", "later", 1_030, 130.0)],
                 duration: 10.0,
             },
         ];
@@ -2023,8 +2134,8 @@ mod tests {
             .map(|item| (item.clip.id.0.as_str(), item.start))
             .collect();
         assert_eq!(starts["first"], 0.0);
-        assert_eq!(starts["overlap"], 10.0);
-        assert_eq!(starts["later"], 30.0);
+        assert_eq!(starts["overlap"], 11.0);
+        assert_eq!(starts["later"], 22.0);
     }
 
     #[test]

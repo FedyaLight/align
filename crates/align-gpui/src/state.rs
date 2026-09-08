@@ -242,7 +242,7 @@ pub struct AppData {
     pub show_search_settings: bool,
     pub show_stage_settings: bool,
     pub show_sequence_results: bool,
-    pub appearance: Option<crate::theme::ThemeMode>,
+    pub appearance: crate::theme::AppearancePreference,
     pub inputs: Vec<PathBuf>,
     pub clips: Vec<ClipRow>,
     pub selection: HashSet<PathBuf>,
@@ -264,6 +264,9 @@ pub struct AppData {
     pub active_sequence_result: usize,
     sequence_constraints: HashMap<usize, Vec<SyncConstraint>>,
     pub audio_stream_channels: HashMap<ClipId, Vec<usize>>,
+    /// Timeline waveforms live only for this process and are regenerated
+    /// from cached fingerprints when a sync runs.
+    pub waveform_previews: HashMap<ClipId, Vec<f32>>,
     pub pending_count: usize,
     pub menu: Option<MenuTarget>,
     pub sequence_picker: Option<SequencePicker>,
@@ -304,6 +307,7 @@ pub struct AppData {
     // Overlays.
     pub show_warning_details: bool,
     pub show_about: bool,
+    pub show_agent_setup: bool,
     pub zoom_level: f64,
     /// Scroll position of the main content (timeline panning).
     pub timeline_scroll: ScrollHandle,
@@ -317,7 +321,7 @@ impl Default for AppData {
     fn default() -> Self {
         Self {
             inputs: Vec::new(),
-            appearance: Some(crate::theme::ThemeMode::Light),
+            appearance: crate::theme::AppearancePreference::load(),
             common_settings: Default::default(),
             sequence_settings: HashMap::new(),
             settings_scope: Default::default(),
@@ -348,6 +352,7 @@ impl Default for AppData {
             active_sequence_result: 0,
             sequence_constraints: HashMap::new(),
             audio_stream_channels: HashMap::new(),
+            waveform_previews: HashMap::new(),
             pending_count: 0,
             menu: None,
             sequence_picker: None,
@@ -384,6 +389,7 @@ impl Default for AppData {
             export_started: false,
             show_warning_details: false,
             show_about: false,
+            show_agent_setup: false,
             zoom_level: 0.0,
             timeline_scroll: ScrollHandle::new(),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -435,6 +441,30 @@ impl AppData {
             .get(&self.current_sequence_key())
             .copied()
             .unwrap_or_default()
+    }
+
+    pub fn scoped_settings_are_default(&self) -> bool {
+        match self.settings_scope {
+            SettingsScope::Common => self.common_settings == SyncDefaults::default(),
+            SettingsScope::CurrentSequence => {
+                self.current_sequence_settings() == SequenceDefaults::default()
+            }
+        }
+    }
+
+    pub fn reset_scoped_settings(&mut self) -> bool {
+        match self.settings_scope {
+            SettingsScope::Common => {
+                let previous = std::mem::take(&mut self.common_settings);
+                previous != self.common_settings
+            }
+            SettingsScope::CurrentSequence => {
+                let key = self.current_sequence_key();
+                self.sequence_settings
+                    .remove(&key)
+                    .is_some_and(|value| value != SequenceDefaults::default())
+            }
+        }
     }
 
     fn current_track_overrides(&self) -> Option<&TrackOverrides> {
@@ -734,7 +764,15 @@ impl AppData {
         if selected.is_empty() {
             return;
         }
+        let removed_ids: HashSet<ClipId> = self
+            .clips
+            .iter()
+            .filter(|clip| selected.contains(&clip.url))
+            .filter_map(|clip| clip.clip_id.clone())
+            .collect();
         self.clips.retain(|c| !selected.contains(&c.url));
+        self.waveform_previews
+            .retain(|clip_id, _| !removed_ids.contains(clip_id));
         self.inputs.retain(|u| !selected.contains(u));
         for url in &selected {
             self.timeline_choices.remove(url);
@@ -879,6 +917,7 @@ impl AppData {
                 }
             }
         } else {
+            self.waveform_previews.clear();
             self.begin_sequence_progress();
         }
         self.selection.clear();
@@ -1916,6 +1955,7 @@ impl AppData {
             .cloned()
             .unwrap_or_default();
         PipelineOptions {
+            generate_waveform_previews: true,
             search_accuracy: defaults.search_accuracy,
             search_overrides: overrides.search,
             source_search_overrides: overrides.search_keys,
@@ -2055,6 +2095,25 @@ fn imported_preview(result: &SyncResult) -> ImportedPreview {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reset_defaults_respects_the_selected_scope() {
+        let mut data = AppData::default();
+        data.common_settings.search_accuracy = align_core::SearchAccuracy::Exhaustive;
+        assert!(!data.scoped_settings_are_default());
+        assert!(data.reset_scoped_settings());
+        assert_eq!(data.common_settings, SyncDefaults::default());
+
+        data.settings_scope = SettingsScope::CurrentSequence;
+        assert!(data.set_scoped_clip_order(Some(ClipOrder::ByFileName)));
+        assert!(!data.scoped_settings_are_default());
+        assert!(data.reset_scoped_settings());
+        assert_eq!(
+            data.current_sequence_settings(),
+            SequenceDefaults::default()
+        );
+        assert!(!data.reset_scoped_settings());
+    }
 
     fn empty_sequence_result(name: &str) -> SyncResult {
         SyncResult {

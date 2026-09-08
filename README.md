@@ -47,6 +47,7 @@ Rust edition 2024 / `cargo fmt` чист, тесты зелёные,
 | VFR classify/canonical + оба walk | `core/timing.rs`, ffprobe packet-walk, AVSampleCursor-walk | ✅ |
 | FCP7 + FCPXML импорт (cuts/retime/transitions/links/relink/resolve) | `core/xml.rs` (verbatim payload round-trip, DOM-спэны) | ✅ |
 | `AlignCLI/main.swift` | `align-cli` (`sync/export/export-json`, прогресс в stderr, exit 2/1) | ✅ |
+| MCP-интеграция для AI-агентов | `align-mcp` (`inspect/sync/export`, stdio JSON-RPC) + копирование настройки и промпта из GUI | ✅ |
 | `TimelineExport` + OTIO/Premiere/FCPXML/precision-script | `core/export/` (модель, 3 врайтера, скрипт дословно) | ✅ |
 | `AudioDriftCorrector` + `ChannelRenderer` + `WAVMetadataPreserver` | `decode/render.rs` (посегментный sinc, exact-length, int32-stems) + `core/wav.rs` + `core/drift.rs` | ✅ |
 | `AlignApp` SwiftUI/AppKit (AppModel 844 строки, ContentView, TimelinePreview Canvas, ExportSheet) | `align-gpui` (GPUI 0.2: DropZone/SourceList/TimelineCanvas/ExportSheet entities) | ✅ |
@@ -122,7 +123,7 @@ cargo run -p align-gpui -- /path/to/project.xml
 Релиз под 3 ОС:
 
 ```bash
-cargo build --release -p align-cli -p align-gpui
+cargo build --release -p align-cli -p align-mcp -p align-gpui
 # macOS: script/package-macos.sh [dir] (без ffmpeg по умолчанию —
 # Apple backend + системный PATH; BUNDLE_FFMPEG=1 чтобы встроить)
 # Windows: cargo-wix (msi) — длинные пути, bundled ffmpeg.exe
@@ -210,7 +211,15 @@ cargo run --release -p align-gpui
 ./target/release/align-cli export --export-media /path/to/output /path/to/media
 ./target/release/align-cli export-json result.json /path/to/output
 ./target/release/align-cli export-json --no-drift --replaced-audio result.json /path/to/output
+
+# MCP: stdio-сервер для AI-агентов
+./target/release/align-mcp
 ```
+
+Готовые JSON-конфигурация MCP и промпт находятся в приложении:
+**Align → Use with AI Agents…**. Сервер предоставляет инструменты
+`align_inspect`, `align_sync` и `align_export` и запускает лежащий рядом
+`align-cli`.
 
 Нужны только Rust stable + системный ffmpeg/ffprobe в PATH
 (контейнерный тир portable-движка и mp4-фикстуры тестов).

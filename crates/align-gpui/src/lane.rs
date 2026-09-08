@@ -622,8 +622,11 @@ mod tests {
             .map(|bar| (bar.clip_id.0.as_str(), bar.start))
             .collect();
         assert_eq!(starts["b"], 0.0);
-        assert_eq!(starts["c"], 500.0);
-        assert_eq!(starts["a"], 1_000.0);
+        assert_eq!(starts["c"], 11.0);
+        assert_eq!(starts["a"], 22.0);
+        let lanes = layout_bars(automatic.bars, &HashMap::new());
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].clips.len(), 3);
         let timed = SyncResult {
             search_overrides: Default::default(),
             stopped: false,

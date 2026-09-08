@@ -103,10 +103,20 @@ version = "0.1.0"
 dependencies = [
  "align-core",
  "align-decode",
+ "dirs 6.0.0",
  "futures",
  "gpui",
  "mimalloc",
+ "serde",
+ "serde_json",
  "usvg",
+]
+
+[[package]]
+name = "align-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

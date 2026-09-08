@@ -401,7 +401,15 @@ fn parse_imported_track(value: &str) -> Result<String, String> {
 }
 
 fn main() {
+    struct SessionCleanup;
+    impl Drop for SessionCleanup {
+        fn drop(&mut self) {
+            align_decode::aaf::cleanup_session_media();
+        }
+    }
+    let session_cleanup = SessionCleanup;
     let code = run();
+    drop(session_cleanup);
     std::process::exit(code);
 }
 

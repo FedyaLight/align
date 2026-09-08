@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/align-core", "crates/align-decode", "crates/align-cli", "crates/align-gpui"]
+members = ["crates/align-core", "crates/align-decode", "crates/align-cli", "crates/align-gpui", "crates/align-mcp"]
 resolver = "2"
 
 [workspace.package]

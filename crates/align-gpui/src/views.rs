@@ -17,17 +17,18 @@ use align_decode::export::ExportArtifact;
 use align_decode::pipeline::{Phase, Pipeline};
 use futures::StreamExt;
 use gpui::{
-    AnchoredPositionMode, Animation, AnimationExt, AnyView, App, ClickEvent, Context, Corner, Div,
-    DragMoveEvent, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ParentElement, PathPromptOptions, Pixels, Point, Render,
-    ScrollHandle, SharedString, Stateful, Styled, Window, anchored, deferred, div, point,
+    AnchoredPositionMode, Animation, AnimationExt, AnyView, App, ClickEvent, ClipboardItem,
+    Context, Corner, Div, DragMoveEvent, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, PathPromptOptions, Pixels, Point,
+    Render, ScrollHandle, SharedString, Stateful, Styled, Window, anchored, deferred, div, point,
     prelude::*, px, rgb, rgba,
 };
 
 use super::icons::{icons, kind_badge, svg_icon};
 use super::lane::CorrectionOption;
 use super::state::{
-    AppData, ClipState, ExportTarget, MenuTarget, Operation, SequencePicker, SettingsScope,
+    AppData, ClipState, ExportTarget, MenuTarget, Operation, SequenceDefaults, SequencePicker,
+    SettingsScope, SyncDefaults,
 };
 use super::text_input::TextInput;
 use super::theme::{Theme, ThemeMode};
@@ -172,6 +173,58 @@ fn export_select_motion<E: IntoElement + Styled + 'static>(
             let height = if reduced { 1. } else { visible };
             el.h(px(menu_height * height)).opacity(visible)
         })
+}
+
+fn settings_select_motion<E: IntoElement + Styled + 'static>(
+    child: E,
+    select: SettingsSelect,
+    menu_height: f32,
+    closing: bool,
+) -> impl IntoElement {
+    let reduced = super::motion::reduced_motion();
+    div()
+        .w(px(210.))
+        .overflow_hidden()
+        .rounded_lg()
+        .shadow_md()
+        .child(child)
+        .with_animation(
+            SharedString::from(format!(
+                "settings-{}-{}",
+                select.id(),
+                if closing { "out" } else { "in" }
+            )),
+            entrance(180),
+            move |el, progress| {
+                let visible = if closing { 1. - progress } else { progress };
+                let height = if reduced { 1. } else { visible };
+                el.h(px(menu_height * height)).opacity(visible)
+            },
+        )
+}
+
+fn settings_reset_motion<E: IntoElement + Styled + 'static>(
+    child: E,
+    closing: bool,
+) -> impl IntoElement {
+    let reduced = super::motion::reduced_motion();
+    div()
+        .h(px(30.))
+        .overflow_hidden()
+        .child(child)
+        .with_animation(
+            if closing {
+                "settings-reset-out"
+            } else {
+                "settings-reset-in"
+            },
+            entrance(180),
+            move |el, progress| {
+                let visible = if closing { 1. - progress } else { progress };
+                let width = if reduced { 1. } else { visible };
+                el.w(px(34. * width)).opacity(visible)
+            },
+        )
 }
 
 fn quality_shift_for_export<E: IntoElement + Styled + 'static>(child: E) -> impl IntoElement {
@@ -373,6 +426,15 @@ mod motion_tests {
         );
         assert_eq!(middle_ellipsis("короткий", 21), "короткий");
     }
+
+    #[test]
+    fn waveform_columns_fill_a_non_divisible_clip_width() {
+        let waveform: Vec<f32> = (0..512).map(|value| value as f32 / 511.0).collect();
+        let width = 748.0;
+        let (columns, column_width) = waveform_columns(&waveform, width);
+        assert!((columns.len() as f32 * column_width - width).abs() < 0.01);
+        assert!(columns.last().is_some_and(|value| *value > 0.99));
+    }
 }
 
 enum SyncMsg {
@@ -391,6 +453,7 @@ struct SyncProgress {
     current: Option<PathBuf>,
     discovered: Option<Clip>,
     preview: Option<MatchPreview>,
+    waveform: Option<(ClipId, Vec<f32>)>,
     sequence_index: usize,
     sequence_count: usize,
 }
@@ -446,6 +509,29 @@ struct ExportReveals {
 enum ExportSelect {
     AafFrameRate,
     UnmatchedPlacement,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsSelect {
+    Search,
+    Audio,
+    Temporal,
+    Threshold,
+    Order,
+    Content,
+}
+
+impl SettingsSelect {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Search => "search",
+            Self::Audio => "audio",
+            Self::Temporal => "temporal",
+            Self::Threshold => "threshold",
+            Self::Order => "order",
+            Self::Content => "content",
+        }
+    }
 }
 
 const TIMELINE_MOVE_MS: u64 = 360;
@@ -639,6 +725,14 @@ pub struct AlignApp {
     export_select: Option<ExportSelect>,
     export_select_closing: bool,
     export_select_generation: u64,
+    settings_select: Option<SettingsSelect>,
+    settings_select_closing: bool,
+    settings_select_generation: u64,
+    settings_close_closing: bool,
+    settings_reset_closing: bool,
+    settings_motion_generation: u64,
+    settings_initial_common: SyncDefaults,
+    settings_initial_sequence: SequenceDefaults,
     selection_controls_closing: bool,
     export_reveals_closing: HashMap<&'static str, u64>,
     export_reveal_generation: u64,
@@ -667,6 +761,14 @@ impl AlignApp {
             export_select: None,
             export_select_closing: false,
             export_select_generation: 0,
+            settings_select: None,
+            settings_select_closing: false,
+            settings_select_generation: 0,
+            settings_close_closing: false,
+            settings_reset_closing: false,
+            settings_motion_generation: 0,
+            settings_initial_common: SyncDefaults::default(),
+            settings_initial_sequence: SequenceDefaults::default(),
             selection_controls_closing: false,
             export_reveals_closing: HashMap::new(),
             export_reveal_generation: 0,
@@ -700,6 +802,7 @@ impl AlignApp {
     pub(crate) fn start_sync(&mut self, cx: &mut Context<Self>) {
         self.search_quality_closing = false;
         self.clear_export_select();
+        self.clear_settings_select();
         self.selection_controls_closing = false;
         self.export_sidebar_closing = false;
         if !self.data.begin_sync_run() {
@@ -755,6 +858,7 @@ impl AlignApp {
                         current: p.current,
                         discovered: p.discovered,
                         preview: p.preview,
+                        waveform: p.waveform,
                         sequence_index,
                         sequence_count,
                     })));
@@ -874,6 +978,11 @@ impl AlignApp {
                 self.data.progress = sequence_index as f32 / sequence_count as f32;
             }
             SyncMsg::Progress(event) => {
+                if let Some((clip_id, waveform)) = event.waveform.as_ref() {
+                    self.data
+                        .waveform_previews
+                        .insert(clip_id.clone(), waveform.clone());
+                }
                 let phase_name = match event.phase {
                     Phase::Inspect => "inspect",
                     Phase::Fingerprint => "fingerprint",
@@ -999,6 +1108,197 @@ impl AlignApp {
         self.export_select_closing = false;
     }
 
+    fn toggle_settings_select(&mut self, select: SettingsSelect, cx: &mut Context<Self>) {
+        if self.settings_select == Some(select) && !self.settings_select_closing {
+            self.close_settings_select(cx);
+            return;
+        }
+        self.settings_select_generation += 1;
+        self.settings_select = Some(select);
+        self.settings_select_closing = false;
+        cx.notify();
+    }
+
+    fn close_settings_select(&mut self, cx: &mut Context<Self>) {
+        if self.settings_select.is_none() || self.settings_select_closing {
+            return;
+        }
+        self.settings_select_generation += 1;
+        let generation = self.settings_select_generation;
+        self.settings_select_closing = true;
+        cx.notify();
+        let timer = cx.background_executor().timer(Duration::from_millis(180));
+        cx.spawn(async move |view, cx| {
+            timer.await;
+            let _ = view.update(cx, |this, cx| {
+                if this.settings_select_generation == generation && this.settings_select_closing {
+                    this.settings_select = None;
+                    this.settings_select_closing = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn clear_settings_select(&mut self) {
+        self.settings_select_generation += 1;
+        self.settings_select = None;
+        self.settings_select_closing = false;
+    }
+
+    fn animate_settings_change(
+        &mut self,
+        was_default: bool,
+        changed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !changed {
+            return;
+        }
+        let was_dirty = self.data.settings_changed;
+        let is_dirty = self.data.common_settings != self.settings_initial_common
+            || self.data.current_sequence_settings() != self.settings_initial_sequence;
+        self.data.settings_changed = is_dirty;
+        let is_default = self.data.scoped_settings_are_default();
+        self.settings_motion_generation += 1;
+        let generation = self.settings_motion_generation;
+        if was_dirty != is_dirty {
+            self.settings_close_closing = true;
+        }
+        if was_default && !is_default {
+            self.settings_reset_closing = false;
+        } else if !was_default && is_default {
+            self.settings_reset_closing = true;
+        }
+        cx.notify();
+        if !self.settings_close_closing && !self.settings_reset_closing {
+            return;
+        }
+        let timer = cx.background_executor().timer(Duration::from_millis(180));
+        cx.spawn(async move |view, cx| {
+            timer.await;
+            let _ = view.update(cx, |this, cx| {
+                if this.settings_motion_generation == generation {
+                    this.settings_close_closing = false;
+                    this.settings_reset_closing = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn set_settings_scope(&mut self, scope: SettingsScope, cx: &mut Context<Self>) {
+        let was_default = self.data.scoped_settings_are_default();
+        self.data.settings_scope = scope;
+        self.clear_settings_select();
+        let is_default = self.data.scoped_settings_are_default();
+        if was_default != is_default {
+            self.settings_motion_generation += 1;
+            let generation = self.settings_motion_generation;
+            self.settings_reset_closing = !was_default && is_default;
+            cx.notify();
+            if self.settings_reset_closing {
+                let timer = cx.background_executor().timer(Duration::from_millis(180));
+                cx.spawn(async move |view, cx| {
+                    timer.await;
+                    let _ = view.update(cx, |this, cx| {
+                        if this.settings_motion_generation == generation {
+                            this.settings_reset_closing = false;
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+                return;
+            }
+        }
+        cx.notify();
+    }
+
+    fn set_settings_option(
+        &mut self,
+        select: SettingsSelect,
+        option: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let inherit = self.data.settings_scope == SettingsScope::CurrentSequence;
+        let index = option.saturating_sub(usize::from(inherit));
+        let was_default = self.data.scoped_settings_are_default();
+        let changed = if inherit && option == 0 {
+            match select {
+                SettingsSelect::Search => self.data.set_scoped_search_accuracy(None),
+                SettingsSelect::Audio => self.data.set_scoped_audio_source(None),
+                SettingsSelect::Temporal => self.data.set_scoped_temporal_mode(None),
+                SettingsSelect::Threshold => self.data.set_scoped_match_threshold(None),
+                SettingsSelect::Order => self.data.set_scoped_clip_order(None),
+                SettingsSelect::Content => self.data.set_scoped_track_content(None),
+            }
+        } else {
+            match select {
+                SettingsSelect::Search => align_core::SearchAccuracy::ALL
+                    .get(index)
+                    .copied()
+                    .is_some_and(|value| self.data.set_scoped_search_accuracy(Some(value))),
+                SettingsSelect::Audio => [
+                    AudioAnalysisSource::Automatic,
+                    AudioAnalysisSource::AllMixed,
+                    AudioAnalysisSource::MixedStream(0),
+                    AudioAnalysisSource::Channel(0),
+                ]
+                .get(index)
+                .copied()
+                .is_some_and(|value| self.data.set_scoped_audio_source(Some(value))),
+                SettingsSelect::Temporal => [
+                    TemporalMode::Auto,
+                    TemporalMode::RecStart,
+                    TemporalMode::RecStop,
+                    TemporalMode::Timecode,
+                ]
+                .get(index)
+                .copied()
+                .is_some_and(|value| self.data.set_scoped_temporal_mode(Some(value))),
+                SettingsSelect::Threshold => [
+                    MatchThreshold::Permissive,
+                    MatchThreshold::Balanced,
+                    MatchThreshold::Conservative,
+                ]
+                .get(index)
+                .copied()
+                .is_some_and(|value| self.data.set_scoped_match_threshold(Some(value))),
+                SettingsSelect::Order => [
+                    ClipOrder::Auto,
+                    ClipOrder::AlternateAuto,
+                    ClipOrder::AsImported,
+                    ClipOrder::ByDateTime,
+                    ClipOrder::ByFileName,
+                    ClipOrder::Ignore,
+                ]
+                .get(index)
+                .copied()
+                .is_some_and(|value| self.data.set_scoped_clip_order(Some(value))),
+                SettingsSelect::Content => [
+                    TrackContent::Auto,
+                    TrackContent::Linear,
+                    TrackContent::Takes,
+                ]
+                .get(index)
+                .copied()
+                .is_some_and(|value| self.data.set_scoped_track_content(Some(value))),
+            }
+        };
+        self.clear_settings_select();
+        self.animate_settings_change(was_default, changed, cx);
+    }
+
+    fn reset_settings(&mut self, cx: &mut Context<Self>) {
+        let was_default = self.data.scoped_settings_are_default();
+        let changed = self.data.reset_scoped_settings();
+        self.clear_settings_select();
+        self.animate_settings_change(was_default, changed, cx);
+    }
+
     fn update_export_options(&mut self, cx: &mut Context<Self>, update: impl FnOnce(&mut AppData)) {
         let before = ExportReveals::new(&self.data).entries();
         update(&mut self.data);
@@ -1084,6 +1384,9 @@ impl AlignApp {
     }
 
     fn finish_search_settings(&mut self, cx: &mut Context<Self>) {
+        self.clear_settings_select();
+        self.settings_close_closing = false;
+        self.settings_reset_closing = false;
         self.data.show_search_settings = false;
         let changed = std::mem::take(&mut self.data.settings_changed);
         if changed {
@@ -1828,13 +2131,22 @@ fn fmt_timecode(start: f64, at: f64) -> String {
     format!("{h:02}:{m:02}:{s:02}:{f:02}")
 }
 
+fn waveform_columns(waveform: &[f32], width: f32) -> (Vec<f32>, f32) {
+    let visible_bins = ((width / 2.0).floor() as usize).clamp(1, waveform.len());
+    let columns = (0..visible_bins)
+        .map(|index| {
+            let start = index * waveform.len() / visible_bins;
+            let end = (index + 1) * waveform.len() / visible_bins;
+            let values = &waveform[start..end];
+            values.iter().sum::<f32>() / values.len() as f32
+        })
+        .collect();
+    (columns, (width / visible_bins as f32).max(1.0))
+}
+
 impl Render for AlignApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = match self.data.appearance {
-            Some(ThemeMode::Light) => Theme::light(),
-            Some(ThemeMode::Dark) => Theme::dark(),
-            None => Theme::of(window.appearance()),
-        };
+        let theme = Theme::current(window.appearance());
         // Viewport-mapped Fit width (mirrors Swift's GeometryReader:
         // viewport minus label column and content padding).
         let fit_width =
@@ -1847,6 +2159,7 @@ impl Render for AlignApp {
             && self.data.error.is_none()
             && self.data.sequence_picker.is_none()
             && !self.data.show_about
+            && !self.data.show_agent_setup
             && !self.data.show_search_quality
             && !self.data.show_search_settings
             && !self.data.show_stage_settings
@@ -1884,6 +2197,10 @@ impl Render for AlignApp {
                     this.close_export_select(cx);
                     return;
                 }
+                if key == "escape" && this.settings_select.is_some() {
+                    this.close_settings_select(cx);
+                    return;
+                }
                 if key == "escape"
                     && this.data.show_export
                     && !matches!(this.data.operation, Operation::Exporting)
@@ -1893,6 +2210,11 @@ impl Render for AlignApp {
                 }
                 if key == "escape" && this.data.show_search_quality {
                     this.close_search_quality(cx);
+                    return;
+                }
+                if key == "escape" && this.data.show_agent_setup {
+                    this.data.show_agent_setup = false;
+                    cx.notify();
                     return;
                 }
                 if key == "escape" && this.data.show_path_fixer {
@@ -2047,7 +2369,15 @@ impl Render for AlignApp {
             root = root.child(overlay(
                 &theme,
                 "overlay-search",
-                search_settings_panel(cx, &theme, &self.data),
+                search_settings_panel(
+                    cx,
+                    &theme,
+                    &self.data,
+                    self.settings_select,
+                    self.settings_select_closing,
+                    self.settings_close_closing,
+                    self.settings_reset_closing,
+                ),
             ));
         }
         if self.data.show_path_fixer {
@@ -2072,6 +2402,13 @@ impl Render for AlignApp {
         }
         if self.data.show_about {
             root = root.child(overlay(&theme, "overlay-about", about_panel(cx, &theme)));
+        }
+        if self.data.show_agent_setup {
+            root = root.child(overlay(
+                &theme,
+                "overlay-agent-setup",
+                agent_setup_panel(cx, &theme),
+            ));
         }
         root
     }
@@ -2867,6 +3204,30 @@ fn timeline_lanes(
                 // hard-clipping past the bar edge. `el` itself is
                 // absolutely positioned, hence a valid anchor.
                 if width >= 24.0 {
+                    if let Some(waveform) = data.waveform_previews.get(&bar.clip_id) {
+                        let (columns, bar_width) = waveform_columns(waveform, width);
+                        let mut preview = div()
+                            .absolute()
+                            .left(px(0.))
+                            .right(px(0.))
+                            .top(px(0.))
+                            .bottom(px(0.))
+                            .overflow_hidden();
+                        for (index, amplitude) in columns.into_iter().enumerate() {
+                            let height = 3.0 + amplitude * (TIMELINE_ROW_H - 21.0);
+                            preview = preview.child(
+                                div()
+                                    .absolute()
+                                    .left(px(index as f32 * bar_width))
+                                    .top(px((TIMELINE_ROW_H - 12.0 - height) * 0.5))
+                                    .w(px((bar_width - 1.0).max(1.0)))
+                                    .h(px(height))
+                                    .rounded_sm()
+                                    .bg(rgba(0xFFFFFF42)),
+                            );
+                        }
+                        el = el.child(preview);
+                    }
                     let video = matches!(bar.kind, MediaKind::Video);
                     let icon_path = if video {
                         icons().film.clone()
@@ -3009,13 +3370,13 @@ fn timeline_lanes(
         )
         .child(tracks);
 
-    div()
-        .w_full()
-        .flex()
-        .flex_row()
-        .p_2()
-        .child(labels)
-        .child(viewport)
+    let lanes = div().w_full().flex().flex_row();
+    let lanes = if data.show_export {
+        lanes.pl_2().py_2()
+    } else {
+        lanes.p_2()
+    };
+    lanes.child(labels).child(viewport)
 }
 
 // ---------------- warning banner + details
@@ -3138,42 +3499,19 @@ fn operation_bar(
         }
         bar = bar.child(status);
     }
-    if data.is_stale() && !busy {
-        if data.pending_count > 0 {
-            bar = bar.child(
-                div()
-                    .text_color(rgb(theme.orange))
-                    .child(format!("＋ {} new", data.pending_count)),
-            );
-            bar = bar.child(
-                div()
-                    .text_color(rgb(theme.dim))
-                    .child("Synchronize to include them."),
-            );
-        } else {
-            bar = bar.child(
-                div()
-                    .text_color(rgb(theme.orange))
-                    .child("Settings changed"),
-            );
-            bar = bar.child(
-                div()
-                    .text_color(rgb(theme.dim))
-                    .child("Synchronize to apply them."),
-            );
-        }
-    }
-    bar = bar.child(div().flex_1());
     if busy {
-        bar = bar.child(button(
+        bar = bar.child(icon_button(
             cx,
             theme,
             "btn-cancel",
+            icons().close.clone(),
             "Cancel",
             true,
             |this, _, _, cx| this.cancel_current(cx),
         ));
-    } else {
+    }
+    bar = bar.child(div().flex_1());
+    if !busy {
         if let Some(result) = &data.result {
             if result.stages.len() > 1 {
                 bar = bar.child(button(
@@ -3389,40 +3727,376 @@ fn track_content_label(value: TrackContent) -> &'static str {
     }
 }
 
-fn next_setting<T: Copy + PartialEq>(current: Option<T>, values: &[T], inherit: bool) -> Option<T> {
-    match current {
-        None => values.first().copied(),
-        Some(value) => values
-            .iter()
-            .position(|candidate| *candidate == value)
-            .and_then(|index| values.get(index + 1).copied())
-            .or_else(|| (!inherit).then(|| values[0])),
-    }
-}
-
-fn settings_value_row(
-    cx: &mut Context<AlignApp>,
-    theme: &Theme,
-    id: &'static str,
-    title: &'static str,
-    value: String,
-    action: impl Fn(&mut AlignApp, &ClickEvent, &mut Window, &mut Context<AlignApp>) + 'static,
-) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .gap_3()
-        .child(div().text_size(px(12.)).child(title))
-        .child(button(cx, theme, id, value, true, action))
-}
-
 fn scoped_label<T: Copy>(value: Option<T>, common: T, label: impl Fn(T) -> &'static str) -> String {
     value.map_or_else(
         || format!("Inherit ({})", label(common)),
         |value| label(value).to_string(),
     )
+}
+
+fn typed_settings_options<T: Copy + PartialEq>(
+    current_scope: bool,
+    current: Option<T>,
+    common: T,
+    values: &[T],
+    label: impl Fn(T) -> &'static str,
+) -> Vec<(String, bool)> {
+    let mut options = Vec::with_capacity(values.len() + usize::from(current_scope));
+    if current_scope {
+        options.push((format!("Inherit ({})", label(common)), current.is_none()));
+    }
+    options.extend(
+        values
+            .iter()
+            .copied()
+            .map(|value| (label(value).to_string(), current == Some(value))),
+    );
+    options
+}
+
+fn settings_options(data: &super::state::AppData, select: SettingsSelect) -> Vec<(String, bool)> {
+    let current_scope = data.settings_scope == SettingsScope::CurrentSequence;
+    let sequence = data.current_sequence_settings();
+    match select {
+        SettingsSelect::Search => typed_settings_options(
+            current_scope,
+            if current_scope {
+                sequence.search_accuracy
+            } else {
+                Some(data.common_settings.search_accuracy)
+            },
+            data.common_settings.search_accuracy,
+            &align_core::SearchAccuracy::ALL,
+            |value| value.label(),
+        ),
+        SettingsSelect::Audio => typed_settings_options(
+            current_scope,
+            if current_scope {
+                sequence.audio_source
+            } else {
+                Some(data.common_settings.audio_source)
+            },
+            data.common_settings.audio_source,
+            &[
+                AudioAnalysisSource::Automatic,
+                AudioAnalysisSource::AllMixed,
+                AudioAnalysisSource::MixedStream(0),
+                AudioAnalysisSource::Channel(0),
+            ],
+            audio_source_label,
+        ),
+        SettingsSelect::Temporal => typed_settings_options(
+            current_scope,
+            if current_scope {
+                sequence.temporal_mode
+            } else {
+                Some(data.common_settings.temporal_mode)
+            },
+            data.common_settings.temporal_mode,
+            &[
+                TemporalMode::Auto,
+                TemporalMode::RecStart,
+                TemporalMode::RecStop,
+                TemporalMode::Timecode,
+            ],
+            |value| value.title(),
+        ),
+        SettingsSelect::Threshold => typed_settings_options(
+            current_scope,
+            if current_scope {
+                sequence.match_threshold
+            } else {
+                Some(data.common_settings.match_threshold)
+            },
+            data.common_settings.match_threshold,
+            &[
+                MatchThreshold::Permissive,
+                MatchThreshold::Balanced,
+                MatchThreshold::Conservative,
+            ],
+            match_threshold_label,
+        ),
+        SettingsSelect::Order => typed_settings_options(
+            current_scope,
+            if current_scope {
+                sequence.clip_order
+            } else {
+                Some(data.common_settings.clip_order)
+            },
+            data.common_settings.clip_order,
+            &[
+                ClipOrder::Auto,
+                ClipOrder::AlternateAuto,
+                ClipOrder::AsImported,
+                ClipOrder::ByDateTime,
+                ClipOrder::ByFileName,
+                ClipOrder::Ignore,
+            ],
+            clip_order_label,
+        ),
+        SettingsSelect::Content => typed_settings_options(
+            current_scope,
+            if current_scope {
+                sequence.track_content
+            } else {
+                Some(data.common_settings.track_content)
+            },
+            data.common_settings.track_content,
+            &[
+                TrackContent::Auto,
+                TrackContent::Linear,
+                TrackContent::Takes,
+            ],
+            track_content_label,
+        ),
+    }
+}
+
+fn settings_menu_row(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    select: SettingsSelect,
+    index: usize,
+    label: String,
+    selected: bool,
+) -> Stateful<Div> {
+    div()
+        .id(SharedString::from(format!(
+            "settings-{}-{index}",
+            select.id()
+        )))
+        .h(px(28.))
+        .px_2()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .rounded_md()
+        .text_size(px(12.))
+        .text_color(rgb(theme.text))
+        .cursor_pointer()
+        .hover(|this| this.bg(rgb(theme.button_hover)))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.set_settings_option(select, index, cx);
+        }))
+        .child(div().min_w(px(0.)).truncate().child(label))
+        .child(
+            div()
+                .w(px(16.))
+                .h(px(16.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(selected, |slot| {
+                    slot.child(svg_icon(icons().check.clone(), 12., theme.accent))
+                }),
+        )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settings_select_row(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    id: &'static str,
+    title: &'static str,
+    value: String,
+    select: SettingsSelect,
+    open: bool,
+    closing: bool,
+    options: Vec<(String, bool)>,
+) -> Div {
+    let menu_height = options.len() as f32 * 28. + 8.;
+    let mut menu = div()
+        .id(SharedString::from(format!("settings-{}-menu", select.id())))
+        .w(px(210.))
+        .flex()
+        .flex_col()
+        .p_1()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(theme.border))
+        .bg(rgb(theme.panel))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+    for (index, (label, selected)) in options.into_iter().enumerate() {
+        menu = menu.child(settings_menu_row(cx, theme, select, index, label, selected));
+    }
+    let mut control = div()
+        .id(id)
+        .relative()
+        .w(px(210.))
+        .h(px(28.))
+        .px_2()
+        .flex_shrink_0()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .rounded_lg()
+        .bg(rgb(if open {
+            theme.border
+        } else {
+            theme.button_hover
+        }))
+        .text_size(px(12.))
+        .text_color(rgb(theme.icon))
+        .cursor_pointer()
+        .hover(|this| this.bg(rgb(theme.border)))
+        .active(|this| this.opacity(0.62))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(cx.listener(move |this, _, _, cx| this.toggle_settings_select(select, cx)))
+        .child(div().min_w(px(0.)).truncate().child(value))
+        .child(div().w(px(12.)).h(px(12.)).flex_shrink_0().child(svg_icon(
+            icons().chevron_down.clone(),
+            12.,
+            theme.icon,
+        )));
+    if open {
+        control = control.child(deferred(
+            anchored()
+                .position_mode(AnchoredPositionMode::Local)
+                .offset(point(px(0.), px(4.)))
+                .snap_to_window_with_margin(px(8.))
+                .child(settings_select_motion(menu, select, menu_height, closing)),
+        ));
+    }
+    div()
+        .w_full()
+        .h(px(28.))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(rgb(theme.dim))
+                .child(title),
+        )
+        .child(control)
+}
+
+fn settings_header(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    data: &super::state::AppData,
+    close_closing: bool,
+    reset_closing: bool,
+) -> Div {
+    let dirty_scope = !data.scoped_settings_are_default();
+    let mut actions = div().h(px(30.)).flex().flex_row().items_center().gap_1();
+    if dirty_scope || reset_closing {
+        actions = actions.child(settings_reset_motion(
+            div().child(icon_button(
+                cx,
+                theme,
+                "settings-reset",
+                icons().reset.clone(),
+                "Reset to defaults",
+                true,
+                |this, _, _, cx| this.reset_settings(cx),
+            )),
+            reset_closing,
+        ));
+    }
+    if data.settings_changed {
+        let mut confirmation = div().relative().w(px(68.)).h(px(30.));
+        confirmation = confirmation.child(
+            div().absolute().right(px(0.)).child(
+                prominent_button(
+                    cx,
+                    theme,
+                    "settings-apply",
+                    "Apply",
+                    true,
+                    |this, _, _, cx| this.finish_search_settings(cx),
+                )
+                .with_animation(
+                    "settings-apply-in",
+                    entrance(180),
+                    |el, progress| el.opacity(progress),
+                ),
+            ),
+        );
+        if close_closing {
+            confirmation = confirmation.child(
+                div().absolute().right(px(0.)).child(
+                    div()
+                        .child(icon_button(
+                            cx,
+                            theme,
+                            "settings-close-out",
+                            icons().close.clone(),
+                            "Close",
+                            true,
+                            |_, _, _, _| {},
+                        ))
+                        .with_animation("settings-close-out", entrance(180), |el, progress| {
+                            el.opacity(1. - progress)
+                        }),
+                ),
+            );
+        }
+        actions = actions.child(confirmation);
+    } else {
+        let mut confirmation = div().relative().w(px(68.)).h(px(30.));
+        confirmation = confirmation.child(
+            div().absolute().right(px(0.)).child(
+                div()
+                    .child(icon_button(
+                        cx,
+                        theme,
+                        "settings-close",
+                        icons().close.clone(),
+                        "Close",
+                        true,
+                        |this, _, _, cx| this.finish_search_settings(cx),
+                    ))
+                    .with_animation("settings-close-in", entrance(180), |el, progress| {
+                        el.opacity(progress)
+                    }),
+            ),
+        );
+        if close_closing {
+            confirmation = confirmation.child(
+                div().absolute().right(px(0.)).child(
+                    prominent_button(
+                        cx,
+                        theme,
+                        "settings-apply-out",
+                        "Apply",
+                        true,
+                        |_, _, _, _| {},
+                    )
+                    .with_animation(
+                        "settings-apply-out",
+                        entrance(180),
+                        |el, progress| el.opacity(1. - progress),
+                    ),
+                ),
+            );
+        }
+        actions = actions.child(confirmation);
+    }
+    div()
+        .w_full()
+        .h(px(30.))
+        .flex_shrink_0()
+        .flex()
+        .flex_row()
+        .items_center()
+        .child(
+            div()
+                .text_size(px(16.))
+                .font_weight(gpui::FontWeight(600.0))
+                .child("Synchronization settings"),
+        )
+        .child(div().flex_1())
+        .child(actions)
 }
 
 fn search_quality_dismiss_layer(cx: &mut Context<AlignApp>) -> impl IntoElement {
@@ -3594,6 +4268,11 @@ fn search_quality_menu(
                 false,
                 |this, _, _, cx| {
                     this.close_search_quality(cx);
+                    this.clear_settings_select();
+                    this.settings_close_closing = false;
+                    this.settings_reset_closing = false;
+                    this.settings_initial_common = this.data.common_settings;
+                    this.settings_initial_sequence = this.data.current_sequence_settings();
                     this.data.show_search_settings = true;
                     this.data.settings_changed = false;
                     cx.notify();
@@ -3606,6 +4285,10 @@ fn search_settings_panel(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &super::state::AppData,
+    selected: Option<SettingsSelect>,
+    select_closing: bool,
+    close_closing: bool,
+    reset_closing: bool,
 ) -> impl IntoElement {
     let sequence = data.current_sequence_settings();
     let common = data.common_settings;
@@ -3654,10 +4337,7 @@ fn search_settings_panel(
                 "✓ Common"
             },
             true,
-            |this, _, _, cx| {
-                this.data.settings_scope = SettingsScope::Common;
-                cx.notify();
-            },
+            |this, _, _, cx| this.set_settings_scope(SettingsScope::Common, cx),
         ))
         .child(button(
             cx,
@@ -3669,185 +4349,38 @@ fn search_settings_panel(
                 "Current sequence"
             },
             true,
-            |this, _, _, cx| {
-                this.data.settings_scope = SettingsScope::CurrentSequence;
-                cx.notify();
-            },
+            |this, _, _, cx| this.set_settings_scope(SettingsScope::CurrentSequence, cx),
         ));
     div()
         .id("search-settings")
-        .w(px(520.))
+        .w(px(560.))
         .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .rounded_lg()
-        .bg(rgb(theme.panel))
-        .border_1()
-        .border_color(rgb(theme.border))
-        .child(modal_header(
-            cx,
-            theme,
-            "Synchronization settings",
-            "settings-close",
-            |this, _, _, cx| this.finish_search_settings(cx),
+        .flex().flex_col().gap_2()
+        .rounded_lg().bg(rgb(theme.panel)).border_1().border_color(rgb(theme.border))
+        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close_settings_select(cx)))
+        .child(settings_header(cx, theme, data, close_closing, reset_closing))
+        .child(div().text_size(px(12.)).text_color(rgb(theme.dim)).child(
+            "Choose defaults for every sequence or replace them for the current sequence. Track menus inherit these values.",
         ))
-        .child(
-            div()
-                .text_size(px(12.))
-                .text_color(rgb(theme.dim))
-                .child("Choose defaults for every sequence or replace them for the current sequence. Track menus inherit these values."),
-        )
         .child(scope_row)
-        .child(settings_value_row(
-            cx,
-            theme,
-            "settings-search",
-            "Search accuracy",
-            scoped_label(search, common.search_accuracy, |value| value.label()),
-            |this, _, _, cx| {
-                let sequence = this.data.current_sequence_settings();
-                let inherit = this.data.settings_scope == SettingsScope::CurrentSequence;
-                let current = if inherit {
-                    sequence.search_accuracy
-                } else {
-                    Some(this.data.common_settings.search_accuracy)
-                };
-                let value = next_setting(current, &align_core::SearchAccuracy::ALL, inherit);
-                this.data.settings_changed |= this.data.set_scoped_search_accuracy(value);
-                cx.notify();
-            },
-        ))
-        .child(settings_value_row(
-            cx,
-            theme,
-            "settings-audio",
-            "Wave source",
-            scoped_label(audio, common.audio_source, audio_source_label),
-            |this, _, _, cx| {
-                const VALUES: [AudioAnalysisSource; 4] = [
-                    AudioAnalysisSource::Automatic,
-                    AudioAnalysisSource::AllMixed,
-                    AudioAnalysisSource::MixedStream(0),
-                    AudioAnalysisSource::Channel(0),
-                ];
-                let inherit = this.data.settings_scope == SettingsScope::CurrentSequence;
-                let current = if inherit {
-                    this.data.current_sequence_settings().audio_source
-                } else {
-                    Some(this.data.common_settings.audio_source)
-                };
-                let value = next_setting(current, &VALUES, inherit);
-                this.data.settings_changed |= this.data.set_scoped_audio_source(value);
-                cx.notify();
-            },
-        ))
-        .child(settings_value_row(
-            cx,
-            theme,
-            "settings-temporal",
-            "Time source",
-            scoped_label(temporal, common.temporal_mode, |value| value.title()),
-            |this, _, _, cx| {
-                const VALUES: [TemporalMode; 4] = [
-                    TemporalMode::Auto,
-                    TemporalMode::RecStart,
-                    TemporalMode::RecStop,
-                    TemporalMode::Timecode,
-                ];
-                let inherit = this.data.settings_scope == SettingsScope::CurrentSequence;
-                let current = if inherit {
-                    this.data.current_sequence_settings().temporal_mode
-                } else {
-                    Some(this.data.common_settings.temporal_mode)
-                };
-                let value = next_setting(current, &VALUES, inherit);
-                this.data.settings_changed |= this.data.set_scoped_temporal_mode(value);
-                cx.notify();
-            },
-        ))
-        .child(settings_value_row(
-            cx,
-            theme,
-            "settings-threshold",
-            "Match threshold",
-            scoped_label(threshold, common.match_threshold, match_threshold_label),
-            |this, _, _, cx| {
-                const VALUES: [MatchThreshold; 3] = [
-                    MatchThreshold::Permissive,
-                    MatchThreshold::Balanced,
-                    MatchThreshold::Conservative,
-                ];
-                let inherit = this.data.settings_scope == SettingsScope::CurrentSequence;
-                let current = if inherit {
-                    this.data.current_sequence_settings().match_threshold
-                } else {
-                    Some(this.data.common_settings.match_threshold)
-                };
-                let value = next_setting(current, &VALUES, inherit);
-                this.data.settings_changed |= this.data.set_scoped_match_threshold(value);
-                cx.notify();
-            },
-        ))
-        .child(settings_value_row(
-            cx,
-            theme,
-            "settings-order",
-            "Clip order",
-            scoped_label(order, common.clip_order, clip_order_label),
-            |this, _, _, cx| {
-                const VALUES: [ClipOrder; 6] = [
-                    ClipOrder::Auto,
-                    ClipOrder::AlternateAuto,
-                    ClipOrder::AsImported,
-                    ClipOrder::ByDateTime,
-                    ClipOrder::ByFileName,
-                    ClipOrder::Ignore,
-                ];
-                let inherit = this.data.settings_scope == SettingsScope::CurrentSequence;
-                let current = if inherit {
-                    this.data.current_sequence_settings().clip_order
-                } else {
-                    Some(this.data.common_settings.clip_order)
-                };
-                let value = next_setting(current, &VALUES, inherit);
-                this.data.settings_changed |= this.data.set_scoped_clip_order(value);
-                cx.notify();
-            },
-        ))
-        .child(settings_value_row(
-            cx,
-            theme,
-            "settings-content",
-            "Track content",
-            scoped_label(content, common.track_content, track_content_label),
-            |this, _, _, cx| {
-                const VALUES: [TrackContent; 3] = [
-                    TrackContent::Auto,
-                    TrackContent::Linear,
-                    TrackContent::Takes,
-                ];
-                let inherit = this.data.settings_scope == SettingsScope::CurrentSequence;
-                let current = if inherit {
-                    this.data.current_sequence_settings().track_content
-                } else {
-                    Some(this.data.common_settings.track_content)
-                };
-                let value = next_setting(current, &VALUES, inherit);
-                this.data.settings_changed |= this.data.set_scoped_track_content(value);
-                cx.notify();
-            },
-        ))
-        .when(data.settings_changed, |panel| {
-            panel.child(prominent_button(
-                cx,
-                theme,
-                "settings-apply",
-                "Apply settings",
-                true,
-                |this, _, _, cx| this.finish_search_settings(cx),
-            ))
-        })
+        .child(settings_select_row(cx, theme, "settings-search", "Search accuracy",
+            scoped_label(search, common.search_accuracy, |value| value.label()), SettingsSelect::Search,
+            selected == Some(SettingsSelect::Search), select_closing, settings_options(data, SettingsSelect::Search)))
+        .child(settings_select_row(cx, theme, "settings-audio", "Wave source",
+            scoped_label(audio, common.audio_source, audio_source_label), SettingsSelect::Audio,
+            selected == Some(SettingsSelect::Audio), select_closing, settings_options(data, SettingsSelect::Audio)))
+        .child(settings_select_row(cx, theme, "settings-temporal", "Time source",
+            scoped_label(temporal, common.temporal_mode, |value| value.title()), SettingsSelect::Temporal,
+            selected == Some(SettingsSelect::Temporal), select_closing, settings_options(data, SettingsSelect::Temporal)))
+        .child(settings_select_row(cx, theme, "settings-threshold", "Match threshold",
+            scoped_label(threshold, common.match_threshold, match_threshold_label), SettingsSelect::Threshold,
+            selected == Some(SettingsSelect::Threshold), select_closing, settings_options(data, SettingsSelect::Threshold)))
+        .child(settings_select_row(cx, theme, "settings-order", "Clip order",
+            scoped_label(order, common.clip_order, clip_order_label), SettingsSelect::Order,
+            selected == Some(SettingsSelect::Order), select_closing, settings_options(data, SettingsSelect::Order)))
+        .child(settings_select_row(cx, theme, "settings-content", "Track content",
+            scoped_label(content, common.track_content, track_content_label), SettingsSelect::Content,
+            selected == Some(SettingsSelect::Content), select_closing, settings_options(data, SettingsSelect::Content)))
 }
 
 // ---------------- diagnostics popover (mirrors DiagnosticsButton)
@@ -5998,6 +6531,126 @@ fn about_panel(cx: &mut Context<AlignApp>, theme: &Theme) -> impl IntoElement {
                 .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
         )
         .child(div().child("Cross-platform media synchronizer"))
+}
+
+// ---------------- MCP setup (Align menu → Use with AI Agents…)
+
+const AGENT_PROMPT: &str = "Use the Align MCP server for media synchronization. Start with align_inspect when you need to understand the supplied media or timeline project. Use align_sync to calculate synchronization and align_export only when I ask for editor-ready files. Pass absolute paths, keep the default balanced settings unless the material calls for a different choice, and report the output files and any warnings clearly.";
+
+fn mcp_server_path() -> PathBuf {
+    let executable = if cfg!(windows) {
+        "align-mcp.exe"
+    } else {
+        "align-mcp"
+    };
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join(executable)))
+        .unwrap_or_else(|| PathBuf::from(executable))
+}
+
+fn mcp_configuration() -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "mcpServers": {
+            "align": {
+                "command": mcp_server_path()
+            }
+        }
+    }))
+    .unwrap_or_default()
+}
+
+fn setup_text_block(theme: &Theme, text: impl Into<SharedString>) -> Div {
+    div()
+        .w_full()
+        .p_3()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(theme.border))
+        .bg(rgb(theme.bg))
+        .text_size(px(12.))
+        .text_color(rgb(theme.icon))
+        .whitespace_normal()
+        .child(text.into())
+}
+
+fn agent_setup_panel(cx: &mut Context<AlignApp>, theme: &Theme) -> impl IntoElement {
+    let configuration = mcp_configuration();
+    div()
+        .id("agent-setup")
+        .w(px(620.))
+        .max_h_full()
+        .m_4()
+        .p_5()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(theme.border))
+        .bg(rgb(theme.panel))
+        .shadow_md()
+        .child(modal_header(
+            cx,
+            theme,
+            "Use Align with AI agents",
+            "agent-setup-close",
+            |this, _, _, cx| {
+                this.data.show_agent_setup = false;
+                cx.notify();
+            },
+        ))
+        .child(
+            div()
+                .text_color(rgb(theme.dim))
+                .child("Connect the bundled MCP server, then give your agent the prompt below."),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight(600.))
+                        .child("MCP configuration"),
+                )
+                .child(div().flex_1())
+                .child(button(
+                    cx,
+                    theme,
+                    "copy-mcp-config",
+                    "Copy configuration",
+                    true,
+                    |_, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(mcp_configuration()));
+                    },
+                )),
+        )
+        .child(setup_text_block(theme, configuration))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight(600.))
+                        .child("Agent prompt"),
+                )
+                .child(div().flex_1())
+                .child(prominent_button(
+                    cx,
+                    theme,
+                    "copy-agent-prompt",
+                    "Copy prompt",
+                    true,
+                    |_, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(AGENT_PROMPT.to_string()));
+                    },
+                )),
+        )
+        .child(setup_text_block(theme, AGENT_PROMPT))
 }
 
 // ---------------- error alert (mirrors .alert)

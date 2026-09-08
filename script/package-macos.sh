@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Packages the Rust Align port for macOS (arm64): Align.app bundle +
-# align-cli, AAF and FFmpeg sidecars, ad-hoc signed.
+# align-cli, align-mcp, AAF and FFmpeg sidecars, ad-hoc signed.
 # Usage: ./script/package-macos.sh [output-dir]   (default: ~/Downloads/Align-macOS)
 set -euo pipefail
 
@@ -32,7 +32,7 @@ if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
 fi
 
 echo "==> building release"
-cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml" -p align-cli -p align-gpui
+cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml" -p align-cli -p align-mcp -p align-gpui
 
 BIN_DIR="$ROOT_DIR/target/release"
 APP_BUNDLE="$OUT_DIR/$APP_NAME.app"
@@ -49,8 +49,11 @@ chmod +x "$APP_MACOS/$APP_NAME"
 cp "$ROOT_DIR/Support/AppIcon.icns" "$RESOURCES/AppIcon.icns" 2>/dev/null || true
 cp "$ROOT_DIR/THIRD_PARTY_NOTICES.txt" "$RESOURCES/THIRD_PARTY_NOTICES.txt"
 cp "$BIN_DIR/align-cli" "$OUT_DIR/align-cli"
+cp "$BIN_DIR/align-cli" "$APP_MACOS/align-cli"
+cp "$BIN_DIR/align-mcp" "$OUT_DIR/align-mcp"
+cp "$BIN_DIR/align-mcp" "$APP_MACOS/align-mcp"
 cp "$ROOT_DIR/THIRD_PARTY_NOTICES.txt" "$OUT_DIR/THIRD_PARTY_NOTICES.txt"
-chmod +x "$OUT_DIR/align-cli"
+chmod +x "$OUT_DIR/align-cli" "$APP_MACOS/align-cli" "$OUT_DIR/align-mcp" "$APP_MACOS/align-mcp"
 cp "$AAF_BUILD_DIR/dist/align-aaf" "$APP_MACOS/align-aaf"
 cp "$AAF_BUILD_DIR/dist/align-aaf" "$OUT_DIR/align-aaf"
 cp -R "$AAF_BUILD_DIR/dist/AAF-Licenses" "$RESOURCES/AAF-Licenses"
@@ -103,6 +106,7 @@ Align – кроссплатформенный синхронизатор мед
 
   Align.app            — графическое приложение (двойной клик)
   align-cli            — batch CLI: sync / export / export-json
+  align-mcp            — MCP server for AI agents (stdio)
   align-aaf            — автономный модуль AAF (Python пользователю не нужен)
   THIRD_PARTY_NOTICES.txt — лицензии сторонних компонентов
 $([ "$BUNDLE_FFMPEG" == "1" ] && echo "  ffmpeg, ffprobe      — bundled sidecars для видеоконтейнеров
@@ -113,6 +117,10 @@ CLI:
   ./align-cli sync /path/to/media > result.json
   ./align-cli export /path/to/output /path/to/media
   ./align-cli export-json result.json /path/to/output
+
+AI AGENTS:
+  Open Align → Align → Use with AI Agents… and copy the MCP configuration
+  and ready-to-use prompt.
 
 Требования: macOS 15+ (Apple backend дергает loadTracks API 15+), Apple Silicon.
 Подпись ad-hoc (локальный запуск). Для распространения нужны
@@ -127,6 +135,7 @@ codesign -dv --verbose=2 "$APP_BUNDLE" 2>&1 | head -5
 
 echo "==> smoke test"
 "$OUT_DIR/align-cli" --help >/dev/null 2>&1 || "$OUT_DIR/align-cli" >/dev/null 2>&1 || true
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | "$OUT_DIR/align-mcp" | grep -q 'align_sync'
 ("$APP_MACOS/$APP_NAME" >/tmp/align-smoke.log 2>&1 & echo $! > /tmp/align-smoke.pid)
 sleep 5
 SMOKE=$(cat /tmp/align-smoke.pid)
