@@ -1050,6 +1050,7 @@ fn write_artifacts(
         &timeline.name,
     );
     combined.temporal_policy = timeline.temporal_policy.clone();
+    combined.copy_assembly_policy_from(timeline);
     let mut artifacts = Vec::with_capacity(formats.len());
     for format in formats {
         if *format == TimelineExportFormat::Aaf {

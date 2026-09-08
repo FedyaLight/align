@@ -555,6 +555,11 @@ pub struct SyncResult {
     /// Search budget that produced this result. Legacy results used Balanced.
     #[serde(default, skip_serializing_if = "crate::SearchAccuracy::is_balanced")]
     pub search_accuracy: crate::SearchAccuracy,
+    /// Imported source tracks whose edits remain fixed while other tracks
+    /// are placed relative to their synchronized media clock. Keys use the
+    /// writer-neutral `imported-video-000001` / `imported-audio-000001` form.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub preserve_editing_tracks: std::collections::BTreeSet<String>,
     pub project: SyncProject,
     pub islands: Vec<SyncIsland>,
     pub unmatched: Vec<ClipId>,

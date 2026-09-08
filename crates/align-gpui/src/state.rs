@@ -210,6 +210,7 @@ struct TrackOverrides {
     order_keys: HashMap<String, ClipOrder>,
     contents: HashMap<ClipId, TrackContent>,
     content_keys: HashMap<String, TrackContent>,
+    preserve_editing: HashSet<String>,
 }
 
 impl TrackOverrides {
@@ -220,6 +221,7 @@ impl TrackOverrides {
             + self.thresholds.len()
             + self.orders.len()
             + self.contents.len()
+            + self.preserve_editing.len()
     }
 
     fn is_empty(&self) -> bool {
@@ -1524,6 +1526,43 @@ impl AppData {
         })
     }
 
+    pub fn lane_can_preserve_editing(&self, lane_id: &str) -> bool {
+        self.lanes.iter().any(|lane| {
+            lane.id == lane_id
+                && (lane.source_key.starts_with("imported-video-")
+                    || lane.source_key.starts_with("imported-audio-"))
+        })
+    }
+
+    pub fn lane_preserves_editing(&self, lane_id: &str) -> bool {
+        let Some(lane) = self.lanes.iter().find(|lane| lane.id == lane_id) else {
+            return false;
+        };
+        self.current_track_overrides()
+            .is_some_and(|overrides| overrides.preserve_editing.contains(&lane.source_key))
+    }
+
+    pub fn set_preserve_editing(&mut self, preserve: bool, lane_id: &str) -> bool {
+        let Some(key) = self
+            .lanes
+            .iter()
+            .find(|lane| lane.id == lane_id)
+            .map(|lane| lane.source_key.clone())
+            .filter(|key| key.starts_with("imported-video-") || key.starts_with("imported-audio-"))
+        else {
+            return false;
+        };
+        let overrides = self
+            .track_overrides
+            .entry(self.current_sequence_key())
+            .or_default();
+        if preserve {
+            overrides.preserve_editing.insert(key)
+        } else {
+            overrides.preserve_editing.remove(&key)
+        }
+    }
+
     pub fn reset_corrections(&mut self) -> bool {
         let sequence_key = self.current_sequence_key();
         if self.current_constraints().is_empty()
@@ -1779,6 +1818,7 @@ impl AppData {
                 default: defaults.track_content,
                 modes: overrides.contents,
             },
+            preserve_editing_tracks: overrides.preserve_editing,
             temporal: align_core::TemporalPolicy {
                 default: defaults.temporal_mode,
                 modes: overrides.temporal,
@@ -1881,6 +1921,7 @@ mod tests {
             stages: Vec::new(),
             selected_stage: None,
             search_accuracy: Default::default(),
+            preserve_editing_tracks: Default::default(),
             project: align_core::SyncProject {
                 clips: Vec::new(),
                 warnings: Vec::new(),
@@ -2060,6 +2101,7 @@ mod tests {
             stages: Vec::new(),
             selected_stage: None,
             search_accuracy: Default::default(),
+            preserve_editing_tracks: Default::default(),
             project: SyncProject {
                 clips: vec![
                     clip("a.mov", MediaKind::Video, 10.0),
@@ -2340,6 +2382,66 @@ mod tests {
     }
 
     #[test]
+    fn preserve_basic_editing_is_an_imported_track_override() {
+        use crate::lane::{BarMatchState, BarVisual, LaneVisual};
+
+        let mut data = AppData {
+            inputs: vec![PathBuf::from("/tmp/project.xml")],
+            timeline_choices: [(PathBuf::from("/tmp/project.xml"), vec![3, 8])]
+                .into_iter()
+                .collect(),
+            lanes: vec![LaneVisual {
+                id: "audio-0".into(),
+                kind: MediaKind::Audio,
+                number: 1,
+                source_key: "imported-audio-000002".into(),
+                source_name: "Imported A2".into(),
+                stream_channels: Vec::new(),
+                clips: vec![BarVisual {
+                    id: "edit".into(),
+                    clip_id: ClipId::new("clip"),
+                    url: PathBuf::from("/v/clip.wav"),
+                    source_key: "imported-audio-000002".into(),
+                    name: "clip.wav".into(),
+                    kind: MediaKind::Audio,
+                    start: 4.0,
+                    duration: 2.0,
+                    confidence: 0.9,
+                    match_state: BarMatchState::Matched,
+                }],
+            }],
+            ..Default::default()
+        };
+        assert!(data.lane_can_preserve_editing("audio-0"));
+        assert!(!data.lane_preserves_editing("audio-0"));
+        assert!(data.set_preserve_editing(true, "audio-0"));
+        assert!(data.lane_preserves_editing("audio-0"));
+        assert_eq!(
+            data.pipeline_options_for_sequence(3)
+                .preserve_editing_tracks
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["imported-audio-000002"]
+        );
+        data.active_sequence_result = 1;
+        assert!(!data.lane_preserves_editing("audio-0"));
+        assert!(
+            data.pipeline_options_for_sequence(8)
+                .preserve_editing_tracks
+                .is_empty()
+        );
+        data.active_sequence_result = 0;
+        assert!(data.reset_corrections());
+        assert!(!data.lane_preserves_editing("audio-0"));
+        assert!(data.set_preserve_editing(true, "audio-0"));
+        assert!(data.set_preserve_editing(false, "audio-0"));
+        assert!(!data.lane_preserves_editing("audio-0"));
+        data.lanes[0].source_key = "/raw/folder".into();
+        assert!(!data.lane_can_preserve_editing("audio-0"));
+        assert!(!data.set_preserve_editing(true, "audio-0"));
+    }
+
+    #[test]
     fn status_text_mirrors_swift() {
         assert_eq!(ClipState::Queued.status_text(), "Queued");
         assert_eq!(
@@ -2404,6 +2506,7 @@ mod tests {
             stages: Vec::new(),
             selected_stage: None,
             search_accuracy: Default::default(),
+            preserve_editing_tracks: Default::default(),
             project: SyncProject {
                 clips: Vec::new(),
                 warnings: Vec::new(),
@@ -2617,6 +2720,7 @@ mod tests {
             stages: Vec::new(),
             selected_stage: None,
             search_accuracy: Default::default(),
+            preserve_editing_tracks: Default::default(),
             project: SyncProject {
                 clips: vec![clip("camera.mov", MediaKind::Video)],
                 warnings: Vec::new(),

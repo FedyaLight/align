@@ -555,6 +555,7 @@ pub(crate) mod tests {
             stages: Vec::new(),
             selected_stage: None,
             search_accuracy: Default::default(),
+            preserve_editing_tracks: Default::default(),
             project: SyncProject {
                 clips: vec![video, rec],
                 warnings: Vec::new(),

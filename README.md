@@ -5,6 +5,7 @@ XML + экспорт + drift-render + CLI + GPUI + metadata/LTC timecode, пар
 ×4 с бит-идентичными результатами, cooperative cancel, sequence picker
 + сохранённые результаты всех sequences и совместный XML/FCPXML/AAF export
 + Common → current sequence → track наследование всех sync-настроек
++ per-track Preserve basic editing для фиксированных cuts/trims/duplicates/gaps
 + сохранение исправленных media paths в отдельную копию XML/FCPXML/AAF
 + отдельные Final Cut timeline/multicam outputs и независимые labels для
   synchronized/unsynchronized clips
@@ -193,6 +194,7 @@ cargo run --release -p align-gpui
 ./target/release/align-cli sync --match-threshold conservative /path/to/media > result.json
 ./target/release/align-cli sync --clip-order by-file-name /path/to/media > result.json
 ./target/release/align-cli sync --track-content linear /path/to/media > result.json
+./target/release/align-cli sync --preserve-basic-editing A1 /path/to/project.xml > result.json
 ./target/release/align-cli sync --all-sequences /path/to/project.xml > results.json
 ./target/release/align-cli sync --write-fixed-project /path/to/project-fixed.xml /path/to/project.xml /path/to/media > result.json
 ./target/release/align-cli export /path/to/output /path/to/media
@@ -200,6 +202,7 @@ cargo run --release -p align-gpui
 ./target/release/align-cli export --write-fixed-project /path/to/project-fixed.aaf /path/to/output /path/to/project.aaf /path/to/media
 ./target/release/align-cli export --unmatched order-only --disable-unmatched --prevent-group-overlaps /path/to/output /path/to/media
 ./target/release/align-cli export --time-source timecode --match-threshold conservative --clip-order by-file-name /path/to/output /path/to/media
+./target/release/align-cli export --preserve-basic-editing V1 --preserve-basic-editing A1 /path/to/output /path/to/project.xml
 ./target/release/align-cli export --no-drift --replaced-audio /path/to/output /path/to/media
 ./target/release/align-cli export --aaf --aaf-fps 25 /path/to/output /path/to/project.aaf
 ./target/release/align-cli export --no-fcpxml-multicam --label-synced --synced-symbol '[SYNCED]' --synced-color Iris --synced-role dialogue /path/to/output /path/to/media

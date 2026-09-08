@@ -327,7 +327,7 @@ impl SearchAccuracy {
     }
 }
 
-#[derive(Args, Clone, Copy, Debug)]
+#[derive(Args, Clone, Debug)]
 struct SyncSettings {
     /// Select a completed synchronization stage (1-based); default is most synced clips.
     #[arg(long, value_name = "N")]
@@ -338,6 +338,10 @@ struct SyncSettings {
     /// Whether clips from one source track may synchronize together.
     #[arg(long, value_enum, default_value_t = TrackContent::Auto)]
     track_content: TrackContent,
+    /// Preserve trims, duplicates, order, positions and gaps on an imported
+    /// track (for example A1 or V2). Repeat for more than one anchor track.
+    #[arg(long = "preserve-basic-editing", value_name = "TRACK", value_parser = parse_imported_track)]
+    preserve_editing_tracks: Vec<String>,
     /// Timestamp evidence (Syncaila Time source).
     #[arg(long, value_enum, default_value_t = TimeSource::Auto)]
     time_source: TimeSource,
@@ -350,7 +354,7 @@ struct SyncSettings {
 }
 
 impl SyncSettings {
-    fn pipeline_options(self) -> PipelineOptions {
+    fn pipeline_options(&self) -> PipelineOptions {
         PipelineOptions {
             search_accuracy: self.search_accuracy.core(),
             temporal: align_core::TemporalPolicy {
@@ -369,9 +373,31 @@ impl SyncSettings {
                 default: self.track_content.core(),
                 modes: std::collections::HashMap::new(),
             },
+            preserve_editing_tracks: self.preserve_editing_tracks.iter().cloned().collect(),
             ..PipelineOptions::default()
         }
     }
+}
+
+fn parse_imported_track(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let (kind, number) = value.split_at_checked(1).ok_or_else(|| {
+        "track must be an imported video or audio track such as V1 or A2".to_string()
+    })?;
+    let number: usize = number.parse().map_err(|_| {
+        "track must be an imported video or audio track such as V1 or A2".to_string()
+    })?;
+    if number == 0 {
+        return Err("track numbers start at 1".into());
+    }
+    let kind = match kind.to_ascii_uppercase().as_str() {
+        "V" => align_core::MediaKind::Video,
+        "A" => align_core::MediaKind::Audio,
+        _ => {
+            return Err("track must be an imported video or audio track such as V1 or A2".into());
+        }
+    };
+    Ok(align_core::export_model::imported_track_key(kind, number))
 }
 
 fn main() {
@@ -939,6 +965,10 @@ mod tests {
             "by-file-name",
             "--track-content",
             "linear",
+            "--preserve-basic-editing",
+            "V1",
+            "--preserve-basic-editing",
+            "A2",
             "--no-drift",
             "--replaced-audio",
             "--no-fcpxml-multicam",
@@ -987,6 +1017,15 @@ mod tests {
         assert_eq!(
             options.track_content.default,
             align_core::TrackContent::Linear
+        );
+        assert_eq!(
+            options.preserve_editing_tracks,
+            [
+                "imported-video-000001".to_string(),
+                "imported-audio-000002".to_string()
+            ]
+            .into_iter()
+            .collect()
         );
         assert!(!aaf);
         assert_eq!(aaf_fps.frame_duration(), None);

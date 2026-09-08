@@ -78,6 +78,8 @@ pub struct PipelineOptions {
     pub match_policy: align_core::MatchPolicy,
     pub clip_order: align_core::ClipOrderPolicy,
     pub track_content: align_core::TrackContentPolicy,
+    /// Imported tracks selected for exact basic-edit preservation.
+    pub preserve_editing_tracks: HashSet<String>,
     /// Temporal evidence overrides (Syncaila Time source), round-tripped
     /// into the result for timeline assembly and export.
     pub temporal: align_core::TemporalPolicy,
@@ -679,6 +681,7 @@ impl Pipeline {
             stages,
             selected_stage,
             search_accuracy: options.search_accuracy,
+            preserve_editing_tracks: options.preserve_editing_tracks.iter().cloned().collect(),
             project: SyncProject {
                 clips,
                 warnings,

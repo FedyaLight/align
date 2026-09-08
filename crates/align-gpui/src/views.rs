@@ -866,6 +866,15 @@ impl AlignApp {
             self.start_sync(cx);
         }
     }
+
+    fn set_preserve_editing(&mut self, preserve: bool, cx: &mut Context<Self>) {
+        let lane_id = self.data.menu.clone().and_then(|menu| menu.lane_id);
+        let changed = lane_id.is_some_and(|id| self.data.set_preserve_editing(preserve, &id));
+        if changed {
+            self.data.menu = None;
+            self.start_sync(cx);
+        }
+    }
 }
 
 // ------------------------------------------------------------ rendering
@@ -3156,6 +3165,7 @@ fn stream_menu_section(
         }
     }
     panel = track_content_section(cx, theme, data, menu, panel);
+    panel = preserve_editing_section(cx, theme, data, menu, panel);
     if let Some(lane_id) = &menu.lane_id {
         let current = data.lane_search_accuracy(lane_id);
         panel = panel.child(menu_header(theme, "Search accuracy".to_string()));
@@ -3196,6 +3206,35 @@ fn stream_menu_section(
     panel = time_source_section(cx, theme, data, menu, panel);
     panel = match_threshold_section(cx, theme, data, menu, panel);
     panel
+}
+
+fn preserve_editing_section(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    data: &super::state::AppData,
+    menu: &MenuTarget,
+    mut panel: Stateful<Div>,
+) -> Stateful<Div> {
+    let Some(lane_id) = menu.lane_id.as_deref() else {
+        return panel;
+    };
+    if !data.lane_can_preserve_editing(lane_id) {
+        return panel;
+    }
+    panel = panel.child(menu_header(theme, "Extra options".to_string()));
+    let selected = data.lane_preserves_editing(lane_id);
+    panel.child(menu_row(
+        cx,
+        theme,
+        "preserve-basic-editing",
+        if selected {
+            "✓ Preserve basic editing".to_string()
+        } else {
+            "Preserve basic editing".to_string()
+        },
+        false,
+        move |this, _, _, cx| this.set_preserve_editing(!selected, cx),
+    ))
 }
 
 fn track_content_section(
