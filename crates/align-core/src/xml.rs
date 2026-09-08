@@ -1119,7 +1119,7 @@ fn local_file_path(value: &str) -> Option<PathBuf> {
 fn decoded_file_url_path(value: &str) -> PathBuf {
     let decoded = percent_decode(value);
     #[cfg(windows)]
-    if decoded.as_bytes().get(0) == Some(&b'/')
+    if decoded.as_bytes().first() == Some(&b'/')
         && decoded
             .as_bytes()
             .get(1)

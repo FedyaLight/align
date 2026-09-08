@@ -43,12 +43,27 @@ pub fn write_with_storylines(
     include_multicam_clip: bool,
     group_storylines: bool,
 ) -> String {
+    write_with_options(timeline, true, include_multicam_clip, group_storylines)
+}
+
+pub fn write_with_options(
+    timeline: &ExportTimeline,
+    include_timeline: bool,
+    include_multicam_clip: bool,
+    group_storylines: bool,
+) -> String {
     let island = timeline.islands.first().cloned().unwrap_or(ExportIsland {
         id: 0,
         clips: Vec::new(),
         duration: 0.0,
     });
-    write_island(timeline, &island, include_multicam_clip, group_storylines)
+    write_island(
+        timeline,
+        &island,
+        include_timeline,
+        include_multicam_clip,
+        group_storylines,
+    )
 }
 
 /// Combine self-contained FCPXML documents into one library. Each source
@@ -98,6 +113,7 @@ fn prefix_references(fragment: &str, prefix: &str) -> String {
 fn write_island(
     timeline: &ExportTimeline,
     island: &ExportIsland,
+    include_timeline: bool,
     include_multicam: bool,
     group_storylines: bool,
 ) -> String {
@@ -311,11 +327,11 @@ fn write_island(
         "    <event name=\"{}\">\n",
         xml_text::escape(&timeline.name)
     );
-    xml += &format!(
+    let mut synced_project = format!(
         "      <project name=\"{} – synced\">\n",
         xml_text::escape(&timeline.name)
     );
-    xml += &format!(
+    synced_project += &format!(
         "        <sequence format=\"{format_id}\" duration=\"{total_duration}\" tcStart=\"{sequence_start}\" tcFormat=\"NDF\">\n          <spine>\n            <gap offset=\"0s\" duration=\"{total_duration}\" name=\"Master\">\n"
     );
 
@@ -398,7 +414,7 @@ fn write_island(
         let target = if group_storylines {
             stories.entry(lane as i64).or_default()
         } else {
-            &mut xml
+            &mut synced_project
         };
         let lane_attribute = if group_storylines {
             String::new()
@@ -455,7 +471,7 @@ fn write_island(
         let target = if group_storylines {
             stories.entry(lane).or_default()
         } else {
-            &mut xml
+            &mut synced_project
         };
         let lane_attribute = if group_storylines {
             String::new()
@@ -473,11 +489,15 @@ fn write_island(
     let mut stories = stories.into_iter().collect::<Vec<_>>();
     stories.sort_by_key(|(lane, _)| (*lane >= 0, lane.unsigned_abs()));
     for (lane, clips) in stories {
-        xml += &format!(
+        synced_project += &format!(
             "              <spine lane=\"{lane}\" offset=\"0s\">\n{clips}              </spine>\n"
         );
     }
-    xml += "            </gap>\n          </spine>\n        </sequence>\n      </project>\n";
+    synced_project +=
+        "            </gap>\n          </spine>\n        </sequence>\n      </project>\n";
+    if include_timeline {
+        xml += &synced_project;
+    }
 
     if include_multicam {
         xml += &format!(
@@ -605,6 +625,19 @@ mod tests {
             2
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn timeline_and_multicam_projects_can_be_selected_independently() {
+        let timeline = fixture_timeline();
+        let timeline_only = write_with_options(&timeline, true, false, false);
+        assert!(timeline_only.contains("– synced"));
+        assert!(!timeline_only.contains("r_multicam"));
+
+        let multicam_only = write_with_options(&timeline, false, true, false);
+        assert!(!multicam_only.contains("– synced"));
+        assert!(multicam_only.contains("r_multicam"));
+        assert!(multicam_only.contains("– multicam"));
     }
 
     #[test]

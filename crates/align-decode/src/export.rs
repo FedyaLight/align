@@ -121,6 +121,8 @@ pub fn export(
         directory,
         formats,
         include_replaced_sequence,
+        true,
+        true,
         false,
     )
 }
@@ -137,6 +139,8 @@ pub struct ExportRequest<'a> {
     pub correct_drift: bool,
     pub include_replaced_sequence: bool,
     pub include_media_files: bool,
+    pub include_fcpxml_timeline: bool,
+    pub include_fcpxml_multicam: bool,
     pub group_fcpxml_storylines: bool,
     pub cancel: &'a std::sync::atomic::AtomicBool,
 }
@@ -152,6 +156,8 @@ pub struct ExportBatchRequest<'a> {
     pub correct_drift: bool,
     pub include_replaced_sequence: bool,
     pub include_media_files: bool,
+    pub include_fcpxml_timeline: bool,
+    pub include_fcpxml_multicam: bool,
     pub group_fcpxml_storylines: bool,
     pub cancel: &'a std::sync::atomic::AtomicBool,
 }
@@ -175,6 +181,8 @@ pub fn export_prepared_many(
                 correct_drift: request.correct_drift,
                 include_replaced_sequence: request.include_replaced_sequence,
                 include_media_files: request.include_media_files,
+                include_fcpxml_timeline: request.include_fcpxml_timeline,
+                include_fcpxml_multicam: request.include_fcpxml_multicam,
                 group_fcpxml_storylines: request.group_fcpxml_storylines,
                 cancel: request.cancel,
             },
@@ -204,6 +212,8 @@ pub fn export_prepared_many(
                     correct_drift: request.correct_drift,
                     include_replaced_sequence: request.include_replaced_sequence,
                     include_media_files: request.include_media_files,
+                    include_fcpxml_timeline: request.include_fcpxml_timeline,
+                    include_fcpxml_multicam: request.include_fcpxml_multicam,
                     group_fcpxml_storylines: request.group_fcpxml_storylines,
                     cancel: request.cancel,
                 },
@@ -220,6 +230,8 @@ pub fn export_prepared_many(
                     correct_drift: request.correct_drift,
                     include_replaced_sequence: request.include_replaced_sequence,
                     include_media_files: request.include_media_files,
+                    include_fcpxml_timeline: request.include_fcpxml_timeline,
+                    include_fcpxml_multicam: request.include_fcpxml_multicam,
                     group_fcpxml_storylines: request.group_fcpxml_storylines,
                     cancel: request.cancel,
                 },
@@ -324,6 +336,8 @@ fn export_prepared_internal(
         correct_drift,
         include_replaced_sequence,
         include_media_files,
+        include_fcpxml_timeline,
+        include_fcpxml_multicam,
         group_fcpxml_storylines,
         cancel,
     } = request;
@@ -697,6 +711,8 @@ fn export_prepared_internal(
         directory,
         &standard_formats,
         include_replaced_sequence,
+        include_fcpxml_timeline,
+        include_fcpxml_multicam,
         group_fcpxml_storylines,
     )?;
     let mut deferred_aaf = None;
@@ -1015,6 +1031,8 @@ fn write_artifacts(
     directory: &Path,
     formats: &[TimelineExportFormat],
     include_replaced_sequence: bool,
+    include_fcpxml_timeline: bool,
+    include_fcpxml_multicam: bool,
     group_fcpxml_storylines: bool,
 ) -> Result<Vec<ExportArtifact>, ExportError> {
     let mut combined = ExportTimeline::new(
@@ -1050,14 +1068,13 @@ fn write_artifacts(
                 align_core::export::premiere::write(&combined, *format, include_replaced_sequence)
                     .into_bytes()
             }
-            TimelineExportFormat::FinalCutProXML => {
-                align_core::export::fcpxml::write_with_storylines(
-                    &combined,
-                    true,
-                    group_fcpxml_storylines,
-                )
-                .into_bytes()
-            }
+            TimelineExportFormat::FinalCutProXML => align_core::export::fcpxml::write_with_options(
+                &combined,
+                include_fcpxml_timeline,
+                include_fcpxml_multicam,
+                group_fcpxml_storylines,
+            )
+            .into_bytes(),
         };
         // Atomic write: tmp + rename.
         let tmp = url.with_extension(format!("tmp-{}", std::process::id()));
@@ -1188,6 +1205,8 @@ mod tests {
                     correct_drift: false,
                     include_replaced_sequence: false,
                     include_media_files: false,
+                    include_fcpxml_timeline: true,
+                    include_fcpxml_multicam: true,
                     group_fcpxml_storylines: false,
                     cancel: &std::sync::atomic::AtomicBool::new(false),
                 },
@@ -1286,6 +1305,8 @@ mod tests {
                 correct_drift: false,
                 include_replaced_sequence: false,
                 include_media_files: false,
+                include_fcpxml_timeline: true,
+                include_fcpxml_multicam: true,
                 group_fcpxml_storylines: false,
                 cancel: &std::sync::atomic::AtomicBool::new(false),
             },
@@ -1370,6 +1391,8 @@ mod tests {
                 correct_drift: false,
                 include_replaced_sequence: false,
                 include_media_files: false,
+                include_fcpxml_timeline: true,
+                include_fcpxml_multicam: true,
                 group_fcpxml_storylines: false,
                 cancel: &std::sync::atomic::AtomicBool::new(false),
             },

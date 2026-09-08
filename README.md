@@ -6,6 +6,8 @@ XML + экспорт + drift-render + CLI + GPUI + metadata/LTC timecode, пар
 + сохранённые результаты всех sequences и совместный XML/FCPXML/AAF export
 + Common → current sequence → track наследование всех sync-настроек
 + сохранение исправленных media paths в отдельную копию XML/FCPXML/AAF
++ отдельные Final Cut timeline/multicam outputs и независимые labels для
+  synchronized/unsynchronized clips
 + форматы + drag&drop в GUI, системные меню с шорткатами, единый
 тулбар, timeline preview с линейкой/зумом/навигацией/V-A дорожками,
 контекстные меню у курсора, export sheet, quit-time cleanup следов**
@@ -15,7 +17,8 @@ XML + экспорт + drift-render + CLI + GPUI + metadata/LTC timecode, пар
 media paths; неразрешённые timeline media можно выбрать через `Relink…` в GUI;
 `File → Analysis Cache` очищает текущий проект или весь cache и сохраняет
 срок хранения 7/30/90 дней либо до ручной очистки;
-custom sequence name и unmatched symbol/color/role доступны в Export)
+custom sequence name, synchronized/unsynchronized symbol, XML color и
+Final Cut audio role доступны в Export)
 (Swift-реализация удалена; исследование и история — в `work/`).
 Rust edition 2024 / `cargo fmt` чист, тесты зелёные,
 `clippy -D warnings` чист, GUI висит idle на 0% CPU.
@@ -194,6 +197,8 @@ cargo run --release -p align-gpui
 ./target/release/align-cli export --unmatched order-only --disable-unmatched --prevent-group-overlaps /path/to/output /path/to/media
 ./target/release/align-cli export --time-source timecode --match-threshold conservative --clip-order by-file-name /path/to/output /path/to/media
 ./target/release/align-cli export --no-drift --replaced-audio /path/to/output /path/to/media
+./target/release/align-cli export --no-fcpxml-multicam --label-synced --synced-symbol '[SYNCED]' --synced-color Iris --synced-role dialogue /path/to/output /path/to/media
+./target/release/align-cli export --no-fcpxml-timeline /path/to/output /path/to/media
 ./target/release/align-cli export --export-media /path/to/output /path/to/media
 ./target/release/align-cli export-json result.json /path/to/output
 ./target/release/align-cli export-json --no-drift --replaced-audio result.json /path/to/output

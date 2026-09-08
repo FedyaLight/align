@@ -1858,6 +1858,8 @@ mod tests {
                     correct_drift: true,
                     include_replaced_sequence: false,
                     include_media_files: false,
+                    include_fcpxml_timeline: true,
+                    include_fcpxml_multicam: true,
                     group_fcpxml_storylines: false,
                     cancel: &cancel,
                 },

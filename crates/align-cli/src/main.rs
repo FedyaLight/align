@@ -53,6 +53,12 @@ enum Command {
         /// Group FCPXML tracks into separate storylines.
         #[arg(long)]
         fcpxml_storylines: bool,
+        /// Omit the synchronized timeline project from FCPXML.
+        #[arg(long)]
+        no_fcpxml_timeline: bool,
+        /// Omit the multicam project from FCPXML.
+        #[arg(long)]
+        no_fcpxml_multicam: bool,
         /// Also create complete camera files with external audio replacing scratch audio.
         #[arg(long)]
         export_media: bool,
@@ -62,6 +68,8 @@ enum Command {
         prevent_group_overlaps: bool,
         #[arg(long)]
         disable_unmatched: bool,
+        #[arg(long)]
+        label_synced: bool,
         #[arg(long)]
         label_unmatched: bool,
         #[command(flatten)]
@@ -90,6 +98,12 @@ enum Command {
         /// Group FCPXML tracks into separate storylines.
         #[arg(long)]
         fcpxml_storylines: bool,
+        /// Omit the synchronized timeline project from FCPXML.
+        #[arg(long)]
+        no_fcpxml_timeline: bool,
+        /// Omit the multicam project from FCPXML.
+        #[arg(long)]
+        no_fcpxml_multicam: bool,
         /// Also create complete camera files with external audio replacing scratch audio.
         #[arg(long)]
         export_media: bool,
@@ -99,6 +113,8 @@ enum Command {
         prevent_group_overlaps: bool,
         #[arg(long)]
         disable_unmatched: bool,
+        #[arg(long)]
+        label_synced: bool,
         #[arg(long)]
         label_unmatched: bool,
         #[command(flatten)]
@@ -251,13 +267,25 @@ impl CutRemoveArgs {
     }
 }
 
-/// Export assignment (Syncaila Export settings): sequence name, symbol,
-/// color and role labels for unmatched clips. All default to off.
+/// Export assignment (Syncaila Export settings): sequence name plus symbol,
+/// color and role labels for synchronized and unmatched clips.
 #[derive(Args, Clone, Debug, Default)]
 struct AssignArgs {
     /// Override the exported sequence/project name.
     #[arg(long, value_name = "NAME")]
     sequence_name: Option<String>,
+    /// Custom symbol for synchronized names (implies labeling).
+    #[arg(long, value_name = "TEXT")]
+    synced_symbol: Option<String>,
+    /// Attach the synchronized symbol as a suffix instead of a prefix.
+    #[arg(long)]
+    synced_symbol_suffix: bool,
+    /// FCP 7 color label for synchronized clips (Premiere/Resolve XML).
+    #[arg(long, value_name = "COLOR")]
+    synced_color: Option<String>,
+    /// Final Cut audio role for synchronized audio (FCPXML only).
+    #[arg(long, value_name = "ROLE")]
+    synced_role: Option<String>,
     /// Custom symbol for unmatched names (implies labeling).
     #[arg(long, value_name = "TEXT")]
     unmatched_symbol: Option<String>,
@@ -645,10 +673,13 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
             aaf,
             replaced_audio,
             fcpxml_storylines,
+            no_fcpxml_timeline,
+            no_fcpxml_multicam,
             export_media,
             unmatched,
             prevent_group_overlaps,
             disable_unmatched,
+            label_synced,
             label_unmatched,
             cut_remove,
             assign,
@@ -696,8 +727,13 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
                         unmatched: unmatched.core(),
                         prevent_group_overlaps,
                         disable_unmatched,
+                        label_synced,
                         label_unmatched,
                         cut_remove: cut_remove.core()?,
+                        synced_symbol: assign.synced_symbol.clone(),
+                        synced_symbol_suffix: assign.synced_symbol_suffix,
+                        synced_color: assign.synced_color.clone(),
+                        synced_role: assign.synced_role.clone(),
                         unmatched_symbol: assign.unmatched_symbol.clone(),
                         unmatched_symbol_suffix: assign.unmatched_symbol_suffix,
                         unmatched_color: assign.unmatched_color.clone(),
@@ -714,11 +750,16 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
                 .map_err(|e| CliError::Failure(e.to_string()))?;
                 timelines.push(timeline);
             }
-            let formats = if aaf {
+            let mut formats = if aaf {
                 vec![align_core::export_model::TimelineExportFormat::Aaf]
             } else {
                 align_core::export_model::TimelineExportFormat::default_formats()
             };
+            if no_fcpxml_timeline && no_fcpxml_multicam {
+                formats.retain(|format| {
+                    *format != align_core::export_model::TimelineExportFormat::FinalCutProXML
+                });
+            }
             let artifacts = align_decode::export::export_prepared_many(
                 align_decode::export::ExportBatchRequest {
                     backend: pipeline.backend(),
@@ -728,6 +769,8 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
                     correct_drift: !no_drift,
                     include_replaced_sequence: replaced_audio,
                     include_media_files: export_media,
+                    include_fcpxml_timeline: !no_fcpxml_timeline,
+                    include_fcpxml_multicam: !no_fcpxml_multicam,
                     group_fcpxml_storylines: fcpxml_storylines,
                     cancel: &cancel,
                 },
@@ -741,10 +784,13 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
             aaf,
             replaced_audio,
             fcpxml_storylines,
+            no_fcpxml_timeline,
+            no_fcpxml_multicam,
             export_media,
             unmatched,
             prevent_group_overlaps,
             disable_unmatched,
+            label_synced,
             label_unmatched,
             cut_remove,
             assign,
@@ -763,8 +809,13 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
                     unmatched: unmatched.core(),
                     prevent_group_overlaps,
                     disable_unmatched,
+                    label_synced,
                     label_unmatched,
                     cut_remove: cut_remove.core()?,
+                    synced_symbol: assign.synced_symbol.clone(),
+                    synced_symbol_suffix: assign.synced_symbol_suffix,
+                    synced_color: assign.synced_color.clone(),
+                    synced_role: assign.synced_role.clone(),
                     unmatched_symbol: assign.unmatched_symbol.clone(),
                     unmatched_symbol_suffix: assign.unmatched_symbol_suffix,
                     unmatched_color: assign.unmatched_color.clone(),
@@ -774,19 +825,27 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
             )
             .map_err(|e| CliError::Failure(e.to_string()))?;
             let cancel = std::sync::atomic::AtomicBool::new(false);
+            let mut formats = if aaf {
+                vec![align_core::export_model::TimelineExportFormat::Aaf]
+            } else {
+                align_core::export_model::TimelineExportFormat::default_formats()
+            };
+            if no_fcpxml_timeline && no_fcpxml_multicam {
+                formats.retain(|format| {
+                    *format != align_core::export_model::TimelineExportFormat::FinalCutProXML
+                });
+            }
             let artifacts = align_decode::export::export_prepared(
                 align_decode::export::ExportRequest {
                     backend: pipeline.backend(),
                     timeline: &timeline,
                     directory: &output,
-                    formats: &if aaf {
-                        vec![align_core::export_model::TimelineExportFormat::Aaf]
-                    } else {
-                        align_core::export_model::TimelineExportFormat::default_formats()
-                    },
+                    formats: &formats,
                     correct_drift: !no_drift,
                     include_replaced_sequence: replaced_audio,
                     include_media_files: export_media,
+                    include_fcpxml_timeline: !no_fcpxml_timeline,
+                    include_fcpxml_multicam: !no_fcpxml_multicam,
                     group_fcpxml_storylines: fcpxml_storylines,
                     cancel: &cancel,
                 },
@@ -833,8 +892,16 @@ mod tests {
             "linear",
             "--no-drift",
             "--replaced-audio",
+            "--no-fcpxml-multicam",
             "--export-media",
+            "--label-synced",
             "--label-unmatched",
+            "--synced-symbol",
+            "✓",
+            "--synced-color",
+            "Iris",
+            "--synced-role",
+            "dialogue.interview",
             "/tmp/out",
             "/tmp/media",
         ])
@@ -845,8 +912,12 @@ mod tests {
             aaf,
             replaced_audio,
             fcpxml_storylines,
+            no_fcpxml_timeline,
+            no_fcpxml_multicam,
             export_media,
+            label_synced,
             label_unmatched,
+            assign,
             ..
         }) = cli.command
         else {
@@ -871,8 +942,14 @@ mod tests {
         assert!(no_drift);
         assert!(replaced_audio);
         assert!(!fcpxml_storylines);
+        assert!(!no_fcpxml_timeline);
+        assert!(no_fcpxml_multicam);
         assert!(export_media);
+        assert!(label_synced);
         assert!(label_unmatched);
+        assert_eq!(assign.synced_symbol.as_deref(), Some("✓"));
+        assert_eq!(assign.synced_color.as_deref(), Some("Iris"));
+        assert_eq!(assign.synced_role.as_deref(), Some("dialogue.interview"));
     }
 
     #[test]

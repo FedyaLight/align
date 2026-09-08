@@ -636,8 +636,18 @@ pub struct ExportAssemblyOptions {
     pub unmatched: UnmatchedPlacement,
     pub prevent_group_overlaps: bool,
     pub disable_unmatched: bool,
+    pub label_synced: bool,
     pub label_unmatched: bool,
     pub cut_remove: CutRemoveOptions,
+    /// Custom symbol for synchronized names (default `[SYNCED]`).
+    /// A non-empty symbol implies labeling, like Syncaila's Add to name.
+    pub synced_symbol: Option<String>,
+    /// Attach the synchronized symbol as a suffix instead of a prefix.
+    pub synced_symbol_suffix: bool,
+    /// FCP 7 color label assigned to synchronized clips.
+    pub synced_color: Option<String>,
+    /// Final Cut audio role assigned to synchronized audio (FCPXML only).
+    pub synced_role: Option<String>,
     /// Custom symbol for unmatched names (default `[UNSYNCED]`).
     /// A non-empty symbol implies labeling, like Syncaila's Add to name.
     pub unmatched_symbol: Option<String>,
@@ -654,37 +664,76 @@ pub struct ExportAssemblyOptions {
 }
 
 impl ExportAssemblyOptions {
+    fn synced_label(&self, fallback: &str) -> Option<String> {
+        assignment_label(
+            fallback,
+            self.label_synced,
+            self.synced_symbol.as_deref(),
+            self.synced_symbol_suffix,
+            "[SYNCED]",
+        )
+    }
+
     fn unmatched_label(&self, fallback: &str) -> Option<String> {
-        let symbol = self.unmatched_symbol.as_deref().unwrap_or("[UNSYNCED]");
-        if !self.label_unmatched && self.unmatched_symbol.as_deref().is_none_or(str::is_empty) {
-            return None;
-        }
-        if symbol.is_empty() {
-            return None;
-        }
-        Some(if self.unmatched_symbol_suffix {
-            format!("{fallback} {symbol}")
-        } else {
-            format!("{symbol} {fallback}")
-        })
+        assignment_label(
+            fallback,
+            self.label_unmatched,
+            self.unmatched_symbol.as_deref(),
+            self.unmatched_symbol_suffix,
+            "[UNSYNCED]",
+        )
+    }
+
+    fn apply_synced_assignment(&self, item: &mut ExportItem) {
+        apply_clip_assignment(
+            item,
+            self.synced_color.as_deref(),
+            self.synced_role.as_deref(),
+        );
     }
 
     fn apply_unmatched_assignment(&self, item: &mut ExportItem) {
-        if let Some(color) = self.unmatched_color.as_deref() {
-            let labels = format!(
-                "<labels><label2>{}</label2></labels>",
-                xml_text::escape(color)
-            );
-            item.fcp7_labels_xml = Some(labels.clone());
-            if let Some(linked) = item.linked_audio_edit.as_mut() {
-                linked.fcp7_labels_xml = Some(labels);
-            }
+        apply_clip_assignment(
+            item,
+            self.unmatched_color.as_deref(),
+            self.unmatched_role.as_deref(),
+        );
+    }
+}
+
+fn assignment_label(
+    fallback: &str,
+    enabled: bool,
+    custom_symbol: Option<&str>,
+    suffix: bool,
+    default_symbol: &str,
+) -> Option<String> {
+    let symbol = custom_symbol.unwrap_or(default_symbol);
+    if (!enabled && custom_symbol.is_none_or(str::is_empty)) || symbol.is_empty() {
+        return None;
+    }
+    Some(if suffix {
+        format!("{fallback} {symbol}")
+    } else {
+        format!("{symbol} {fallback}")
+    })
+}
+
+fn apply_clip_assignment(item: &mut ExportItem, color: Option<&str>, role: Option<&str>) {
+    if let Some(color) = color {
+        let labels = format!(
+            "<labels><label2>{}</label2></labels>",
+            xml_text::escape(color)
+        );
+        item.fcp7_labels_xml = Some(labels.clone());
+        if let Some(linked) = item.linked_audio_edit.as_mut() {
+            linked.fcp7_labels_xml = Some(labels);
         }
-        if let Some(role) = self.unmatched_role.as_deref() {
-            item.fcpxml_audio_role = Some(role.to_string());
-            if let Some(linked) = item.linked_audio_edit.as_mut() {
-                linked.fcpxml_audio_role = Some(role.to_string());
-            }
+    }
+    if let Some(role) = role {
+        item.fcpxml_audio_role = Some(role.to_string());
+        if let Some(linked) = item.linked_audio_edit.as_mut() {
+            linked.fcpxml_audio_role = Some(role.to_string());
         }
     }
 }
@@ -1083,6 +1132,17 @@ impl ExportTimeline {
             })
             .collect();
 
+        for item in groups.iter_mut().flat_map(|island| &mut island.clips) {
+            let fallback = item
+                .display_name
+                .clone()
+                .unwrap_or_else(|| file_name(&item.clip.url));
+            if let Some(label) = options.synced_label(&fallback) {
+                item.display_name = Some(label);
+            }
+            options.apply_synced_assignment(item);
+        }
+
         let mut order_only_islands = HashSet::new();
         if options.unmatched != UnmatchedPlacement::Remove {
             // Swift: nextID = (max ?? -1) + 1.
@@ -1297,7 +1357,13 @@ impl ExportTimeline {
                             .unwrap_or_else(|| file_name(&base.clip.url)),
                     )
                 } else {
-                    edit.name.clone()
+                    let fallback = edit
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| file_name(&base.clip.url));
+                    options
+                        .synced_label(&fallback)
+                        .or_else(|| edit.name.clone())
                 },
                 clip: {
                     let mut clip = base.clip.clone();
@@ -1351,6 +1417,8 @@ impl ExportTimeline {
             };
             if is_unmatched {
                 options.apply_unmatched_assignment(&mut imported_item);
+            } else {
+                options.apply_synced_assignment(&mut imported_item);
             }
             imported_items.push(imported_item);
         }
@@ -2264,6 +2332,62 @@ mod tests {
             matches: Vec::new(),
             temporal_policy: TemporalPolicy::default(),
         }
+    }
+
+    fn synced_result() -> SyncResult {
+        let item = placed_clip("recorder.wav", false, 0.0, 10.0);
+        SyncResult {
+            search_overrides: Default::default(),
+            stopped: false,
+            stages: Vec::new(),
+            selected_stage: None,
+            search_accuracy: Default::default(),
+            project: crate::model::SyncProject {
+                clips: vec![item.clip.clone()],
+                warnings: Vec::new(),
+                imported_timeline: None,
+            },
+            islands: vec![crate::model::SyncIsland {
+                id: 0,
+                placements: vec![crate::model::ClipPlacement {
+                    clip_id: item.clip.id.clone(),
+                    mapping: crate::model::TimeMap {
+                        points: item.mapping_points,
+                    },
+                    confidence: 0.9,
+                }],
+            }],
+            unmatched: Vec::new(),
+            matches: Vec::new(),
+            temporal_policy: TemporalPolicy::default(),
+        }
+    }
+
+    #[test]
+    fn synced_name_color_and_role_reach_writers() {
+        let timeline = ExportTimeline::from_result_with_options(
+            &synced_result(),
+            ExportAssemblyOptions {
+                synced_symbol: Some("✓".to_string()),
+                synced_symbol_suffix: true,
+                synced_color: Some("Iris".to_string()),
+                synced_role: Some("dialogue.interview".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("timeline");
+        let item = &timeline.islands[0].clips[0];
+        assert_eq!(item.display_name.as_deref(), Some("recorder.wav ✓"));
+        let premiere = super::super::premiere::write(
+            &timeline,
+            super::TimelineExportFormat::PremiereXML,
+            false,
+        );
+        assert!(premiere.contains("<label2>Iris</label2>"));
+        assert!(premiere.contains("<name>recorder.wav ✓</name>"));
+        let fcpxml = super::super::fcpxml::write(&timeline, false);
+        assert!(fcpxml.contains("name=\"recorder.wav ✓\""));
+        assert!(fcpxml.contains("audioRole=\"dialogue.interview\""));
     }
 
     #[test]

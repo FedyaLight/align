@@ -278,16 +278,20 @@ pub struct AppData {
     pub export_drift: bool,
     pub export_replaced: bool,
     pub export_storylines: bool,
+    pub export_fcpxml_timeline: bool,
+    pub export_fcpxml_multicam: bool,
     pub export_media: bool,
     pub export_unmatched: UnmatchedPlacement,
     pub export_prevent_overlaps: bool,
     pub export_disable_unmatched: bool,
+    pub export_label_synced: bool,
     pub export_label_unmatched: bool,
     pub export_cut_common_gaps: bool,
     pub export_cut_lone_recorder: bool,
     pub export_cut_shorter_than: f64,
     pub export_trim_starts: f64,
     pub export_trim_ends: f64,
+    pub export_synced_symbol_suffix: bool,
     pub export_unmatched_symbol_suffix: bool,
     pub export_started: bool,
     // Overlays.
@@ -350,16 +354,20 @@ impl Default for AppData {
             export_drift: true,
             export_replaced: false,
             export_storylines: false,
+            export_fcpxml_timeline: true,
+            export_fcpxml_multicam: true,
             export_media: false,
             export_unmatched: UnmatchedPlacement::ByOrderAndTime,
             export_prevent_overlaps: false,
             export_disable_unmatched: false,
+            export_label_synced: false,
             export_label_unmatched: false,
             export_cut_common_gaps: false,
             export_cut_lone_recorder: false,
             export_cut_shorter_than: 0.0,
             export_trim_starts: 0.0,
             export_trim_ends: 0.0,
+            export_synced_symbol_suffix: false,
             export_unmatched_symbol_suffix: false,
             export_started: false,
             show_warning_details: false,
@@ -528,7 +536,7 @@ impl AppData {
     }
 
     pub fn export_output_selected(&self) -> bool {
-        !self.export_selected.is_empty() || self.export_media
+        !self.export_targets().is_empty() || self.export_media
     }
 
     pub fn can_begin_export(&self) -> bool {
@@ -1535,6 +1543,12 @@ impl AppData {
         let mut formats = Vec::new();
         for target in ExportTarget::all() {
             if self.export_selected.contains(&target) {
+                if target == ExportTarget::FinalCutPro
+                    && !self.export_fcpxml_timeline
+                    && !self.export_fcpxml_multicam
+                {
+                    continue;
+                }
                 formats.extend(target.formats());
             }
         }
@@ -2536,6 +2550,17 @@ mod tests {
         // Canonical order: OTIO, script, then Premiere.
         let names: Vec<_> = formats.iter().map(|f| f.file_extension()).collect();
         assert_eq!(names, vec!["otio", "py", "xml"]);
+
+        data.export_selected.clear();
+        data.export_selected.insert(ExportTarget::FinalCutPro);
+        assert_eq!(
+            data.export_targets(),
+            vec![TimelineExportFormat::FinalCutProXML]
+        );
+        data.export_fcpxml_timeline = false;
+        data.export_fcpxml_multicam = false;
+        assert!(data.export_targets().is_empty());
+        assert!(!data.export_output_selected());
     }
 
     #[test]

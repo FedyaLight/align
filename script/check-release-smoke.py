@@ -60,10 +60,39 @@ def main():
     assert {item['format'] for item in artifacts} == expected, 'missing export format'
     for item in artifacts:
         assert Path(item['url']).stat().st_size > 0, 'empty artifact'
+
+    timeline_only = run(['export-json', '--no-drift', '--no-fcpxml-multicam',
+        '--label-synced', '--synced-color', 'Iris', '--synced-role',
+        'dialogue.interview', str(output / 'sync.json'),
+        str(output / 'timeline-only')], 'timeline-only')
+    timeline_fcpxml = Path(next(item['url'] for item in timeline_only
+        if item['format'] == 'finalCutProXML')).read_text(encoding='utf-8')
+    assert '– synced' in timeline_fcpxml and 'r_multicam' not in timeline_fcpxml
+    assert '[SYNCED] a.wav' in timeline_fcpxml
+    assert 'audioRole="dialogue.interview"' in timeline_fcpxml
+    timeline_premiere = Path(next(item['url'] for item in timeline_only
+        if item['format'] == 'premiereXML')).read_text(encoding='utf-8')
+    assert '<label2>Iris</label2>' in timeline_premiere
+    assert '<name>[SYNCED] a.wav</name>' in timeline_premiere
+
+    multicam_only = run(['export-json', '--no-drift', '--no-fcpxml-timeline',
+        str(output / 'sync.json'), str(output / 'multicam-only')], 'multicam-only')
+    multicam_fcpxml = Path(next(item['url'] for item in multicam_only
+        if item['format'] == 'finalCutProXML')).read_text(encoding='utf-8')
+    assert '– synced' not in multicam_fcpxml and 'r_multicam' in multicam_fcpxml
+    without_fcpxml = run(['export-json', '--no-drift', '--no-fcpxml-timeline',
+        '--no-fcpxml-multicam', str(output / 'sync.json'),
+        str(output / 'without-fcpxml')], 'without-fcpxml')
+    assert all(item['format'] != 'finalCutProXML' for item in without_fcpxml)
+
     corrected = output / 'export' / 'Corrected Audio'
     assert not corrected.exists() or not list(corrected.glob('*.wav')), 'no-drift pair created corrected audio'
     report = {'platform': platform.platform(), 'cli': str(cli), 'sha256': hashlib.sha256(cli.read_bytes()).hexdigest(),
-              'clips': 2, 'islands': 1, 'offsetErrorSeconds': error, 'exportFormats': sorted(expected)}
+              'clips': 2, 'islands': 1, 'offsetErrorSeconds': error,
+              'exportFormats': sorted(expected),
+              'finalCutOutputs': ['timeline-only', 'multicam-only'],
+              'syncedLabels': {'symbol': '[SYNCED]', 'color': 'Iris',
+                  'audioRole': 'dialogue.interview'}}
     (output / 'verification.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
     print(json.dumps(report, indent=2))
 

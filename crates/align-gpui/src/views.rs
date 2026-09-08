@@ -138,6 +138,9 @@ enum PathRepairMsg {
 #[derive(Clone)]
 struct ExportInputs {
     sequence_name: Entity<TextInput>,
+    synced_symbol: Entity<TextInput>,
+    synced_color: Entity<TextInput>,
+    synced_role: Entity<TextInput>,
     unmatched_symbol: Entity<TextInput>,
     unmatched_color: Entity<TextInput>,
     unmatched_role: Entity<TextInput>,
@@ -167,6 +170,9 @@ impl ExportInputs {
     fn new(cx: &mut Context<AlignApp>) -> Self {
         Self {
             sequence_name: cx.new(|cx| TextInput::new(cx, "Keep source name")),
+            synced_symbol: cx.new(|cx| TextInput::new(cx, "e.g. [SYNCED]")),
+            synced_color: cx.new(|cx| TextInput::new(cx, "e.g. Green")),
+            synced_role: cx.new(|cx| TextInput::new(cx, "e.g. Dialogue")),
             unmatched_symbol: cx.new(|cx| TextInput::new(cx, "e.g. [UNSYNCED]")),
             unmatched_color: cx.new(|cx| TextInput::new(cx, "e.g. Rose")),
             unmatched_role: cx.new(|cx| TextInput::new(cx, "e.g. Dialogue")),
@@ -176,6 +182,9 @@ impl ExportInputs {
     fn any_focused(&self, window: &Window, cx: &App) -> bool {
         [
             &self.sequence_name,
+            &self.synced_symbol,
+            &self.synced_color,
+            &self.synced_role,
             &self.unmatched_symbol,
             &self.unmatched_color,
             &self.unmatched_role,
@@ -619,6 +628,9 @@ impl AlignApp {
         };
         use align_core::export_model::{CutRemoveOptions, ExportAssemblyOptions, ExportTimeline};
         let sequence_name = ExportInputs::value(&self.export_inputs.sequence_name, cx);
+        let synced_symbol = ExportInputs::value(&self.export_inputs.synced_symbol, cx);
+        let synced_color = ExportInputs::value(&self.export_inputs.synced_color, cx);
+        let synced_role = ExportInputs::value(&self.export_inputs.synced_role, cx);
         let unmatched_symbol = ExportInputs::value(&self.export_inputs.unmatched_symbol, cx);
         let unmatched_color = ExportInputs::value(&self.export_inputs.unmatched_color, cx);
         let unmatched_role = ExportInputs::value(&self.export_inputs.unmatched_role, cx);
@@ -634,6 +646,7 @@ impl AlignApp {
                 unmatched: self.data.export_unmatched,
                 prevent_group_overlaps: self.data.export_prevent_overlaps,
                 disable_unmatched: self.data.export_disable_unmatched,
+                label_synced: self.data.export_label_synced,
                 label_unmatched: self.data.export_label_unmatched,
                 cut_remove: CutRemoveOptions {
                     common_gaps: self.data.export_cut_common_gaps,
@@ -642,6 +655,10 @@ impl AlignApp {
                     trim_starts: self.data.export_trim_starts,
                     trim_ends: self.data.export_trim_ends,
                 },
+                synced_symbol: synced_symbol.clone(),
+                synced_symbol_suffix: self.data.export_synced_symbol_suffix,
+                synced_color: synced_color.clone(),
+                synced_role: synced_role.clone(),
                 unmatched_symbol: unmatched_symbol.clone(),
                 unmatched_symbol_suffix: self.data.export_unmatched_symbol_suffix,
                 unmatched_color: unmatched_color.clone(),
@@ -681,6 +698,8 @@ impl AlignApp {
         let drift = self.data.export_drift;
         let replaced = self.data.export_replaced;
         let storylines = self.data.export_storylines;
+        let fcpxml_timeline = self.data.export_fcpxml_timeline;
+        let fcpxml_multicam = self.data.export_fcpxml_multicam;
         let media = self.data.export_media;
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<ExportMsg>();
         std::thread::spawn(move || {
@@ -711,6 +730,8 @@ impl AlignApp {
                     correct_drift: drift,
                     include_replaced_sequence: replaced,
                     include_media_files: media,
+                    include_fcpxml_timeline: fcpxml_timeline,
+                    include_fcpxml_multicam: fcpxml_multicam,
                     group_fcpxml_storylines: storylines,
                     cancel: &cancel,
                 },
@@ -3950,10 +3971,34 @@ fn export_sheet(
             group = group.child(check_row(
                 cx,
                 theme,
+                "exp-fcpxml-timeline",
+                data.export_fcpxml_timeline,
+                "Include synchronized timeline".to_string(),
+                !busy,
+                |this, _, _, cx| {
+                    this.data.export_fcpxml_timeline = !this.data.export_fcpxml_timeline;
+                    cx.notify();
+                },
+            ));
+            group = group.child(check_row(
+                cx,
+                theme,
+                "exp-fcpxml-multicam",
+                data.export_fcpxml_multicam,
+                "Include multicam clip".to_string(),
+                !busy,
+                |this, _, _, cx| {
+                    this.data.export_fcpxml_multicam = !this.data.export_fcpxml_multicam;
+                    cx.notify();
+                },
+            ));
+            group = group.child(check_row(
+                cx,
+                theme,
                 "exp-storylines",
                 data.export_storylines,
                 "Group FCPXML tracks as storylines".to_string(),
-                !busy,
+                !busy && data.export_fcpxml_timeline,
                 |this, _, _, cx| {
                     this.data.export_storylines = !this.data.export_storylines;
                     cx.notify();
@@ -4165,6 +4210,51 @@ fn export_sheet(
                 "Sequence name",
                 inputs.sequence_name.clone(),
             ));
+            group = group.child(check_row(
+                cx,
+                theme,
+                "exp-label-synced",
+                data.export_label_synced,
+                "Mark names as [SYNCED]".to_string(),
+                !busy,
+                |this, _, _, cx| {
+                    this.data.export_label_synced = !this.data.export_label_synced;
+                    cx.notify();
+                },
+            ));
+            group = group.child(export_text_field(
+                theme,
+                "Synchronized symbol",
+                inputs.synced_symbol.clone(),
+            ));
+            group = group.child(check_row(
+                cx,
+                theme,
+                "exp-synced-symbol-suffix",
+                data.export_synced_symbol_suffix,
+                "Put synchronized symbol after clip name".to_string(),
+                !busy,
+                |this, _, _, cx| {
+                    this.data.export_synced_symbol_suffix = !this.data.export_synced_symbol_suffix;
+                    cx.notify();
+                },
+            ));
+            if data.export_selected.contains(&ExportTarget::Premiere)
+                || data.export_selected.contains(&ExportTarget::ResolveXml)
+            {
+                group = group.child(export_text_field(
+                    theme,
+                    "Synchronized XML color",
+                    inputs.synced_color.clone(),
+                ));
+            }
+            if data.export_selected.contains(&ExportTarget::FinalCutPro) {
+                group = group.child(export_text_field(
+                    theme,
+                    "Synchronized Final Cut role",
+                    inputs.synced_role.clone(),
+                ));
+            }
             if data.unmatched_count() > 0 {
                 group = group.child(export_text_field(
                     theme,
@@ -4184,17 +4274,19 @@ fn export_sheet(
                         cx.notify();
                     },
                 ));
-                if data.export_selected.contains(&ExportTarget::Premiere) {
+                if data.export_selected.contains(&ExportTarget::Premiere)
+                    || data.export_selected.contains(&ExportTarget::ResolveXml)
+                {
                     group = group.child(export_text_field(
                         theme,
-                        "Premiere color",
+                        "Unmatched XML color",
                         inputs.unmatched_color.clone(),
                     ));
                 }
                 if data.export_selected.contains(&ExportTarget::FinalCutPro) {
                     group = group.child(export_text_field(
                         theme,
-                        "Final Cut audio role",
+                        "Unmatched Final Cut role",
                         inputs.unmatched_role.clone(),
                     ));
                 }
