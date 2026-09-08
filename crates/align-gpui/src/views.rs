@@ -26,7 +26,9 @@ use gpui::{
 
 use super::icons::{icons, kind_badge, svg_icon};
 use super::lane::CorrectionOption;
-use super::state::{AppData, ClipState, MenuTarget, Operation, SequencePicker, SettingsScope};
+use super::state::{
+    AppData, ClipState, ExportTarget, MenuTarget, Operation, SequencePicker, SettingsScope,
+};
 use super::text_input::TextInput;
 use super::theme::{Theme, ThemeMode};
 use crate::{MinimizeWindow, ToggleFullscreen, ZoomWindow};
@@ -131,16 +133,90 @@ fn quality_dropdown_motion<E: IntoElement + Styled + 'static>(
             } else {
                 "search-quality-dropdown-in"
             },
-            entrance(if closing { 150 } else { 180 }),
+            entrance(200),
             move |el, progress| {
                 let visible = if reduced {
-                    if closing { 0. } else { 1. }
+                    if closing { 1. - progress } else { progress }
                 } else if closing {
                     1. - progress
                 } else {
                     progress
                 };
-                el.h(px(MENU_HEIGHT * visible)).opacity(visible)
+                let height = if reduced { 1. } else { visible };
+                el.h(px(MENU_HEIGHT * height)).opacity(visible)
+            },
+        )
+}
+
+fn export_select_motion<E: IntoElement + Styled + 'static>(
+    child: E,
+    select: ExportSelect,
+    menu_height: f32,
+    closing: bool,
+) -> impl IntoElement {
+    let reduced = super::motion::reduced_motion();
+    let animation_id = match (select, closing) {
+        (ExportSelect::AafFrameRate, false) => "export-aaf-select-in",
+        (ExportSelect::AafFrameRate, true) => "export-aaf-select-out",
+        (ExportSelect::UnmatchedPlacement, false) => "export-unmatched-select-in",
+        (ExportSelect::UnmatchedPlacement, true) => "export-unmatched-select-out",
+    };
+    div()
+        .w(px(160.))
+        .overflow_hidden()
+        .rounded_lg()
+        .shadow_md()
+        .child(child)
+        .with_animation(animation_id, entrance(200), move |el, progress| {
+            let visible = if closing { 1. - progress } else { progress };
+            let height = if reduced { 1. } else { visible };
+            el.h(px(menu_height * height)).opacity(visible)
+        })
+}
+
+fn quality_shift_for_export<E: IntoElement + Styled + 'static>(child: E) -> impl IntoElement {
+    let reduced = super::motion::reduced_motion();
+    super::motion::Slide {
+        child: Some(child),
+        x: 68.,
+        y: 0.,
+    }
+    .with_animation(
+        "timeline-quality-shift",
+        entrance(200),
+        move |mut el, progress| {
+            el.x = if reduced { 0. } else { 68. * (1. - progress) };
+            el
+        },
+    )
+}
+
+fn export_button_entrance<E: IntoElement + 'static>(child: E) -> impl IntoElement {
+    div().child(child).with_animation(
+        "timeline-export-button-in",
+        entrance(200),
+        |el, progress| el.opacity(progress),
+    )
+}
+
+fn export_reveal<E: IntoElement + 'static>(
+    child: E,
+    id: &'static str,
+    max_height: f32,
+    closing: bool,
+) -> impl IntoElement {
+    let reduced = super::motion::reduced_motion();
+    div()
+        .w_full()
+        .overflow_hidden()
+        .child(child)
+        .with_animation(
+            (id, usize::from(closing)),
+            entrance(180),
+            move |el, progress| {
+                let visible = if closing { 1. - progress } else { progress };
+                let height = if reduced { 1. } else { visible };
+                el.max_h(px(max_height * height)).opacity(visible)
             },
         )
 }
@@ -188,6 +264,33 @@ mod motion_tests {
         }
         assert!(motion_ease(0.5) > 0.9);
         assert!(entrance(200).oneshot);
+    }
+
+    #[test]
+    fn export_reveals_follow_selected_formats_and_parent_options() {
+        let mut data = AppData::default();
+        let initial = ExportReveals::new(&data);
+        assert!(!initial.final_cut);
+        assert!(!initial.premiere);
+        assert!(!initial.aaf);
+        assert!(!initial.synced_labels);
+
+        data.export_selected.extend([
+            ExportTarget::FinalCutPro,
+            ExportTarget::Premiere,
+            ExportTarget::Aaf,
+        ]);
+        data.export_label_synced = true;
+        let selected = ExportReveals::new(&data);
+        assert!(selected.final_cut && selected.storylines);
+        assert!(selected.premiere && selected.aaf);
+        assert!(selected.synced_xml && selected.synced_final_cut);
+
+        data.export_fcpxml_timeline = false;
+        data.export_label_synced = false;
+        let disabled = ExportReveals::new(&data);
+        assert!(!disabled.storylines);
+        assert!(!disabled.synced_xml && !disabled.synced_final_cut);
     }
 }
 
@@ -240,6 +343,72 @@ struct ExportInputs {
 struct PathFixerInputs {
     old_folder: Entity<TextInput>,
     omit_extensions: Entity<TextInput>,
+}
+
+#[derive(Clone, Copy)]
+struct ExportReveals {
+    final_cut: bool,
+    storylines: bool,
+    premiere: bool,
+    aaf: bool,
+    unmatched_kept: bool,
+    unmatched_label_control: bool,
+    synced_labels: bool,
+    synced_xml: bool,
+    synced_final_cut: bool,
+    unmatched_labels: bool,
+    unmatched_xml: bool,
+    unmatched_final_cut: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExportSelect {
+    AafFrameRate,
+    UnmatchedPlacement,
+}
+
+impl ExportReveals {
+    fn new(data: &AppData) -> Self {
+        let final_cut = data.export_selected.contains(&ExportTarget::FinalCutPro);
+        let xml = data.export_selected.contains(&ExportTarget::Premiere)
+            || data.export_selected.contains(&ExportTarget::ResolveXml);
+        let unmatched_kept = data.unmatched_count() > 0
+            && data.export_unmatched != align_core::export_model::UnmatchedPlacement::Remove;
+        Self {
+            final_cut,
+            storylines: final_cut && data.export_fcpxml_timeline,
+            premiere: data.export_selected.contains(&ExportTarget::Premiere),
+            aaf: data.export_selected.contains(&ExportTarget::Aaf),
+            unmatched_kept,
+            unmatched_label_control: unmatched_kept,
+            synced_labels: data.export_label_synced,
+            synced_xml: data.export_label_synced && xml,
+            synced_final_cut: data.export_label_synced && final_cut,
+            unmatched_labels: unmatched_kept && data.export_label_unmatched,
+            unmatched_xml: unmatched_kept && data.export_label_unmatched && xml,
+            unmatched_final_cut: unmatched_kept && data.export_label_unmatched && final_cut,
+        }
+    }
+
+    fn entries(self) -> [(&'static str, bool); 12] {
+        [
+            ("export-final-cut-options", self.final_cut),
+            ("export-storylines", self.storylines),
+            ("export-premiere-options", self.premiere),
+            ("export-aaf-options", self.aaf),
+            ("export-unmatched-kept", self.unmatched_kept),
+            (
+                "export-unmatched-label-control",
+                self.unmatched_label_control,
+            ),
+            ("export-synced-labels", self.synced_labels),
+            ("export-synced-xml", self.synced_xml),
+            ("export-synced-final-cut", self.synced_final_cut),
+            ("export-unmatched-labels", self.unmatched_labels),
+            ("export-unmatched-xml", self.unmatched_xml),
+            ("export-unmatched-final-cut", self.unmatched_final_cut),
+        ]
+    }
 }
 
 impl PathFixerInputs {
@@ -300,7 +469,12 @@ pub struct AlignApp {
     export_scroll_drag: Option<(f32, f32)>,
     export_sidebar_closing: bool,
     search_quality_closing: bool,
+    export_select: Option<ExportSelect>,
+    export_select_closing: bool,
+    export_select_generation: u64,
     selection_controls_closing: bool,
+    export_reveals_closing: HashMap<&'static str, u64>,
+    export_reveal_generation: u64,
 }
 
 impl Focusable for AlignApp {
@@ -321,7 +495,12 @@ impl AlignApp {
             export_scroll_drag: None,
             export_sidebar_closing: false,
             search_quality_closing: false,
+            export_select: None,
+            export_select_closing: false,
+            export_select_generation: 0,
             selection_controls_closing: false,
+            export_reveals_closing: HashMap::new(),
+            export_reveal_generation: 0,
         }
     }
 
@@ -349,6 +528,7 @@ impl AlignApp {
 
     pub(crate) fn start_sync(&mut self, cx: &mut Context<Self>) {
         self.search_quality_closing = false;
+        self.clear_export_select();
         self.selection_controls_closing = false;
         self.export_sidebar_closing = false;
         if !self.data.begin_sync_run() {
@@ -530,6 +710,8 @@ impl AlignApp {
         }
         self.data.show_export = true;
         self.export_sidebar_closing = false;
+        self.export_reveals_closing.clear();
+        self.clear_export_select();
         self.data.show_search_quality = false;
         self.search_quality_closing = false;
         self.data.export_started = false;
@@ -539,21 +721,105 @@ impl AlignApp {
     }
 
     fn close_search_quality(&mut self, cx: &mut Context<Self>) {
-        if !self.data.show_search_quality {
+        if !self.data.show_search_quality || self.search_quality_closing {
             return;
         }
-        self.data.show_search_quality = false;
         self.search_quality_closing = true;
         cx.notify();
 
-        let timer = cx.background_executor().timer(Duration::from_millis(150));
+        let timer = cx.background_executor().timer(Duration::from_millis(200));
         cx.spawn(async move |view, cx| {
             timer.await;
             let _ = view.update(cx, |this, cx| {
                 if this.search_quality_closing {
+                    this.data.show_search_quality = false;
                     this.search_quality_closing = false;
                     cx.notify();
                 }
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_export_select(&mut self, select: ExportSelect, cx: &mut Context<Self>) {
+        if self.export_select == Some(select) && !self.export_select_closing {
+            self.close_export_select(cx);
+            return;
+        }
+        self.export_select_generation += 1;
+        self.export_select = Some(select);
+        self.export_select_closing = false;
+        cx.notify();
+    }
+
+    fn close_export_select(&mut self, cx: &mut Context<Self>) {
+        if self.export_select.is_none() || self.export_select_closing {
+            return;
+        }
+        self.export_select_generation += 1;
+        let generation = self.export_select_generation;
+        self.export_select_closing = true;
+        cx.notify();
+
+        let timer = cx.background_executor().timer(Duration::from_millis(200));
+        cx.spawn(async move |view, cx| {
+            timer.await;
+            let _ = view.update(cx, |this, cx| {
+                if this.export_select_generation == generation && this.export_select_closing {
+                    this.export_select = None;
+                    this.export_select_closing = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn clear_export_select(&mut self) {
+        self.export_select_generation += 1;
+        self.export_select = None;
+        self.export_select_closing = false;
+    }
+
+    fn update_export_options(&mut self, cx: &mut Context<Self>, update: impl FnOnce(&mut AppData)) {
+        let before = ExportReveals::new(&self.data).entries();
+        update(&mut self.data);
+        let select_is_available = match self.export_select {
+            Some(ExportSelect::AafFrameRate) => {
+                self.data.export_selected.contains(&ExportTarget::Aaf)
+            }
+            Some(ExportSelect::UnmatchedPlacement) => self.data.unmatched_count() > 0,
+            None => true,
+        };
+        if !select_is_available {
+            self.clear_export_select();
+        }
+        let after = ExportReveals::new(&self.data).entries();
+        let mut closing = Vec::new();
+        for ((id, was_visible), (_, is_visible)) in before.into_iter().zip(after) {
+            if was_visible && !is_visible {
+                self.export_reveal_generation += 1;
+                let generation = self.export_reveal_generation;
+                self.export_reveals_closing.insert(id, generation);
+                closing.push((id, generation));
+            } else if !was_visible && is_visible {
+                self.export_reveals_closing.remove(id);
+            }
+        }
+        cx.notify();
+        if closing.is_empty() {
+            return;
+        }
+        let timer = cx.background_executor().timer(Duration::from_millis(180));
+        cx.spawn(async move |view, cx| {
+            timer.await;
+            let _ = view.update(cx, |this, cx| {
+                for (id, generation) in closing {
+                    if this.export_reveals_closing.get(id) == Some(&generation) {
+                        this.export_reveals_closing.remove(id);
+                    }
+                }
+                cx.notify();
             });
         })
         .detach();
@@ -563,6 +829,7 @@ impl AlignApp {
         if !self.data.show_export || self.export_sidebar_closing {
             return;
         }
+        self.clear_export_select();
         self.export_sidebar_closing = true;
         cx.notify();
 
@@ -573,6 +840,7 @@ impl AlignApp {
                 if this.export_sidebar_closing {
                     this.data.show_export = false;
                     this.export_sidebar_closing = false;
+                    this.clear_export_select();
                     cx.notify();
                 }
             });
@@ -617,6 +885,7 @@ impl AlignApp {
             .update(cx, |input, cx| input.set_text(omitted, cx));
         self.data.show_export = false;
         self.export_sidebar_closing = false;
+        self.clear_export_select();
         self.data.show_path_fixer = true;
         self.data.error = None;
         self.data.menu = None;
@@ -1199,7 +1468,7 @@ fn prominent_button(
     label: impl Into<SharedString>,
     enabled: bool,
     action: impl Fn(&mut AlignApp, &ClickEvent, &mut Window, &mut Context<AlignApp>) + 'static,
-) -> impl IntoElement {
+) -> Stateful<Div> {
     let mut el = div()
         .id(id.into())
         .px_3()
@@ -1393,6 +1662,10 @@ impl Render for AlignApp {
             // export text field owns keyboard focus.
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
                 let key: &str = &e.keystroke.key;
+                if key == "escape" && this.export_select.is_some() {
+                    this.close_export_select(cx);
+                    return;
+                }
                 if key == "escape"
                     && this.data.show_export
                     && !matches!(this.data.operation, Operation::Exporting)
@@ -1495,9 +1768,15 @@ impl Render for AlignApp {
                     &self.data,
                     &self.export_inputs,
                     &self.export_scroll,
+                    &self.export_reveals_closing,
+                    self.export_select,
+                    self.export_select_closing,
                     self.export_sidebar_closing,
                 ))
                 .child(export_sidebar_action(cx, &theme, &self.data));
+        }
+        if self.export_select.is_some() {
+            root = root.child(export_select_dismiss_layer(cx));
         }
         if let Some(picker) = self.data.sequence_picker.clone() {
             root = root.child(overlay(
@@ -1666,7 +1945,11 @@ fn toolbar(
                     )),
             ));
         }
-        bar = bar.child(quality);
+        if has_timeline {
+            bar = bar.child(quality_shift_for_export(quality));
+        } else {
+            bar = bar.child(quality);
+        }
         bar = bar.child(
             div()
                 .absolute()
@@ -1685,15 +1968,15 @@ fn toolbar(
                 )),
         );
     }
-    if !data.show_export {
-        bar = bar.child(prominent_button(
+    if !data.show_export && has_timeline {
+        bar = bar.child(export_button_entrance(prominent_button(
             cx,
             theme,
             "btn-export-bar",
             "Export",
             active && data.can_export(),
             |this, _, _, cx| this.start_export_sheet(cx),
-        ));
+        )));
     }
     bar
 }
@@ -2897,20 +3180,31 @@ fn search_quality_dismiss_layer(cx: &mut Context<AlignApp>) -> impl IntoElement 
         )
 }
 
+fn export_select_dismiss_layer(cx: &mut Context<AlignApp>) -> impl IntoElement {
+    div()
+        .absolute()
+        .top(px(0.))
+        .left(px(0.))
+        .size_full()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                this.close_export_select(cx);
+                cx.stop_propagation();
+            }),
+        )
+}
+
 fn search_quality_button(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &super::state::AppData,
     enabled: bool,
 ) -> impl IntoElement {
-    let label = if data.show_search_quality {
-        "Sync quality".to_string()
-    } else {
-        format!(
-            "Quality: {}",
-            data.current_effective_settings().search_accuracy.label()
-        )
-    };
+    let label = format!(
+        "Quality: {}",
+        data.current_effective_settings().search_accuracy.label()
+    );
     let mut control = div()
         .id("btn-search-quality")
         .w_full()
@@ -4004,7 +4298,7 @@ fn check_row(
     title: String,
     enabled: bool,
     action: impl Fn(&mut AlignApp, &ClickEvent, &mut Window, &mut Context<AlignApp>) + 'static,
-) -> impl IntoElement {
+) -> Stateful<Div> {
     // The tick hides in the unchecked box by matching its fill.
     let tick = if checked { theme.on_accent } else { theme.bg };
     let mut row = div()
@@ -4045,49 +4339,167 @@ fn check_row(
     )
 }
 
-/// Compact single-choice row: a checkmark without checkbox chrome.
-fn choice_row(
+fn export_select_option(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     id: impl Into<SharedString>,
-    checked: bool,
-    title: String,
-    enabled: bool,
+    selected: bool,
+    title: &'static str,
     action: impl Fn(&mut AlignApp, &ClickEvent, &mut Window, &mut Context<AlignApp>) + 'static,
-) -> impl IntoElement {
-    let mut row = div()
+) -> Stateful<Div> {
+    div()
         .id(id.into())
+        .h(px(28.))
+        .px_3()
         .flex()
         .flex_row()
         .items_center()
-        .gap_2()
+        .justify_between()
+        .gap_3()
+        .rounded_md()
+        .text_size(px(12.))
+        .text_color(rgb(theme.text))
+        .cursor_pointer()
+        .hover(|this| this.bg(rgb(theme.button_hover)))
+        .on_click(cx.listener(move |this, event, window, cx| {
+            action(this, event, window, cx);
+            this.close_export_select(cx);
+        }))
+        .child(div().min_w(px(0.)).truncate().child(title))
+        .child(
+            div()
+                .w(px(16.))
+                .h(px(16.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(selected, |slot| {
+                    slot.child(svg_icon(icons().check.clone(), 12., theme.accent))
+                }),
+        )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn export_select_row(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    id: impl Into<SharedString>,
+    label: &'static str,
+    value: String,
+    select: ExportSelect,
+    open: bool,
+    closing: bool,
+    enabled: bool,
+    menu_height: f32,
+    menu: Stateful<Div>,
+) -> Div {
+    let mut button = div()
+        .id(id.into())
+        .relative()
+        .w(px(160.))
+        .h(px(28.))
         .px_2()
-        .py_1()
-        .rounded_md();
+        .flex_shrink_0()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .rounded_lg()
+        .bg(rgb(if open {
+            theme.border
+        } else {
+            theme.button_hover
+        }))
+        .text_size(px(12.))
+        .child(div().min_w(px(0.)).truncate().child(value))
+        .child(div().w(px(12.)).h(px(12.)).flex_shrink_0().child(svg_icon(
+            icons().chevron_down.clone(),
+            12.,
+            theme.icon,
+        )));
     if enabled {
-        row = row
+        button = button
+            .text_color(rgb(theme.icon))
             .cursor_pointer()
-            .on_click(cx.listener(move |this, e, window, cx| action(this, e, window, cx)));
+            .hover(|this| this.bg(rgb(theme.border)))
+            .active(|this| this.opacity(0.62))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_export_select(select, cx);
+            }));
     } else {
-        row = row.opacity(0.6);
+        button = button.text_color(rgb(theme.dim)).opacity(0.42);
     }
-    row.child(
-        div()
-            .w(px(16.))
-            .h(px(16.))
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .when(checked, |slot| {
-                slot.child(svg_icon(icons().check.clone(), 12.0, theme.accent))
-            }),
-    )
-    .child(
-        div()
-            .text_color(rgb(if enabled { theme.text } else { theme.dim }))
-            .child(title),
-    )
+    if open {
+        button = button.child(deferred(
+            anchored()
+                .position_mode(AnchoredPositionMode::Local)
+                .offset(point(px(0.), px(4.)))
+                .snap_to_window_with_margin(px(8.))
+                .child(export_select_motion(menu, select, menu_height, closing)),
+        ));
+    }
+    div()
+        .w_full()
+        .h(px(28.))
+        .px_2()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(rgb(theme.dim))
+                .child(label),
+        )
+        .child(button)
+}
+
+fn aaf_frame_rate_options() -> [(&'static str, Option<align_core::MediaTime>, &'static str); 9] {
+    [
+        ("auto", None, "Automatic"),
+        (
+            "23976",
+            Some(align_core::MediaTime::new(1001, 24_000)),
+            "23.976",
+        ),
+        ("24", Some(align_core::MediaTime::new(1, 24)), "24"),
+        ("25", Some(align_core::MediaTime::new(1, 25)), "25"),
+        (
+            "2997",
+            Some(align_core::MediaTime::new(1001, 30_000)),
+            "29.97",
+        ),
+        ("30", Some(align_core::MediaTime::new(1, 30)), "30"),
+        ("50", Some(align_core::MediaTime::new(1, 50)), "50"),
+        (
+            "5994",
+            Some(align_core::MediaTime::new(1001, 60_000)),
+            "59.94",
+        ),
+        ("60", Some(align_core::MediaTime::new(1, 60)), "60"),
+    ]
+}
+
+fn aaf_frame_rate_label(value: Option<align_core::MediaTime>) -> &'static str {
+    aaf_frame_rate_options()
+        .into_iter()
+        .find_map(|(_, option, label)| (option == value).then_some(label))
+        .unwrap_or("Automatic")
+}
+
+fn unmatched_placement_label(
+    placement: align_core::export_model::UnmatchedPlacement,
+) -> &'static str {
+    use align_core::export_model::UnmatchedPlacement as P;
+    match placement {
+        P::ByOrderAndTime => "By order & time",
+        P::ByOrderOnly => "By order only",
+        P::Remove => "Remove",
+    }
 }
 
 fn step_button(
@@ -4172,11 +4584,7 @@ fn seconds_stepper(
         ))
 }
 
-fn export_text_field(
-    theme: &Theme,
-    title: &'static str,
-    input: Entity<TextInput>,
-) -> impl IntoElement {
+fn export_text_field(theme: &Theme, title: &'static str, input: Entity<TextInput>) -> Div {
     div()
         .flex()
         .flex_row()
@@ -4192,6 +4600,15 @@ fn export_text_field(
                 .child(title),
         )
         .child(div().flex_1().min_w(px(0.)).child(input))
+}
+
+fn export_dependent_options(theme: &Theme, content: impl IntoElement) -> Div {
+    div()
+        .ml_4()
+        .pl_2()
+        .border_l_1()
+        .border_color(rgb(theme.separator))
+        .child(content)
 }
 
 fn path_fixer_panel(
@@ -4509,12 +4926,16 @@ fn export_scrollbar(
         )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn export_sidebar(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &super::state::AppData,
     inputs: &ExportInputs,
     scroll: &ScrollHandle,
+    reveals_closing: &HashMap<&'static str, u64>,
+    export_select: Option<ExportSelect>,
+    export_select_closing: bool,
     closing: bool,
 ) -> impl IntoElement {
     let can_close = !matches!(data.operation, Operation::Exporting);
@@ -4564,7 +4985,16 @@ fn export_sidebar(
                 })
                 .child(div().flex_1()),
         )
-        .child(export_sheet(cx, theme, data, inputs, scroll))
+        .child(export_sheet(
+            cx,
+            theme,
+            data,
+            inputs,
+            scroll,
+            reveals_closing,
+            export_select,
+            export_select_closing,
+        ))
         .cursor_default()
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
@@ -4601,14 +5031,18 @@ fn export_sidebar_action(
         ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn export_sheet(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &super::state::AppData,
     inputs: &ExportInputs,
     scroll: &ScrollHandle,
+    reveals_closing: &HashMap<&'static str, u64>,
+    export_select: Option<ExportSelect>,
+    export_select_closing: bool,
 ) -> Stateful<Div> {
-    use super::state::{ExportTarget, Operation};
+    use super::state::Operation;
     let busy = matches!(data.operation, Operation::Exporting);
     let done = matches!(data.operation, Operation::Exported) && data.export_started;
     let mut sheet = div()
@@ -4665,6 +5099,7 @@ fn export_sheet(
         .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
         .pb_2();
     let mut settings = div().flex().flex_col().gap_3();
+    let reveals = ExportReveals::new(data);
     // Formats.
     {
         let mut group = div().flex().flex_col().gap_1().flex_shrink_0();
@@ -4680,14 +5115,143 @@ fn export_sheet(
                 title,
                 !busy,
                 move |this, _, _, cx| {
-                    if this.data.export_selected.contains(&target) {
-                        this.data.export_selected.remove(&target);
-                    } else {
-                        this.data.export_selected.insert(target);
-                    }
-                    cx.notify();
+                    this.update_export_options(cx, |data| {
+                        if data.export_selected.contains(&target) {
+                            data.export_selected.remove(&target);
+                        } else {
+                            data.export_selected.insert(target);
+                        }
+                    });
                 },
             ));
+            if target == ExportTarget::FinalCutPro
+                && (reveals.final_cut || reveals_closing.contains_key("export-final-cut-options"))
+            {
+                let mut options = div().flex().flex_col().gap_1();
+                options = options.child(check_row(
+                    cx,
+                    theme,
+                    "exp-fcpxml-timeline",
+                    data.export_fcpxml_timeline,
+                    "Synchronized timeline".to_string(),
+                    !busy,
+                    |this, _, _, cx| {
+                        this.update_export_options(cx, |data| {
+                            data.export_fcpxml_timeline = !data.export_fcpxml_timeline;
+                        });
+                    },
+                ));
+                options = options.child(check_row(
+                    cx,
+                    theme,
+                    "exp-fcpxml-multicam",
+                    data.export_fcpxml_multicam,
+                    "Multicam clip".to_string(),
+                    !busy,
+                    |this, _, _, cx| {
+                        this.data.export_fcpxml_multicam = !this.data.export_fcpxml_multicam;
+                        cx.notify();
+                    },
+                ));
+                if reveals.storylines || reveals_closing.contains_key("export-storylines") {
+                    options = options.child(export_reveal(
+                        check_row(
+                            cx,
+                            theme,
+                            "exp-storylines",
+                            data.export_storylines,
+                            "Group tracks as storylines".to_string(),
+                            !busy,
+                            |this, _, _, cx| {
+                                this.data.export_storylines = !this.data.export_storylines;
+                                cx.notify();
+                            },
+                        ),
+                        "export-storylines",
+                        32.,
+                        !reveals.storylines,
+                    ));
+                }
+                group = group.child(export_reveal(
+                    export_dependent_options(theme, options),
+                    "export-final-cut-options",
+                    104.,
+                    !reveals.final_cut,
+                ));
+            }
+            if target == ExportTarget::Premiere
+                && (reveals.premiere || reveals_closing.contains_key("export-premiere-options"))
+            {
+                group = group.child(export_reveal(
+                    export_dependent_options(
+                        theme,
+                        check_row(
+                            cx,
+                            theme,
+                            "exp-replaced",
+                            data.export_replaced,
+                            "Add a sequence with replaced camera audio".to_string(),
+                            !busy,
+                            |this, _, _, cx| {
+                                this.data.export_replaced = !this.data.export_replaced;
+                                cx.notify();
+                            },
+                        ),
+                    ),
+                    "export-premiere-options",
+                    40.,
+                    !reveals.premiere,
+                ));
+            }
+            if target == ExportTarget::Aaf
+                && (reveals.aaf || reveals_closing.contains_key("export-aaf-options"))
+            {
+                let mut menu = div()
+                    .id("export-aaf-frame-rate-menu")
+                    .w(px(160.))
+                    .flex()
+                    .flex_col()
+                    .p_1()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(theme.border))
+                    .bg(rgb(theme.panel))
+                    .shadow_md()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+                for (id, frame_duration, title) in aaf_frame_rate_options() {
+                    menu = menu.child(export_select_option(
+                        cx,
+                        theme,
+                        format!("exp-aaf-fps-{id}"),
+                        data.export_aaf_frame_duration == frame_duration,
+                        title,
+                        move |this, _, _, cx| {
+                            this.data.export_aaf_frame_duration = frame_duration;
+                            cx.notify();
+                        },
+                    ));
+                }
+                let select_open = export_select == Some(ExportSelect::AafFrameRate);
+                let options = export_select_row(
+                    cx,
+                    theme,
+                    "exp-aaf-frame-rate",
+                    "Frame rate",
+                    aaf_frame_rate_label(data.export_aaf_frame_duration).to_string(),
+                    ExportSelect::AafFrameRate,
+                    select_open,
+                    select_open && export_select_closing,
+                    !busy,
+                    260.,
+                    menu,
+                );
+                group = group.child(export_reveal(
+                    export_dependent_options(theme, options),
+                    "export-aaf-options",
+                    36.,
+                    !reveals.aaf,
+                ));
+            }
         }
         group = group.child(check_row(
             cx,
@@ -4701,59 +5265,6 @@ fn export_sheet(
                 cx.notify();
             },
         ));
-        if data.export_selected.contains(&ExportTarget::FinalCutPro) {
-            group = group.child(check_row(
-                cx,
-                theme,
-                "exp-fcpxml-timeline",
-                data.export_fcpxml_timeline,
-                "Include synchronized timeline".to_string(),
-                !busy,
-                |this, _, _, cx| {
-                    this.data.export_fcpxml_timeline = !this.data.export_fcpxml_timeline;
-                    cx.notify();
-                },
-            ));
-            group = group.child(check_row(
-                cx,
-                theme,
-                "exp-fcpxml-multicam",
-                data.export_fcpxml_multicam,
-                "Include multicam clip".to_string(),
-                !busy,
-                |this, _, _, cx| {
-                    this.data.export_fcpxml_multicam = !this.data.export_fcpxml_multicam;
-                    cx.notify();
-                },
-            ));
-            group = group.child(check_row(
-                cx,
-                theme,
-                "exp-storylines",
-                data.export_storylines,
-                "Group FCPXML tracks as storylines".to_string(),
-                !busy && data.export_fcpxml_timeline,
-                |this, _, _, cx| {
-                    this.data.export_storylines = !this.data.export_storylines;
-                    cx.notify();
-                },
-            ));
-        }
-        if data.export_selected.contains(&ExportTarget::Premiere) {
-            let on = data.export_replaced;
-            group = group.child(check_row(
-                cx,
-                theme,
-                "exp-replaced",
-                on,
-                "Also add a sequence with external audio replacing camera audio".to_string(),
-                !busy,
-                |this, _, _, cx| {
-                    this.data.export_replaced = !this.data.export_replaced;
-                    cx.notify();
-                },
-            ));
-        }
         columns = columns.child(group);
     }
     {
@@ -4774,47 +5285,6 @@ fn export_sheet(
                     cx.notify();
                 },
             ));
-            settings = settings.child(group);
-        }
-        if data.export_selected.contains(&ExportTarget::Aaf) {
-            let mut group = div().flex().flex_col().gap_1();
-            group = group.child(export_section_title(theme, "Resolve AAF frame rate"));
-            for (id, frame_duration, title) in [
-                ("auto", None, "Automatic"),
-                (
-                    "23976",
-                    Some(align_core::MediaTime::new(1001, 24_000)),
-                    "23.976",
-                ),
-                ("24", Some(align_core::MediaTime::new(1, 24)), "24"),
-                ("25", Some(align_core::MediaTime::new(1, 25)), "25"),
-                (
-                    "2997",
-                    Some(align_core::MediaTime::new(1001, 30_000)),
-                    "29.97",
-                ),
-                ("30", Some(align_core::MediaTime::new(1, 30)), "30"),
-                ("50", Some(align_core::MediaTime::new(1, 50)), "50"),
-                (
-                    "5994",
-                    Some(align_core::MediaTime::new(1001, 60_000)),
-                    "59.94",
-                ),
-                ("60", Some(align_core::MediaTime::new(1, 60)), "60"),
-            ] {
-                group = group.child(choice_row(
-                    cx,
-                    theme,
-                    format!("exp-aaf-fps-{id}"),
-                    data.export_aaf_frame_duration == frame_duration,
-                    title.to_string(),
-                    !busy,
-                    move |this, _, _, cx| {
-                        this.data.export_aaf_frame_duration = frame_duration;
-                        cx.notify();
-                    },
-                ));
-            }
             settings = settings.child(group);
         }
         // Timeline assembly.
@@ -4930,48 +5400,73 @@ fn export_sheet(
             use align_core::export_model::UnmatchedPlacement as P;
             let mut group = div().flex().flex_col();
             group = group.child(export_section_title(theme, "Unmatched clips"));
+            let mut menu = div()
+                .id("export-unmatched-placement-menu")
+                .w(px(160.))
+                .flex()
+                .flex_col()
+                .p_1()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(theme.border))
+                .bg(rgb(theme.panel))
+                .shadow_md()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
             for (placement, title, id) in [
                 (P::ByOrderAndTime, "By order & time", "exp-unmatched-time"),
                 (P::ByOrderOnly, "By order only", "exp-unmatched-order"),
                 (P::Remove, "Remove", "exp-unmatched-remove"),
             ] {
-                group = group.child(choice_row(
+                menu = menu.child(export_select_option(
                     cx,
                     theme,
                     id,
                     data.export_unmatched == placement,
-                    title.to_string(),
-                    !busy,
+                    title,
                     move |this, _, _, cx| {
-                        this.data.export_unmatched = placement;
-                        cx.notify();
+                        this.update_export_options(cx, |data| {
+                            data.export_unmatched = placement;
+                        });
                     },
                 ));
             }
-            group = group.child(check_row(
+            let select_open = export_select == Some(ExportSelect::UnmatchedPlacement);
+            group = group.child(export_select_row(
                 cx,
                 theme,
-                "exp-disable-unmatched",
-                data.export_disable_unmatched,
-                "Disable in timeline".to_string(),
-                !busy && data.export_unmatched != P::Remove,
-                |this, _, _, cx| {
-                    this.data.export_disable_unmatched = !this.data.export_disable_unmatched;
-                    cx.notify();
-                },
+                "exp-unmatched-placement",
+                "Placement",
+                unmatched_placement_label(data.export_unmatched).to_string(),
+                ExportSelect::UnmatchedPlacement,
+                select_open,
+                select_open && export_select_closing,
+                !busy,
+                92.,
+                menu,
             ));
-            group = group.child(check_row(
-                cx,
-                theme,
-                "exp-label-unmatched",
-                data.export_label_unmatched,
-                "Mark names as [UNSYNCED]".to_string(),
-                !busy && data.export_unmatched != P::Remove,
-                |this, _, _, cx| {
-                    this.data.export_label_unmatched = !this.data.export_label_unmatched;
-                    cx.notify();
-                },
-            ));
+            if reveals.unmatched_kept || reveals_closing.contains_key("export-unmatched-kept") {
+                group = group.child(export_reveal(
+                    export_dependent_options(
+                        theme,
+                        check_row(
+                            cx,
+                            theme,
+                            "exp-disable-unmatched",
+                            data.export_disable_unmatched,
+                            "Disable in timeline".to_string(),
+                            !busy,
+                            |this, _, _, cx| {
+                                this.data.export_disable_unmatched =
+                                    !this.data.export_disable_unmatched;
+                                cx.notify();
+                            },
+                        ),
+                    ),
+                    "export-unmatched-kept",
+                    40.,
+                    !reveals.unmatched_kept,
+                ));
+            }
             settings = settings.child(group);
         }
     }
@@ -4979,93 +5474,145 @@ fn export_sheet(
     {
         let mut group = div().flex().flex_col().gap_1();
         group = group.child(export_section_title(theme, "Names & labels"));
-        {
-            group = group.child(export_text_field(
-                theme,
-                "Sequence name",
-                inputs.sequence_name.clone(),
-            ));
-            group = group.child(check_row(
-                cx,
-                theme,
-                "exp-label-synced",
-                data.export_label_synced,
-                "Mark names as [SYNCED]".to_string(),
-                !busy,
-                |this, _, _, cx| {
-                    this.data.export_label_synced = !this.data.export_label_synced;
-                    cx.notify();
-                },
-            ));
-            group = group.child(export_text_field(
-                theme,
-                "Synchronized symbol",
-                inputs.synced_symbol.clone(),
-            ));
-            group = group.child(check_row(
-                cx,
-                theme,
-                "exp-synced-symbol-suffix",
-                data.export_synced_symbol_suffix,
-                "Put synchronized symbol after clip name".to_string(),
-                !busy,
-                |this, _, _, cx| {
-                    this.data.export_synced_symbol_suffix = !this.data.export_synced_symbol_suffix;
-                    cx.notify();
-                },
-            ));
-            if data.export_selected.contains(&ExportTarget::Premiere)
-                || data.export_selected.contains(&ExportTarget::ResolveXml)
-            {
-                group = group.child(export_text_field(
+        group = group.child(export_text_field(
+            theme,
+            "Sequence name",
+            inputs.sequence_name.clone(),
+        ));
+        group = group.child(check_row(
+            cx,
+            theme,
+            "exp-label-synced",
+            data.export_label_synced,
+            "Label synchronized clips".to_string(),
+            !busy,
+            |this, _, _, cx| {
+                this.update_export_options(cx, |data| {
+                    data.export_label_synced = !data.export_label_synced;
+                });
+            },
+        ));
+        if reveals.synced_labels || reveals_closing.contains_key("export-synced-labels") {
+            let mut details = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(export_text_field(
                     theme,
-                    "Synchronized XML color",
-                    inputs.synced_color.clone(),
-                ));
-            }
-            if data.export_selected.contains(&ExportTarget::FinalCutPro) {
-                group = group.child(export_text_field(
-                    theme,
-                    "Synchronized Final Cut role",
-                    inputs.synced_role.clone(),
-                ));
-            }
-            if data.unmatched_count() > 0 {
-                group = group.child(export_text_field(
-                    theme,
-                    "Unmatched symbol",
-                    inputs.unmatched_symbol.clone(),
-                ));
-                group = group.child(check_row(
+                    "Name marker",
+                    inputs.synced_symbol.clone(),
+                ))
+                .child(check_row(
                     cx,
                     theme,
-                    "exp-symbol-suffix",
-                    data.export_unmatched_symbol_suffix,
-                    "Put symbol after clip name".to_string(),
+                    "exp-synced-symbol-suffix",
+                    data.export_synced_symbol_suffix,
+                    "Place marker after clip name".to_string(),
                     !busy,
                     |this, _, _, cx| {
-                        this.data.export_unmatched_symbol_suffix =
-                            !this.data.export_unmatched_symbol_suffix;
+                        this.data.export_synced_symbol_suffix =
+                            !this.data.export_synced_symbol_suffix;
                         cx.notify();
                     },
                 ));
-                if data.export_selected.contains(&ExportTarget::Premiere)
-                    || data.export_selected.contains(&ExportTarget::ResolveXml)
-                {
-                    group = group.child(export_text_field(
-                        theme,
-                        "Unmatched XML color",
-                        inputs.unmatched_color.clone(),
-                    ));
-                }
-                if data.export_selected.contains(&ExportTarget::FinalCutPro) {
-                    group = group.child(export_text_field(
-                        theme,
-                        "Unmatched Final Cut role",
-                        inputs.unmatched_role.clone(),
-                    ));
-                }
+            if reveals.synced_xml || reveals_closing.contains_key("export-synced-xml") {
+                details = details.child(export_reveal(
+                    export_text_field(theme, "XML label color", inputs.synced_color.clone()),
+                    "export-synced-xml",
+                    36.,
+                    !reveals.synced_xml,
+                ));
             }
+            if reveals.synced_final_cut || reveals_closing.contains_key("export-synced-final-cut") {
+                details = details.child(export_reveal(
+                    export_text_field(theme, "Final Cut audio role", inputs.synced_role.clone()),
+                    "export-synced-final-cut",
+                    36.,
+                    !reveals.synced_final_cut,
+                ));
+            }
+            group = group.child(export_reveal(
+                export_dependent_options(theme, details),
+                "export-synced-labels",
+                152.,
+                !reveals.synced_labels,
+            ));
+        }
+        if data.unmatched_count() > 0
+            && (reveals.unmatched_label_control
+                || reveals_closing.contains_key("export-unmatched-label-control"))
+        {
+            let mut unmatched = div().flex().flex_col().gap_1().child(check_row(
+                cx,
+                theme,
+                "exp-label-unmatched",
+                data.export_label_unmatched,
+                "Label unmatched clips".to_string(),
+                !busy,
+                |this, _, _, cx| {
+                    this.update_export_options(cx, |data| {
+                        data.export_label_unmatched = !data.export_label_unmatched;
+                    });
+                },
+            ));
+            if reveals.unmatched_labels || reveals_closing.contains_key("export-unmatched-labels") {
+                let mut details = div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(export_text_field(
+                        theme,
+                        "Name marker",
+                        inputs.unmatched_symbol.clone(),
+                    ))
+                    .child(check_row(
+                        cx,
+                        theme,
+                        "exp-symbol-suffix",
+                        data.export_unmatched_symbol_suffix,
+                        "Place marker after clip name".to_string(),
+                        !busy,
+                        |this, _, _, cx| {
+                            this.data.export_unmatched_symbol_suffix =
+                                !this.data.export_unmatched_symbol_suffix;
+                            cx.notify();
+                        },
+                    ));
+                if reveals.unmatched_xml || reveals_closing.contains_key("export-unmatched-xml") {
+                    details = details.child(export_reveal(
+                        export_text_field(theme, "XML label color", inputs.unmatched_color.clone()),
+                        "export-unmatched-xml",
+                        36.,
+                        !reveals.unmatched_xml,
+                    ));
+                }
+                if reveals.unmatched_final_cut
+                    || reveals_closing.contains_key("export-unmatched-final-cut")
+                {
+                    details = details.child(export_reveal(
+                        export_text_field(
+                            theme,
+                            "Final Cut audio role",
+                            inputs.unmatched_role.clone(),
+                        ),
+                        "export-unmatched-final-cut",
+                        36.,
+                        !reveals.unmatched_final_cut,
+                    ));
+                }
+                unmatched = unmatched.child(export_reveal(
+                    export_dependent_options(theme, details),
+                    "export-unmatched-labels",
+                    152.,
+                    !reveals.unmatched_labels,
+                ));
+            }
+            group = group.child(export_reveal(
+                unmatched,
+                "export-unmatched-label-control",
+                192.,
+                !reveals.unmatched_label_control,
+            ));
         }
         settings = settings.child(group);
     }
