@@ -65,6 +65,12 @@ jobs:
           exe=""
           if [[ "${{ runner.os }}" == "Windows" ]]; then exe=".exe"; fi
           python script/check-release-smoke.py "target/release/align-cli$exe" release-smoke
+      - name: Verify preserve basic editing
+        shell: bash
+        run: |
+          exe=""
+          if [[ "${{ runner.os }}" == "Windows" ]]; then exe=".exe"; fi
+          python script/check-preserve-editing-smoke.py --cli "target/release/align-cli$exe" --output release-smoke/preserve-editing
       - name: Verify bundled AAF import and export
         shell: bash
         run: |
