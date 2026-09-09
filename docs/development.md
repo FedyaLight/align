@@ -149,8 +149,12 @@ picture operations then require system FFmpeg/ffprobe. To build the sidecars:
 ```
 
 That build requires a C toolchain, make, curl, tar, xz, and NASM where applicable.
-The release workflow stages binaries and license files for all three platforms;
-MSI, DMG, AppImage, and notarization workflows are not provided.
+For a tag named `align-rs-vX.Y.Z` matching the workspace version, the release
+workflow also builds Velopack installers/update packages for macOS, Windows,
+and Linux and publishes them in a GitHub Release. The desktop app uses those
+checksum-verified packages for **Align → Check for Updates…**. Distribution
+code signing and Apple notarization still require release credentials and are
+not configured in this repository.
 
 ## Repository conventions
 

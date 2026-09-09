@@ -60,7 +60,11 @@ const TRASH: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 1
 /// Document with down arrow (drop zone, mirrors native `arrow.down.doc`).
 const DROP: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g stroke="white" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M4 1.5h5.5L13 5v8.5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-11a1 1 0 0 1 1-1z"/><path d="M9.5 1.5V5H13"/><path d="M8 7.5V12M6 10l2 2 2-2"/></g></svg>"#;
 
+/// GitHub mark.
+const GITHUB: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="white" d="M12 .7a12 12 0 0 0-3.79 23.4c.6.12.82-.26.82-.58v-2.23c-3.34.73-4.04-1.42-4.04-1.42-.55-1.39-1.33-1.76-1.33-1.76-1.09-.74.08-.73.08-.73 1.2.09 1.84 1.24 1.84 1.24 1.07 1.84 2.81 1.31 3.5 1 .11-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.66.24 2.88.12 3.18.77.84 1.24 1.91 1.24 3.22 0 4.61-2.81 5.62-5.48 5.92.43.37.81 1.1.81 2.22v3.3c0 .32.22.7.83.58A12 12 0 0 0 12 .7z"/></svg>"#;
+
 pub struct IconPaths {
+    pub app: String,
     pub film: String,
     pub waveform: String,
     pub plus: String,
@@ -75,6 +79,7 @@ pub struct IconPaths {
     pub reset: String,
     pub trash: String,
     pub drop: String,
+    pub github: String,
 }
 
 static CACHE: OnceLock<IconPaths> = OnceLock::new();
@@ -122,6 +127,7 @@ fn asset_dir() -> std::path::PathBuf {
 fn paths_for(dir: &std::path::Path) -> IconPaths {
     let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
     IconPaths {
+        app: path("app-icon.png"),
         film: path("film.svg"),
         waveform: path("waveform.svg"),
         plus: path("plus.svg"),
@@ -136,11 +142,17 @@ fn paths_for(dir: &std::path::Path) -> IconPaths {
         reset: path("reset.svg"),
         trash: path("trash.svg"),
         drop: path("drop.svg"),
+        github: path("github.svg"),
     }
 }
 
 fn write_all(dir: &std::path::Path) {
     let _ = std::fs::create_dir_all(dir);
+    let app_icon = include_bytes!("../../../Support/AppIcon.png");
+    let app_icon_path = dir.join("app-icon.png");
+    if !std::fs::read(&app_icon_path).is_ok_and(|current| current == app_icon) {
+        let _ = std::fs::write(app_icon_path, app_icon);
+    }
     let write = |name: &str, svg: &str| {
         let path = dir.join(name);
         let current = std::fs::read_to_string(&path).unwrap_or_default();
@@ -162,6 +174,7 @@ fn write_all(dir: &std::path::Path) {
     write("reset.svg", RESET);
     write("trash.svg", TRASH);
     write("drop.svg", DROP);
+    write("github.svg", GITHUB);
 }
 
 /// Remove the materialized icon assets (quit-time cleanup: no traces).

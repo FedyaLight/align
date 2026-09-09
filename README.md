@@ -32,6 +32,8 @@ cargo run --release -p align-gpui
 ```
 
 The desktop executable is `align`; the command-line executable is `align-cli`.
+Installed desktop releases can check, download, and apply updates from the
+**Align** menu on macOS, Windows, and Linux.
 AAF support requires an additional [build step](docs/development.md#aaf-module).
 
 ```sh

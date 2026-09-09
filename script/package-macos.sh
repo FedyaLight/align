@@ -8,6 +8,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${1:-$HOME/Downloads/Align-macOS}"
 APP_NAME="Align"
 BUNDLE_ID="com.align.app"
+APP_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT_DIR/Cargo.toml" | head -1)"
 # Default sidecars support portable decoding and AAF picture metadata.
 BUNDLE_FFMPEG="${BUNDLE_FFMPEG:-1}"
 FFMPEG_DIR="${FFMPEG_DIR:-}"
@@ -101,7 +102,7 @@ cat >"$APP_CONTENTS/Info.plist" <<PLIST
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.0</string>
+  <string>$APP_VERSION</string>
   <key>CFBundleVersion</key>
   <string>1</string>
   <key>LSMinimumSystemVersion</key>

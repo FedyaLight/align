@@ -9,6 +9,7 @@ mod motion;
 mod state;
 mod text_input;
 mod theme;
+mod updater;
 mod views;
 
 use gpui::{
@@ -20,6 +21,7 @@ actions!(
     align,
     [
         AboutAlign,
+        CheckForUpdates,
         UseWithAiAgents,
         LightAppearance,
         DarkAppearance,
@@ -60,6 +62,13 @@ fn show_about(cx: &mut App) {
     view.update(cx, |this, cx| {
         this.data.show_about = true;
         cx.notify();
+    });
+}
+
+fn check_for_updates(cx: &mut App) {
+    update_view(cx, |this, cx| {
+        this.data.show_about = true;
+        this.check_for_updates(cx);
     });
 }
 
@@ -187,6 +196,7 @@ fn app_menus(appearance: theme::AppearancePreference) -> Vec<Menu> {
             name: "Align".into(),
             items: vec![
                 MenuItem::action("About Align", AboutAlign),
+                MenuItem::action("Check for Updates…", CheckForUpdates),
                 MenuItem::separator(),
                 MenuItem::action("Use with AI Agents…", UseWithAiAgents),
                 MenuItem::separator(),
@@ -255,6 +265,8 @@ fn app_menus(appearance: theme::AppearancePreference) -> Vec<Menu> {
 }
 
 fn main() {
+    velopack::VelopackApp::build().run();
+
     struct SessionCleanup;
     impl Drop for SessionCleanup {
         fn drop(&mut self) {
@@ -282,6 +294,7 @@ fn main() {
             // System commands: without registered actions + bindings + menus
             // macOS swallows keys like Cmd+Q and the menu bar stays empty.
             cx.on_action(|_: &AboutAlign, cx| show_about(cx));
+            cx.on_action(|_: &CheckForUpdates, cx| check_for_updates(cx));
             cx.on_action(|_: &UseWithAiAgents, cx| show_agent_setup(cx));
             cx.on_action(|_: &LightAppearance, cx| {
                 set_appearance(theme::AppearancePreference::Light, cx)

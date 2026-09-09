@@ -130,7 +130,56 @@ jobs:
           cp LICENSE THIRD_PARTY_NOTICES.txt dist-bundle/
           cp target/ffmpeg-minimal/* dist-bundle/
           ls -la dist-bundle/
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "8.0.x"
+      - name: Install Velopack packager
+        run: dotnet tool install --global vpk --version 1.2.0
+      - name: Build installable update package
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#align-rs-v}"
+          workspace_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          if [[ "$version" != "$workspace_version" ]]; then
+            echo "Tag version $version does not match Cargo.toml version $workspace_version" >&2
+            exit 1
+          fi
+          exe=""
+          icon="Support/AppIcon.png"
+          extra=()
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            exe=".exe"
+            icon=""
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            icon="Support/AppIcon.icns"
+            extra+=(--bundleId com.align.app)
+          fi
+          args=(pack --packId com.align.app --packTitle Align --packVersion "$version" --packDir dist-bundle --mainExe "align$exe" --outputDir velopack-release)
+          if [[ -n "$icon" ]]; then args+=(--icon "$icon"); fi
+          vpk "${args[@]}" "${extra[@]}"
       - uses: actions/upload-artifact@v4
         with:
           name: align-${{ runner.os }}
           path: dist-bundle/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: updates-${{ runner.os }}
+          path: velopack-release/
+
+  publish-release:
+    name: publish GitHub release
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/align-rs-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: updates-*
+          path: release-assets
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-assets/*

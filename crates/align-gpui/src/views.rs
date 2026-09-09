@@ -15,8 +15,8 @@ use gpui::{
     AnchoredPositionMode, Animation, AnimationExt, AnyView, App, ClickEvent, ClipboardItem,
     Context, Corner, Div, DragMoveEvent, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, PathPromptOptions, Pixels, Point,
-    Render, ScrollHandle, SharedString, Stateful, Styled, Window, anchored, deferred, div, point,
-    prelude::*, px, rgb, rgba,
+    Render, ScrollHandle, SharedString, Stateful, Styled, Window, anchored, deferred, div, img,
+    point, prelude::*, px, rgb, rgba,
 };
 
 use super::icons::{icons, kind_badge, svg_icon};
@@ -27,6 +27,7 @@ use super::state::{
 };
 use super::text_input::TextInput;
 use super::theme::{Theme, ThemeMode};
+use super::updater::{self, UpdateState};
 use crate::{MinimizeWindow, ToggleFullscreen, ZoomWindow};
 
 // ------------------------------------------------------------ messages
@@ -733,6 +734,7 @@ pub struct AlignApp {
     export_reveal_generation: u64,
     timeline_transitions: HashMap<ClipId, TimelineTransition>,
     timeline_motion_generation: u64,
+    update_state: UpdateState,
 }
 
 impl Focusable for AlignApp {
@@ -769,6 +771,7 @@ impl AlignApp {
             export_reveal_generation: 0,
             timeline_transitions: HashMap::new(),
             timeline_motion_generation: 0,
+            update_state: UpdateState::default(),
         }
     }
 
@@ -792,6 +795,73 @@ impl AlignApp {
             });
         })
         .detach();
+    }
+
+    pub(crate) fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        if self.update_state.is_busy() {
+            return;
+        }
+        self.update_state = UpdateState::Checking;
+        cx.notify();
+
+        let (tx, rx) = futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(updater::check());
+        });
+        let view = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let state = rx.await.unwrap_or(UpdateState::Failed);
+            let _ = view.update(cx, |this, cx| {
+                this.update_state = state;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn download_update(&mut self, cx: &mut Context<Self>) {
+        let state = std::mem::take(&mut self.update_state);
+        let UpdateState::Available { manager, update } = state else {
+            self.update_state = state;
+            return;
+        };
+        let version = update.TargetFullRelease.Version.clone();
+        self.update_state = UpdateState::Downloading { version };
+        cx.notify();
+
+        let (tx, rx) = futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(updater::download(manager, update));
+        });
+        let view = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let state = rx.await.unwrap_or(UpdateState::Failed);
+            let _ = view.update(cx, |this, cx| {
+                this.update_state = state;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn restart_and_update(&mut self) {
+        if matches!(
+            self.data.operation,
+            Operation::Synchronizing | Operation::Exporting | Operation::Repairing
+        ) {
+            return;
+        }
+        let state = std::mem::take(&mut self.update_state);
+        let UpdateState::Ready { manager, asset } = state else {
+            self.update_state = state;
+            return;
+        };
+        super::icons::cleanup();
+        align_decode::media_assets::cleanup();
+        if let Err(error) = manager.apply_updates_and_restart(&asset) {
+            eprintln!("Could not install the Align update: {error}");
+            self.update_state = UpdateState::Failed;
+        }
     }
 
     pub(crate) fn start_sync(&mut self, cx: &mut Context<Self>) {
@@ -1954,7 +2024,7 @@ fn button(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     id: impl Into<SharedString>,
-    label: impl Into<SharedString>,
+    label: impl IntoElement,
     enabled: bool,
     action: impl Fn(&mut AlignApp, &ClickEvent, &mut Window, &mut Context<AlignApp>) + 'static,
 ) -> impl IntoElement {
@@ -1967,7 +2037,7 @@ fn button(
         .rounded_lg()
         .bg(rgb(theme.button_hover))
         .text_size(px(12.))
-        .child(label.into());
+        .child(label);
     if enabled {
         el = el
             .text_color(rgb(theme.icon))
@@ -2399,7 +2469,11 @@ impl Render for AlignApp {
             ));
         }
         if self.data.show_about {
-            root = root.child(overlay(&theme, "overlay-about", about_panel(cx, &theme)));
+            root = root.child(overlay(
+                &theme,
+                "overlay-about",
+                about_panel(cx, &theme, &self.update_state, self.data.operation),
+            ));
         }
         if self.data.show_agent_setup {
             root = root.child(overlay(
@@ -6499,23 +6573,114 @@ fn export_sheet(
 
 // ---------------- about panel (Align menu → About Align)
 
-fn about_panel(cx: &mut Context<AlignApp>, theme: &Theme) -> impl IntoElement {
+fn platform_label() -> String {
+    let operating_system = match std::env::consts::OS {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        other => other,
+    };
+    format!("{operating_system} · {}", std::env::consts::ARCH)
+}
+
+fn about_panel(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    update_state: &UpdateState,
+    operation: Operation,
+) -> impl IntoElement {
+    let update_version = update_state.version().unwrap_or_default();
+    let restart_blocked = matches!(
+        operation,
+        Operation::Synchronizing | Operation::Exporting | Operation::Repairing
+    );
+
+    let mut update_actions = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap_2();
+    match update_state {
+        UpdateState::Idle | UpdateState::Current | UpdateState::Failed => {
+            update_actions = update_actions.child(button(
+                cx,
+                theme,
+                "about-check-updates",
+                match update_state {
+                    UpdateState::Idle => "Check for Updates",
+                    UpdateState::Current => "Up to Date",
+                    UpdateState::Failed => "Couldn’t Check · Try Again",
+                    _ => unreachable!(),
+                },
+                true,
+                |this, _, _, cx| this.check_for_updates(cx),
+            ));
+        }
+        UpdateState::Checking => {
+            update_actions = update_actions.child(button(
+                cx,
+                theme,
+                "about-checking-updates",
+                "Checking for Updates…",
+                false,
+                |_, _, _, _| {},
+            ));
+        }
+        UpdateState::Available { .. } => {
+            update_actions = update_actions.child(prominent_button(
+                cx,
+                theme,
+                "about-download-update",
+                format!("Update to {update_version}"),
+                true,
+                |this, _, _, cx| this.download_update(cx),
+            ));
+        }
+        UpdateState::Downloading { .. } => {
+            update_actions = update_actions.child(prominent_button(
+                cx,
+                theme,
+                "about-downloading-update",
+                format!("Downloading {update_version}…"),
+                false,
+                |_, _, _, _| {},
+            ));
+        }
+        UpdateState::Ready { .. } => {
+            update_actions = update_actions.child(prominent_button(
+                cx,
+                theme,
+                "about-install-update",
+                if restart_blocked {
+                    "Finish Current Operation First"
+                } else {
+                    "Restart and Update"
+                },
+                !restart_blocked,
+                |this, _, _, _| this.restart_and_update(),
+            ));
+        }
+    }
+
     div()
+        .id("about-panel")
         .flex()
         .flex_col()
         .items_center()
-        .gap_2()
-        .p_6()
+        .gap_3()
+        .p_5()
         .m_4()
-        .w(px(360.))
+        .w(px(380.))
         .rounded_lg()
         .border_1()
         .border_color(rgb(theme.border))
         .bg(rgb(theme.panel))
+        .shadow_md()
         .child(modal_header(
             cx,
             theme,
-            "Align",
+            "About",
             "btn-about-close",
             |this, _, _, cx| {
                 this.data.show_about = false;
@@ -6523,11 +6688,47 @@ fn about_panel(cx: &mut Context<AlignApp>, theme: &Theme) -> impl IntoElement {
             },
         ))
         .child(
+            img(PathBuf::from(&icons().app))
+                .mt_1()
+                .size(px(72.))
+                .rounded_xl(),
+        )
+        .child(
+            div()
+                .text_size(px(24.))
+                .font_weight(gpui::FontWeight(650.0))
+                .child("Align"),
+        )
+        .child(
             div()
                 .text_color(rgb(theme.dim))
-                .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
+                .text_size(px(12.))
+                .child(format!(
+                    "Version {} · {}",
+                    env!("CARGO_PKG_VERSION"),
+                    platform_label()
+                )),
         )
-        .child(div().child("Cross-platform media synchronizer"))
+        .child(update_actions)
+        .child(button(
+            cx,
+            theme,
+            "about-github",
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(svg_icon(icons().github.clone(), 13.0, theme.icon))
+                .child("Star on GitHub"),
+            true,
+            |_, _, _, cx| cx.open_url(updater::REPOSITORY_URL),
+        ))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme.dim))
+                .child("© 2026 Align contributors"),
+        )
 }
 
 // ---------------- MCP setup (Align menu → Use with AI Agents…)
