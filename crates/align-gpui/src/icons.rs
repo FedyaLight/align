@@ -63,6 +63,12 @@ const DROP: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16
 /// GitHub mark.
 const GITHUB: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="white" d="M12 .7a12 12 0 0 0-3.79 23.4c.6.12.82-.26.82-.58v-2.23c-3.34.73-4.04-1.42-4.04-1.42-.55-1.39-1.33-1.76-1.33-1.76-1.09-.74.08-.73.08-.73 1.2.09 1.84 1.24 1.84 1.24 1.07 1.84 2.81 1.31 3.5 1 .11-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.66.24 2.88.12 3.18.77.84 1.24 1.91 1.24 3.22 0 4.61-2.81 5.62-5.48 5.92.43.37.81 1.1.81 2.22v3.3c0 .32.22.7.83.58A12 12 0 0 0 12 .7z"/></svg>"#;
 
+/// Export destination folder.
+const FOLDER: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M1.75 4.25h4l1.5 1.5h7v6.5a1.25 1.25 0 0 1-1.25 1.25H3a1.25 1.25 0 0 1-1.25-1.25v-8z" fill="none" stroke="white" stroke-width="1.4" stroke-linejoin="round"/></svg>"#;
+
+/// Heart used for the reserved support action.
+const HEART: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M8 13.4S2.2 10.1 2.2 5.8A2.9 2.9 0 0 1 8 5.2a2.9 2.9 0 0 1 5.8.6C13.8 10.1 8 13.4 8 13.4z" fill="none" stroke="white" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+
 pub struct IconPaths {
     pub app: String,
     pub film: String,
@@ -80,6 +86,8 @@ pub struct IconPaths {
     pub trash: String,
     pub drop: String,
     pub github: String,
+    pub folder: String,
+    pub heart: String,
 }
 
 static CACHE: OnceLock<IconPaths> = OnceLock::new();
@@ -143,6 +151,8 @@ fn paths_for(dir: &std::path::Path) -> IconPaths {
         trash: path("trash.svg"),
         drop: path("drop.svg"),
         github: path("github.svg"),
+        folder: path("folder.svg"),
+        heart: path("heart.svg"),
     }
 }
 
@@ -175,6 +185,8 @@ fn write_all(dir: &std::path::Path) {
     write("trash.svg", TRASH);
     write("drop.svg", DROP);
     write("github.svg", GITHUB);
+    write("folder.svg", FOLDER);
+    write("heart.svg", HEART);
 }
 
 /// Remove the materialized icon assets (quit-time cleanup: no traces).

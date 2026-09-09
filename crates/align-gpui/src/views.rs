@@ -12,11 +12,11 @@ use align_decode::export::ExportArtifact;
 use align_decode::pipeline::{Phase, Pipeline};
 use futures::StreamExt;
 use gpui::{
-    AnchoredPositionMode, Animation, AnimationExt, AnyView, App, ClickEvent, ClipboardItem,
-    Context, Corner, Div, DragMoveEvent, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, PathPromptOptions, Pixels, Point,
-    Render, ScrollHandle, SharedString, Stateful, Styled, Window, anchored, deferred, div, img,
-    point, prelude::*, px, rgb, rgba,
+    AnchoredPositionMode, Animation, AnimationExt, AnyView, App, BoxShadow, ClickEvent,
+    ClipboardItem, Context, Corner, Div, DragMoveEvent, Entity, FocusHandle, Focusable,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
+    PathPromptOptions, Pixels, Point, Render, ScrollHandle, SharedString, Stateful, Styled, Window,
+    anchored, deferred, div, img, point, prelude::*, px, rgb, rgba,
 };
 
 use super::icons::{icons, kind_badge, svg_icon};
@@ -3551,7 +3551,9 @@ fn operation_bar(
             .min_w(px(0.))
             .text_size(px(12.))
             .gap_1();
-        status = status.child(data.status.clone());
+        if !(data.show_export && matches!(data.operation, Operation::Exported)) {
+            status = status.child(data.status.clone());
+        }
         if busy {
             status = status.child(
                 div()
@@ -5875,6 +5877,14 @@ fn export_sidebar(
     )
 }
 
+fn export_reveal_label() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "Show in Finder",
+        "windows" => "Show in Explorer",
+        _ => "Open Folder",
+    }
+}
+
 fn export_sidebar_action(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
@@ -5894,6 +5904,388 @@ fn export_sidebar_action(
         ))
 }
 
+fn export_success_button(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    id: &'static str,
+    label: &'static str,
+    prominent: bool,
+    enabled: bool,
+    action: impl Fn(&mut AlignApp, &ClickEvent, &mut Window, &mut Context<AlignApp>) + 'static,
+) -> Stateful<Div> {
+    let mut button = div()
+        .id(id)
+        .w_full()
+        .h(px(34.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_lg()
+        .text_size(px(12.))
+        .font_weight(gpui::FontWeight(600.0))
+        .child(label);
+    if prominent {
+        button = button
+            .bg(rgb(theme.accent))
+            .text_color(rgb(theme.on_accent))
+            .hover(|this| this.bg(rgb(theme.accent_hover)));
+    } else {
+        button = button
+            .bg(rgb(theme.button_hover))
+            .text_color(rgb(theme.icon))
+            .hover(|this| this.bg(rgb(theme.border)));
+    }
+    if enabled {
+        button = button
+            .cursor_pointer()
+            .active(|this| this.opacity(0.72))
+            .on_click(cx.listener(move |this, event, window, cx| {
+                action(this, event, window, cx);
+            }));
+    } else {
+        button = button.opacity(0.42);
+    }
+    button
+}
+
+fn export_confetti(theme: &Theme) -> Div {
+    let mut layer = div()
+        .absolute()
+        .top(px(4.))
+        .left(px(0.))
+        .w_full()
+        .h(px(104.));
+    if super::motion::reduced_motion() {
+        return layer;
+    }
+
+    // Fixed geometry keeps the burst tasteful and deterministic. Each piece
+    // animates at paint time so the success layout never shifts underneath it.
+    let particles = [
+        (-78., -14., 4., 8., theme.accent),
+        (-58., -43., 6., 5., theme.orange),
+        (-35., -59., 4., 9., theme.cyan),
+        (-12., -68., 5., 6., theme.green),
+        (18., -66., 4., 8., theme.orange),
+        (42., -54., 6., 5., theme.accent),
+        (65., -34., 4., 9., theme.green),
+        (80., -8., 5., 6., theme.cyan),
+        (-66., 13., 5., 5., theme.green),
+        (-42., 24., 4., 8., theme.accent),
+        (45., 22., 5., 7., theme.orange),
+        (68., 11., 4., 5., theme.accent),
+    ];
+    for (index, (x, y, width, height, color)) in particles.into_iter().enumerate() {
+        let particle = div()
+            .absolute()
+            .left(gpui::relative(0.5))
+            .top(px(39.))
+            .w(px(width))
+            .h(px(height))
+            .rounded_sm()
+            .bg(rgb(color));
+        layer = layer.child(
+            super::motion::Slide {
+                child: Some(particle),
+                x: 0.,
+                y: 0.,
+            }
+            .with_animation(
+                SharedString::from(format!("export-success-confetti-{index}")),
+                Animation::new(Duration::from_millis(720)),
+                move |mut element, progress| {
+                    let outward = motion_ease((progress / 0.72).clamp(0., 1.));
+                    element.x = x * outward;
+                    element.y = y * outward + 30. * progress * progress;
+                    let opacity = if progress < 0.1 {
+                        progress / 0.1
+                    } else if progress > 0.62 {
+                        (1. - progress) / 0.38
+                    } else {
+                        1.
+                    }
+                    .clamp(0., 1.);
+                    element.child = element.child.map(|child| child.opacity(opacity));
+                    element
+                },
+            ),
+        );
+    }
+    layer
+}
+
+fn export_support_button(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    id: &'static str,
+    icon: String,
+    label: &'static str,
+    enabled: bool,
+    action: impl Fn(&mut AlignApp, &ClickEvent, &mut Window, &mut Context<AlignApp>) + 'static,
+) -> impl IntoElement {
+    let reduced = super::motion::reduced_motion();
+    let accent = theme.accent;
+    let separator = theme.separator;
+    let mut button = div()
+        .id(id)
+        .flex_1()
+        .h(px(32.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(separator))
+        .text_size(px(11.))
+        .font_weight(gpui::FontWeight(550.0))
+        .text_color(rgb(theme.icon))
+        .child(svg_icon(icon, 13., theme.icon))
+        .child(label);
+    if enabled {
+        button = button
+            .cursor_pointer()
+            .hover(|this| this.bg(rgb(theme.button_hover)))
+            .active(|this| this.opacity(0.62))
+            .on_click(cx.listener(move |this, event, window, cx| {
+                action(this, event, window, cx);
+            }));
+    } else {
+        button = button
+            .opacity(0.48)
+            .tooltip(hover_tip("Support options coming soon.".to_string(), theme));
+    }
+
+    button.with_animation(
+        SharedString::from(format!("{id}-highlight")),
+        Animation::new(Duration::from_millis(1_250)),
+        move |button, progress| {
+            if reduced || progress < 0.62 {
+                return button.shadow_none().border_color(rgb(separator));
+            }
+            let phase = ((progress - 0.62) / 0.38).clamp(0., 1.);
+            let pulse = (std::f32::consts::PI * phase).sin();
+            if pulse <= 0.001 {
+                return button.shadow_none().border_color(rgb(separator));
+            }
+            let glow_alpha = (42. * pulse).round() as u32;
+            let border_alpha = (72. + 92. * pulse).round() as u32;
+            button
+                .border_color(rgba((accent << 8) | border_alpha))
+                .shadow(vec![BoxShadow {
+                    color: rgba((accent << 8) | glow_alpha).into(),
+                    offset: point(px(0.), px(0.)),
+                    blur_radius: px(10. + 5. * pulse),
+                    spread_radius: px(1.),
+                }])
+        },
+    )
+}
+
+fn export_success_sheet(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    data: &super::state::AppData,
+) -> Stateful<Div> {
+    let destination = data
+        .export_dir
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Export destination".to_string());
+    let destination_name = data
+        .export_dir
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Export destination".to_string());
+    let file_count = data.exported_files.len();
+    let file_count_label = format!(
+        "{file_count} file{}",
+        if file_count == 1 { "" } else { "s" }
+    );
+
+    let hero = div()
+        .relative()
+        .w_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .text_center()
+        .child(export_confetti(theme))
+        .child(
+            div()
+                .w(px(52.))
+                .h(px(52.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(rgba((theme.green << 8) | 0x26))
+                .child(svg_icon(icons().check.clone(), 23., theme.green)),
+        )
+        .child(
+            div()
+                .mt_3()
+                .text_size(px(20.))
+                .font_weight(gpui::FontWeight(650.0))
+                .text_color(rgb(theme.text))
+                .child("Export Complete"),
+        );
+
+    let destination_card = div()
+        .w_full()
+        .h(px(62.))
+        .px_3()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .rounded_xl()
+        .border_1()
+        .border_color(rgb(theme.separator))
+        .bg(rgb(theme.bg))
+        .shadow_xs()
+        .child(
+            div()
+                .w(px(36.))
+                .h(px(36.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_lg()
+                .bg(rgba((theme.accent << 8) | 0x1E))
+                .child(svg_icon(icons().folder.clone(), 18., theme.accent)),
+        )
+        .child(
+            div()
+                .min_w(px(0.))
+                .flex_1()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(12.))
+                        .font_weight(gpui::FontWeight(600.0))
+                        .text_color(rgb(theme.text))
+                        .child(destination_name),
+                )
+                .child(
+                    div()
+                        .id("export-success-destination-path")
+                        .mt(px(2.))
+                        .truncate()
+                        .text_size(px(10.))
+                        .text_color(rgb(theme.dim))
+                        .tooltip(hover_tip(destination.clone(), theme))
+                        .child(middle_ellipsis(&destination, 38)),
+                ),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(10.))
+                .text_color(rgb(theme.dim))
+                .child(file_count_label),
+        );
+
+    let actions = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(export_success_button(
+            cx,
+            theme,
+            "export-success-reveal",
+            export_reveal_label(),
+            true,
+            true,
+            |this, _, _, cx| {
+                this.data.reveal_export();
+                cx.notify();
+            },
+        ))
+        .child(export_success_button(
+            cx,
+            theme,
+            "export-success-back",
+            "Back to Export Settings",
+            false,
+            true,
+            |this, _, _, cx| {
+                this.data.return_to_export_settings();
+                cx.notify();
+            },
+        ));
+
+    let support = div()
+        .w_full()
+        .pt_4()
+        .border_t_1()
+        .border_color(rgb(theme.separator))
+        .child(
+            div()
+                .mb_2()
+                .w_full()
+                .text_center()
+                .text_size(px(10.))
+                .font_weight(gpui::FontWeight(600.0))
+                .text_color(rgb(theme.dim))
+                .child("Align saved you some time?"),
+        )
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(export_support_button(
+                    cx,
+                    theme,
+                    "export-success-star",
+                    icons().github.clone(),
+                    "Star on GitHub",
+                    true,
+                    |_, _, _, cx| cx.open_url(updater::REPOSITORY_URL),
+                ))
+                .child(export_support_button(
+                    cx,
+                    theme,
+                    "export-success-support",
+                    icons().heart.clone(),
+                    "Support Align",
+                    false,
+                    |_, _, _, _| {},
+                )),
+        );
+
+    div()
+        .id("export-success-sheet")
+        .relative()
+        .w_full()
+        .flex_1()
+        .min_h(px(0.))
+        .p_5()
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .child(slide_in(hero, "export-success-hero", 0))
+        .child(
+            div()
+                .mt_5()
+                .child(slide_in(destination_card, "export-success-destination", 50)),
+        )
+        .child(
+            div()
+                .mt_3()
+                .child(slide_in(actions, "export-success-actions", 100)),
+        )
+        .child(div().flex_1())
+        .child(slide_in(support, "export-success-support-footer", 150))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn export_sheet(
     cx: &mut Context<AlignApp>,
@@ -5908,6 +6300,9 @@ fn export_sheet(
     use super::state::Operation;
     let busy = matches!(data.operation, Operation::Exporting);
     let done = matches!(data.operation, Operation::Exported) && data.export_started;
+    if done {
+        return export_success_sheet(cx, theme, data);
+    }
     let mut sheet = div()
         .id("export-sheet")
         .flex()
@@ -6521,53 +6916,9 @@ fn export_sheet(
                     ),
             );
         }
-    } else if done {
-        sheet = sheet.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .text_color(rgb(theme.green))
-                .child(svg_icon(icons().check.clone(), 14.0, theme.green))
-                .child("Export complete"),
-        );
     }
-    // Sidebar actions. In-flight cancellation stays in the persistent
-    // operation bar so it is not duplicated here.
-    if done && !busy {
-        let mut row = div()
-            .flex()
-            .flex_row()
-            .gap_2()
-            .flex_shrink_0()
-            .pt_3()
-            .border_t_1()
-            .border_color(rgb(theme.separator));
-        row = row.child(div().flex_1());
-        row = row.child(button(
-            cx,
-            theme,
-            "exp-reveal",
-            "Show in Finder",
-            true,
-            |this, _, _, cx| {
-                this.data.reveal_export();
-                cx.notify();
-            },
-        ));
-        row = row.child(prominent_button(
-            cx,
-            theme,
-            "exp-done",
-            "Done",
-            true,
-            |this, _, _, cx| {
-                this.close_export_sidebar(cx);
-            },
-        ));
-        sheet = sheet.child(row);
-    }
+    // In-flight cancellation stays in the persistent operation bar so it is
+    // not duplicated here.
     sheet
 }
 

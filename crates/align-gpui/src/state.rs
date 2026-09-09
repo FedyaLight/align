@@ -1747,6 +1747,18 @@ impl AppData {
         }
     }
 
+    pub fn return_to_export_settings(&mut self) {
+        if self.operation != Operation::Exported {
+            return;
+        }
+        self.operation = Operation::Ready;
+        self.export_started = false;
+        self.progress = 0.0;
+        self.status = "Ready to export.".to_string();
+        self.error = None;
+        self.exported_files.clear();
+    }
+
     pub fn dismiss_error(&mut self) {
         self.error = None;
     }
@@ -2092,6 +2104,27 @@ fn imported_preview(result: &SyncResult) -> ImportedPreview {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn returning_to_export_settings_keeps_choices_and_clears_completion() {
+        let mut data = AppData::default();
+        let destination = PathBuf::from("/tmp/finished-export");
+        data.export_dir = Some(destination.clone());
+        data.export_selected.insert(ExportTarget::Premiere);
+        data.exported_files.push(destination.join("timeline.xml"));
+        data.operation = Operation::Exported;
+        data.export_started = true;
+        data.progress = 1.0;
+
+        data.return_to_export_settings();
+
+        assert_eq!(data.operation, Operation::Ready);
+        assert!(!data.export_started);
+        assert_eq!(data.progress, 0.0);
+        assert!(data.exported_files.is_empty());
+        assert_eq!(data.export_dir, Some(destination));
+        assert!(data.export_selected.contains(&ExportTarget::Premiere));
+    }
 
     #[test]
     fn reset_defaults_respects_the_selected_scope() {
