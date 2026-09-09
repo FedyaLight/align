@@ -239,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn icons_parse_with_the_renderer_usvg() {
+    fn icons_parse_with_the_renderer_and_stay_monochrome() {
         let _guard = TEST_LOCK.lock().unwrap();
         let _cleanup = TestCleanup;
         // `SvgRenderer::render_pixmap` calls `Tree::from_data` with default
@@ -270,35 +270,8 @@ mod tests {
                 "{path} has empty viewport"
             );
             assert!(!tree.root().children().is_empty(), "{path} renders nothing");
-        }
-    }
-
-    #[test]
-    fn assets_materialize_and_stay_monochrome() {
-        let _guard = TEST_LOCK.lock().unwrap();
-        let _cleanup = TestCleanup;
-        let _ = icons();
-        let paths = [
-            &icons().film,
-            &icons().waveform,
-            &icons().plus,
-            &icons().check,
-            &icons().warn,
-            &icons().fit,
-            &icons().zoom_in,
-            &icons().zoom_out,
-            &icons().chevron_down,
-            &icons().chevron_right,
-            &icons().close,
-            &icons().reset,
-            &icons().trash,
-            &icons().drop,
-        ];
-        for path in paths {
-            let body = std::fs::read_to_string(path).expect("icon asset written");
-            assert!(body.contains("<svg"), "{path} is svg");
-            // Single-color silhouettes only: no embedded dark/light fills
-            // that would fight the runtime tint.
+            let body = std::str::from_utf8(&bytes).expect("UTF-8 SVG");
+            // Embedded colors would fight the runtime tint.
             assert!(
                 !body.contains("black") && !body.contains("#"),
                 "{path} must not hardcode colors"

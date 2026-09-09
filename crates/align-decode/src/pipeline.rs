@@ -1,16 +1,14 @@
-//! End-to-end pipeline: port of `SyncEngine.open/synchronize` orchestration.
+//! Media import, analysis, refinement, and synchronization orchestration.
 //!
 //! Stages: expand inputs → inspect (backend, warnings
 //! for unreadable files) → fingerprints (backend decode + content-addressed
 //! cache + automatic multi-stream selection) → coarse match → fine refine
-//! (via [`BackendWindowProvider`]) → graph solve → [`SyncResult`].
+//! (via [`BackendWindowProvider`]) → graph solve → [`align_core::SyncResult`].
 //!
 //! Important implementation choices:
 //! - fingerprinting and refinement use four bounded workers with indexed
 //!   deterministic results;
-//! - ClipIDs hash `path\0duration-micros` (canonical across backends) where
-//!   Swift hashes `path\0CMTime(value)\0CMTime(timescale)`. Stable within
-//!   the Rust pipeline on every OS; corpus regression compares by path;
+//! - ClipIDs hash `path\0duration-micros`, using the same units across backends;
 //! - spanned-file, BWF/iXML/container/LTC timecode, FCP 7 XML and FCPXML
 //!   evidence join the same waveform-first graph without overriding a
 //!   confident audio match.
@@ -145,7 +143,7 @@ pub struct PipelineOptions {
     pub track_content: align_core::TrackContentPolicy,
     /// Imported tracks selected for exact basic-edit preservation.
     pub preserve_editing_tracks: HashSet<String>,
-    /// Temporal evidence overrides (Syncaila Time source), round-tripped
+    /// Temporal evidence overrides, round-tripped
     /// into the result for timeline assembly and export.
     pub temporal: align_core::TemporalPolicy,
     /// Saved + CLI path redirections for missing-media relink.
@@ -355,7 +353,7 @@ impl Pipeline {
     /// [`align_core::SyncResult`].
     ///
     /// Fingerprint decode and fine refine run on up to 4 workers with
-    /// deterministic indexed results (Swift task-group parity); `progress`
+    /// deterministic indexed results; `progress`
     /// is shared across those threads, `cancel` is polled per clip,
     /// candidate and job.
     pub fn synchronize(
@@ -428,7 +426,7 @@ impl Pipeline {
                         event.discovered = Some(clip.clone());
                         p(event);
                     }
-                    // Mirror Swift's VFR caveats: audio sync is unaffected,
+                    // Variable video timing does not affect audio sync,
                     // but constant-rate interchange needs a CFR transcode.
                     if let Some(video) = &clip.video {
                         use align_core::VideoFrameRateMode;
@@ -576,20 +574,9 @@ impl Pipeline {
             .iter()
             .map(|c| (c.id.clone(), c.duration.as_seconds()))
             .collect();
-        let clip_paths: HashMap<ClipId, (PathBuf, AudioAnalysisSource)> = clips
+        let clip_paths = clips
             .iter()
-            .map(|c| {
-                (
-                    c.id.clone(),
-                    (
-                        c.url.clone(),
-                        source_map
-                            .get(&c.id)
-                            .copied()
-                            .unwrap_or(AudioAnalysisSource::Automatic),
-                    ),
-                )
-            })
+            .map(|c| (c.id.clone(), c.url.clone()))
             .collect();
         let provider = BackendWindowProvider {
             backend: &*self.backend,
@@ -603,9 +590,8 @@ impl Pipeline {
                 None,
             ));
         }
-        // Refined result if accepted, else the candidate it came from
-        // (mirrors Swift's refined/rejected previews). Boxed so the
-        // shared reference outlives the call.
+        // Preview the refined result if accepted, otherwise the original
+        // candidate. Boxing keeps the shared reference valid for the call.
         let refine_progress: Option<Box<dyn Fn(align_core::RefineEvent) + Send + Sync>> =
             progress.as_ref().map(|p| {
                 let candidates = &candidates;
@@ -661,25 +647,24 @@ impl Pipeline {
             .into_iter()
             .filter(|m| !SyncConstraint::rejects_pair(constraints, &m.left, &m.right))
             .collect();
-        let timecoded = align_core::analyze_timecodes(
-            &clips,
-            &[refined.clone(), spanned_matches.clone()].concat(),
-            constraints,
-            &options.temporal,
-        );
         let eligible = |matches: &[align_core::PairwiseMatch]| {
             let matches =
                 align_core::enforce_track_content(matches, &options.track_content, &order_context);
             align_core::enforce_clip_order(&matches, &options.clip_order, &order_context)
         };
         let waveform_matches = eligible(&refined);
-        let span_matches = eligible(&[refined.clone(), spanned_matches.clone()].concat());
-        let refined = eligible(&[refined, spanned_matches, timecoded].concat());
+        let mut combined = refined;
+        combined.extend(spanned_matches);
+        let timecoded =
+            align_core::analyze_timecodes(&clips, &combined, constraints, &options.temporal);
+        let span_matches = eligible(&combined);
+        combined.extend(timecoded);
+        let refined = eligible(&combined);
 
         // ---- solve
         if let Some(p) = &progress {
             p(PipelineProgress::basic(Phase::Solve, 0, 1, None));
-            // Metadata edges surface as refined previews (Swift parity).
+            // Metadata edges also appear in refined previews.
             for m in refined
                 .iter()
                 .filter(|m| !matches!(m.evidence, align_core::MatchEvidence::Waveform))
@@ -1047,6 +1032,20 @@ impl Pipeline {
             ));
         }
 
+        if all_variants.iter().all(|variants| variants.len() == 1) {
+            return Ok((
+                clips
+                    .iter()
+                    .zip(all_variants)
+                    .map(|(clip, mut variants)| align_core::ClipFingerprints {
+                        clip_id: clip.id.clone(),
+                        fingerprints: variants.pop().unwrap().fingerprints,
+                    })
+                    .collect(),
+                HashMap::new(),
+            ));
+        }
+
         // Automatic multi-stream selection: most shared hashes wins
         // (mirrors SyncEngine.selectFingerprints, ties → lowest index).
         let mut first_owner: HashMap<u64, &ClipId> = HashMap::new();
@@ -1098,12 +1097,6 @@ impl Pipeline {
     }
 }
 
-/// Island mapping knots for one placement. Faithful port of
-/// `SyncEngine.mappingPoints`: affine fallback for < 2 knots, otherwise
-/// the propagated knots filtered to 0…=duration, re-anchored at source 0
-/// and `duration` (deduped at 1e-6), evaluated through the piecewise map.
-/// Without the re-anchor, affine fallbacks (sampled at source 0…1) would
-/// collapse every clip to a 1-second bar.
 fn solve_stage(
     kind: align_core::SyncStageKind,
     clips: &[Clip],
@@ -1175,6 +1168,8 @@ fn solve_stage(
     }
 }
 
+/// Mapping knots filtered to the clip range and re-anchored at both ends.
+/// Affine fallbacks sampled at source 0…1 must span the full clip duration.
 fn mapping_points(
     rate: f64,
     offset: f64,
@@ -1226,7 +1221,7 @@ fn mapping_points(
 }
 
 /// Canonical ClipID: SHA256 hex (12 bytes) of `path\0duration-micros`.
-/// Backend-independent by construction (unlike Swift's CMTime units).
+/// Uses the same duration units across media backends.
 pub fn clip_id_for(path: &str, duration_micros: i64) -> ClipId {
     let mut hasher = Sha256::new();
     hasher.update(path.as_bytes());
@@ -1687,7 +1682,7 @@ mod tests {
     #[test]
     fn portable_vfr_walk_classifies_variable_and_warns() {
         // 30 fps + 15 fps segments concatenated = genuinely variable
-        // packet durations (mirrors work/vfr-fixture/variable.mp4).
+        // packet durations.
         let dir = fixture_dir("vfr");
         let seg = |name: &str, rate: u32| {
             ffmpeg_clip(
@@ -2407,7 +2402,7 @@ mod tests {
 
     #[test]
     fn bwf_enriches_clip() {
-        use align_core::{RecordingTimestampSource, VideoFrameRateMode};
+        use align_core::RecordingTimestampSource;
         let dir = fixture_dir("bwf");
         // TimeReference 45296 s @48 kHz → 2024-05-06T12:34:56Z + TC.
         let body = noise(10 * 48000, 0xBE);
@@ -2437,7 +2432,6 @@ mod tests {
         assert_eq!(tc.text, "12:34:56:00");
         assert!(clip.media_span.is_none());
         assert!(clip.video.is_none());
-        let _ = VideoFrameRateMode::Constant;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2520,8 +2514,7 @@ mod tests {
         assert_eq!(result.matches.len(), 1);
         let m = &result.matches[0];
         assert_eq!(m.evidence, Some(MatchEvidence::Timecode));
-        // Left/right follow ClipID hash order (arbitrary, like Swift's
-        // rawValue order) — the invariant is |offset| and overlap.
+        // Left/right follow ClipID hash order; check offset magnitude and overlap.
         assert!(
             (m.offset.as_seconds().abs() - 20.0).abs() < 0.01,
             "offset={}",
@@ -2931,7 +2924,7 @@ mod tests {
 
     #[test]
     fn mapping_points_span_full_duration() {
-        use align_core::{MapPoint, MediaTime};
+        use align_core::MapPoint;
         // Affine fallback (e.g. graph fallback sampled at source 0…1)
         // must still cover the whole clip, not collapse to a 1 s bar.
         let knots = mapping_points(1.0, 12.5, &[], 730.8);
@@ -2960,7 +2953,6 @@ mod tests {
         assert!(knots.len() >= 3);
         assert!((knots.first().expect("knots").source.as_seconds() - 0.0).abs() < 1e-9);
         assert!((knots.last().expect("knots").source.as_seconds() - 720.3).abs() < 1e-9);
-        let _ = MediaTime::seconds(0.0);
     }
 
     #[test]

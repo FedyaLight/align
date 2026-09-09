@@ -11,12 +11,14 @@ use std::path::PathBuf;
 use align_decode::pipeline::{Phase, Pipeline, PipelineError, PipelineInput, PipelineOptions};
 use clap::{Args, Parser, Subcommand};
 
+mod export_job;
+
 #[derive(Parser)]
 #[command(name = "align-cli", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
-    /// Media/folder paths for bare `open` (no subcommand).
+    /// Inspect media, folders, or timeline projects without synchronizing.
     #[arg(global = true)]
     paths: Vec<PathBuf>,
 }
@@ -25,6 +27,7 @@ struct Cli {
 enum Command {
     /// Synchronize media, print SyncResult JSON.
     Sync {
+        /// Select one sequence from an imported project (1-based).
         #[arg(long, value_name = "N", conflicts_with = "all_sequences")]
         sequence: Option<usize>,
         /// Synchronize every sequence in the imported XML, FCPXML, or AAF.
@@ -38,47 +41,14 @@ enum Command {
     },
     /// Synchronize + drift-corrected export, print artifacts JSON.
     Export {
+        /// Select one sequence from an imported project (1-based).
         #[arg(long, value_name = "N", conflicts_with = "all_sequences")]
         sequence: Option<usize>,
         /// Synchronize and export every sequence in the imported project.
         #[arg(long)]
         all_sequences: bool,
-        #[arg(long)]
-        no_drift: bool,
-        /// Export linked picture and audio AAF tracks (requires the bundled align-aaf module).
-        #[arg(long)]
-        aaf: bool,
-        /// Override the Resolve timeline frame rate stored in AAF timecode.
-        #[arg(long, value_enum, default_value_t = AafFps::Auto)]
-        aaf_fps: AafFps,
-        #[arg(long)]
-        replaced_audio: bool,
-        /// Group FCPXML tracks into separate storylines.
-        #[arg(long)]
-        fcpxml_storylines: bool,
-        /// Omit the synchronized timeline project from FCPXML.
-        #[arg(long)]
-        no_fcpxml_timeline: bool,
-        /// Omit the multicam project from FCPXML.
-        #[arg(long)]
-        no_fcpxml_multicam: bool,
-        /// Also create complete camera files with external audio replacing scratch audio.
-        #[arg(long)]
-        export_media: bool,
-        #[arg(long, value_enum, default_value_t = Unmatched::OrderTime)]
-        unmatched: Unmatched,
-        #[arg(long)]
-        prevent_group_overlaps: bool,
-        #[arg(long)]
-        disable_unmatched: bool,
-        #[arg(long)]
-        label_synced: bool,
-        #[arg(long)]
-        label_unmatched: bool,
         #[command(flatten)]
-        cut_remove: CutRemoveArgs,
-        #[command(flatten)]
-        assign: AssignArgs,
+        export: ExportOptions,
         #[command(flatten)]
         relink: RelinkArgs,
         #[command(flatten)]
@@ -86,47 +56,13 @@ enum Command {
         output: PathBuf,
         paths: Vec<PathBuf>,
     },
-    /// Export a saved result JSON.
+    /// Export saved synchronization JSON (one result or a batch).
     ExportJson {
         /// Select a completed synchronization stage (1-based).
         #[arg(long, value_name = "N")]
         stage: Option<usize>,
-        #[arg(long)]
-        no_drift: bool,
-        /// Export linked picture and audio AAF tracks (requires the bundled align-aaf module).
-        #[arg(long)]
-        aaf: bool,
-        /// Override the Resolve timeline frame rate stored in AAF timecode.
-        #[arg(long, value_enum, default_value_t = AafFps::Auto)]
-        aaf_fps: AafFps,
-        #[arg(long)]
-        replaced_audio: bool,
-        /// Group FCPXML tracks into separate storylines.
-        #[arg(long)]
-        fcpxml_storylines: bool,
-        /// Omit the synchronized timeline project from FCPXML.
-        #[arg(long)]
-        no_fcpxml_timeline: bool,
-        /// Omit the multicam project from FCPXML.
-        #[arg(long)]
-        no_fcpxml_multicam: bool,
-        /// Also create complete camera files with external audio replacing scratch audio.
-        #[arg(long)]
-        export_media: bool,
-        #[arg(long, value_enum, default_value_t = Unmatched::OrderTime)]
-        unmatched: Unmatched,
-        #[arg(long)]
-        prevent_group_overlaps: bool,
-        #[arg(long)]
-        disable_unmatched: bool,
-        #[arg(long)]
-        label_synced: bool,
-        #[arg(long)]
-        label_unmatched: bool,
         #[command(flatten)]
-        cut_remove: CutRemoveArgs,
-        #[command(flatten)]
-        assign: AssignArgs,
+        export: ExportOptions,
         result: PathBuf,
         output: PathBuf,
     },
@@ -138,7 +74,54 @@ enum Command {
     },
 }
 
-/// Missing-media relink (Syncaila Path Fixer): saved redirections apply
+#[derive(Args)]
+struct ExportOptions {
+    /// Disable clock-drift correction during export.
+    #[arg(long)]
+    no_drift: bool,
+    /// Export linked picture and audio AAF tracks (requires the bundled align-aaf module).
+    #[arg(long)]
+    aaf: bool,
+    /// Override the composition timecode frame rate in exported AAF.
+    #[arg(long, value_enum, default_value_t = AafFps::Auto)]
+    aaf_fps: AafFps,
+    /// Add a sequence with external audio replacing camera audio.
+    #[arg(long)]
+    replaced_audio: bool,
+    /// Group FCPXML tracks into separate storylines.
+    #[arg(long)]
+    fcpxml_storylines: bool,
+    /// Omit the synchronized timeline project from FCPXML.
+    #[arg(long)]
+    no_fcpxml_timeline: bool,
+    /// Omit the multicam project from FCPXML.
+    #[arg(long)]
+    no_fcpxml_multicam: bool,
+    /// Also create complete camera files with external audio replacing scratch audio.
+    #[arg(long)]
+    export_media: bool,
+    /// Placement policy for clips without a synchronization match.
+    #[arg(long, value_enum, default_value_t = Unmatched::OrderTime)]
+    unmatched: Unmatched,
+    /// Place independent synchronization groups without overlaps.
+    #[arg(long)]
+    prevent_group_overlaps: bool,
+    /// Mark unmatched clips as disabled in exported timelines.
+    #[arg(long)]
+    disable_unmatched: bool,
+    /// Label synchronized clips in exported timelines.
+    #[arg(long)]
+    label_synced: bool,
+    /// Label unmatched clips in exported timelines.
+    #[arg(long)]
+    label_unmatched: bool,
+    #[command(flatten)]
+    cut_remove: CutRemoveArgs,
+    #[command(flatten)]
+    assign: AssignArgs,
+}
+
+/// Missing-media relinking: saved redirections apply
 /// on every run, manual picks apply once.
 #[derive(Args, Clone, Debug, Default)]
 struct RelinkArgs {
@@ -230,7 +213,7 @@ fn write_fixed_project(
     Ok(())
 }
 
-/// Post-sync Cut / Remove (Syncaila Extra options). All default to off.
+/// Optional post-synchronization trimming and removal. Disabled by default.
 #[derive(Args, Clone, Copy, Debug, Default)]
 struct CutRemoveArgs {
     /// Cut ranges empty on every clip and close the timeline.
@@ -273,7 +256,7 @@ impl CutRemoveArgs {
     }
 }
 
-/// Export assignment (Syncaila Export settings): sequence name plus symbol,
+/// Export naming and labels: sequence name plus symbol,
 /// color and role labels for synchronized and unmatched clips.
 #[derive(Args, Clone, Debug, Default)]
 struct AssignArgs {
@@ -342,7 +325,7 @@ struct SyncSettings {
     /// track (for example A1 or V2). Repeat for more than one anchor track.
     #[arg(long = "preserve-basic-editing", value_name = "TRACK", value_parser = parse_imported_track)]
     preserve_editing_tracks: Vec<String>,
-    /// Timestamp evidence (Syncaila Time source).
+    /// Timestamp evidence used to support synchronization.
     #[arg(long, value_enum, default_value_t = TimeSource::Auto)]
     time_source: TimeSource,
     /// Required waveform confidence.
@@ -404,7 +387,7 @@ fn main() {
     struct SessionCleanup;
     impl Drop for SessionCleanup {
         fn drop(&mut self) {
-            align_decode::aaf::cleanup_session_media();
+            align_decode::media_assets::cleanup();
         }
     }
     let session_cleanup = SessionCleanup;
@@ -693,7 +676,7 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         None if cli.paths.is_empty() => Err(CliError::Usage),
         None => {
-            // Bare paths: inspect only (mirrors Swift `open`).
+            // Bare paths inspect without synchronizing.
             let pipeline = Pipeline::default_backend();
             let inputs = to_inputs(&cli.paths, None);
             let redirects = align_core::redirect::load_from(&align_core::redirect::config_file());
@@ -701,7 +684,12 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
                 redirects,
                 ..Default::default()
             };
-            let project = pipeline.open_with(&inputs, &options)?;
+            let mut project = pipeline.open_with(&inputs, &options)?;
+            align_decode::media_assets::preserve_project(
+                &mut project,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .map_err(|error| CliError::Failure(format!("Save embedded AAF media: {error}")))?;
             print_json(&project)
         }
         Some(Command::Sync {
@@ -737,6 +725,10 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
                 let mut result =
                     pipeline.synchronize(&inputs, &[], &options, Some(&progress), &cancel)?;
                 select_stage(&mut result, settings.stage)?;
+                align_decode::media_assets::preserve_project(&mut result.project, &cancel)
+                    .map_err(|error| {
+                        CliError::Failure(format!("Save embedded AAF media: {error}"))
+                    })?;
                 results.push(result);
             }
             if all_sequences {
@@ -748,21 +740,7 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
         Some(Command::Export {
             sequence,
             all_sequences,
-            no_drift,
-            aaf,
-            aaf_fps,
-            replaced_audio,
-            fcpxml_storylines,
-            no_fcpxml_timeline,
-            no_fcpxml_multicam,
-            export_media,
-            unmatched,
-            prevent_group_overlaps,
-            disable_unmatched,
-            label_synced,
-            label_unmatched,
-            cut_remove,
-            assign,
+            export,
             relink,
             settings,
             output,
@@ -798,142 +776,22 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
                 select_stage(&mut result, settings.stage)?;
                 results.push(result);
             }
-            let result_count = results.len();
-            let mut timelines = Vec::with_capacity(result_count);
-            for (index, result) in results.iter().enumerate() {
-                let timeline = align_core::export_model::ExportTimeline::from_result_with_options(
-                    result,
-                    align_core::export_model::ExportAssemblyOptions {
-                        unmatched: unmatched.core(),
-                        prevent_group_overlaps,
-                        disable_unmatched,
-                        label_synced,
-                        label_unmatched,
-                        cut_remove: cut_remove.core()?,
-                        synced_symbol: assign.synced_symbol.clone(),
-                        synced_symbol_suffix: assign.synced_symbol_suffix,
-                        synced_color: assign.synced_color.clone(),
-                        synced_role: assign.synced_role.clone(),
-                        unmatched_symbol: assign.unmatched_symbol.clone(),
-                        unmatched_symbol_suffix: assign.unmatched_symbol_suffix,
-                        unmatched_color: assign.unmatched_color.clone(),
-                        unmatched_role: assign.unmatched_role.clone(),
-                        sequence_name: assign.sequence_name.as_ref().map(|name| {
-                            if result_count > 1 {
-                                format!("{name} {}", index + 1)
-                            } else {
-                                name.clone()
-                            }
-                        }),
-                    },
-                )
-                .map_err(|e| CliError::Failure(e.to_string()))?;
-                timelines.push(timeline);
-            }
-            let mut formats = if aaf {
-                vec![align_core::export_model::TimelineExportFormat::Aaf]
-            } else {
-                align_core::export_model::TimelineExportFormat::default_formats()
-            };
-            if no_fcpxml_timeline && no_fcpxml_multicam {
-                formats.retain(|format| {
-                    *format != align_core::export_model::TimelineExportFormat::FinalCutProXML
-                });
-            }
-            let artifacts = align_decode::export::export_prepared_many(
-                align_decode::export::ExportBatchRequest {
-                    backend: pipeline.backend(),
-                    timelines: &timelines,
-                    directory: &output,
-                    formats: &formats,
-                    correct_drift: !no_drift,
-                    include_replaced_sequence: replaced_audio,
-                    include_media_files: export_media,
-                    aaf_frame_duration: aaf_fps.frame_duration(),
-                    include_fcpxml_timeline: !no_fcpxml_timeline,
-                    include_fcpxml_multicam: !no_fcpxml_multicam,
-                    group_fcpxml_storylines: fcpxml_storylines,
-                    cancel: &cancel,
-                },
-                None,
-            )?;
+            let artifacts = export.execute(pipeline.backend(), &results, &output, &cancel)?;
             print_json(&artifacts)
         }
         Some(Command::ExportJson {
             stage,
-            no_drift,
-            aaf,
-            aaf_fps,
-            replaced_audio,
-            fcpxml_storylines,
-            no_fcpxml_timeline,
-            no_fcpxml_multicam,
-            export_media,
-            unmatched,
-            prevent_group_overlaps,
-            disable_unmatched,
-            label_synced,
-            label_unmatched,
-            cut_remove,
-            assign,
+            export,
             result,
             output,
         }) => {
-            let bytes = std::fs::read(&result)
-                .map_err(|e| CliError::Failure(format!("read {}: {e}", result.display())))?;
-            let mut sync_result: align_core::SyncResult = serde_json::from_slice(&bytes)
-                .map_err(|e| CliError::Failure(format!("parse {}: {e}", result.display())))?;
-            select_stage(&mut sync_result, stage)?;
-            let pipeline = Pipeline::default_backend();
-            let timeline = align_core::export_model::ExportTimeline::from_result_with_options(
-                &sync_result,
-                align_core::export_model::ExportAssemblyOptions {
-                    unmatched: unmatched.core(),
-                    prevent_group_overlaps,
-                    disable_unmatched,
-                    label_synced,
-                    label_unmatched,
-                    cut_remove: cut_remove.core()?,
-                    synced_symbol: assign.synced_symbol.clone(),
-                    synced_symbol_suffix: assign.synced_symbol_suffix,
-                    synced_color: assign.synced_color.clone(),
-                    synced_role: assign.synced_role.clone(),
-                    unmatched_symbol: assign.unmatched_symbol.clone(),
-                    unmatched_symbol_suffix: assign.unmatched_symbol_suffix,
-                    unmatched_color: assign.unmatched_color.clone(),
-                    unmatched_role: assign.unmatched_role.clone(),
-                    sequence_name: assign.sequence_name.clone(),
-                },
-            )
-            .map_err(|e| CliError::Failure(e.to_string()))?;
-            let cancel = std::sync::atomic::AtomicBool::new(false);
-            let mut formats = if aaf {
-                vec![align_core::export_model::TimelineExportFormat::Aaf]
-            } else {
-                align_core::export_model::TimelineExportFormat::default_formats()
-            };
-            if no_fcpxml_timeline && no_fcpxml_multicam {
-                formats.retain(|format| {
-                    *format != align_core::export_model::TimelineExportFormat::FinalCutProXML
-                });
+            let mut results = export_job::read_results(&result)?;
+            for result in &mut results {
+                select_stage(result, stage)?;
             }
-            let artifacts = align_decode::export::export_prepared(
-                align_decode::export::ExportRequest {
-                    backend: pipeline.backend(),
-                    timeline: &timeline,
-                    directory: &output,
-                    formats: &formats,
-                    correct_drift: !no_drift,
-                    include_replaced_sequence: replaced_audio,
-                    include_media_files: export_media,
-                    aaf_frame_duration: aaf_fps.frame_duration(),
-                    include_fcpxml_timeline: !no_fcpxml_timeline,
-                    include_fcpxml_multicam: !no_fcpxml_multicam,
-                    group_fcpxml_storylines: fcpxml_storylines,
-                    cancel: &cancel,
-                },
-                None,
-            )?;
+            let pipeline = Pipeline::default_backend();
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let artifacts = export.execute(pipeline.backend(), &results, &output, &cancel)?;
             print_json(&artifacts)
         }
         Some(Command::ClearCache { older_than_days }) => {
@@ -995,17 +853,21 @@ mod tests {
         .expect("export arguments");
         let Some(Command::Export {
             settings,
-            no_drift,
-            aaf,
-            aaf_fps,
-            replaced_audio,
-            fcpxml_storylines,
-            no_fcpxml_timeline,
-            no_fcpxml_multicam,
-            export_media,
-            label_synced,
-            label_unmatched,
-            assign,
+            export:
+                ExportOptions {
+                    no_drift,
+                    aaf,
+                    aaf_fps,
+                    replaced_audio,
+                    fcpxml_storylines,
+                    no_fcpxml_timeline,
+                    no_fcpxml_multicam,
+                    export_media,
+                    label_synced,
+                    label_unmatched,
+                    assign,
+                    ..
+                },
             ..
         }) = cli.command
         else {
@@ -1077,7 +939,10 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::ExportJson {
-                aaf_fps: AafFps::Fps2997,
+                export: ExportOptions {
+                    aaf_fps: AafFps::Fps2997,
+                    ..
+                },
                 ..
             })
         ));

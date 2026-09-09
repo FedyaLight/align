@@ -1,4 +1,4 @@
-//! Persistent missing-media path redirections (Syncaila Path Fixer).
+//! Persistent directory redirections for missing media.
 //!
 //! A redirection maps an old parent-directory prefix to a new location:
 //! a missing file under the old prefix is looked up under the new one.

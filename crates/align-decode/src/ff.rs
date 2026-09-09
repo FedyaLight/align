@@ -254,13 +254,43 @@ impl PacketTiming {
 
 /// Video timing without decoding frames: packet PTS/duration walk feeding
 /// the shared [`align_core::classify`]. Early-exits once variability is
-/// proven (CFR needs the full walk — same as Swift's cursor pass).
+/// proven; constant-rate classification requires the full walk.
 pub fn video_timing(path: &Path) -> Result<align_core::VideoTimingInspection, DecodeError> {
+    let bin =
+        ffprobe_bin().ok_or_else(|| DecodeError::FfmpegMissing("ffprobe not found".into()))?;
+    let decoder = bin.canonicalize().ok().and_then(|bin| {
+        Some(format!(
+            "{}:{}",
+            bin.display(),
+            align_core::cache::media_revision(&bin).ok()?
+        ))
+    });
+    let identity = |path: &Path| align_core::cache::media_revision(path).ok();
+    let before = identity(path);
+    let cache = align_core::FingerprintCache::with_backend(None, "portable-timing1");
+    if let Some(decoder) = &decoder
+        && let Some(timing) = cache.load_video_timing(path, decoder)
+    {
+        return Ok(timing);
+    }
+    let timing = video_timing_uncached(path, &bin)?;
+    // A scan racing a media rewrite must not publish a cached classification.
+    if before.is_some()
+        && before == identity(path)
+        && let Some(decoder) = &decoder
+    {
+        cache.save_video_timing(path, decoder, timing);
+    }
+    Ok(timing)
+}
+
+fn video_timing_uncached(
+    path: &Path,
+    bin: &Path,
+) -> Result<align_core::VideoTimingInspection, DecodeError> {
     use align_core::canonical_frame_duration;
     use std::io::BufRead;
 
-    let bin =
-        ffprobe_bin().ok_or_else(|| DecodeError::FfmpegMissing("ffprobe not found".into()))?;
     let mut child = Command::new(bin)
         .args([
             "-v",
@@ -281,20 +311,19 @@ pub fn video_timing(path: &Path) -> Result<align_core::VideoTimingInspection, De
     let stdout = child.stdout.take().ok_or(DecodeError::UnsupportedOutput)?;
 
     // Nominal rate + dimensions from the header call.
-    let header_json =
-        Command::new(ffprobe_bin().ok_or_else(|| DecodeError::FfmpegMissing("ffprobe".into()))?)
-            .args([
-                "-v",
-                "error",
-                "-print_format",
-                "json",
-                "-show_streams",
-                "-select_streams",
-                "v:0",
-            ])
-            .arg(path)
-            .output()
-            .map_err(DecodeError::Io)?;
+    let header_json = Command::new(bin)
+        .args([
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-select_streams",
+            "v:0",
+        ])
+        .arg(path)
+        .output()
+        .map_err(DecodeError::Io)?;
     let header = parse_video_stream(&header_json.stdout);
     let frame_duration = header
         .as_ref()

@@ -1,4 +1,4 @@
-//! Sample-accurate refinement. Port of Sources/AlignCore/FineMatcher.swift.
+//! Sample-accurate refinement of coarse waveform matches.
 //!
 //! A coarse pair is re-observed through narrow 16 kHz mono windows
 //! (audio-only: ≤ 8.3 s × 16 kHz ≈ 0.5 MiB resident per window) at several
@@ -39,8 +39,7 @@ pub struct AudioWindow {
     pub samples: Vec<f32>,
 }
 
-/// 16 kHz mono window source. `None` = undecodable/cancelled (mirrors
-/// Swift `try? await decoder.decodeWindow`).
+/// 16 kHz mono window source. `None` means undecodable or cancelled.
 pub trait WindowProvider: Send + Sync {
     fn window(
         &self,
@@ -69,10 +68,8 @@ pub struct RefineEvent {
 }
 
 /// Refine all candidates; `clips` are all known ids (disjoint-set universe).
-/// Progress mirrors Swift `.refine` phase events (rejected non-usable first,
-/// then one event per candidate in index order).
-/// Refine all candidates with up to 4 parallel workers (mirrors Swift's
-/// `withTaskGroup` reader gate); indexed results keep input order, so
+/// Progress reports unusable candidates first, then one event per candidate.
+/// Up to four workers refine candidates; indexed results keep input order, so
 /// outcomes are identical to sequential execution. Progress events carry a
 /// monotonic completion count; disjoint-set acceptance stays sequential
 /// and deterministic.
@@ -239,6 +236,29 @@ fn refine(
         return None;
     }
 
+    // Broad drift ridges need waveform checks independent of the three
+    // windows used to estimate the affine rate. A line of hash collisions
+    // alone is not enough to synchronize a long recording.
+    if allow_rate && affine.residual <= 0.012 && (m.rate - 1.0).abs() * m.covered_seconds >= 2.0 {
+        let checks = observe(
+            m,
+            left_dur,
+            right_dur,
+            &[0.3, 0.7],
+            2.1,
+            left_source,
+            right_source,
+            provider,
+        );
+        if checks.len() != 2
+            || checks.iter().any(|o| {
+                o.quality < 0.6 || (o.right - (affine.rate * o.left + affine.offset)).abs() > 0.002
+            })
+        {
+            return None;
+        }
+    }
+
     let (alignment_points, residual) = if affine.residual <= 0.012 {
         (
             [m.left_start_seconds, m.left_end_seconds]
@@ -294,8 +314,7 @@ fn refine(
         covered_seconds: m.covered_seconds,
         residual_seconds: residual.max(1.0 / FINE_SAMPLE_RATE),
         alignment_points,
-        // Coarse evidence is waveform-only at this stage (mirrors Swift,
-        // which constructs the refined match with the default evidence).
+        // Coarse evidence is waveform-only at this stage.
         evidence: MatchEvidence::Waveform,
     })
 }
@@ -612,13 +631,13 @@ impl FineDisjointSet {
     }
 }
 
-// Re-exported for the future parallel scheduler (same indexed contract).
+// Shared helper for callers collecting matched clip IDs.
 pub use crate::matcher::matched_ids;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{MediaKind, MediaTime};
+    use crate::model::MediaTime;
 
     fn id(s: &str) -> ClipId {
         ClipId::new(s)
@@ -917,9 +936,90 @@ mod tests {
     }
 
     #[test]
+    fn long_drift_candidate_requires_fresh_waveform_evidence() {
+        struct ClockAudio {
+            unrelated: bool,
+        }
+        impl WindowProvider for ClockAudio {
+            fn window(
+                &self,
+                clip: &ClipId,
+                start: f64,
+                duration: f64,
+                _: AudioAnalysisSource,
+            ) -> Option<AudioWindow> {
+                let noise = |i: i64| {
+                    let mut x = (i as u64).wrapping_add(17);
+                    let multiplier = if self.unrelated && clip.0 == "b" {
+                        0x9e3779b97f4a7c15
+                    } else {
+                        0xbf58476d1ce4e5b9
+                    };
+                    x = (x ^ (x >> 30)).wrapping_mul(multiplier);
+                    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+                    ((x ^ (x >> 31)) >> 32) as u32 as f64 / u32::MAX as f64 - 0.5
+                };
+                let samples = (0..(duration * FINE_SAMPLE_RATE) as usize)
+                    .map(|i| {
+                        let t = start + i as f64 / FINE_SAMPLE_RATE;
+                        let source = if clip.0 == "b" {
+                            (t - 6.656) / 1.001
+                        } else {
+                            t
+                        };
+                        let x = source * 400.0;
+                        let j = x.floor() as i64;
+                        (noise(j) + (noise(j + 1) - noise(j)) * (x - j as f64)) as f32
+                    })
+                    .collect();
+                Some(AudioWindow {
+                    start,
+                    sample_rate: FINE_SAMPLE_RATE,
+                    samples,
+                })
+            }
+        }
+        let clips = [("a", 1.0, 0.0), ("b", 1.001, 104.0)]
+            .into_iter()
+            .map(|(name, rate, offset)| crate::ClipFingerprints {
+                clip_id: id(name),
+                fingerprints: (0..1200)
+                    .map(|k| crate::Fingerprint {
+                        hash: k as u64,
+                        frame: ((1000 + k * 40) as f64 * rate + offset).round() as u32,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let coarse = crate::match_fingerprints(clips, None, &[]);
+        assert_eq!(coarse.len(), 1);
+        let durations = [(id("a"), 4000.0), (id("b"), 4020.0)].into_iter().collect();
+        let run = |unrelated| {
+            refine_forest(
+                &durations,
+                &coarse,
+                &MatchPolicy::default(),
+                &HashMap::new(),
+                &ClockAudio { unrelated },
+                &std::sync::atomic::AtomicBool::new(false),
+                None,
+            )
+        };
+        let refined = run(false);
+        assert_eq!(refined.len(), 1);
+        for t in [100.0, 1500.0, 3000.0] {
+            assert!((refined[0].rate * t + refined[0].offset - (1.001 * t + 6.656)).abs() < 0.005);
+        }
+        let unrelated = run(true);
+        assert!(
+            unrelated.is_empty(),
+            "landmark line cannot substitute for matching waveform: {unrelated:?}"
+        );
+    }
+
+    #[test]
     fn media_time_seconds_roundtrip() {
         let t = MediaTime::seconds(6.4);
         assert!((t.as_seconds() - 6.4).abs() < 1e-9);
-        let _ = MediaKind::Audio;
     }
 }

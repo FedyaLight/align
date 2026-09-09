@@ -1,12 +1,17 @@
-//! GCC-PHAT fine alignment with sub-sample interpolation.
-//! Port of Sources/AlignCore/GCCPHAT.swift (vDSP DFT -> rustfft).
+//! GCC-PHAT alignment with parabolic sub-sample peak interpolation.
 //!
-//! Thresholds are identical: min 16k samples, max 128k, peak/RMS >= 4,
-//! prominence >= 1.015, parabolic sub-sample refinement. Quality blend
-//! 0.7 * peakToRMS + 0.3 * prominence is unchanged.
+//! Accepted windows contain 16K–128K samples. Peak/RMS must be at least 4
+//! and prominence at least 1.015. FFT plans are shared across refine workers.
+
+use std::sync::{Arc, OnceLock};
 
 use num_complex::Complex32;
-use rustfft::FftPlanner;
+use rustfft::{Fft, FftPlanner};
+
+// Only four power-of-two sizes (16K–128K) pass the gate below. Plans are
+// immutable, so all refine workers can share this bounded cache.
+type FftPair = (Arc<dyn Fft<f32>>, Arc<dyn Fft<f32>>);
+static PLANS: [OnceLock<FftPair>; 4] = [const { OnceLock::new() }; 4];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GccPhatResult {
@@ -29,19 +34,22 @@ pub fn align(left: &[f32], right: &[f32], maximum_lag: usize) -> Option<GccPhatR
         return None;
     }
 
-    let mut planner = FftPlanner::<f32>::new();
-    let forward = planner.plan_fft_forward(count);
-    let inverse = planner.plan_fft_inverse(count);
+    let (forward, inverse) = PLANS[count.trailing_zeros() as usize - 14].get_or_init(|| {
+        let mut planner = FftPlanner::<f32>::new();
+        (
+            planner.plan_fft_forward(count),
+            planner.plan_fft_inverse(count),
+        )
+    });
 
     let mut lb: Vec<Complex32> = l.iter().map(|&v| Complex32::new(v, 0.0)).collect();
     let mut rb: Vec<Complex32> = r.iter().map(|&v| Complex32::new(v, 0.0)).collect();
     forward.process(&mut lb);
     forward.process(&mut rb);
 
-    // Cross-spectrum with PHAT weighting, Swift-identical conjugation:
-    // conj(left) * right. The sign of the resulting lag is load-bearing
-    // (observation timestamps add it directly), so it must match Swift
-    // exactly — a flip here biases every refined offset by twice the
+    // Cross-spectrum with PHAT weighting: conj(left) * right. Observation
+    // timestamps add the signed lag directly; flipping the conjugation
+    // biases every refined offset by twice the
     // in-window lag with a deceptively tiny residual.
     let mut cross: Vec<Complex32> = Vec::with_capacity(count);
     for i in 0..count {
@@ -166,25 +174,27 @@ mod tests {
 
     #[test]
     fn finds_known_delay() {
-        let base = pseudo_noise(32_768, 0x1234);
-        let shift = 1_234;
-        let delayed = delayed(&base, shift);
-        let r = align(&base, &delayed, 4_000).expect("should align");
-        // Signed convention (Swift-identical): right lags left → positive.
-        // The sign is load-bearing downstream — never abs() it here.
-        assert!(
-            (r.lag_samples - shift as f64).abs() < 2.0,
-            "lag={}",
-            r.lag_samples
-        );
-        assert!(r.quality > 0.0);
-        // And the mirror: swapped inputs flip the sign.
-        let r2 = align(&delayed, &base, 4_000).expect("should align");
-        assert!(
-            (r2.lag_samples + shift as f64).abs() < 2.0,
-            "lag={}",
-            r2.lag_samples
-        );
+        for size in [16_384, 32_768, 65_536, 131_072, 32_768] {
+            let base = pseudo_noise(size, 0x1234);
+            let shift = 1_234;
+            let delayed = delayed(&base, shift);
+            let r = align(&base, &delayed, 4_000).expect("should align");
+            // Signed convention: right lags left → positive.
+            // The sign is load-bearing downstream — never abs() it here.
+            assert!(
+                (r.lag_samples - shift as f64).abs() < 2.0,
+                "lag={}",
+                r.lag_samples
+            );
+            assert!(r.quality > 0.0);
+            // And the mirror: swapped inputs flip the sign.
+            let r2 = align(&delayed, &base, 4_000).expect("should align");
+            assert!(
+                (r2.lag_samples + shift as f64).abs() < 2.0,
+                "lag={}",
+                r2.lag_samples
+            );
+        }
     }
 
     #[test]

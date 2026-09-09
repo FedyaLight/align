@@ -259,7 +259,7 @@ fn main() {
     impl Drop for SessionCleanup {
         fn drop(&mut self) {
             icons::cleanup();
-            align_decode::aaf::cleanup_session_media();
+            align_decode::media_assets::cleanup();
         }
     }
     let _session_cleanup = SessionCleanup;
@@ -276,7 +276,7 @@ fn main() {
             // quit that does not dispatch our custom QuitApp action.
             cx.on_app_quit(|_| async {
                 icons::cleanup();
-                align_decode::aaf::cleanup_session_media();
+                align_decode::media_assets::cleanup();
             })
             .detach();
             // System commands: without registered actions + bindings + menus

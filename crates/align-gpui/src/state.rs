@@ -1,7 +1,4 @@
-//! Application state: faithful port of Swift `AppModel`.
-//! Session model only (no project files): stale-on-add, one-shot Clear,
-//! live provisional preview during sync, corrections that re-run sync,
-//! export-sheet state, diagnostics, reveal-in-finder.
+//! Desktop application state and synchronization job lifecycle.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -2643,7 +2640,7 @@ mod tests {
     }
 
     #[test]
-    fn status_text_mirrors_swift() {
+    fn status_text_describes_clip_state() {
         assert_eq!(ClipState::Queued.status_text(), "Queued");
         assert_eq!(
             ClipState::Matching { confidence: 0.637 }.status_text(),

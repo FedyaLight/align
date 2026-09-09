@@ -286,7 +286,7 @@ pub fn enforce_clip_order(
         .collect()
 }
 
-/// Apply Syncaila-style source-track semantics before graph solving.
+/// Apply source-track matching policies before graph solving.
 /// Structural spanned-media links are parts of one recording and bypass the
 /// filter; every other same-track edge is rejected when either side is Linear.
 pub fn enforce_track_content(

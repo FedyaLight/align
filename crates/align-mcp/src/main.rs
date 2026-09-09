@@ -203,7 +203,7 @@ fn call_tool(params: &Value) -> Result<Value, (i64, String)> {
         .cloned()
         .unwrap_or_default();
     let args = match name {
-        "align_inspect" => inspect_args(&arguments),
+        "align_inspect" => media_paths(&arguments),
         "align_sync" => sync_args(&arguments, false),
         "align_export" => sync_args(&arguments, true),
         _ => return Err((-32602, format!("Unknown tool: {name}"))),
@@ -213,10 +213,6 @@ fn call_tool(params: &Value) -> Result<Value, (i64, String)> {
         Err(message) => return Ok(tool_error(message)),
     };
     Ok(run_cli(args))
-}
-
-fn inspect_args(arguments: &Map<String, Value>) -> Result<Vec<String>, String> {
-    media_paths(arguments)
 }
 
 fn sync_args(arguments: &Map<String, Value>, export: bool) -> Result<Vec<String>, String> {

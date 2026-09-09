@@ -1,5 +1,4 @@
-//! Premiere Pro / Resolve-bootstrap FCP7 XML writer. Port of
-//! `PremiereXMLWriter.swift`.
+//! FCP 7 XML output for Premiere Pro and Resolve.
 //!
 //! One sequence per combined island (`– synced`, plus an optional `–
 //! replaced` recorder-audio sequence for Premiere), original FCP7 effect
@@ -1029,7 +1028,7 @@ fn transition_item(t: &ExportTransition, rate: SequenceRate) -> String {
     let start = rate.frames(t.start, Rounding::Nearest);
     let end = rate.frames(t.end, Rounding::Nearest);
     if let Some(source) = &t.fcp7_transition_xml {
-        // Mirror Swift's DOM rewrite (start/end coordinates only): splice
+        // Rewrite start/end coordinates only: splice
         // the first <start>/<end> pair, fall back to synthesis.
         if let Some(rewritten) =
             splice_pair(source, "start", start).and_then(|xml| splice_pair(&xml, "end", end))

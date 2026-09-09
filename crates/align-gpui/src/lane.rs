@@ -99,7 +99,7 @@ pub fn provisional_groups(
         if visited.contains(id) {
             continue;
         }
-        // FIFO queue = BFS, like Swift's `removeFirst`.
+        // Breadth-first traversal.
         let mut queue = std::collections::VecDeque::from([id]);
         let mut starts: HashMap<&ClipId, f64> = [(id, 0.0)].into_iter().collect();
         visited.insert(id);
@@ -248,8 +248,10 @@ pub fn layout_bars(
     stream_channels: &HashMap<ClipId, Vec<usize>>,
 ) -> Vec<LaneVisual> {
     let mut lanes = Vec::new();
-    for kind in [MediaKind::Video, MediaKind::Audio] {
-        let segments: Vec<BarVisual> = bars.iter().filter(|b| b.kind == kind).cloned().collect();
+    let (video, audio): (Vec<_>, Vec<_>) = bars
+        .into_iter()
+        .partition(|bar| bar.kind == MediaKind::Video);
+    for (kind, segments) in [(MediaKind::Video, video), (MediaKind::Audio, audio)] {
         let requests: Vec<TimelineTrackRequest> = segments
             .iter()
             .map(|b| {
@@ -283,11 +285,10 @@ pub fn layout_bars(
             } else {
                 String::new()
             };
-            let layouts: Vec<Vec<usize>> = sorted
+            let layouts: Vec<&Vec<usize>> = sorted
                 .iter()
                 .filter_map(|b| stream_channels.get(&b.clip_id))
                 .filter(|v| !v.is_empty())
-                .cloned()
                 .collect();
             let stream_count = layouts.iter().map(|v| v.len()).min().unwrap_or(0);
             let channels: Vec<usize> = (0..stream_count)
@@ -347,13 +348,13 @@ pub fn source_name_for(key: &str) -> String {
 // Pure layout math used by the timeline renderer, unit-tested apart from
 // GPUI so bar positions are provable without a display server.
 
-/// Width of the label column (mirrors Swift `labelWidth`).
+/// Width of the label column in pixels.
 pub const LABEL_WIDTH: f32 = 56.0;
-/// Minimum on-screen bar width (mirrors Swift `max(2.0, …)`).
+/// Minimum on-screen bar width in pixels.
 pub const MIN_BAR_WIDTH: f64 = 2.0;
 
 /// Fit-zoom scale: at `zoom` 1.0 the whole `duration` spans `fit_width`
-/// (mirrors Swift's `availableWidth`, i.e. viewport minus label column).
+/// (the viewport width minus the label column).
 pub fn timeline_scale(duration: f64, zoom: f64, fit_width: f32) -> (f64, f32) {
     let duration = duration.max(1.0);
     let fit = fit_width.max(100.0);
@@ -361,10 +362,8 @@ pub fn timeline_scale(duration: f64, zoom: f64, fit_width: f32) -> (f64, f32) {
     (px_per_sec, (duration * px_per_sec) as f32)
 }
 
-/// Per-bar `(x, width)` in px for one lane row, mirroring Swift's
-/// `ZStack` + `offset(x:)` absolute placement: `x` is exact
-/// (`start * px_per_sec`), never accumulated, and `width` is clamped to
-/// the next bar's start (like Swift's `min(availableWidth, …)`), so
+/// Per-bar `(x, width)` in pixels. Position is `start * px_per_sec`, never
+/// accumulated. Width is clamped to the next bar's start, so
 /// min-width bars can never shift — or visually cover — their neighbours.
 /// `bars` must be sorted by `start` (as `layout_bars` emits them).
 pub fn bar_row_geometry(bars: &[BarVisual], px_per_sec: f64) -> Vec<(f32, f32)> {
@@ -498,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn source_names_mirror_swift() {
+    fn source_names_format_device_keys() {
         assert_eq!(source_name_for("device:Sony:A:123"), "Sony A 123");
         assert_eq!(source_name_for("span:abc"), "Linked BWF");
         assert_eq!(source_name_for("imported-video-000003"), "Imported V3");
@@ -670,7 +669,7 @@ mod tests {
         assert!((timeline_w - fit_width).abs() < 0.01);
         let geometry = bar_row_geometry(&bars, px_per_sec);
         // Exact absolute positions (no accumulation drift); widths follow
-        // Swift's `max(0, min(available, max(2, natural)))`: slivers narrower
+        // max(0, min(available, max(2, natural))): slivers narrower
         // than 2 px are allowed when the next bar starts sooner, but bars
         // never overlap and the last bar ends exactly at the Fit edge.
         for (i, ((x, width), bar)) in geometry.iter().zip(bars.iter()).enumerate() {
@@ -704,7 +703,7 @@ mod tests {
     #[test]
     fn row_geometry_clamps_to_next_bar_start() {
         // Dense pack where the natural width would cover the neighbour:
-        // mirrors Swift's `min(availableWidth, max(2.0, naturalWidth))`.
+        // clamp the minimum-width bar to the available space.
         let mk = |id: &str, start: f64, duration: f64| BarVisual {
             id: id.to_string(),
             clip_id: ClipId::new(id),

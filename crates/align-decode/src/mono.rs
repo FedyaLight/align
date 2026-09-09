@@ -1,26 +1,13 @@
-//! Shared streaming chain: discrete-channel mono selection + fixed-block
-//! resampling. Used by every decode path (Symphonia packets, FFmpeg pipe,
-//! both engines on macOS) so channel choice and resample numerics are
-//! identical everywhere.
+//! Shared streaming channel selection and resampling.
 //!
-//! Mirrors Swift `consumeAdaptiveMono` + `MonoSampleRateConverter`:
-//! - explicit channel override wins; otherwise the loudest channel per
-//!   fixed 512-source-frame window, keeping the previous one while within 90% (hysteresis) —
-//!   opposite-phase stereo never cancels out, and no FFmpeg-side downmix
-//!   is ever used for automatic analysis; an explicit mixed mode averages
-//!   every channel for sources where programme audio is distributed;
-//! - fixed 4096-frame input chunks through `rubato::FftFixedIn` (sinc);
-//!   equal rates bypass the resampler entirely (bit-exact passthrough,
-//!   like Swift's `converter == nil`);
-//! - `finish()` flushes the filter tail like Swift's `endOfStream` loop,
-//!   so stream length is exact and no rate-dependent truncation bias
-//!   appears between files.
+//! Explicit channel selection takes precedence. Automatic selection chooses
+//! the loudest channel per 512-source-frame window and keeps the previous
+//! channel while it remains within 90% of the loudest. Mixed mode averages
+//! channels explicitly; automatic mode avoids opposite-phase cancellation.
 //!
-//! Group-delay note: the sinc is linear-phase with a ratio-dependent
-//! constant delay (`output_delay()`). Every stream drops exactly that many
-//! leading output frames, so output sample `n` is true time `n/target_rate`
-//! on *every* rate pair — no cross-rate bias between files (this is stricter
-//! than Swift, which does not compensate `AVAudioConverter` latency).
+//! 4096-frame chunks pass through `rubato::FftFixedIn`; equal sample rates
+//! bypass resampling. The filter tail is flushed and its group delay removed
+//! so output sample positions remain aligned across sample-rate pairs.
 
 use rubato::{FftFixedIn, Resampler};
 
@@ -319,9 +306,8 @@ where
         }
         // Flush the filter tail until emitted (post-drop) output reaches
         // content length. Zero-padded rounds past that are ring-down
-        // silence, not signal. (Swift's endOfStream loop stops on converter
-        // state; rubato has no end flag, so the bound is counted instead
-        // of sensed.)
+        // silence, not signal. Rubato has no end flag, so stop at the
+        // expected output length.
         let expected = (self.in_total as f64 * self.target_rate / self.source_rate).ceil() as usize;
         self.cap = Some(expected);
         for _ in 0..64 {

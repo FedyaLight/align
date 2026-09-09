@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn cursor_boundaries_preserve_multibyte_text() {
-        let text = "Aя🙂";
+        let text = "Aé🙂";
         assert_eq!(next_boundary(text, 0), 1);
         assert_eq!(next_boundary(text, 1), 3);
         assert_eq!(next_boundary(text, 3), 7);
@@ -645,7 +645,7 @@ mod tests {
 
     #[test]
     fn utf16_offsets_round_trip_at_character_boundaries() {
-        let text = "Aя🙂Z";
+        let text = "Aé🙂Z";
         for utf8 in [0, 1, 3, 7, 8] {
             let utf16 = offset_to_utf16(text, utf8);
             assert_eq!(offset_from_utf16(text, utf16), utf8);

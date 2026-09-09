@@ -1,6 +1,6 @@
-//! Timeline lane packing. Port of Sources/AlignCore/TimelineTrackAllocator.swift.
+//! Timeline lane packing.
 //!
-//! Two phases, identical to Swift: (1) each source's clips pack into
+//! Two phases: (1) each source's clips pack into
 //! source-local lanes (takes and stems keep stable order), (2) whole source
 //! lanes merge into shared global time lanes. Non-overlapping files of one
 //! camera/recorder source reuse a row; unrelated sources share a track when
@@ -53,7 +53,7 @@ pub fn source_key_for_clip(
     source_key_for_url(url)
 }
 
-/// Parent directory of the media file (Swift: `deletingLastPathComponent`).
+/// Parent directory of the media file.
 pub fn source_key_for_url(url: &Path) -> String {
     url.parent()
         .map(|p| p.as_os_str().to_string_lossy().into_owned())

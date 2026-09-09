@@ -1,9 +1,7 @@
-//! Export timeline model. Port of the `ExportTimeline` half of
-//! `TimelineExport.swift` (writers live in sibling modules).
+//! Writer-neutral timeline assembly and export options.
 //!
-//! One timeline island becomes one NLE sequence: every sync island plus
-//! every unmatched clip lands in a single compact sequence ordered by
-//! consistent embedded timestamps (or stable fallback).
+//! Transforms solved placements and imported edits into tracks, clips,
+//! transitions, and media references consumed by sibling format writers.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -643,7 +641,7 @@ pub struct ExportAssemblyOptions {
     pub label_unmatched: bool,
     pub cut_remove: CutRemoveOptions,
     /// Custom symbol for synchronized names (default `[SYNCED]`).
-    /// A non-empty symbol implies labeling, like Syncaila's Add to name.
+    /// A non-empty symbol enables labeling.
     pub synced_symbol: Option<String>,
     /// Attach the synchronized symbol as a suffix instead of a prefix.
     pub synced_symbol_suffix: bool,
@@ -652,7 +650,7 @@ pub struct ExportAssemblyOptions {
     /// Final Cut audio role assigned to synchronized audio (FCPXML only).
     pub synced_role: Option<String>,
     /// Custom symbol for unmatched names (default `[UNSYNCED]`).
-    /// A non-empty symbol implies labeling, like Syncaila's Add to name.
+    /// A non-empty symbol enables labeling.
     pub unmatched_symbol: Option<String>,
     /// Attach the symbol as a suffix instead of a prefix.
     pub unmatched_symbol_suffix: bool,
@@ -741,9 +739,8 @@ fn apply_clip_assignment(item: &mut ExportItem, color: Option<&str>, role: Optio
     }
 }
 
-/// Post-sync Cut / Remove (Syncaila Extra options): opt-in timeline
-/// surgery applied after assembly. Everything defaults to off, which
-/// preserves legacy assembly exactly.
+/// Optional trimming and removal applied after timeline assembly.
+/// All operations are disabled by default.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CutRemoveOptions {
     /// Cut ranges empty on every item and close the timeline.
@@ -1149,7 +1146,6 @@ impl ExportTimeline {
 
         let mut order_only_islands = HashSet::new();
         if options.unmatched != UnmatchedPlacement::Remove {
-            // Swift: nextID = (max ?? -1) + 1.
             let next_id = groups.iter().map(|g| g.id as i64).max().unwrap_or(-1) + 1;
             for (index, clip_id) in result.unmatched.iter().enumerate() {
                 let Some(clip) = clips_by_id.get(clip_id) else {

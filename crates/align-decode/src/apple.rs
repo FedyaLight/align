@@ -1,26 +1,12 @@
-//! Apple-native engine: AVFoundation demux + decode via `objc2`, same
-//! contracts as `AudioDecoder.swift` + `SyncEngine.inspect` (4-reader gate
-//! lives one layer up, 0.9-hysteresis adaptive mono, native-rate discrete
-//! channels).
+//! AVFoundation media inspection and audio decoding through `objc2`.
 //!
-//! Division of labour (deliberate): AVFoundation owns container parsing,
-//! codec decode (incl. VideoToolbox hardware paths) and sample timing —
-//! that is where ~all platform value sits. Resampling is the shared
-//! [`crate::mono`] sinc (identical delay-compensated numerics on every
-//! engine) instead of `AVAudioConverter`, so fingerprints never depend on
-//! which engine decoded them.
+//! Outputs attach to audio tracks. Video tracks provide presence, timecode,
+//! and sample timing without decoding picture frames. Audio passes through
+//! the shared channel selection and delay-compensated resampling chain.
 //!
-//! Audio-only: outputs attach to audio tracks only; video tracks are
-//! enumerated for presence (`has_video`) and never read. VFR cursor walk
-//! and Sony/timecode metadata land with the metadata milestone; until then
-//! video timing reports through the same unknown-mode path as containers
-//! without sample-timing info.
-//!
-//! Threading: `loadTracksWithMediaType:completionHandler:` crosses threads
-//! via a raw-pointer channel (`NSArray`/`AVAssetTrack` are not `Send` in
-//! objc2) with balanced retain/from_raw ownership — contained in
-//! [`load_tracks`]. Everything else runs synchronously on the caller's
-//! thread; all `unsafe` blocks document their contract inline.
+//! Track loading uses completion handlers across a raw-pointer channel;
+//! returned Objective-C objects are retained before crossing the boundary.
+//! Decoder concurrency is bounded by the pipeline.
 
 use std::path::Path;
 use std::sync::mpsc;
@@ -50,7 +36,7 @@ use crate::backend::{AudioStreamProbe, BackendKind, MediaBackend, ProbeReport, V
 
 // ------------------------------------------------------------ asset plumbing
 
-/// Real Foundation call (also proves `objc2` linkage without Swift).
+/// Construct a Foundation file URL from a filesystem path.
 pub fn file_url(path: &Path) -> Option<Retained<NSURL>> {
     NSURL::from_file_path(path)
 }
@@ -271,8 +257,7 @@ fn is_numeric(time: CMTime) -> bool {
         )
 }
 /// Native (rate, channels, bits, float?) from the track's first format
-/// description. The array element is a `CMAudioFormatDescription`; the CF
-/// pointer cast mirrors Swift's `as!` at the same call site.
+/// description. The array contains `CMAudioFormatDescription` objects.
 fn stream_format(
     track: &AVAssetTrack,
 ) -> Result<(f64, usize, Option<u32>, Option<bool>), DecodeError> {
@@ -430,7 +415,7 @@ fn check_completed(reader: &AVAssetReader, path: &Path) -> Result<(), DecodeErro
 }
 
 /// Next data buffer: owned bytes; the first buffer's PTS (captured even
-/// from marker-only buffers, like Swift's `actualStart`) flows through
+/// from marker-only buffers) flows through
 /// `first_pts`. Marker-only buffers are skipped inside the loop. Owned
 /// copy only — one memcpy per buffer is noise next to decode cost, and a
 /// single path means fewer unsafe blocks than a zero-copy fast lane.
@@ -504,7 +489,7 @@ impl MediaBackend for AppleNativeBackend {
         }
         let audio = audio_tracks(&asset)?;
         if audio.is_empty() {
-            // Match Swift: a file with neither audio nor video is inaccessible.
+            // A file with neither audio nor video is inaccessible.
             let no_video = video_probe(&asset)?.is_none();
             if no_video {
                 return Err(DecodeError::NoAudio(path.display().to_string()));
@@ -605,8 +590,7 @@ impl MediaBackend for AppleNativeBackend {
                 Ok(())
             },
         )?;
-        // Presentation timestamps come from the buffers themselves (mirrors
-        // Swift's `CMSampleBufferGetPresentationTimeStamp` actualStart).
+        // Read presentation timestamps from the sample buffers.
         let mut actual_start = None::<f64>;
         while samples.borrow().len() < want {
             let Some(bytes) = next_buffer(&session.output, &mut actual_start)? else {

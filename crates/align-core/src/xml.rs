@@ -1,14 +1,12 @@
-//! FCP 7 XML + FCPXML timeline import. Port of `FCP7XMLImporter.swift`,
-//! `FCPXMLImporter.swift` and `TimelineImporter.swift`.
+//! FCP 7 XML and FCPXML timeline import.
 //!
 //! A minimal arena DOM over quick-xml streaming: elements keep children,
 //! trimmed text, attributes, parent links and **verbatim byte spans** —
 //! effect/filter/transition payloads round-trip byte-identically into
-//! Premiere exports. No external entities are ever loaded (Swift parity:
-//! `.nodeLoadExternalEntitiesNever`). XPath is replaced by targeted
-//! traversal helpers covering exactly the shapes both importers query.
+//! Premiere exports. External entities are never loaded. Targeted traversal
+//! helpers handle the supported import structures.
 //!
-//! Known limitation (documented, like other explicit boundaries): files
+//! Known limitation: files
 //! with a `DOCTYPE` internal subset (`[...]`) misparse in streaming mode.
 //! Real FCP7/FCPXML exports carry none; such files error instead of
 //! producing a plausible-but-wrong timeline.
@@ -474,7 +472,7 @@ impl TimelineDraft {
         (draft, replacements)
     }
 
-    /// Resolve draft edits against inspected clips (mirror Swift `resolve`).
+    /// Resolve draft edits against inspected clips.
     pub fn resolve(&self, clips: &[Clip]) -> ImportedTimeline {
         let clips_by_path: HashMap<String, &Clip> = clips
             .iter()
@@ -663,7 +661,7 @@ impl TimelineDraft {
     }
 
     /// Warnings for timeline media that could not be opened (deduped).
-    /// Extensions in `omit` (Syncaila Omit extensions, e.g. timeline
+    /// Extensions in `omit` (for example, timeline
     /// photos) are skipped silently instead of warning.
     pub fn unresolved_warnings(&self, clips: &[Clip], omit: &[String]) -> Vec<SyncWarning> {
         let paths: HashSet<String> = clips
@@ -805,7 +803,7 @@ impl std::error::Error for ImportError {}
 
 // ------------------------------------------------------------ importer
 
-/// Dispatch by root element (`fcpxml` vs anything else), like Swift.
+/// Dispatch by root element (`fcpxml` or FCP 7 XML).
 pub fn read_timeline(
     path: &Path,
     sequence_index: Option<usize>,

@@ -1,4 +1,4 @@
-//! Sync graph solve. Port of Sources/AlignCore/MatchGraph.swift.
+//! Robust synchronization graph solving.
 //!
 //! 1. Admit edges: spanned-metadata always, waveform only past the selected
 //!    match threshold with ≥ 3 anchors, ≥ 3 s covered, residual ≤ 0.1 s.
@@ -115,7 +115,7 @@ pub fn solve(
 }
 
 /// Total sort key: confidence desc, anchors desc, coverage desc,
-/// residual asc, then ids — quantized exactly like Swift `preferredEdge`.
+/// residual asc, then IDs. Floating-point criteria are quantized.
 fn edge_key(m: &PairwiseMatch) -> (Reverse<i64>, Reverse<usize>, Reverse<i64>, i64, &str, &str) {
     (
         Reverse((m.confidence * 10_000.0).round() as i64),
@@ -150,7 +150,7 @@ fn solve_component(
         *degree.entry(&e.right).or_default() += e.confidence;
     }
     // First maximal in input order on full ties (strict improvement only),
-    // ties on score broken toward the smaller id — like Swift `max(by:)`.
+    // ties on score are broken toward the smaller ID.
     let mut root = &clips[0];
     let mut best = degree.get(root).copied().unwrap_or(0.0)
         + if preferred_roots.contains(root) {
@@ -411,7 +411,7 @@ fn solve_equations(
 }
 
 /// Gaussian elimination with partial pivoting. First-maximal pivot (strict
-/// `>`), mirroring Swift `max(by:)` tie behaviour.
+/// `>` comparison) keeps tie-breaking deterministic.
 fn gaussian_solve(matrix: &[Vec<f64>], rhs: &[f64]) -> Vec<f64> {
     let n = matrix.len();
     let mut m: Vec<Vec<f64>> = matrix.to_vec();
@@ -436,8 +436,7 @@ fn gaussian_solve(matrix: &[Vec<f64>], rhs: &[f64]) -> Vec<f64> {
             if factor == 0.0 {
                 continue;
             }
-            // Indexed to mirror the Swift elimination loop 1:1; the borrow is
-            // split so pivot row and target row coexist without aliasing.
+            // Split the borrow so pivot and target rows do not alias.
             let (top, bottom) = m.split_at_mut(row);
             let pivot_row = &top[col];
             for (item, slot) in bottom[0].iter_mut().enumerate().take(n).skip(col) {

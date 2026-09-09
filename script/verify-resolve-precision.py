@@ -3,15 +3,16 @@
 import argparse
 import json
 import os
-import sys
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("otio")
 parser.add_argument("--project", required=True)
 parser.add_argument("--timeline", required=True)
 args = parser.parse_args()
-sys.path.append('/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules')
-import DaVinciResolveScript as dvr
+try:
+    import DaVinciResolveScript as dvr
+except ModuleNotFoundError as error:
+    raise SystemExit('Add the Resolve Scripting/Modules directory to PYTHONPATH before running this check.') from error
 
 resolve = dvr.scriptapp('Resolve')
 if not resolve:

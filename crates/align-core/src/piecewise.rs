@@ -1,9 +1,7 @@
-//! Monotonic piecewise time maps. Port of
-//! Sources/AlignCore/PiecewiseTimeMapping.swift (incl.
-//! `SolvedMappingPoint` alias).
+//! Monotonic piecewise time mappings.
 //!
-//! Used by `MatchGraph.propagateMappings` and (later) `SyncEngine` island
-//! assembly. Pure `f64` math, identical on all OSes.
+//! Used when propagating graph placements and assembling synchronization
+//! islands. Values interpolate between knots and extrapolate at the edges.
 
 /// One knot: `island = f(source)`, monotone non-decreasing by construction.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -70,7 +68,7 @@ impl PiecewiseTimeMapping {
         }
     }
 
-    /// Linear interpolation with clamping outside the knot range. With
+    /// Linear interpolation with extrapolation outside the knot range. With
     /// fewer than 2 knots returns the single island (or identity).
     pub fn value_at(&self, source: f64) -> f64 {
         if self.points.len() < 2 {
@@ -104,7 +102,7 @@ impl PiecewiseTimeMapping {
         )
     }
 
-    /// Ramer–Douglas–Peucker on the island axis, like Swift `simplify`.
+    /// Ramer–Douglas–Peucker simplification on the island axis.
     fn simplify(points: &[MapPoint], tolerance: f64) -> Vec<MapPoint> {
         if points.len() <= 2 {
             return points.to_vec();
@@ -144,8 +142,8 @@ mod tests {
     }
 
     #[test]
-    fn interpolates_and_extrapolates_like_swift() {
-        // Swift `value(at:)` clamps the *segment* but extrapolates the edge
+    fn interpolates_and_extrapolates_edge_segments() {
+        // Evaluation clamps the segment index but extrapolates the edge
         // segments linearly; callers guard range with `contains()`.
         let m =
             PiecewiseTimeMapping::new(vec![MapPoint::new(0.0, 10.0), MapPoint::new(10.0, 20.0)]);

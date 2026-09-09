@@ -1,5 +1,4 @@
-//! Final Cut Pro FCPXML writer. Port of `FinalCutProXMLWriter.swift`:
-//! resources (sequence format + per-media assets), a multicam resource
+//! Final Cut Pro FCPXML writer: resources (sequence format + per-media assets), a multicam resource
 //! grouping angles by source, a synced multi-track project and a multicam
 //! project. Times are reduced `MediaTime` rationals (`0s`, `100/25s`).
 

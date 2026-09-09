@@ -1,13 +1,8 @@
 //! Bounded parallel map with deterministic indexed results.
-//! Mirrors Swift's `withTaskGroup` + indexed-buffer pattern (e.g. the
-//! 4-reader fingerprint gate): at most `limit` jobs run at once, results
-//! return in INPUT order regardless of completion order, so matching and
-//! solves stay bit-identical between sequential and parallel runs.
+//! At most `limit` jobs run at once. Results retain input order regardless
+//! of completion order, keeping downstream tie-breaking deterministic.
 //!
-//! A panicking job aborts the whole map after joining its siblings (Swift
-//! task-group semantics). Jobs must be panic-free on reachable inputs —
-//! decode/match code paths are audited for that; an unreachable panic
-//! propagates loudly instead of silently corrupting order.
+//! A panicking job aborts the map after joining its siblings.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};

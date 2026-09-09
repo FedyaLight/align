@@ -1,16 +1,12 @@
 //! Sparse spectral landmark fingerprints.
-//! Port of Sources/AlignCore/Fingerprint.swift (vDSP -> realfft).
 //!
-//! Default parameters remain identical to Swift:
-//! 8 kHz mono, 1024-sample frames, 512 hop, 5 bands, top-2 peaks per frame
-//! with score >= 2.5, target deltas [8, 20, 36].
-//! Search levels select 1–5 peaks per frame without changing quality gates.
-//! FFT numerics differ in the last ulp from vDSP, so the on-disk cache
-//! version is bumped (see `cache.rs`) — matching behaviour is unchanged.
+//! Analysis uses 8 kHz mono, 1024-sample frames, a 512-sample hop, five bands,
+//! and target deltas of 8, 20, and 36 frames. Search levels select one to five
+//! peaks per frame without changing match-confidence gates. FFT scratch and
+//! landmark traversal buffers are reused between frames.
 
 use realfft::{RealFftPlanner, RealToComplex};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Search work budget: more spectral bands generate more candidate landmarks.
@@ -91,6 +87,7 @@ pub struct FingerprintExtractor {
     accuracy: SearchAccuracy,
     forward: Arc<dyn RealToComplex<f32>>,
     spectrum: Vec<num_complex::Complex32>,
+    fft_scratch: Vec<num_complex::Complex32>,
     magnitudes: Vec<f32>,
     window: Vec<f32>,
     scratch: Vec<f32>,
@@ -115,6 +112,7 @@ impl FingerprintExtractor {
         let mut planner = RealFftPlanner::<f32>::new();
         let forward = planner.plan_fft_forward(FRAME_SIZE);
         let spectrum = forward.make_output_vec();
+        let fft_scratch = forward.make_scratch_vec();
         // vDSP_HANN_NORM equivalent: 0.5 * (1 - cos(2*pi*n/(N-1))).
         // Relative peak picking is insensitive to the NORM scale factor.
         let window: Vec<f32> = (0..FRAME_SIZE)
@@ -127,6 +125,7 @@ impl FingerprintExtractor {
             accuracy,
             forward,
             spectrum,
+            fft_scratch,
             magnitudes: vec![0.0; HALF],
             window,
             scratch: vec![0.0; FRAME_SIZE],
@@ -138,7 +137,7 @@ impl FingerprintExtractor {
     }
 
     /// Streaming ingest. Bounded memory: the pending buffer is compacted
-    /// every 8 frames, exactly like the Swift version.
+    /// every eight frames.
     pub fn consume(&mut self, samples: &[f32]) {
         self.pending.extend_from_slice(samples);
         self.process_available();
@@ -154,9 +153,9 @@ impl FingerprintExtractor {
             for i in 0..FRAME_SIZE {
                 self.scratch[i] = self.pending[self.consumed + i] * self.window[i];
             }
-            // realfft processes in place; disjoint field borrows, no alloc.
+            // realfft overwrites the input buffer.
             self.forward
-                .process(&mut self.scratch, &mut self.spectrum)
+                .process_with_scratch(&mut self.scratch, &mut self.spectrum, &mut self.fft_scratch)
                 .expect("fft");
             for (i, c) in self.spectrum.iter().take(HALF).enumerate() {
                 // vDSP_zvmags = squared magnitude.
@@ -203,21 +202,27 @@ impl FingerprintExtractor {
 
     fn make_fingerprints(peaks: &[Peak]) -> Vec<Fingerprint> {
         const DELTAS: [u32; 3] = [8, 20, 36];
-        let mut by_frame: HashMap<u32, Vec<Peak>> = HashMap::new();
-        for p in peaks {
-            by_frame.entry(p.frame).or_default().push(*p);
-        }
+        // Peaks arrive in frame order. Three cursors replace a hash table
+        // and a separate allocation for every frame, retaining output order.
+        let mut cursors = [0; DELTAS.len()];
         let mut out = Vec::with_capacity(peaks.len() * DELTAS.len() * 2);
         for anchor in peaks {
-            for delta in DELTAS {
-                if let Some(targets) = by_frame.get(&anchor.frame.wrapping_add(delta)) {
-                    for t in targets {
-                        let hash = (anchor.bin as u64) << 32 | (t.bin as u64) << 16 | delta as u64;
-                        out.push(Fingerprint {
-                            hash,
-                            frame: anchor.frame,
-                        });
-                    }
+            for (cursor, delta) in cursors.iter_mut().zip(DELTAS) {
+                let Some(target_frame) = anchor.frame.checked_add(delta) else {
+                    continue;
+                };
+                while *cursor < peaks.len() && peaks[*cursor].frame < target_frame {
+                    *cursor += 1;
+                }
+                for t in peaks[*cursor..]
+                    .iter()
+                    .take_while(|t| t.frame == target_frame)
+                {
+                    let hash = (anchor.bin as u64) << 32 | (t.bin as u64) << 16 | delta as u64;
+                    out.push(Fingerprint {
+                        hash,
+                        frame: anchor.frame,
+                    });
                 }
             }
         }
@@ -228,6 +233,36 @@ impl FingerprintExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn ordered_targets_preserve_sparse_frames_and_peak_order() {
+        let peaks: Vec<_> = [
+            (0, 10),
+            (0, 11),
+            (8, 20),
+            (8, 21),
+            (20, 30),
+            (36, 40),
+            (44, 50),
+        ]
+        .into_iter()
+        .map(|(frame, bin)| Peak { frame, bin })
+        .collect();
+        let mut expected = Vec::new();
+        for anchor in &peaks {
+            for delta in [8, 20, 36] {
+                for target in peaks.iter().filter(|p| p.frame == anchor.frame + delta) {
+                    expected.push(Fingerprint {
+                        hash: (anchor.bin as u64) << 32 | (target.bin as u64) << 16 | delta as u64,
+                        frame: anchor.frame,
+                    });
+                }
+            }
+        }
+        assert_eq!(FingerprintExtractor::make_fingerprints(&peaks), expected);
+        assert!(FingerprintExtractor::make_fingerprints(&[]).is_empty());
+    }
 
     fn sine(freq: f32, secs: f32) -> Vec<f32> {
         (0..(secs * SAMPLE_RATE as f32) as usize)

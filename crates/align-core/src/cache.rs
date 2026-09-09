@@ -1,15 +1,9 @@
-//! Content-addressed fingerprint cache.
-//! Port of Sources/AlignCore/FingerprintCache.swift.
+//! Persistent fingerprint and video-timing cache.
 //!
-//! Differences (deliberate, documented):
-//! - format: bincode instead of binary plist (plist has no stable Rust
-//!   writer; bincode is smaller and faster on all 3 OSes);
-//! - hash: BLAKE3 over (version, backend, variant, normalized path, size,
-//!   mtime, head+tail 1 MiB) instead of SHA256 (same security margin for
-//!   cache keys, ~8x faster, less CPU wake on laptops);
-//! - version bumped so Swift plist and older Rust entries are never misread.
-//! - location: OS cache dir via `dirs` (`~/Library/Caches`,
-//!   `%LOCALAPPDATA%`, `~/.cache`), same semantics as Swift.
+//! Fingerprint keys include the cache version, backend, analysis variant,
+//! normalized media path, metadata, and samples from the first and last MiB.
+//! Video-timing entries also identify the probe executable. Entries use
+//! versioned bincode payloads and atomic writes in the OS cache directory.
 
 use crate::fingerprint::Fingerprint;
 use serde::{Deserialize, Serialize};
@@ -26,6 +20,12 @@ struct Payload {
     backend_tag: String,
     media_path: PathBuf,
     fingerprints: Vec<Fingerprint>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TimingPayload {
+    media_path: PathBuf,
+    timing: crate::VideoTimingInspection,
 }
 
 /// v5 omitted the media path but its fingerprints remain valid. Keep this
@@ -111,7 +111,10 @@ impl FingerprintCache {
         };
         for e in entries.flatten() {
             let p = e.path();
-            if p.extension().and_then(|s| s.to_str()) != Some("bin") {
+            if !matches!(
+                p.extension().and_then(|s| s.to_str()),
+                Some("bin" | "timing")
+            ) {
                 continue;
             }
             st.file_count += 1;
@@ -137,22 +140,30 @@ impl FingerprintCache {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("bin") {
+            if !matches!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("bin" | "timing")
+            ) {
                 continue;
             }
             let Ok(metadata) = entry.metadata() else {
                 continue;
             };
-            let Some(payload) = std::fs::read(&path)
-                .ok()
-                .and_then(|bytes| bincode::deserialize::<Payload>(&bytes).ok())
-            else {
+            let Some(media_path) = std::fs::read(&path).ok().and_then(|bytes| {
+                if path.extension().and_then(|value| value.to_str()) == Some("timing") {
+                    serde_json::from_slice::<TimingPayload>(&bytes)
+                        .ok()
+                        .map(|p| p.media_path)
+                } else {
+                    bincode::deserialize::<Payload>(&bytes)
+                        .ok()
+                        .filter(|p| p.version == CACHE_VERSION)
+                        .map(|p| p.media_path)
+                }
+            }) else {
                 continue;
             };
-            if payload.version == CACHE_VERSION
-                && media.contains(&normalized_path(&payload.media_path))
-                && std::fs::remove_file(path).is_ok()
-            {
+            if media.contains(&normalized_path(&media_path)) && std::fs::remove_file(path).is_ok() {
                 removed.file_count += 1;
                 removed.total_bytes += metadata.len();
                 let waveform = entry.path().with_extension("waveform");
@@ -177,7 +188,10 @@ impl FingerprintCache {
         let now = std::time::SystemTime::now();
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("bin") {
+            if !matches!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("bin" | "timing")
+            ) {
                 continue;
             }
             let Ok(metadata) = entry.metadata() else {
@@ -200,6 +214,57 @@ impl FingerprintCache {
             }
         }
         removed
+    }
+
+    /// Packet timing shares cache clearing/retention with fingerprints.
+    /// `decoder` includes the resolved ffprobe executable's identity.
+    pub fn load_video_timing(
+        &self,
+        media: &Path,
+        decoder: &str,
+    ) -> Option<crate::VideoTimingInspection> {
+        let path = self.video_timing_path(media, decoder).ok()?;
+        let bytes = std::fs::read(path).ok()?;
+        serde_json::from_slice::<TimingPayload>(&bytes)
+            .ok()
+            .map(|p| p.timing)
+    }
+
+    pub fn save_video_timing(
+        &self,
+        media: &Path,
+        decoder: &str,
+        timing: crate::VideoTimingInspection,
+    ) {
+        let Ok(path) = self.video_timing_path(media, decoder) else {
+            return;
+        };
+        let payload = TimingPayload {
+            media_path: normalized_path(media),
+            timing,
+        };
+        let Ok(bytes) = serde_json::to_vec(&payload) else {
+            return;
+        };
+        if std::fs::create_dir_all(&self.dir).is_err() {
+            return;
+        }
+        // Distinct writers never share a temporary file, even within one process.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("timing-tmp-{}-{serial}", std::process::id()));
+        if std::fs::write(&tmp, bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    fn video_timing_path(&self, media: &Path, decoder: &str) -> std::io::Result<PathBuf> {
+        // Keep nanosecond mtime precision in addition to the existing sampled
+        // fingerprint identity (path, length, mtime, first/last MiB).
+        let revision = media_revision(media)?;
+        self.cache_path(media, &format!("video-timing-v1:{decoder}:{revision}"))
+            .map(|p| p.with_extension("timing"))
     }
 
     pub fn load(&self, media: &Path, variant: &str) -> Option<Vec<Fingerprint>> {
@@ -237,8 +302,7 @@ impl FingerprintCache {
         if std::fs::create_dir_all(&self.dir).is_err() {
             return;
         }
-        // Atomic write: tmp + rename, so a crash never leaves a half file
-        // (same guarantee as Swift `.atomic`).
+        // Write to a temporary file and rename after completing the payload.
         let payload = Payload {
             version: CACHE_VERSION,
             backend_tag: self.backend_tag.clone(),
@@ -362,6 +426,33 @@ impl FingerprintCache {
     }
 }
 
+/// Cheap change stamp used before/after a packet walk. Cache keys additionally
+/// sample file contents. Unix ctime detects rewrites with a restored mtime.
+pub fn media_revision(path: &Path) -> std::io::Result<String> {
+    let metadata = std::fs::metadata(path)?;
+    let stamp = format!(
+        "{}:{:?}:{:?}",
+        metadata.len(),
+        metadata.modified()?,
+        metadata.created().ok()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(format!(
+            "{stamp}:{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.ctime(),
+            metadata.ctime_nsec()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(stamp)
+    }
+}
+
 fn default_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
@@ -383,6 +474,54 @@ fn normalized_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_timing_invalidates_and_obeys_cache_management() {
+        let root =
+            std::env::temp_dir().join(format!("align-timing-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let media = root.join("media.mov");
+        std::fs::write(&media, b"first payload").unwrap();
+        let cache = FingerprintCache::with_backend(Some(root.join("cache")), "portable-timing1");
+        let timing = crate::VideoTimingInspection {
+            frame_duration: Some(crate::MediaTime::new(1, 25)),
+            mode: crate::VideoFrameRateMode::Constant,
+        };
+        cache.save_video_timing(&media, "decoder1", timing);
+        assert_eq!(cache.load_video_timing(&media, "decoder1"), Some(timing));
+        assert_eq!(cache.load_video_timing(&media, "decoder2"), None);
+        let old_time = std::fs::metadata(&media).unwrap().modified().unwrap();
+        std::fs::write(&media, b"other payload").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&media)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+        assert_eq!(
+            cache.load_video_timing(&media, "decoder1"),
+            None,
+            "sampled bytes invalidate even with unchanged size/mtime"
+        );
+        cache.save_video_timing(&media, "decoder1", timing);
+        let path = cache.video_timing_path(&media, "decoder1").unwrap();
+        std::fs::write(&path, b"broken cache").unwrap();
+        assert_eq!(cache.load_video_timing(&media, "decoder1"), None);
+        cache.save_video_timing(&media, "decoder1", timing);
+        assert_eq!(cache.statistics().file_count, 2);
+        assert_eq!(
+            cache.clear_media(std::slice::from_ref(&media)).file_count,
+            2
+        );
+        cache.save_video_timing(&media, "decoder1", timing);
+        assert_eq!(
+            cache.prune_older_than(std::time::Duration::ZERO).file_count,
+            1
+        );
+        assert_eq!(cache.load_video_timing(&media, "decoder1"), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn roundtrip_and_invalidation() {

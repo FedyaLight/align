@@ -1,11 +1,9 @@
-//! Export orchestration: drift sidecars + precision stems + writers.
-//! Port of `SyncEngine.export/exportCorrected/exportPrepared`.
+//! Export preparation and format dispatch.
 //!
-//! Job model mirrors Swift: drift-corrected WAVs (`Corrected Audio`) and
-//! per-channel precision stems (`Resolve Precision Audio`) render once per
-//! unique asset (existence short-circuits re-renders), progress counts
-//! drift + precision jobs together, writers emit atomically, and the
-//! precision script is chmodded executable.
+//! Renders corrected audio and precision stems, retains temporary source
+//! media, and writes timeline artifacts. Prepared audio is reused when its
+//! cache identity matches the requested operation. Single and batch exports
+//! share the same preparation path.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -116,8 +114,15 @@ pub fn export(
         .validate_audio_source_channels()
         .map_err(ExportError::Timeline)?;
     std::fs::create_dir_all(directory).map_err(|e| ExportError::Io(e.to_string()))?;
+    let mut timeline = timeline.clone();
+    crate::media_assets::preserve_export(
+        &mut timeline,
+        directory,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .map_err(|error| ExportError::Io(error.to_string()))?;
     write_artifacts(
-        timeline,
+        &timeline,
         directory,
         formats,
         include_replaced_sequence,
@@ -127,9 +132,7 @@ pub fn export(
     )
 }
 
-/// Drift-corrected export with precision stems — mirrors `exportPrepared`.
-/// Sequential job execution (Swift uses structured concurrency; same
-/// outputs, deterministic order).
+/// Drift-corrected export with precision stems and sequential job execution.
 /// Export job description (bundles the growing parameter list).
 pub struct ExportRequest<'a> {
     pub backend: &'a dyn MediaBackend,
@@ -358,6 +361,13 @@ fn export_prepared_internal(
     );
     combined.temporal_policy = timeline.temporal_policy.clone();
     combined.copy_assembly_policy_from(timeline);
+    crate::media_assets::preserve_export(&mut combined, directory, cancel).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            ExportError::Cancelled
+        } else {
+            ExportError::Io(error.to_string())
+        }
+    })?;
     // Resolve floors the timeline end even when the final audio item extends
     // into the next partial frame. Extend only a final recorder's derived
     // precision stem with silence so an Entire Timeline render retains it.
@@ -1066,7 +1076,6 @@ fn write_artifacts(
             | TimelineExportFormat::ResolveScript
             | TimelineExportFormat::ResolveXML => "DaVinci Resolve",
         };
-        // En dash in app bundle names mirrors Swift exactly.
         let url = directory.join(format!("Align – {application}.{}", format.file_extension()));
         let bytes: Vec<u8> = match format {
             TimelineExportFormat::Aaf => unreachable!(),

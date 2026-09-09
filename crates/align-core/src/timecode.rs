@@ -1,4 +1,4 @@
-//! Timecode-overlap matching. Port of `TimecodeMatcher.swift`.
+//! Timecode-overlap matching.
 //!
 //! Clips carrying a trusted source timecode but no waveform/spanned match
 //! join by timecode overlap: each unmatched timecoded clip pairs with the
@@ -88,7 +88,7 @@ pub fn analyze_timecodes(
             }
         }
 
-        let Some((target, target_start, overlap)) = best else {
+        let Some((target, target_tc, overlap)) = best else {
             continue;
         };
         let key = pair_key(&candidate.id, &target.id);
@@ -97,13 +97,9 @@ pub fn analyze_timecodes(
         }
         matched_pairs.insert(key);
 
-        let Some(target_tc) = policy.anchors(target).1 else {
-            continue;
-        };
         let candidate_tc = candidate_start;
-        // Anchored targets stay left (Swift's first two branches coincide:
-        // anchor preference, else id order).
-        let anchor_target = anchors.iter().any(|a| a.id == target.id);
+        // Prefer anchored targets on the left, otherwise use clip-ID order.
+        let anchor_target = matched_ids.contains(&target.id);
         let (left, left_tc, right, right_tc) = if anchor_target || target.id.0 < candidate.id.0 {
             (target, target_tc, candidate, candidate_tc)
         } else {
@@ -128,7 +124,6 @@ pub fn analyze_timecodes(
             alignment_points: Vec::new(),
             evidence: MatchEvidence::Timecode,
         });
-        let _ = target_start;
     }
     new_matches
 }

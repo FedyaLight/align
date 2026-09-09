@@ -1,9 +1,9 @@
-//! Linked file-set matching. Port of `SpannedMediaMatcher.swift`.
+//! Structural matching of linked recording parts.
 //!
 //! Consecutive parts of one BWF/RF64/BW64 `link` set join seamlessly —
 //! even with zero waveform overlap — staying separate source clips on one
 //! NLE track. Edges are metadata-only (confidence 1, rate 1) and bypass
-//! the waveform admission gates in the graph solve, exactly like Swift.
+//! the waveform admission gates in the graph solve.
 //! Incomplete sets warn instead of guessing across the gap.
 
 use std::collections::{HashMap, HashSet};

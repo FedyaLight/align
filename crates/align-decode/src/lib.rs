@@ -1,13 +1,9 @@
-//! Cross-platform decode, inspect, render and export.
-//! - Symphonia for WAV/AIFF/M4A/MP3/PCM (no system deps, `mmap`-friendly).
-//! - Portable builds use the bundled minimal FFmpeg sidecar for containers;
-//!   macOS defaults to AVFoundation and does not bundle FFmpeg.
-//! - rubato SincFixed resample to 8 kHz mono / 16 kHz windows with the same
-//!   32_768-frame fixed blocks and 0.9-hysteresis adaptive mono as Swift.
+//! Media inspection, decoding, rendering, and export.
 //!
-//! Concurrency mirrors `AVAssetReaderGate`: max 4 parallel decodes per
-//! process via `parallel::par_map`, stable indexed ordering, cooperative
-//! cancellation via an atomic flag.
+//! macOS defaults to AVFoundation. Portable decoding uses Symphonia for
+//! supported audio and FFmpeg for other containers. Both use shared channel
+//! selection and resampling. Pipeline workers are bounded and return results
+//! in input order.
 
 use std::path::Path;
 use thiserror::Error;
@@ -17,6 +13,7 @@ pub mod backend;
 pub mod export;
 pub mod ff;
 mod ltc;
+pub mod media_assets;
 mod mix;
 pub mod mono;
 pub mod pipeline;
@@ -59,9 +56,9 @@ pub enum DecodeError {
     Io(#[from] std::io::Error),
 }
 
-/// Concurrency cap: same 4-reader limit as Swift `AVAssetReaderGate`.
+/// Maximum concurrent decoder jobs.
 pub const MAX_PARALLEL_DECODERS: usize = 4;
-/// Fixed resample block, mirrors `MonoSampleRateConverter.inputChunkSize`.
+/// Fixed decode/resample block size in frames.
 pub const RESAMPLE_BLOCK: usize = 32_768;
 
 pub fn supported_extensions() -> &'static [&'static str] {

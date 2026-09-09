@@ -1,45 +1,11 @@
-//! Platform backends: native Apple media stack on macOS, portable engine
-//! everywhere else. Algorithms (matcher, graph, export), DSP (fingerprint,
-//! GCC-PHAT) and UI (GPUI) stay shared — only media inspect/decode is
-//! platform-specific.
+//! Media inspection and audio-decoding backends.
 //!
-//! Why the split is exactly here:
-//! - Decode/inspect is where the OS gives free hardware: VideoToolbox
-//!   decoders, AVAudioConverter quality/speed, AVSampleCursor VFR walk,
-//!   Sony/timecode metadata paths, battery-friendly I/O scheduling.
-//! - FFT/DSP is NOT worth splitting: a 1024-pt real FFT is ~microseconds,
-//!   the fingerprint stage runs ~16 FFT/s per file — decode dominates by
-//!   orders of magnitude. Shared DSP also means bit-identical fingerprints,
-//!   one cache format family and comparable result SHAs across OSes.
-//!   (A vDSP FFT backend can be added later behind the same trait if
-//!   profiling ever shows otherwise — the seam is reserved.)
+//! macOS defaults to AVFoundation; other platforms use the portable backend.
+//! `ALIGN_BACKEND=portable` selects portable decoding on macOS. Matching,
+//! resampling, and timeline assembly are shared across backends.
 //!
-//! Selection: [`default_backend_kind`] returns AppleNative on macOS unless
-//! `ALIGN_BACKEND=portable` (aka `pure-rust`) forces the portable engine —
-//! the escape hatch for CI determinism checks and debugging. Off macOS the
-//! portable engine is the only option; requesting native falls back with a
-//! warning.
-//!
-//! ## Apple backend implementation (Rust + objc2, no Swift)
-//!
-//! The Apple backend re-implements `AudioDecoder.swift` / `inspect` /
-//! `VideoTimingInspector` directly in Rust via `objc2-av-foundation`
-//! without a Swift runtime or a second build toolchain.
-//!
-//! Swift -> objc2 call map (same contracts: 4-reader gate, 32k blocks,
-//! 0.9-hysteresis adaptive mono, `.max` converter quality):
-//! - `AVURLAsset(url:)` + `loadTracks(withMediaType:)` -> identical calls
-//! - `AVAssetReader` + `AVAssetReaderTrackOutput` (LinearPCM f32) -> identical
-//! - `MonoSampleRateConverter` (AVAudioConverter) -> identical, same quality
-//! - `VideoTimingInspector` (AVSampleCursor full walk) -> identical
-//! - channel/stream selection + hysteresis -> shared (`align_core::model`)
-//! - Sony NonRealTimeMeta / BWF bext / R3D proxy notes -> shared pure file IO
-//! - ClipID SHA256 -> shared `sha2` (identical digest, stable result JSON)
-//!
-//! Deliberately NOT kept as a Swift dylib + FFI: that would mean two
-//! toolchains (Xcode + cargo), the Swift runtime inside the process, and a
-//! packaging split (the portable backend is needed on Win/Linux anyway).
-//! Pure Rust over native C/ObjC APIs is one toolchain and thinner.
+//! The interface returns audio samples and timing metadata. Video frames are
+//! not decoded for synchronization.
 
 use align_core::{AudioAnalysisSource, MediaTime, SourceTimecode, VideoFrameRateMode};
 use std::path::Path;
@@ -48,16 +14,8 @@ use crate::DecodeError;
 
 // ------------------------------------------------------------ audio-only
 //
-// INVARIANT: video tracks are never opened, video frames are never decoded,
-// pixel buffers are never allocated. Containers (MOV/MP4/MTS/MXF/R3D) are
-// opened for their *audio streams and timing metadata only* — exactly like
-// Swift, where `AVAssetReaderTrackOutput` is attached to audio tracks and
-// `VideoTimingInspector` walks `AVSampleCursor` timestamps without reading
-// sample data.
-//
-// The trait enforces this structurally: there is no method returning video
-// samples, only mono `f32` audio (`decode_*`) and scalar metadata
-// (`ProbeReport`). Memory budgets (resident, worst case per job):
+// Decode methods return audio only; probes inspect video timing metadata
+// without decoding picture frames. Buffer limits below apply per job.
 pub const ANALYSIS_SAMPLE_RATE_HZ: u32 = 8_000;
 /// 8 kHz mono f32 = 32 KiB per second of audio, streamed in blocks.
 pub const ANALYSIS_BYTES_PER_SEC: usize = 32_000;
@@ -149,7 +107,7 @@ pub struct VideoProbe {
 }
 
 /// The single seam between shared algorithms and OS media stacks.
-/// Both backends must honour the same contracts (mirrors Swift):
+/// Both backends must honor the same contracts:
 /// 8 kHz mono stream / 16 kHz windows, adaptive-mono hysteresis 0.9,
 /// cooperative cancellation via the caller's `consume` returning Err.
 pub trait MediaBackend: Send + Sync {
@@ -186,8 +144,7 @@ pub trait MediaBackend: Send + Sync {
     ) -> Result<f64, DecodeError>;
 
     /// Same, but 32-bit integer samples for bit-exact stems of 32-bit-int
-    /// sources (other formats convert through f32, like Swift's int32
-    /// reader path).
+    /// sources. Other formats convert through f32.
     fn decode_native_i32(
         &self,
         path: &Path,

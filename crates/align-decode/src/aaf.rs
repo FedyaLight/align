@@ -211,7 +211,7 @@ fn read_response(
     let mut command = Command::new(executable);
     command.arg(operation).arg(path);
     if operation == "read-timeline" {
-        command.arg(session_media_dir());
+        command.arg(crate::media_assets::extraction_directory()?);
     }
     let mut child = command
         .stdin(Stdio::null())
@@ -239,20 +239,6 @@ fn read_response(
     }
     validate_import(&result)?;
     Ok(result)
-}
-
-/// AAF sources may contain embedded media. Keep extracted files alive for the
-/// process, then remove them when the desktop app or CLI exits normally.
-pub fn session_media_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("align-aaf-media-{}", std::process::id()))
-}
-
-pub fn cleanup_session_media() {
-    let _ = std::fs::remove_dir_all(session_media_dir());
-    // Builds before session-scoped extraction used this persistent directory.
-    if let Some(cache) = dirs::cache_dir() {
-        let _ = std::fs::remove_dir_all(cache.join("Align").join("AAF Media"));
-    }
 }
 
 fn validate_import(result: &ImportedAudio) -> Result<(), AafError> {
@@ -927,16 +913,6 @@ mod tests {
             read_audio(Path::new("missing.aaf"), &AtomicBool::new(true)),
             Err(AafError::Cancelled)
         ));
-    }
-
-    #[test]
-    fn session_media_cleanup_removes_the_process_directory() {
-        let directory = session_media_dir();
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join("embedded.wav"), b"temporary").unwrap();
-        cleanup_session_media();
-        assert!(!directory.exists());
     }
 
     #[test]

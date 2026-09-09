@@ -49,5 +49,3 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = true
-# Один job декода ~128 КБ стейта; thin-LTO даёт почти max скорость
-# без 10-минутных сборок fat-LTO на CI под 3 ОС.

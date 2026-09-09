@@ -1,22 +1,26 @@
-//! Coarse waveform matching. Port of Sources/AlignCore/FingerprintMatcher.swift
-//! (`PairwiseMatch` lives in MatchGraph.swift in Swift; it is defined here
-//! next to its producer).
+//! Coarse waveform matching and pairwise alignment evidence.
 //!
-//! Pipeline (thresholds identical to Swift):
+//! Matching stages:
 //! 1. global inverted index over landmark hashes (groups > `max(48, 2.2×clips)`
 //!    are ubiquitous-noise and skipped; singletons cannot vote);
-//! 2. per-pair frame-delta histogram, 8-frame buckets, winner needs ≥ 12 votes;
+//! 2. clip-run pairs vote into frame-delta histograms (8-frame buckets,
+//!    winner needs ≥ 12 votes); normal peak selection scans without sorting;
 //! 3. repeated-take guard: two near-equal distant peaks stay unmatched unless
 //!    a trusted timecode/recording timestamp selects one (metadata never
 //!    creates a match, it only disambiguates proven waveform peaks);
-//! 4. anchors re-collected around the winning bucket (±2), one per 40-frame
-//!    bucket, then Theil–Sen-style robust affine fit + least-squares refine;
+//!    a broad ambiguous ridge can instead be validated as a long clock-drift
+//!    line, with independent coverage and competing-line rejection;
+//! 4. a monotonic window recovers the last anchor around the winning bucket
+//!    (±2), one per 40-frame bucket, preserving exhaustive traversal results;
+//!    then robust affine fit + least-squares refine;
 //! 5. confidence blend 0.25/0.20/0.25/0.20/0.10; drift rate reported only past
 //!    600 s span with 50 anchors, otherwise exactly 1.0.
 //!
-//! Memory: only fingerprints (`u64`+`u32` per landmark) are resident.
+//! Memory: fingerprint records, sparse vote histograms, and anchor maps.
 //! Decoded audio is streamed through and never stored — see the audio-only
 //! invariant in `align-decode/src/backend.rs`.
+
+mod ridge;
 
 use std::collections::{HashMap, HashSet};
 
@@ -26,7 +30,7 @@ use crate::model::{Clip, ClipId, MatchEvidence, SyncConstraint, TemporalPolicy};
 // ---------------------------------------------------------------- types
 
 /// Fingerprints of one clip selected for matching (one audio source variant).
-/// Taken by value and drained by the matcher, like Swift's `inout` + `removeAll`.
+/// Taken by value and drained by the matcher.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClipFingerprints {
     pub clip_id: ClipId,
@@ -208,18 +212,18 @@ pub fn match_fingerprints(
     timing_hints: Option<&ClipTimingHints>,
     constraints: &[SyncConstraint],
 ) -> Vec<PairwiseMatch> {
-    let clip_ids: Vec<ClipId> = clips.iter().map(|c| c.clip_id.clone()).collect();
+    let mut clip_ids = Vec::with_capacity(clips.len());
     let mut records: Vec<Record> =
         Vec::with_capacity(clips.iter().map(|c| c.fingerprints.len()).sum());
-    for (index, clip) in clips.iter().enumerate() {
-        records.extend(clip.fingerprints.iter().map(|f| Record {
+    for (index, clip) in clips.into_iter().enumerate() {
+        clip_ids.push(clip.clip_id);
+        records.extend(clip.fingerprints.into_iter().map(|f| Record {
             hash: f.hash,
             frame: f.frame,
             clip: index as u32,
         }));
     }
-    drop(clips);
-    records.sort();
+    records.sort_unstable_by_key(|record| record.hash);
 
     let max_group_size = 48.max((clip_ids.len() as f64 * 2.2) as usize);
     let groups: Vec<(usize, usize)> = {
@@ -231,6 +235,7 @@ pub fn match_fingerprints(
                 end += 1;
             }
             if end - start >= 2 && end - start <= max_group_size {
+                records[start..end].sort_unstable_by_key(|record| (record.clip, record.frame));
                 out.push((start, end));
             }
             start = end;
@@ -238,35 +243,26 @@ pub fn match_fingerprints(
         out
     };
 
-    // Pass 1: vote frame-delta histograms per pair.
+    // Hash groups are ordered by clip, then frame. Look up each pair's
+    // histogram once per group; occurrences from one clip cannot vote.
     let mut votes: HashMap<PairKey, HashMap<i64, usize>> = HashMap::new();
     for &(start, end) in &groups {
-        for i in start..end {
-            for j in (i + 1)..end {
-                let (first, second) = (records[i], records[j]);
-                if first.clip == second.clip {
-                    continue;
+        for_each_clip_pair(&records[start..end], |key, left, right| {
+            let histogram = votes.entry(key).or_default();
+            for l in left {
+                for r in right {
+                    let delta = r.frame as i64 - l.frame as i64;
+                    *histogram
+                        .entry(delta.div_euclid(BUCKET_WIDTH_FRAMES))
+                        .or_default() += 1;
                 }
-                let (left, right) = if first.clip < second.clip {
-                    (first, second)
-                } else {
-                    (second, first)
-                };
-                let delta = right.frame as i64 - left.frame as i64;
-                *votes
-                    .entry(PairKey {
-                        left: left.clip,
-                        right: right.clip,
-                    })
-                    .or_default()
-                    .entry(delta.div_euclid(BUCKET_WIDTH_FRAMES))
-                    .or_default() += 1;
             }
-        }
+        });
     }
 
     // Winners + repeated-take guard.
     let mut winning: HashMap<PairKey, (i64, usize, usize)> = HashMap::new();
+    let mut drifting = HashMap::new();
     for (pair, histogram) in &votes {
         let left_id = &clip_ids[pair.left as usize];
         let right_id = &clip_ids[pair.right as usize];
@@ -285,8 +281,11 @@ pub fn match_fingerprints(
             })
             .map(|(b, v)| (*b, *v))
             .collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let Some(mut selected) = ranked.first().copied() else {
+        let Some(mut selected) = ranked
+            .iter()
+            .copied()
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+        else {
             continue;
         };
         if selected.1 < policy::VOTE_THRESHOLD {
@@ -294,16 +293,21 @@ pub fn match_fingerprints(
         }
         let mut runner_up = ranked
             .iter()
-            .find(|(b, _)| (*b - selected.0).abs() > 2)
+            .filter(|(b, _)| (*b - selected.0).abs() > 2)
             .map(|(_, v)| *v)
+            .max()
             .unwrap_or(0);
         let margin = selected.1 as f64 / runner_up.max(1) as f64;
         if runner_up >= policy::REPEATED_TAKE_VOTES && margin < policy::REPEATED_TAKE_MARGIN {
-            let Some(expected) = timing_hints.and_then(|h| h.expected_offset(left_id, right_id))
-            else {
-                continue;
-            };
-            let Some(hinted) = hinted_peak(&ranked, expected) else {
+            // Preserve the original tie order for metadata disambiguation.
+            ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let hinted = timing_hints
+                .and_then(|h| h.expected_offset(left_id, right_id))
+                .and_then(|expected| hinted_peak(&ranked, expected));
+            let Some(hinted) = hinted else {
+                if let Some(candidate) = ridge::Candidate::new(&ranked) {
+                    drifting.insert(*pair, candidate);
+                }
                 continue;
             };
             selected = hinted;
@@ -316,40 +320,39 @@ pub fn match_fingerprints(
         winning.insert(*pair, (selected.0, selected.1, runner_up));
     }
 
-    // Pass 2: anchors around the winning bucket, one per 40-frame bucket.
+    drop(votes);
+
+    // Only the last eligible right occurrence survives each anchor write.
+    // Its upper bound moves monotonically through the sorted right frames,
+    // so recovering anchors takes O(left.len() + right.len()) per clip pair.
     let mut anchors: HashMap<PairKey, HashMap<i64, Anchor>> = HashMap::new();
     for &(start, end) in &groups {
-        for i in start..end {
-            for j in (i + 1)..end {
-                let (first, second) = (records[i], records[j]);
-                if first.clip == second.clip {
-                    continue;
-                }
-                let (left, right) = if first.clip < second.clip {
-                    (first, second)
-                } else {
-                    (second, first)
-                };
-                let key = PairKey {
-                    left: left.clip,
-                    right: right.clip,
-                };
-                let Some(winner) = winning.get(&key) else {
-                    continue;
-                };
-                let delta = right.frame as i64 - left.frame as i64;
-                if (delta.div_euclid(BUCKET_WIDTH_FRAMES) - winner.0).abs() > 2 {
-                    continue;
-                }
-                anchors.entry(key).or_default().insert(
-                    left.frame as i64 / ANCHOR_BUCKET_FRAMES,
-                    Anchor {
-                        left: left.frame as f64 * SECONDS_PER_FRAME,
-                        right: right.frame as f64 * SECONDS_PER_FRAME,
-                    },
-                );
+        for_each_clip_pair(&records[start..end], |key, left, right| {
+            if let Some(candidate) = drifting.get_mut(&key) {
+                candidate.observe(left, right);
             }
-        }
+            let Some(winner) = winning.get(&key) else {
+                return;
+            };
+            let points = anchors.entry(key).or_default();
+            let mut upper = 0;
+            for l in left {
+                let low = l.frame as i64 + (winner.0 - 2) * BUCKET_WIDTH_FRAMES;
+                let high = l.frame as i64 + (winner.0 + 3) * BUCKET_WIDTH_FRAMES;
+                while upper < right.len() && (right[upper].frame as i64) < high {
+                    upper += 1;
+                }
+                if upper > 0 && right[upper - 1].frame as i64 >= low {
+                    points.insert(
+                        l.frame as i64 / ANCHOR_BUCKET_FRAMES,
+                        Anchor {
+                            left: l.frame as f64 * SECONDS_PER_FRAME,
+                            right: right[upper - 1].frame as f64 * SECONDS_PER_FRAME,
+                        },
+                    );
+                }
+            }
+        });
     }
     drop(records);
 
@@ -364,44 +367,16 @@ pub fn match_fingerprints(
             points.sort_by(|a, b| a.left.total_cmp(&b.left));
             let fit = robust_fit(&points)?;
             let margin = winner.1 as f64 / winner.2.max(1) as f64;
-            let expected_buckets =
-                1.0f64.max(fit.span / (ANCHOR_BUCKET_FRAMES as f64 * SECONDS_PER_FRAME));
-            let density = fit.inliers as f64 / expected_buckets;
-            let confidence = 0.25 * (fit.inliers as f64 / 100.0).min(1.0)
-                + 0.20 * (fit.span / 300.0).min(1.0)
-                + 0.25 * (density / 0.35).min(1.0)
-                + 0.20 * ((0.12 - fit.residual) / 0.10).clamp(0.0, 1.0)
-                + 0.10 * ((margin - 1.0) / 2.0).clamp(0.0, 1.0);
-            let rate = if fit.span >= policy::DRIFT_MIN_SPAN_SECONDS
-                && fit.inliers >= policy::DRIFT_MIN_ANCHORS
-            {
-                fit.rate
-            } else {
-                1.0
-            };
-            Some(PairwiseMatch {
-                left: clip_ids[key.left as usize].clone(),
-                right: clip_ids[key.right as usize].clone(),
-                rate,
-                offset: fit.offset,
-                confidence,
-                anchors: fit.inliers,
-                left_start_seconds: fit.start,
-                left_end_seconds: fit.end,
-                covered_seconds: fit.span,
-                residual_seconds: fit.residual,
-                alignment_points: fit
-                    .points
-                    .iter()
-                    .map(|p| PairAlignmentPoint {
-                        left: p.left,
-                        right: p.right,
-                    })
-                    .collect(),
-                evidence: MatchEvidence::Waveform,
-            })
+            Some(fitted_match(*key, fit, margin, &clip_ids))
         })
         .collect();
+    out.extend(drifting.into_iter().filter_map(|(key, candidate)| {
+        let (fit, margin) = candidate.fit()?;
+        Some(fitted_match(key, fit, margin, &clip_ids))
+    }));
+    // Drift can move allowed histogram buckets back to a rejected affine
+    // offset. Apply the user's constraint to the fitted result as well.
+    out.retain(|m| !SyncConstraint::rejects_alignment(constraints, &m.left, &m.right, m.offset));
     // Total order: deterministic regardless of hash-map iteration order.
     out.sort_by(|a, b| {
         b.confidence
@@ -410,6 +385,66 @@ pub fn match_fingerprints(
             .then_with(|| a.right.0.cmp(&b.right.0))
     });
     out
+}
+
+fn fitted_match(key: PairKey, fit: Fit, margin: f64, clip_ids: &[ClipId]) -> PairwiseMatch {
+    let expected_buckets = 1.0f64.max(fit.span / (ANCHOR_BUCKET_FRAMES as f64 * SECONDS_PER_FRAME));
+    let density = fit.inliers as f64 / expected_buckets;
+    let confidence = 0.25 * (fit.inliers as f64 / 100.0).min(1.0)
+        + 0.20 * (fit.span / 300.0).min(1.0)
+        + 0.25 * (density / 0.35).min(1.0)
+        + 0.20 * ((0.12 - fit.residual) / 0.10).clamp(0.0, 1.0)
+        + 0.10 * ((margin - 1.0) / 2.0).clamp(0.0, 1.0);
+    let rate =
+        if fit.span >= policy::DRIFT_MIN_SPAN_SECONDS && fit.inliers >= policy::DRIFT_MIN_ANCHORS {
+            fit.rate
+        } else {
+            1.0
+        };
+    PairwiseMatch {
+        left: clip_ids[key.left as usize].clone(),
+        right: clip_ids[key.right as usize].clone(),
+        rate,
+        offset: fit.offset,
+        confidence,
+        anchors: fit.inliers,
+        left_start_seconds: fit.start,
+        left_end_seconds: fit.end,
+        covered_seconds: fit.span,
+        residual_seconds: fit.residual,
+        alignment_points: fit
+            .points
+            .iter()
+            .map(|p| PairAlignmentPoint {
+                left: p.left,
+                right: p.right,
+            })
+            .collect(),
+        evidence: MatchEvidence::Waveform,
+    }
+}
+
+/// Visit distinct clip runs in a hash group, preserving frame order.
+fn for_each_clip_pair(records: &[Record], mut visit: impl FnMut(PairKey, &[Record], &[Record])) {
+    let mut remaining = records;
+    while let Some(first) = remaining.first() {
+        let end = remaining
+            .iter()
+            .position(|r| r.clip != first.clip)
+            .unwrap_or(remaining.len());
+        let (left, rest) = remaining.split_at(end);
+        for right in rest.chunk_by(|a, b| a.clip == b.clip) {
+            visit(
+                PairKey {
+                    left: first.clip,
+                    right: right[0].clip,
+                },
+                left,
+                right,
+            );
+        }
+        remaining = rest;
+    }
 }
 
 /// Nearest local-maximum peak to the trusted offset: within 2 buckets and at
@@ -598,6 +633,135 @@ mod tests {
         assert!(m.residual_seconds < 1e-9);
         assert!(approx(m.confidence, 0.63, 0.05), "conf={}", m.confidence);
         assert_eq!(m.evidence, MatchEvidence::Waveform);
+    }
+
+    #[test]
+    fn repeated_landmarks_keep_last_in_window_anchor_for_both_offset_signs() {
+        for delta in [-100i64, 100] {
+            let mut clips = vec![
+                ClipFingerprints {
+                    clip_id: id("a"),
+                    fingerprints: Vec::new(),
+                },
+                ClipFingerprints {
+                    clip_id: id("b"),
+                    fingerprints: Vec::new(),
+                },
+            ];
+            for k in 0..20u32 {
+                let frame = 1000 + k * 40;
+                let hash = k as u64;
+                for shift in [0, 1] {
+                    clips[0].fingerprints.push(Fingerprint {
+                        hash,
+                        frame: frame + shift,
+                    });
+                }
+                // The distant occurrence must not replace an in-window anchor.
+                for shift in [0, 1, 2, 800] {
+                    clips[1].fingerprints.push(Fingerprint {
+                        hash,
+                        frame: (frame as i64 + delta + shift) as u32,
+                    });
+                }
+            }
+            // Input order must not affect which occurrence survives.
+            for clip in &mut clips {
+                clip.fingerprints.reverse();
+            }
+            let matches = match_fingerprints(clips, None, &[]);
+            assert_eq!(matches.len(), 1);
+            let matched = &matches[0];
+            assert_eq!(matched.anchors, 20);
+            assert!(approx(matched.offset, (delta + 1) as f64 * 0.064, 1e-9));
+            for (k, point) in matched.alignment_points.iter().enumerate() {
+                let left = (1001 + k * 40) as f64 * 0.064;
+                assert!(approx(point.left, left, 1e-9));
+                assert!(approx(point.right, left + (delta + 1) as f64 * 0.064, 1e-9));
+            }
+        }
+    }
+
+    fn drift_pair(rate: f64, copies: usize) -> Vec<ClipFingerprints> {
+        let mut clips = vec![
+            ClipFingerprints {
+                clip_id: id("a"),
+                fingerprints: Vec::new(),
+            },
+            ClipFingerprints {
+                clip_id: id("b"),
+                fingerprints: Vec::new(),
+            },
+        ];
+        for k in 0..1200u32 {
+            let frame = 1000 + k * 40;
+            clips[0].fingerprints.push(Fingerprint {
+                hash: k as u64,
+                frame,
+            });
+            for copy in 0..copies {
+                clips[1].fingerprints.push(Fingerprint {
+                    hash: k as u64,
+                    frame: (frame as f64 * rate + 104.0 + copy as f64 * 800.0).round() as u32,
+                });
+            }
+        }
+        clips
+    }
+
+    #[test]
+    fn long_drift_ridge_recovers_both_clock_directions_but_not_repeated_takes() {
+        for rate in [0.999, 1.001] {
+            let clips = drift_pair(rate, 1);
+            let found = match_fingerprints(clips.clone(), None, &[]);
+            assert_eq!(found.len(), 1, "rate={rate}");
+            let m = &found[0];
+            assert!(approx(m.rate, rate, 0.000002), "{}", m.rate);
+            assert!(approx(m.offset, 104.0 * 0.064, 0.01), "{}", m.offset);
+            assert!(m.anchors >= 1000 && m.covered_seconds > 3000.0);
+            assert_eq!(found, match_fingerprints(clips.clone(), None, &[]));
+            let mut damaged = clips.clone();
+            damaged[1].fingerprints.retain(|p| p.hash % 3 != 0);
+            for p in &mut damaged[1].fingerprints {
+                p.frame += (p.hash % 3) as u32;
+            }
+            let recovered = match_fingerprints(damaged, None, &[]);
+            assert_eq!(recovered.len(), 1);
+            assert!(approx(recovered[0].rate, rate, 0.000002));
+
+            assert!(match_fingerprints(drift_pair(rate, 2), None, &[]).is_empty());
+            let mut partial_repeat = drift_pair(rate, 2);
+            partial_repeat[1].fingerprints = partial_repeat[1]
+                .fingerprints
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| i % 2 == 0 || i / 2 < 960)
+                .map(|(_, p)| *p)
+                .collect();
+            assert!(match_fingerprints(partial_repeat, None, &[]).is_empty());
+            for constraint in [
+                SyncConstraint::rejecting_pair(id("b"), id("a")),
+                SyncConstraint::rejecting_alignment(id("b"), id("a"), -104.0 * 0.064),
+            ] {
+                assert!(match_fingerprints(clips.clone(), None, &[constraint]).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn diffuse_offset_histogram_without_a_clock_line_is_rejected() {
+        for seed in 0..16u64 {
+            let mut random = seed + 1;
+            let mut clips = drift_pair(1.001, 1);
+            for p in &mut clips[1].fingerprints {
+                random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                p.frame = 1000 + p.hash as u32 * 40 + 104 + ((random >> 32) % 56) as u32;
+            }
+            assert!(
+                match_fingerprints(clips, None, &[]).is_empty(),
+                "seed={seed}"
+            );
+        }
     }
 
     #[test]

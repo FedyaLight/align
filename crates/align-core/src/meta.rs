@@ -1,15 +1,8 @@
-//! Embedded-metadata readers: Broadcast Wave (BWF/RF64/BW64 `bext` + `link`
-//! file-sets + `iXML` SPEED), Sony XAVC `NonRealTimeMeta` tail XML, and
-//! `HH:MM:SS:FF` timecode strings. Port of `BWFMetadataReader.swift` and the file-IO half
-//! of `SourceTimecodeReader.swift` (the AVAsset timecode track lives in the
-//! Apple backend; ffprobe tags are parsed in `align-decode`).
+//! Embedded metadata: Broadcast Wave `bext`, linked file sets, iXML SPEED,
+//! Sony NonRealTimeMeta XML, and timecode labels.
 //!
-//! Pure file IO + ordinarily no allocation past a few KB — shared by both
-//! engines. Deliberate deviation: bext dates resolve in UTC, not the device
-//! local zone (Swift uses `.current`). Only *differences* of embedded
-//! timestamps ever steer matching (16 h gate, timecode hints), so behaviour
-//! is identical on any single machine while absolute dates stay
-//! zone-unambiguous.
+//! BWF dates resolve in UTC so recording timestamps do not depend on the
+//! machine's time zone. Container timecode tracks are read by `align-decode`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -38,7 +31,7 @@ pub struct BwfMetadata {
 
 impl BwfMetadata {
     /// Audio timecode with explicit deterministic priority, identical on
-    /// both backends (see outputs/TIMECODE-RESEARCH.md §6):
+    /// both backends:
     /// 1. bext TimeReference + fmt rate (elapsed; EBU data wins over iXML
     ///    copies), display from iXML RATE/FLAG when present, else 25 NDF;
     /// 2. iXML TIMESTAMP copy when bext is absent;
@@ -90,7 +83,7 @@ pub struct IxmlSpeed {
 
 /// Parse RIFF/RF64/BW64 headers + `ds64`/`bext`/`fmt `/`link`/`iXML`
 /// chunks in a single pass. Returns `None` for non-WAVE files (12-byte
-/// sniff, like Swift).
+/// signature check).
 pub fn read_bwf(path: &Path) -> Option<BwfMetadata> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).ok()?;
@@ -184,7 +177,7 @@ pub fn read_bwf(path: &Path) -> Option<BwfMetadata> {
 
 fn ascii(buf: &[u8], at: usize, count: usize) -> Option<String> {
     let slice = buf.get(at..at.checked_add(count)?)?;
-    // Swift trims control characters (NUL padding included).
+    // Trim control characters, including NUL padding.
     let text: String = slice
         .iter()
         .take_while(|b| **b != 0)
@@ -195,7 +188,7 @@ fn ascii(buf: &[u8], at: usize, count: usize) -> Option<String> {
     if text.is_empty() {
         return None;
     }
-    // Must be ASCII-decodable like Swift's `.ascii`; reject garbage.
+    // Reject non-ASCII bytes in this fixed-format field.
     if text.bytes().any(|b| b >= 0x80) {
         return None;
     }
@@ -281,7 +274,7 @@ fn make_bwf_timecode(
 }
 
 /// EBU Tech 3285 Supplement 4 `link` chunk: file-set identity + this file's
-/// part number. Strict like Swift: ≥2 files, dense 1..=n numbering, exactly
+/// part number. Requires ≥2 files, dense 1..=n numbering, and exactly
 /// one `actual` matching this filename (case-insensitive), else None.
 fn parse_media_span(data: &[u8], actual_filename: &str) -> Option<MediaSpan> {
     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
@@ -381,8 +374,7 @@ fn parse_media_span(data: &[u8], actual_filename: &str) -> Option<MediaSpan> {
     if files.len() < 2 {
         return None;
     }
-    // Entries without a positive number or filename are dropped, like
-    // Swift's `compactMap` (rather than failing the whole set).
+    // Drop entries without a positive number or filename.
     files.retain(|f| {
         f.number.is_some_and(|n| n > 0) && f.name.as_deref().is_some_and(|n| !n.is_empty())
     });
@@ -569,9 +561,7 @@ fn parse_ixml_rate(text: &str) -> Option<MediaTime> {
 
 // ------------------------------------------------------------ Sony tail
 
-/// Last-1MB tail Belfry: Sony XAVC embeds `NonRealTimeMeta` XML at the file
-/// end (also inside MXF/MP4). Returns the XML substring, mirroring Swift's
-/// `readTail` + `sonyDocument` slice.
+/// Extract Sony NonRealTimeMeta XML from the last MiB of an MXF/MP4 file.
 pub fn read_sony_tail(path: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).ok()?;

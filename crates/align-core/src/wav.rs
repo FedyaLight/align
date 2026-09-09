@@ -1,12 +1,11 @@
-//! WAV broadcast-extension surgery. Port of `WAVMetadataPreserver.swift`
-//! (pure file IO, shared by drift render and stem extraction).
+//! Broadcast Wave metadata preservation for corrected audio and stems.
 //!
 //! After rendering, the source file's `bext` is transplanted into the
 //! render: fixed 602-byte prefix preserved, `TimeReference` shifted by the
 //! trim offset, and a `T=Align <operation>` line appended to CodingHistory
 //! (CRLF-normalized). Peak caches, cues and unknown device chunks are
 //! deliberately NOT copied (they describe stretched-away samples).
-//! Files without `bext` pass through untouched, like Swift.
+//! Files without `bext` pass through untouched.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;

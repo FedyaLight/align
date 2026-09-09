@@ -1,9 +1,4 @@
-//! GPUI views: faithful layout port of the SwiftUI app.
-//!
-//! Structure mirrors `ContentView`: top actions, main content (drop zone →
-//! source list → timeline preview), warning banner, bottom status/zoom bar,
-//! the export sidebar, and modal alerts and settings.
-//! Interactive elements carry `.id()` and dispatch via `cx.listener`.
+//! Desktop views, controls, and background-job integration.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -424,7 +419,7 @@ mod motion_tests {
             middle_ellipsis("/projects/client/episode/final-deliverables", 21),
             "/projects/…liverables"
         );
-        assert_eq!(middle_ellipsis("короткий", 21), "короткий");
+        assert_eq!(middle_ellipsis("brief", 21), "brief");
     }
 
     #[test]
@@ -963,7 +958,11 @@ impl AlignApp {
     }
 
     fn apply_sync_msg(&mut self, msg: SyncMsg) {
-        let before = timeline_poses(&self.data);
+        let changes_layout = match &msg {
+            SyncMsg::Progress(event) => event.discovered.is_some() || event.preview.is_some(),
+            _ => true,
+        };
+        let before = changes_layout.then(|| timeline_poses(&self.data));
         match msg {
             SyncMsg::SequenceStart {
                 sequence_index,
@@ -977,11 +976,9 @@ impl AlignApp {
                 );
                 self.data.progress = sequence_index as f32 / sequence_count as f32;
             }
-            SyncMsg::Progress(event) => {
-                if let Some((clip_id, waveform)) = event.waveform.as_ref() {
-                    self.data
-                        .waveform_previews
-                        .insert(clip_id.clone(), waveform.clone());
+            SyncMsg::Progress(mut event) => {
+                if let Some((clip_id, waveform)) = event.waveform.take() {
+                    self.data.waveform_previews.insert(clip_id, waveform);
                 }
                 let phase_name = match event.phase {
                     Phase::Inspect => "inspect",
@@ -1028,7 +1025,9 @@ impl AlignApp {
                 }
             },
         }
-        self.record_timeline_layout_change(before);
+        if let Some(before) = before {
+            self.record_timeline_layout_change(before);
+        }
     }
 
     pub(crate) fn start_export_sheet(&mut self, cx: &mut Context<Self>) {
@@ -2147,8 +2146,7 @@ fn waveform_columns(waveform: &[f32], width: f32) -> (Vec<f32>, f32) {
 impl Render for AlignApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::current(window.appearance());
-        // Viewport-mapped Fit width (mirrors Swift's GeometryReader:
-        // viewport minus label column and content padding).
+        // Fit width excludes the label column and content padding.
         let fit_width =
             (f32::from(window.viewport_size().width) - super::lane::LABEL_WIDTH - 16.0).max(100.0);
         // While a modal or context menu is open the content below keeps
@@ -3140,9 +3138,8 @@ fn timeline_lanes(
                         .child(format!("{kind_glyph}{}", lane.number)),
                 ),
         );
-        // Track area: fixed-size cell; bars are absolutely positioned
-        // (mirrors Swift's ZStack + offset), so placement is exact and
-        // min-width bars can never shift their neighbours.
+        // Absolute placement prevents minimum-width bars from shifting
+        // their neighbors.
         {
             let mut track = div()
                 .relative()
@@ -3172,7 +3169,7 @@ fn timeline_lanes(
                 };
                 let ink = 0xFFFFFF;
                 let clip_id = bar.clip_id.clone();
-                // Corner radius min(4, w/2) like Swift; square slivers.
+                // Keep narrow slivers square; cap other corner radii at 4 px.
                 let mut el = div()
                     .id(SharedString::from(format!("bar-{}", bar.clip_id.0)))
                     .absolute()
@@ -4946,7 +4943,7 @@ fn clip_order_section(
     panel
 }
 
-/// Track-level time source (Syncaila Time source): which timestamp
+/// Track-level time source: which timestamp
 /// evidence this track's clips may use. Compact radio rows; when the
 /// selected evidence is missing on every clip the header says so and the
 /// engine falls back to stable order without guessing.

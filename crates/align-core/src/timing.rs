@@ -1,16 +1,13 @@
-//! Video timing classification. Port of the pure half of
-//! `VideoTimingInspector.swift` (the `AVSampleCursor` walk lives in the
-//! Apple backend, the packet walk in the portable backend; both feed
-//! [`classify`]).
+//! Video timing classification shared by both media backends.
 //!
-//! A track is variable iff sample durations *or* presentation deltas spread
-//! beyond max(10 µs, 0.5 % of min) over ≥ 2 observations — identical to
-//! Swift's `RangeAccumulator`. `canonical_frame_duration` snaps a nominal
-//! rate to broadcast standards within 0.1 %, else falls back.
+//! Sample durations or presentation deltas varying beyond max(10 µs, 0.5%
+//! of the minimum) over at least two observations indicate variable timing.
+//! Nominal frame rates within 0.1% of a broadcast rate use its canonical
+//! rational duration.
 
 use crate::model::{MediaTime, VideoFrameRateMode};
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VideoTimingInspection {
     pub frame_duration: Option<MediaTime>,
     pub mode: VideoFrameRateMode,
@@ -95,8 +92,7 @@ pub fn canonical_frame_duration(
             }
         }
         if let Some((err, duration)) = best {
-            // Nearest standard within 0.1 % of itself (ties → first listed,
-            // mirroring Swift's strict-`<` min).
+            // Nearest standard within 0.1%; ties select the first listed rate.
             let fps = duration.timescale as f64 / duration.value as f64;
             if err / fps < 0.001 {
                 return Some(duration);

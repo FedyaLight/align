@@ -1,19 +1,9 @@
-//! Render engine: drift-corrected sidecars + precision channel stems.
-//! Port of `AudioDriftCorrector.swift` + `AudioChannelRenderer.swift`
-//! (the BWF transplant is shared `align_core::wav`).
+//! Streaming drift correction, channel stems, and placement padding.
 //!
-//! Time-stretch method (deliberate, documented): per-segment near-unity
-//! sinc resampling (rubato) instead of AVFoundation's spectral
-//! `audioTimePitchAlgorithm` composition. For clock-drift ratios
-//! (≤ ~0.5 %, typically ppm-level) a high-quality sinc at the exact
-//! segment ratio is transparent and bit-deterministic across OSes; a phase
-//! vocoder would add platform-dependent FFT artifacts for zero audible
-//! benefit at these ratios. Segments abut directly (no crossfade), like
-//! Swift's scaled composition ranges.
-//!
-//! Streaming: the source decodes ONCE at native rate; blocks route into
-//! the current segment by source position. Full files are never resident
-//! (blocks are packet-sized; resampler scratch is per-segment).
+//! The source is decoded once at native rate. Per-segment resampling maps
+//! source ranges to their validated timeline durations; adjacent segments
+//! meet without a crossfade. Buffers are bounded by decode blocks and
+//! resampler scratch. Broadcast Wave metadata is handled by `align_core::wav`.
 
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
@@ -93,6 +83,7 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), RenderError> {
 struct WavWriter {
     file: std::fs::File,
     frames_written: u64,
+    bytes: Vec<u8>,
 }
 
 impl WavWriter {
@@ -129,52 +120,41 @@ impl WavWriter {
         Ok(Self {
             file,
             frames_written: 0,
+            bytes: Vec::new(),
         })
     }
 
-    fn write_f32(&mut self, channels: usize, planes: &[Vec<f32>]) -> Result<(), RenderError> {
-        let n = planes.first().map_or(0, Vec::len);
-        let mut bytes = Vec::with_capacity(n * channels * 4);
-        let mut iters: Vec<std::slice::Iter<'_, f32>> =
-            planes.iter().take(channels).map(|p| p.iter()).collect();
-        if iters.len() != channels {
+    fn write_pcm<T: Copy>(
+        &mut self,
+        channels: usize,
+        planes: &[impl AsRef<[T]>],
+        encode: fn(T) -> [u8; 4],
+    ) -> Result<(), RenderError> {
+        let n = planes.first().map_or(0, |p| p.as_ref().len());
+        if planes.len() < channels || planes.iter().take(channels).any(|p| p.as_ref().len() < n) {
             return Err(RenderError::CannotRead);
         }
-        for _ in 0..n {
-            for it in &mut iters {
-                match it.next() {
-                    Some(v) => bytes.extend_from_slice(&v.to_le_bytes()),
-                    None => return Err(RenderError::CannotRead),
-                }
+        self.bytes.clear();
+        self.bytes.reserve(n * channels * 4);
+        for i in 0..n {
+            for plane in planes.iter().take(channels) {
+                self.bytes.extend_from_slice(&encode(plane.as_ref()[i]));
             }
         }
-        self.file
-            .write_all(&bytes)
-            .map_err(|_| RenderError::CannotWrite)?;
-        self.frames_written += n as u64;
-        Ok(())
+        self.flush_frames(n)
     }
 
-    fn write_i32(&mut self, channels: usize, planes: &[Vec<i32>]) -> Result<(), RenderError> {
-        let n = planes.first().map_or(0, Vec::len);
-        let mut bytes = Vec::with_capacity(n * channels * 4);
-        let mut iters: Vec<std::slice::Iter<'_, i32>> =
-            planes.iter().take(channels).map(|p| p.iter()).collect();
-        if iters.len() != channels {
-            return Err(RenderError::CannotRead);
-        }
-        for _ in 0..n {
-            for it in &mut iters {
-                match it.next() {
-                    Some(v) => bytes.extend_from_slice(&v.to_le_bytes()),
-                    None => return Err(RenderError::CannotRead),
-                }
-            }
-        }
+    fn write_silence(&mut self, channels: usize, frames: usize) -> Result<(), RenderError> {
+        self.bytes.clear();
+        self.bytes.resize(frames * channels * 4, 0);
+        self.flush_frames(frames)
+    }
+
+    fn flush_frames(&mut self, frames: usize) -> Result<(), RenderError> {
         self.file
-            .write_all(&bytes)
+            .write_all(&self.bytes)
             .map_err(|_| RenderError::CannotWrite)?;
-        self.frames_written += n as u64;
+        self.frames_written += frames as u64;
         Ok(())
     }
 
@@ -432,13 +412,13 @@ pub fn render_drift_cancellable(
                         check_cancel(cancel).map_err(decode_render_error)?;
                         let out = segment.push(block.frames).map_err(decode_render_error)?;
                         writer
-                            .write_f32(channels, &out)
+                            .write_pcm(channels, &out, f32::to_le_bytes)
                             .map_err(decode_render_error)
                     },
                 )
                 .map_err(RenderError::from)?;
             let tail = segment.finish(cancel)?;
-            writer.write_f32(channels, &tail)?;
+            writer.write_pcm(channels, &tail, f32::to_le_bytes)?;
         }
         check_cancel(cancel)?;
         writer.finalize()?;
@@ -542,7 +522,7 @@ pub fn render_pad_cancellable(
         while silence > 0 {
             check_cancel(cancel)?;
             let n = silence.min(4096) as usize;
-            writer.write_f32(channels, &vec![vec![0.0; n]; channels])?;
+            writer.write_silence(channels, n)?;
             silence -= n as u64;
         }
         let range = selection.map(|(start, end)| {
@@ -557,10 +537,9 @@ pub fn render_pad_cancellable(
                 check_cancel(cancel).map_err(decode_render_error)?;
                 let available = block.frames.first().map_or(0, Vec::len);
                 let take = remaining.map_or(available, |n| n.min(available as u64) as usize);
-                let selected: Vec<Vec<f32>> =
-                    block.frames.iter().map(|ch| ch[..take].to_vec()).collect();
+                let selected: Vec<&[f32]> = block.frames.iter().map(|ch| &ch[..take]).collect();
                 writer
-                    .write_f32(channels, &selected)
+                    .write_pcm(channels, &selected, f32::to_le_bytes)
                     .map_err(decode_render_error)?;
                 if let Some(ref mut n) = remaining {
                     *n -= take as u64;
@@ -608,8 +587,8 @@ pub fn render_pad_cancellable(
 // ------------------------------------------------------------ channel stem
 
 /// Sample-exact mono stem extraction (precision audio for Resolve).
-/// int32 iff the source is 32-bit integer (mirrors Swift's commonFormat
-/// selection); otherwise 32-bit float. BWF TimeReference shifts by the
+/// Uses int32 for 32-bit integer sources, otherwise float32. BWF
+/// TimeReference shifts by the
 /// trim offset, CodingHistory gains a channel-extraction line.
 #[allow(clippy::too_many_arguments)]
 pub fn render_channel(
@@ -698,7 +677,7 @@ pub fn render_channel_cancellable(
         let mut writer = WavWriter::create(&tmp, sample_rate as u32, 1, int32)?;
         let mut remaining = take_frames;
         if int32 {
-            let actual = backend
+            backend
                 .decode_native_i32(
                     source,
                     0,
@@ -709,21 +688,17 @@ pub fn render_channel_cancellable(
                             return Ok(());
                         }
                         let got = block.frames[channel].len() as i64;
-                        // Skip seek-quantum lead-in precisely.
-                        let lead = 0; // actual-start accounting below
-                        let _ = lead;
                         let take = got.min(remaining) as usize;
                         writer
-                            .write_i32(1, &[block.frames[channel][..take].to_vec()])
+                            .write_pcm(1, &[&block.frames[channel][..take]], i32::to_le_bytes)
                             .map_err(decode_render_error)?;
                         remaining -= take as i64;
                         Ok(())
                     },
                 )
                 .map_err(RenderError::from)?;
-            let _ = actual;
         } else {
-            let actual = backend
+            backend
                 .decode_native(
                     source,
                     0,
@@ -736,14 +711,13 @@ pub fn render_channel_cancellable(
                         let got = block.frames[channel].len() as i64;
                         let take = got.min(remaining) as usize;
                         writer
-                            .write_f32(1, &[block.frames[channel][..take].to_vec()])
+                            .write_pcm(1, &[&block.frames[channel][..take]], f32::to_le_bytes)
                             .map_err(decode_render_error)?;
                         remaining -= take as i64;
                         Ok(())
                     },
                 )
                 .map_err(RenderError::from)?;
-            let _ = actual;
         }
         if remaining > 0 {
             return Err(RenderError::CannotRead);
@@ -752,11 +726,7 @@ pub fn render_channel_cancellable(
         while tail_remaining > 0 {
             check_cancel(cancel)?;
             let n = tail_remaining.min(4096) as usize;
-            if int32 {
-                writer.write_i32(1, &[vec![0; n]])?;
-            } else {
-                writer.write_f32(1, &[vec![0.0; n]])?;
-            }
+            writer.write_silence(1, n)?;
             tail_remaining -= n as u64;
         }
         check_cancel(cancel)?;
@@ -827,6 +797,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn wav_writer_preserves_pcm_bits_and_rejects_short_planes() {
+        let dir = tmp("pcm-bits");
+        for int32 in [false, true] {
+            let path = dir.join(if int32 { "int.wav" } else { "float.wav" });
+            let mut writer = WavWriter::create(&path, 48000, 2, int32).unwrap();
+            let expected = if int32 {
+                let left = [i32::MIN, 0, i32::MAX];
+                let right = [1, -1, 123456789];
+                writer
+                    .write_pcm(2, &[&left[..], &right[..1]], i32::to_le_bytes)
+                    .unwrap_err();
+                writer
+                    .write_pcm(2, &[left, right], i32::to_le_bytes)
+                    .unwrap();
+                left.into_iter()
+                    .zip(right)
+                    .flat_map(|(l, r)| [l, r])
+                    .flat_map(i32::to_le_bytes)
+                    .collect::<Vec<_>>()
+            } else {
+                let left = [-0.0f32, f32::from_bits(0x7fc01234), 1.0];
+                let right = [f32::INFINITY, -1.0, f32::MIN_POSITIVE];
+                writer
+                    .write_pcm(2, &[&left[..], &right[..1]], f32::to_le_bytes)
+                    .unwrap_err();
+                writer
+                    .write_pcm(2, &[left, right], f32::to_le_bytes)
+                    .unwrap();
+                left.into_iter()
+                    .zip(right)
+                    .flat_map(|(l, r)| [l, r])
+                    .flat_map(f32::to_le_bytes)
+                    .collect::<Vec<_>>()
+            };
+            let capacity = writer.bytes.capacity();
+            writer.write_silence(2, 2).unwrap();
+            assert_eq!(writer.bytes.capacity(), capacity);
+            assert_eq!(writer.frames_written, 5);
+            writer.finalize().unwrap();
+            let bytes = std::fs::read(path).unwrap();
+            assert_eq!(&bytes[80..104], expected);
+            assert_eq!(&bytes[104..], &[0; 16]);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

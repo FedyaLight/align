@@ -1,7 +1,7 @@
 //! Application theme: light and dark palettes following the system
 //! appearance (`Window::appearance()`, re-rendered automatically on change).
 //! Signal colors (matched/unmatched/pending bars) stay identical in both
-//! modes, like SwiftUI's semantic green/orange/blue; chrome adapts.
+//! modes; window chrome adapts to the selected appearance.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};

@@ -1,16 +1,8 @@
-//! align-core: portable sync engine. No Apple frameworks.
+//! Portable synchronization algorithms and data types.
 //!
-//! Port map (Swift -> Rust):
-//! - Model.swift -> `model`
-//! - Fingerprint.swift (Accelerate) -> `fingerprint` (realfft)
-//! - GCCPHAT.swift (Accelerate) -> `gccphat` (rustfft)
-//! - FingerprintCache.swift (CryptoKit+plist) -> `cache` (BLAKE3+bincode)
-//! - FingerprintMatcher.swift -> `matcher` (identical thresholds)
-//! - MatchGraph.swift -> `graph` (identical IRLS solve)
-//! - PiecewiseTimeMapping.swift -> `piecewise`
-//! - TimelineTrackAllocator.swift -> `allocator`
-//! - FineMatcher / drift policy -> `fine` / `drift`
-//! - Timeline import/export -> `xml` / `export`
+//! Media decoding and platform APIs live in `align-decode`. This crate owns
+//! fingerprints, pairwise matching, graph solving, time mappings, timeline
+//! assembly, interchange writers, and the analysis cache.
 
 pub mod allocator;
 pub mod cache;

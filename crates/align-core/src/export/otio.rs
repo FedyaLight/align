@@ -1,11 +1,11 @@
-//! Resolve OTIO writer. Port of `ResolveOTIOWriter.swift`.
+//! OpenTimelineIO output for Resolve.
 //!
 //! Frame-quantized portable timeline (the sample-accurate path is the
 //! sibling precision importer script): video tracks with camera A/V link
 //! groups, per-channel mono audio tracks, gaps, portable Cross Dissolves
 //! as `SMPTE_Dissolve`, and `LinearTimeWarp` for constant retimes
 //! (negative scalar for reverse). Serialized pretty-printed with sorted
-//! keys, slashes unescaped — like Swift's `JSONSerialization` options.
+//! keys and unescaped slashes.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -298,7 +298,7 @@ fn gap(duration: f64, rate: f64) -> Value {
 }
 
 /// Portable dissolve between consecutive entries (video `transitionAfter`
-/// field, like Swift's shared track builder).
+/// field).
 fn transition_between<'a>(left: &'a Entry, right: &'a Entry) -> Option<&'a ExportTransition> {
     let t = left.item.transition_after.as_ref()?;
     if t.is_otio_portable && t.right_instance_id == right.item.instance_id {
@@ -371,8 +371,7 @@ fn media_start(item: &ExportItem, kind: &str) -> f64 {
             == Some(crate::model::RecordingTimestampSource::EmbeddedMetadata)
     {
         if let Some(date) = item.clip.recorded_at {
-            // Seconds since UTC midnight (Swift uses local startOfDay;
-            // consistent per machine either way — see module docs).
+            // Seconds since UTC midnight.
             return (date % 86_400) as f64;
         }
     }
@@ -380,7 +379,7 @@ fn media_start(item: &ExportItem, kind: &str) -> f64 {
 }
 
 fn tracks<'a>(entries: Vec<Entry<'a>>, kind: &str) -> Vec<Vec<Entry<'a>>> {
-    // Forced single-source dissolve tracks (video only), like Swift.
+    // Keep a source's video dissolve on one track.
     let mut forced: Vec<Vec<Entry>> = Vec::new();
     let mut allocatable: Vec<Entry> = Vec::new();
     if kind == "Video" {

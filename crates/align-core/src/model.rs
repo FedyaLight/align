@@ -1,6 +1,6 @@
-//! Align core: pure portable logic. No AVFoundation / CoreMedia / Accelerate.
-//! Maps 1:1 to Sources/AlignCore Model.swift field names (serde renames keep
-//! CLI `export-json` byte-compatible with the Swift implementation).
+//! Shared media, synchronization, and timeline data types.
+//!
+//! Serialized field names are part of the saved-result and CLI JSON contracts.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -25,7 +25,7 @@ impl std::fmt::Display for ClipId {
 
 // ---------------------------------------------------------------- Media time
 
-/// Rational media timestamp. Mirrors Swift `MediaTime(value:timescale:)`.
+/// Rational media timestamp: value divided by timescale.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MediaTime {
     pub value: i64,
@@ -45,8 +45,7 @@ impl MediaTime {
         }
     }
 
-    /// Microseconds constructor (mirrors Swift `.microseconds(Double)`,
-    /// which takes *seconds* — the name is the precision, not the unit).
+    /// Construct from seconds, rounded to microsecond precision.
     pub fn microseconds(value: f64) -> Self {
         Self {
             value: (value * 1_000_000.0).round() as i64,
@@ -355,16 +354,14 @@ impl SourceTimecode {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Clip {
-    /// Swift JSON key is `id` (via Identifiable); keep it.
     pub id: ClipId,
-    /// Serialized as string path (Swift used URL). Keeps JSON readable and
-    /// portable across macOS / Windows / Linux.
+    /// Filesystem path serialized as a JSON string.
     pub url: PathBuf,
     pub kind: MediaKind,
     pub duration: MediaTime,
     pub audio: Vec<AudioSummary>,
     pub video: Option<VideoSummary>,
-    /// Unix seconds. `None` = unknown (Swift `Date?`).
+    /// Unix seconds; `None` means unknown.
     pub recorded_at: Option<i64>,
     pub recorded_at_source: Option<RecordingTimestampSource>,
     pub source_identifier: Option<String>,
@@ -424,7 +421,7 @@ pub enum TimelineTransitionKind {
 pub struct TimelineEdit {
     pub id: String,
     pub name: Option<String>,
-    /// Swift key is `clipID`.
+    /// Serialized as `clipID` for saved-result compatibility.
     #[serde(rename = "clipID")]
     pub clip_id: ClipId,
     pub media_type: MediaKind,
@@ -750,20 +747,19 @@ impl AudioAnalysisSource {
     }
 }
 
-/// Which timestamp evidence a source's clips may use (mirrors Syncaila's
-/// Time source: Auto / File timestamp as REC START / REC STOP / Timecode).
+/// Timestamp evidence permitted for clips from a source.
 /// Orthogonal to [`AudioAnalysisSource`] (wave source): this never selects
 /// audio, only which instants may hint competing waveform peaks and order
-/// islands/unmatched clips. It never creates a match without audio
-/// evidence and never overrides a confident waveform edge.
+/// islands/unmatched clips. Valid timecode can also support temporal
+/// matches; it does not override a confident waveform edge.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TemporalMode {
     /// Automatically use the available file timestamp as recording start
-    /// and timecode, matching Syncaila's default time-source policy.
+    /// and timecode.
     #[default]
     Auto,
-    /// The clip's timestamp (metadata or file date, like Syncaila) is the
+    /// The clip's timestamp (metadata or file date) is the
     /// recording start.
     RecStart,
     /// The clip's timestamp is the recording end: start = stamp − duration.
@@ -809,11 +805,9 @@ impl TemporalMode {
     }
 }
 
-/// Per-source temporal overrides with a session default. Sparse like
-/// `audio_sources`: absent = default. Carried through
-/// [`PipelineOptions`]-equivalent
-/// inputs into [`SyncResult`] so export and lane layout resolve the same
-/// instants without re-threading parameters.
+/// Per-source temporal overrides with a session default.
+/// Missing overrides use the default. Saved in [`SyncResult`] so export
+/// and lane layout use the same timestamp policy.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TemporalPolicy {
@@ -834,7 +828,7 @@ impl TemporalPolicy {
     }
 }
 
-/// Adaptive mono selection ported from `AudioDecoder.consumeAdaptiveMono`:
+/// Adaptive mono selection:
 /// picks the loudest channel per block, keeps the previous channel while it
 /// stays within 90% of the loudest (hysteresis). This is what keeps
 /// opposite-phase stereo from cancelling out.
@@ -854,10 +848,7 @@ pub fn select_mono_channel(energies: &[f64], previous: Option<usize>) -> usize {
 
 // ------------------------------------------------------------- constraints
 
-/// Manual corrections from the timeline UI (right-click Reject / Find
-/// Another). Port of Swift `SyncConstraint` (deliberately NOT serialized:
-/// Swift constrains it to `Hashable + Sendable`, corrections live only in
-/// the session like in `AppModel.constraints`).
+/// Session-only matching constraints from the timeline UI. Not serialized.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ConstraintKind {
     RejectedPair,
@@ -1120,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn constraints_mirror_swift_semantics() {
+    fn constraints_apply_to_unordered_pairs() {
         let a = ClipId::new("a");
         let b = ClipId::new("b");
         let c = ClipId::new("c");

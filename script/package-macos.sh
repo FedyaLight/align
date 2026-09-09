@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Packages the Rust Align port for macOS (arm64): Align.app bundle +
+# Packages Align for macOS (arm64): Align.app bundle +
 # align-cli, align-mcp, AAF and FFmpeg sidecars, ad-hoc signed.
 # Usage: ./script/package-macos.sh [output-dir]   (default: ~/Downloads/Align-macOS)
 set -euo pipefail
@@ -11,6 +11,13 @@ BUNDLE_ID="com.align.app"
 # Default sidecars support portable decoding and AAF picture metadata.
 BUNDLE_FFMPEG="${BUNDLE_FFMPEG:-1}"
 FFMPEG_DIR="${FFMPEG_DIR:-}"
+ALIGN_SKIP_LAUNCH_CHECK="${ALIGN_SKIP_LAUNCH_CHECK:-0}"
+
+if [[ -e "$OUT_DIR" || -L "$OUT_DIR" ]]; then
+  echo "Package destination already exists: $OUT_DIR" >&2
+  echo "Choose a new output directory." >&2
+  exit 1
+fi
 
 # Build the self-contained AAF module before touching an existing package.
 AAF_BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/align-aaf-package.XXXXXX")"
@@ -41,18 +48,22 @@ APP_MACOS="$APP_CONTENTS/MacOS"
 RESOURCES="$APP_CONTENTS/Resources"
 
 echo "==> staging $OUT_DIR"
-rm -rf "$OUT_DIR"
+mkdir -p "$(dirname "$OUT_DIR")"
+mkdir "$OUT_DIR"
 mkdir -p "$APP_MACOS" "$RESOURCES"
 
 cp "$BIN_DIR/align" "$APP_MACOS/$APP_NAME"
 chmod +x "$APP_MACOS/$APP_NAME"
-cp "$ROOT_DIR/Support/AppIcon.icns" "$RESOURCES/AppIcon.icns" 2>/dev/null || true
+cp "$ROOT_DIR/Support/AppIcon.icns" "$RESOURCES/AppIcon.icns"
+cp "$ROOT_DIR/Support/PrivacyInfo.xcprivacy" "$RESOURCES/PrivacyInfo.xcprivacy"
 cp "$ROOT_DIR/THIRD_PARTY_NOTICES.txt" "$RESOURCES/THIRD_PARTY_NOTICES.txt"
+cp "$ROOT_DIR/LICENSE" "$RESOURCES/LICENSE"
 cp "$BIN_DIR/align-cli" "$OUT_DIR/align-cli"
 cp "$BIN_DIR/align-cli" "$APP_MACOS/align-cli"
 cp "$BIN_DIR/align-mcp" "$OUT_DIR/align-mcp"
 cp "$BIN_DIR/align-mcp" "$APP_MACOS/align-mcp"
 cp "$ROOT_DIR/THIRD_PARTY_NOTICES.txt" "$OUT_DIR/THIRD_PARTY_NOTICES.txt"
+cp "$ROOT_DIR/LICENSE" "$OUT_DIR/LICENSE"
 chmod +x "$OUT_DIR/align-cli" "$APP_MACOS/align-cli" "$OUT_DIR/align-mcp" "$APP_MACOS/align-mcp"
 cp "$AAF_BUILD_DIR/dist/align-aaf" "$APP_MACOS/align-aaf"
 cp "$AAF_BUILD_DIR/dist/align-aaf" "$OUT_DIR/align-aaf"
@@ -102,16 +113,17 @@ cat >"$APP_CONTENTS/Info.plist" <<PLIST
 PLIST
 
 cat >"$OUT_DIR/README.txt" <<README
-Align – кроссплатформенный синхронизатор медиа (Rust + GPUI)
+Align — audio synchronization for video editing
 
-  Align.app            — графическое приложение (двойной клик)
+  Align.app            — desktop application
   align-cli            — batch CLI: sync / export / export-json
   align-mcp            — MCP server for AI agents (stdio)
-  align-aaf            — автономный модуль AAF (Python пользователю не нужен)
-  THIRD_PARTY_NOTICES.txt — лицензии сторонних компонентов
-$([ "$BUNDLE_FFMPEG" == "1" ] && echo "  ffmpeg, ffprobe      — bundled sidecars для видеоконтейнеров
-                         (находятся автоматически рядом с бинарниками)" || echo "  (без bundled ffmpeg: на macOS используется Apple backend;
-   для portable-движка нужен системный ffmpeg/ffprobe в PATH)")
+  align-aaf            — self-contained AAF module (no Python installation needed)
+  LICENSE              — Align license
+  THIRD_PARTY_NOTICES.txt — third-party license notices
+$([ "$BUNDLE_FFMPEG" == "1" ] && echo "  ffmpeg, ffprobe      — bundled media tools
+                         (discovered beside the executables)" || echo "  (FFmpeg omitted: macOS uses the Apple backend;
+   portable decoding requires ffmpeg/ffprobe on PATH)")
 
 CLI:
   ./align-cli sync /path/to/media > result.json
@@ -119,27 +131,35 @@ CLI:
   ./align-cli export-json result.json /path/to/output
 
 AI AGENTS:
-  Open Align → Align → Use with AI Agents… and copy the MCP configuration
+  Open Align → Use with AI Agents… and copy the MCP configuration
   and ready-to-use prompt.
 
-Требования: macOS 15+ (Apple backend дергает loadTracks API 15+), Apple Silicon.
-Подпись ad-hoc (локальный запуск). Для распространения нужны
-Developer ID + notarization.
+Requirements: macOS 15 or later, Apple Silicon.
+Ad-hoc signed for local use. Distribution signing and notarization are not included.
 README
 
 echo "==> ad-hoc sign + verify"
 codesign --force --deep --sign - "$APP_BUNDLE" >/dev/null
 plutil -lint "$APP_CONTENTS/Info.plist"
+plutil -lint "$RESOURCES/PrivacyInfo.xcprivacy"
 codesign --verify --deep --strict "$APP_BUNDLE"
 codesign -dv --verbose=2 "$APP_BUNDLE" 2>&1 | head -5
 
 echo "==> smoke test"
-"$OUT_DIR/align-cli" --help >/dev/null 2>&1 || "$OUT_DIR/align-cli" >/dev/null 2>&1 || true
+"$OUT_DIR/align-cli" --help >/dev/null
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | "$OUT_DIR/align-mcp" | grep -q 'align_sync'
-("$APP_MACOS/$APP_NAME" >/tmp/align-smoke.log 2>&1 & echo $! > /tmp/align-smoke.pid)
-sleep 5
-SMOKE=$(cat /tmp/align-smoke.pid)
-if kill -0 "$SMOKE" 2>/dev/null; then echo "    app alive"; kill "$SMOKE"; else echo "    app exited early:"; head -5 /tmp/align-smoke.log; fi
+if [[ "$ALIGN_SKIP_LAUNCH_CHECK" != "1" ]]; then
+  "$APP_MACOS/$APP_NAME" >"$AAF_BUILD_DIR/launch.log" 2>&1 &
+  launch_pid=$!
+  sleep 5
+  if ! kill -0 "$launch_pid" 2>/dev/null; then
+    cat "$AAF_BUILD_DIR/launch.log" >&2
+    echo "Application exited during the launch check." >&2
+    exit 1
+  fi
+  kill "$launch_pid"
+  wait "$launch_pid" 2>/dev/null || true
+fi
 
 echo "==> done: $OUT_DIR"
 du -sh "$OUT_DIR"

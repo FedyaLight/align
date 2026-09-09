@@ -1,14 +1,8 @@
-//! Drift policy + segment math. Port of the pure half of
-//! `AudioDriftCorrector.swift` (rendering lives in `align-decode`, which
-//! owns codecs and file IO).
+//! Clock-drift policy and segment mapping.
 //!
-//! A sidecar is rendered only when the island mapping materially slips (≥ 16 ms
-//! anywhere). The 1 ms deadband beyond the ±15 ms presentation tolerance keeps
-//! quantization at the boundary from creating a needless file. Rendering
-//! stretches each mapping segment to its island length
-//! with a near-unity sinc ratio per segment — the portable equivalent of
-//! Swift's spectral `audioTimePitchAlgorithm` composition (see render docs
-//! for the quality argument).
+//! A correction is rendered when a validated mapping accumulates at least
+//! 16 ms of slip. Rendering lives in `align-decode`; it resamples each segment
+//! to its mapped duration and preserves discrete source channels.
 
 use crate::model::MappingPoint;
 
