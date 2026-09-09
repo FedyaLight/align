@@ -8,7 +8,8 @@
 //!   localization, then a confirmed monotonic piecewise map (3–8 knots,
 //!   residual ≤ 6 ms). Unconfirmed jumps are rejected, never guessed.
 //! - short-span clock drift requires agreement with two held-out windows;
-//!   long-span rate estimation uses 600 s / 50 anchors of coarse evidence.
+//!   long-span rate estimation uses 600 s / 50 anchors of coarse evidence
+//!   and nine waveform windows with a robust slope estimate.
 //! - the forest pass applies the requested match threshold, then accepts
 //!   refined pairs unless they close a cycle with confidence < 0.85.
 //!
@@ -181,6 +182,8 @@ fn refine(
 
     let fractions: &[f64] = if m.covered_seconds < 20.0 {
         &[0.5]
+    } else if can_estimate_rate(m) {
+        &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
     } else {
         &[0.15, 0.5, 0.85]
     };
@@ -236,15 +239,15 @@ fn refine(
         return None;
     }
 
-    // Broad drift ridges need waveform checks independent of the three
+    // Broad drift ridges need waveform checks independent of the fitting
     // windows used to estimate the affine rate. A line of hash collisions
     // alone is not enough to synchronize a long recording.
-    if allow_rate && affine.residual <= 0.012 && (m.rate - 1.0).abs() * m.covered_seconds >= 2.0 {
+    if allow_rate && (m.rate - 1.0).abs() * m.covered_seconds >= 2.0 {
         let checks = observe(
             m,
             left_dur,
             right_dur,
-            &[0.3, 0.7],
+            &[0.25, 0.75],
             2.1,
             left_source,
             right_source,
@@ -536,7 +539,29 @@ struct Affine {
 
 fn fit(points: &[Observation], allow_rate: bool) -> Affine {
     debug_assert!(!points.is_empty());
-    let (rate, offset) = if allow_rate {
+    let (rate, offset) = if allow_rate && points.len() >= 7 {
+        // Theil–Sen: a single echo/delay must not tilt the clock for the
+        // whole recording. Widely spaced pairs avoid magnifying local jitter.
+        let lo = points.iter().map(|p| p.left).fold(f64::INFINITY, f64::min);
+        let hi = points
+            .iter()
+            .map(|p| p.left)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let mut slopes = Vec::new();
+        for (i, a) in points.iter().enumerate() {
+            for b in &points[i + 1..] {
+                let span = b.left - a.left;
+                if span.abs() > 0.0 && span.abs() >= (hi - lo) * 0.25 {
+                    slopes.push((b.right - a.right) / span);
+                }
+            }
+        }
+        slopes.sort_by(f64::total_cmp);
+        let rate = slopes.get(slopes.len() / 2).copied().unwrap_or(1.0);
+        let mut offsets: Vec<_> = points.iter().map(|p| p.right - rate * p.left).collect();
+        offsets.sort_by(f64::total_cmp);
+        (rate, offsets[offsets.len() / 2])
+    } else if allow_rate {
         let n = points.len() as f64;
         let mean_left = points.iter().map(|p| p.left).sum::<f64>() / n;
         let mean_right = points.iter().map(|p| p.right).sum::<f64>() / n;
@@ -899,6 +924,32 @@ mod tests {
             })
             .collect();
         assert!(piecewise_fit(&few).is_none());
+    }
+
+    #[test]
+    fn long_clock_fit_resists_one_acoustic_delay() {
+        // A moving microphone or echo can move one otherwise valid match.
+        // That must not turn a 2 ppm clock into a render-worthy 10 ppm clock.
+        let points: Vec<_> = (1..=9)
+            .map(|i| {
+                let left = i as f64 * 600.0;
+                Observation {
+                    left,
+                    right: left * 1.000002 + 0.05 + if i == 9 { 0.030 } else { 0.0 },
+                    quality: 1.0,
+                }
+            })
+            .collect();
+        let result = fit(&points, true);
+        assert!(
+            (result.rate - 1.000002).abs() < 0.0000001,
+            "rate {}",
+            result.rate
+        );
+        assert!(
+            result.residual > 0.005,
+            "retain acoustic uncertainty for graph weights"
+        );
     }
 
     #[test]

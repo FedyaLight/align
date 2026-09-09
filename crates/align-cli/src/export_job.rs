@@ -110,7 +110,18 @@ impl ExportOptions {
                 group_fcpxml_storylines: fcpxml_storylines,
                 cancel,
             },
-            None,
+            Some(&mut |progress: align_decode::export::ExportJobProgress| {
+                eprintln!(
+                    "export {}/{} {}",
+                    progress.completed,
+                    progress.total,
+                    progress
+                        .current
+                        .as_deref()
+                        .map(align_core::model::file_name)
+                        .unwrap_or_default()
+                );
+            }),
         )?;
         Ok(artifacts)
     }

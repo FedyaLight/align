@@ -6,6 +6,7 @@
 //! share the same preparation path.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(not(unix))]
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -456,8 +457,8 @@ fn export_prepared_internal(
     } else {
         0
     };
-    // Read the original once per export, including its metadata chunks.
-    // File size/mtime alone cannot detect same-path, same-size replacements.
+    // Stamp each source once. Unix inode + ctime detect replacements and
+    // same-size rewrites even with a restored mtime, without reading video.
     let mut source_tags = HashMap::new();
     for item in &all_items {
         let needs_asset = drift_ids.contains(item.clip.id.0.as_str())
@@ -467,7 +468,7 @@ fn export_prepared_internal(
         if needs_asset && !source_tags.contains_key(&item.clip.url) {
             source_tags.insert(
                 item.clip.url.clone(),
-                source_content_tag(&item.clip.url, cancel)?,
+                source_revision_tag(&item.clip.url, cancel)?,
             );
         }
     }
@@ -540,7 +541,7 @@ fn export_prepared_internal(
                         format!("drift {}{}ppm", if ppm >= 0 { "+" } else { "" }, ppm)
                     };
                     let destination = audio_dir.join(format!(
-                        "{stem} – {correction} – {suffix}-{}-{}-r11.wav",
+                        "{stem} – {correction} – {suffix}-{}-{}-r12.wav",
                         item.mapping_digest(),
                         source_tags[&item.clip.url]
                     ));
@@ -649,7 +650,7 @@ fn export_prepared_internal(
                     let urls = (0..channels)
                         .map(|channel| {
                             let destination = precision_dir.join(format!(
-                                "{stem} – channel {} – {suffix}-{}-{}-{}-r11.wav",
+                                "{stem} – channel {} – {suffix}-{}-{}-{}-r12.wav",
                                 channel + 1,
                                 prepared.precision_digest(),
                                 source_tags[&item.clip.url],
@@ -839,7 +840,7 @@ fn pad_plan(
     Some((
         pad,
         audio_dir.join(format!(
-            "{stem} – pad {pad} – {suffix}-{tag}-{}-{}-{source_tag}-r11.wav",
+            "{stem} – pad {pad} – {suffix}-{tag}-{}-{}-{source_tag}-r12.wav",
             item.selected_source_in("audio").to_bits(),
             item.selected_source_out("audio").to_bits()
         )),
@@ -857,6 +858,25 @@ struct MediaFilePlan {
     url: PathBuf,
 }
 
+fn source_revision_tag(
+    path: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<String, ExportError> {
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(ExportError::Cancelled);
+    }
+    #[cfg(unix)]
+    {
+        let revision =
+            align_core::cache::media_revision(path).map_err(|e| ExportError::Io(e.to_string()))?;
+        Ok(blake3::hash(revision.as_bytes()).to_hex()[..32].to_string())
+    }
+    // Without an inode/change-time stamp, retain strict content invalidation.
+    #[cfg(not(unix))]
+    source_content_tag(path, cancel)
+}
+
+#[cfg(not(unix))]
 fn source_content_tag(
     path: &Path,
     cancel: &std::sync::atomic::AtomicBool,
@@ -1130,6 +1150,31 @@ mod tests {
     use align_core::{
         AudioSummary, Clip, ClipId, MediaKind, MediaTime, VideoFrameRateMode, VideoSummary,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn source_revision_invalidates_restored_mtime_and_honors_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.wav");
+        std::fs::write(&path, b"original").unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let before = source_revision_tag(&path, &cancel).unwrap();
+        assert_eq!(source_revision_tag(&path, &cancel).unwrap(), before);
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, b"replaced").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        assert_ne!(source_revision_tag(&path, &cancel).unwrap(), before);
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(
+            source_revision_tag(&path, &cancel),
+            Err(ExportError::Cancelled)
+        ));
+    }
 
     fn item(id: &str, kind: MediaKind, start: f64, duration: f64) -> ExportItem {
         let audio = AudioSummary {

@@ -6,8 +6,8 @@
 
 use crate::model::MappingPoint;
 
-/// Minimum correctable slip: 1 ms beyond the ±15 ms ATSC presentation
-/// tolerance so numerical noise at the boundary cannot trigger resampling.
+/// Export policy, not evidence of clock drift: ignore accumulated slip below
+/// 16 ms. Waveform refinement must establish the changing offset first.
 pub const MINIMUM_CORRECTABLE_SLIP: f64 = 0.016;
 const COMPARISON_EPSILON: f64 = 1e-9;
 

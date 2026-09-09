@@ -13,7 +13,9 @@ static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 use align_core::drift::segments;
 use align_core::model::file_name;
-use rubato::{FftFixedIn, Resampler};
+use rubato::{
+    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
 
 use crate::DecodeError;
 use crate::backend::{MediaBackend, NativeBlock, NativeBlockI32};
@@ -73,6 +75,34 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), RenderError> {
     } else {
         Ok(())
     }
+}
+
+/// A camera's last audio sample may precede its last video frame. After a
+/// successful decode, fill only that sub-frame gap at the container's end.
+/// Never conceal truncated audio-only files or missing audio inside an edit.
+fn finish_video_tail(
+    writer: &mut WavWriter,
+    probe: &crate::backend::ProbeReport,
+    end_seconds: f64,
+    remaining: u64,
+    sample_rate: f64,
+    channels: usize,
+) -> Result<(), RenderError> {
+    if remaining == 0 {
+        return Ok(());
+    }
+    let frame_duration = probe
+        .video
+        .as_ref()
+        .and_then(|v| v.frame_duration)
+        .map_or(0.001, |t| t.as_seconds());
+    if !probe.has_video
+        || (end_seconds - probe.duration_seconds).abs() > 1.0 / sample_rate
+        || remaining as f64 > (frame_duration * sample_rate).ceil()
+    {
+        return Err(RenderError::CannotRead);
+    }
+    writer.write_silence(channels, remaining as usize)
 }
 
 // ------------------------------------------------------------ wav writer
@@ -209,7 +239,7 @@ impl WavWriter {
 
 /// Rendered segment: source range stretched to the island range.
 struct Segment {
-    resampler: Vec<FftFixedIn<f32>>,
+    resampler: Vec<SincFixedIn<f32>>,
     pending: Vec<Vec<f32>>,
     skip: usize,
     emitted: usize,
@@ -229,18 +259,33 @@ impl Segment {
         if !(ratio.is_finite() && ratio > 0.0) {
             return Err(RenderError::InvalidMapping);
         }
-        // Exact rational sinc: 1 MHz base keeps ppm ratios integral.
-        let out_rate = (1_000_000.0 * ratio).round().max(1.0) as usize;
+        // Arbitrary clock ratios must not determine the FFT size or be
+        // rounded to whole ppm: that can accumulate milliseconds on long takes.
+        // A fixed sinc kernel bounds work and latency independently of ratio.
         let mut resampler = Vec::with_capacity(channels);
         for _ in 0..channels {
             resampler.push(
-                FftFixedIn::new(1_000_000, out_rate, 4096, 2, 1)
-                    .map_err(|_| RenderError::CannotWrite)?,
+                SincFixedIn::new(
+                    ratio,
+                    1.0,
+                    SincInterpolationParameters {
+                        sinc_len: 128,
+                        f_cutoff: 0.95,
+                        oversampling_factor: 256,
+                        interpolation: SincInterpolationType::Linear,
+                        window: WindowFunction::BlackmanHarris2,
+                    },
+                    4096,
+                    1,
+                )
+                .map_err(|_| RenderError::CannotWrite)?,
             );
         }
-        let skip = resampler
-            .first()
-            .map_or(0, |r: &FftFixedIn<f32>| r.output_delay());
+        // rubato 0.15 SincFixedIn starts its interpolation index at -kernel/2:
+        // the first returned sample is already at source time zero. Its
+        // output_delay() describes buffered lookahead, not leading samples
+        // to discard (unlike FftFixedIn). Analytic phase tests cover this.
+        let skip = 0;
         Ok(Self {
             resampler,
             pending: vec![Vec::new(); channels],
@@ -310,9 +355,7 @@ impl Segment {
             dst.extend_from_slice(&produced[0]);
         }
         self.uniform_slice(&mut out);
-        // A near-unity ratio can have a million-frame FFT period. Empty
-        // output means the FFT is buffering input, not that its tail ended.
-        // Budget enough input for two complete FFT periods plus the delay.
+        // Flush the bounded filter delay and any partial input block.
         for _ in 0..self.flush_rounds {
             check_cancel(cancel)?;
             if self.emitted >= self.expected {
@@ -547,8 +590,15 @@ pub fn render_pad_cancellable(
                 Ok(())
             })
             .map_err(RenderError::from)?;
-        if remaining.is_some_and(|n| n != 0) {
-            return Err(RenderError::CannotRead);
+        if let (Some(n), Some((_, end))) = (remaining, selection) {
+            finish_video_tail(
+                &mut writer,
+                &probe,
+                end as f64 / sample_rate,
+                n,
+                sample_rate,
+                channels,
+            )?;
         }
         check_cancel(cancel)?;
         writer.finalize()?;
@@ -719,9 +769,14 @@ pub fn render_channel_cancellable(
                 )
                 .map_err(RenderError::from)?;
         }
-        if remaining > 0 {
-            return Err(RenderError::CannotRead);
-        }
+        finish_video_tail(
+            &mut writer,
+            &probe,
+            source_start.max(0.0) + duration,
+            remaining as u64,
+            sample_rate,
+            1,
+        )?;
         let mut tail_remaining = tail_samples;
         while tail_remaining > 0 {
             check_cancel(cancel)?;
@@ -1033,6 +1088,33 @@ mod tests {
         assert_eq!(&samples[384..386], &[0.6, -0.6]);
         assert_eq!(&samples[samples.len() - 2..], &[0.7, -0.7]);
         assert_eq!(samples.iter().filter(|v| **v != 0.0).count(), 4);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn camera_tail_gap_is_silent_but_truncated_audio_is_rejected() {
+        let dir = tmp("camera-tail");
+        let src = dir.join("source.wav");
+        write_stereo_wav(&src, 48000, 1, 42);
+        let mut probe = crate::portable::PortableBackend.inspect(&src).unwrap();
+        let dst = dir.join("tail.wav");
+        let mut writer = WavWriter::create(&dst, 48000, 2, false).unwrap();
+        assert_eq!(
+            finish_video_tail(&mut writer, &probe, 1.0, 6, 48000.0, 2),
+            Err(RenderError::CannotRead)
+        );
+        probe.has_video = true;
+        assert_eq!(
+            finish_video_tail(&mut writer, &probe, 0.9, 6, 48000.0, 2),
+            Err(RenderError::CannotRead)
+        );
+        assert_eq!(
+            finish_video_tail(&mut writer, &probe, 1.0, 4800, 48000.0, 2),
+            Err(RenderError::CannotRead)
+        );
+        finish_video_tail(&mut writer, &probe, 1.0, 6, 48000.0, 2).unwrap();
+        writer.finalize().unwrap();
+        assert_eq!(read_pad_samples(&dst), vec![0.0; 12]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1404,6 +1486,66 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fractional_ppm_preserves_phase_at_end_of_long_take() {
+        let dir = tmp("fractional-ppm");
+        let src = dir.join("source.wav");
+        let dst = dir.join("corrected.wav");
+        let sr = 8000;
+        let duration = 600.0;
+        let ratio = 1.00001745;
+        let tone = |time: f64| 0.4 * (std::f64::consts::TAU * 997.0 * time).sin();
+        let mut writer = hound::WavWriter::create(
+            &src,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: sr,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            },
+        )
+        .unwrap();
+        for i in 0..(duration * sr as f64) as usize {
+            writer
+                .write_sample(tone(i as f64 / sr as f64) as f32)
+                .unwrap();
+        }
+        writer.finalize().unwrap();
+        render_drift(
+            &crate::portable::PortableBackend,
+            &src,
+            &dst,
+            &[(0.0, 0.0), (duration, duration * ratio)],
+        )
+        .unwrap();
+        let reader = hound::WavReader::open(&dst).unwrap();
+        assert_eq!(
+            reader.duration(),
+            (duration * ratio * sr as f64).round() as u32
+        );
+        let mut squared_error = 0.0;
+        let mut count = 0;
+        for (i, sample) in reader.into_samples::<f32>().enumerate() {
+            let time = i as f64 / sr as f64;
+            if (590.0..599.0).contains(&time) {
+                squared_error += (sample.unwrap() as f64 - tone(time / ratio)).powi(2);
+                count += 1;
+            }
+        }
+        assert!((squared_error / count as f64).sqrt() < 0.005);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn clock_ratio_has_bounded_streaming_latency() {
+        for ratio in [1.000801, 0.9999977, 1.000002161] {
+            let mut segment = Segment::new(0.0, 60.0, 60.0 * ratio, 48000.0, 2).unwrap();
+            assert!(segment.skip < 4096, "ratio {ratio}: delay {}", segment.skip);
+            let out = segment.push(vec![vec![0.25; 4096]; 2]).unwrap();
+            assert!(!out[0].is_empty(), "ratio {ratio}: first block buffered");
+        }
     }
 
     #[test]
