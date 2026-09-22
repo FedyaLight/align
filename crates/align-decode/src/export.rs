@@ -104,7 +104,7 @@ impl std::fmt::Display for ExportError {
 
 impl std::error::Error for ExportError {}
 
-/// Plain export (no drift render, no stems) — mirrors `SyncEngine.export`.
+/// Write timelines without rendering drift corrections or audio stems.
 pub fn export(
     timeline: &ExportTimeline,
     directory: &Path,

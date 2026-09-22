@@ -61,7 +61,7 @@ pub struct PairwiseMatch {
 }
 
 /// Trusted metadata hints. May only disambiguate proven waveform peaks —
-/// never create a match on its own (mirrors `ClipTimingHints`).
+/// never create a match on its own.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ClipTimingHints {
     pub recording_starts: HashMap<ClipId, f64>,

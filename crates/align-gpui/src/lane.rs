@@ -1,7 +1,5 @@
-//! Timeline lane visuals: port of the `AppModel` layout half
-//! (`TimelineLaneVisual`, `layout`, provisional BFS groups, chronology,
-//! source names). Both the live provisional preview and the final result
-//! render through this one builder, so pre- and post-sync timelines agree.
+//! Timeline lane visuals for provisional matches and completed results.
+//! Both views use the same lane allocator and source labels.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -72,7 +70,7 @@ impl LiveMatch {
 }
 
 /// One finished group: bars plus optional ruler timecode when the first
-/// group is timecode-chronologied (mirrors `timelineStartTimecode`).
+/// group is timecode-chronologied.
 pub struct FinalTimeline {
     pub bars: Vec<BarVisual>,
     pub states: Vec<(ClipId, f64, MatchEvidence)>,
@@ -80,8 +78,7 @@ pub struct FinalTimeline {
 }
 
 /// Provisional groups from live previews: BFS over candidate edges,
-/// island offsets propagated along match direction (mirror
-/// `rebuildProvisionalTimeline`). Returns (clip_id, start) groups.
+/// island offsets propagated along match direction. Returns (clip_id, start) groups.
 pub fn provisional_groups(
     clips: &HashMap<ClipId, LiveClip>,
     matches: &HashMap<String, LiveMatch>,
@@ -242,7 +239,7 @@ pub fn final_bars(result: &align_core::SyncResult) -> FinalTimeline {
     }
 }
 
-/// Pack bars into V/A numbered lanes (mirror `layout`).
+/// Pack bars into V/A numbered lanes.
 pub fn layout_bars(
     bars: Vec<BarVisual>,
     stream_channels: &HashMap<ClipId, Vec<usize>>,
@@ -382,7 +379,7 @@ pub fn bar_row_geometry(bars: &[BarVisual], px_per_sec: f64) -> Vec<(f32, f32)> 
 }
 
 /// Correction options for one clip: refined waveform matches involving it,
-/// sorted by partner name (mirror `correctionOptions`).
+/// sorted by partner name.
 #[derive(Clone, Debug)]
 pub struct CorrectionOption {
     pub id: String,
@@ -537,6 +534,61 @@ mod tests {
         assert_eq!(lanes.len(), 1);
         assert_eq!(lanes[0].clips.len(), 2);
         assert_eq!(lanes[0].source_name, "v");
+    }
+
+    #[test]
+    fn layout_fills_gap_from_other_folder_without_moving_clips() {
+        let make_bar = |id: &str, source: &str, start, duration, state| BarVisual {
+            id: id.into(),
+            clip_id: clip_id(id),
+            url: PathBuf::from(source).join(id),
+            source_key: source.into(),
+            name: id.into(),
+            kind: MediaKind::Video,
+            start,
+            duration,
+            confidence: 1.0,
+            match_state: state,
+        };
+        let lanes = layout_bars(
+            vec![
+                make_bar(
+                    "unmatched",
+                    "/disk-a/camera",
+                    0.0,
+                    90.0,
+                    BarMatchState::Unmatched,
+                ),
+                make_bar(
+                    "later",
+                    "/disk-a/camera",
+                    5088.0,
+                    5900.0,
+                    BarMatchState::Matched,
+                ),
+                make_bar(
+                    "insert",
+                    "/disk-b/camera",
+                    123.0,
+                    4958.0,
+                    BarMatchState::Matched,
+                ),
+            ],
+            &HashMap::new(),
+        );
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].number, 1);
+        assert_eq!(
+            lanes[0]
+                .clips
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unmatched", "insert", "later"]
+        );
+        assert_eq!(lanes[0].clips[1].start, 123.0);
+        assert_eq!(lanes[0].clips[1].duration, 4958.0);
+        assert_eq!(lanes[0].clips[0].match_state, BarMatchState::Unmatched);
     }
 
     #[test]

@@ -43,7 +43,7 @@ pub enum ClipState {
 }
 
 impl ClipState {
-    /// Second-line status text under the clip name (mirrors `stateText`).
+    /// Second-line status text under the clip name.
     pub fn status_text(&self) -> String {
         match self {
             Self::Queued => "Queued".to_string(),
@@ -277,7 +277,7 @@ pub struct AppData {
     pub path_fixer_prefer_proxies: bool,
     pub show_path_fixer: bool,
     pub path_fixer_dir: Option<PathBuf>,
-    // Export sheet state (mirrors ExportSheet @State).
+    // Export sheet state.
     pub show_export: bool,
     pub export_dir: Option<PathBuf>,
     pub export_selected: HashSet<ExportTarget>,
@@ -646,7 +646,7 @@ impl AppData {
         })
     }
 
-    /// Zoom factor: 0.0 = Fit, 1.0 = 8x (mirrors `pow(8, zoomLevel)`).
+    /// Zoom factor: 0.0 = Fit, 1.0 = 8x.
     pub fn zoom(&self) -> f64 {
         8.0f64.powf(self.zoom_level.clamp(0.0, 1.0))
     }
@@ -690,7 +690,7 @@ impl AppData {
         self.pan_to(Some(f32::from(cur.x) + dx), Some(f32::from(cur.y) + dy));
     }
 
-    // ---------------- session edits (mirror add/remove/clear)
+    // ---------------- session edits
 
     /// Add media/tagged timeline paths; marks the session stale when a
     /// result exists, otherwise resets the preview. Multi-sequence
@@ -864,9 +864,9 @@ impl AppData {
         }
     }
 
-    // ---------------- sync lifecycle (mirror synchronize/apply/cancel)
+    // ---------------- sync lifecycle
 
-    /// Reset per-run state before a sync pass (mirrors `synchronize()`).
+    /// Reset per-run state before a sync pass.
     pub fn begin_sync_run(&mut self) -> bool {
         if !self.can_run_sync() {
             return false;
@@ -1013,7 +1013,7 @@ impl AppData {
         true
     }
 
-    /// Phase-weighted progress + status (mirrors `apply(SyncProgress)`).
+    /// Phase-weighted progress + status.
     pub fn apply_progress(
         &mut self,
         phase: &str,
@@ -1090,7 +1090,7 @@ impl AppData {
 
     fn receive_preview(&mut self, event: &MatchPreview) {
         lane::apply_preview(&mut self.live_matches, event);
-        // Mark both sides as matching (mirrors `receive(SyncMatchPreview)`).
+        // Mark both sides as matching.
         for row in &mut self.clips {
             let Some(id) = &row.clip_id else { continue };
             if *id == event.left || *id == event.right {
@@ -1164,7 +1164,7 @@ impl AppData {
         true
     }
 
-    /// Final result (mirrors `apply(SyncResult)`).
+    /// Final result.
     pub fn apply_result(&mut self, result: SyncResult) {
         self.sequence_results = vec![result.clone()];
         self.active_sequence_result = 0;
@@ -1339,7 +1339,7 @@ impl AppData {
         };
     }
 
-    // ---------------- corrections (mirror rejectPair/rejectAlignment/...)
+    // ---------------- corrections
 
     pub fn correction_options_for(&self, clip_id: &ClipId) -> Vec<lane::CorrectionOption> {
         let names: HashMap<ClipId, String> = self
@@ -2022,7 +2022,7 @@ impl AppData {
     }
 }
 
-// ---------------- helpers (mirror private AppModel helpers)
+// ---------------- helpers
 
 fn drift_of_placement(result: &SyncResult, clip_id: &ClipId) -> f64 {
     let placement = result
@@ -2057,7 +2057,7 @@ fn sorted_live_matches(map: &HashMap<String, LiveMatch>) -> Vec<LiveMatch> {
     rows
 }
 
-/// Preview items for imported timelines (mirror `timelinePreview`).
+/// Preview items for imported timelines.
 type ImportedPreview = (
     Vec<BarVisual>,
     Vec<(ClipId, f64, MatchEvidence)>,

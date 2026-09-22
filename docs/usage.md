@@ -1,5 +1,16 @@
 # Usage
 
+## macOS installation
+
+The release app is not Developer ID signed or notarized. If macOS says the app
+is damaged, move `Align.app` to `/Applications`, then run these commands in
+Terminal. Only do this for a copy downloaded from this project's official release.
+
+```sh
+sudo xattr -dr com.apple.quarantine "/Applications/Align.app"
+open "/Applications/Align.app"
+```
+
 ## Desktop workflow
 
 1. Add recordings, a folder, or a timeline project. Select a sequence when the

@@ -170,7 +170,7 @@ impl XmlDoc {
         out
     }
 
-    /// First direct child text, trimmed (mirrors `childText`).
+    /// First direct child text, trimmed.
     pub fn child_text(&self, idx: usize, name: &str) -> Option<String> {
         let t = self
             .children_named(idx, name)

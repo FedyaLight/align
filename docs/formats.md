@@ -65,7 +65,8 @@ make ambiguous evidence reliable.
 The solver keeps disconnected groups separate. Drift rendering uses validated
 affine or piecewise time mappings, preserves discrete audio channels, and writes
 new WAV files. It does not alter source recordings. This is clock correction,
-not a general-purpose creative time-stretch tool.
+not a general-purpose creative time-stretch tool. See
+[drift correction](drift.md) for interpretation and export behavior.
 
 ## Media ownership
 

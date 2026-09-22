@@ -276,7 +276,7 @@ impl Pipeline {
         Ok(replacements.len())
     }
 
-    /// Inspect-only open (mirrors `SyncEngine.open`): expand, inspect,
+    /// Inspect-only open: expand, inspect,
     /// spanned warnings, timeline relink/resolve — no matching.
     pub fn open(&self, inputs: &[PipelineInput]) -> Result<SyncProject, PipelineError> {
         self.open_with(inputs, &PipelineOptions::default())
@@ -366,7 +366,7 @@ impl Pipeline {
     ) -> Result<align_core::SyncResult, PipelineError> {
         let expanded = expand(inputs)?;
         // Timeline relink runs BEFORE inspection so relinked files are
-        // inspected like directly added media (mirrors SyncEngine.expand).
+        // inspected like directly added media.
         let draft = expanded
             .timeline
             .map(|t| {
@@ -636,7 +636,7 @@ impl Pipeline {
             return Err(PipelineError::Cancelled);
         }
 
-        // Metadata edges (mirror SyncEngine order): seamless file-set parts
+        // Metadata edges: seamless file-set parts
         // join without waveform, then timecode overlaps the leftovers.
         // Spanned edges ignore rejected *alignments* (they carry none) but
         // honour rejected pairs.
@@ -805,8 +805,7 @@ impl Pipeline {
         }
 
         let video = probe.video.as_ref().map(|v| {
-            // Container timecode first, Sony LTC fallback (mirrors
-            // standard-track → Sony order) with the sequence rate.
+            // Prefer container timecode, then Sony sidecar timecode with the sequence rate.
             let fallback = v.frame_duration.unwrap_or(MediaTime::new(1, 25));
             let source_timecode = v.source_timecode.clone().or_else(|| {
                 sony.as_deref()
@@ -1046,8 +1045,8 @@ impl Pipeline {
             ));
         }
 
-        // Automatic multi-stream selection: most shared hashes wins
-        // (mirrors SyncEngine.selectFingerprints, ties → lowest index).
+        // Automatic multi-stream selection: most shared hashes wins.
+        // Ties select the lowest channel index.
         let mut first_owner: HashMap<u64, &ClipId> = HashMap::new();
         let mut shared: HashSet<u64> = HashSet::new();
         for (clip, variants) in clips.iter().zip(all_variants.iter()) {

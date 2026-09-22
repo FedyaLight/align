@@ -1518,7 +1518,7 @@ impl ExportTimeline {
 
     /// Chronology keys of all islands in combined order (kind, value).
     /// The timeline ruler shows a timecode when the first key is
-    /// timecode-based (kind 1), mirroring `timelineStartTimecode`.
+    /// timecode-based (kind 1).
     pub fn combined_chronology(&self) -> Vec<(i32, f64)> {
         let policy = &self.temporal_policy;
         let mut order: Vec<&ExportIsland> = self.islands.iter().collect();
@@ -1788,7 +1788,7 @@ fn median(values: &mut [f64]) -> f64 {
 
 // ------------------------------------------------------------ xml text
 
-/// XML escaping + identifier sanitizing (mirrors `XMLText`).
+/// XML escaping + identifier sanitizing.
 pub mod xml_text {
     use crate::model::MediaTime;
     pub fn escape(value: &str) -> String {
@@ -1813,7 +1813,7 @@ pub mod xml_text {
             .collect()
     }
 
-    /// `%.9f`-style number without trailing zeros (mirrors `xmlNumber`).
+    /// `%.9f`-style number without trailing zeros.
     pub fn number(value: f64) -> String {
         let rounded = value.round();
         if (value - rounded).abs() < 0.000_001 {

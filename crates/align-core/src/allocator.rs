@@ -38,7 +38,7 @@ impl TimelineTrackRequest {
     }
 }
 
-/// Mirrors `sourceKey(for:)`: hardware identity → span id → parent directory.
+/// Source identity: hardware identifier, then recording span, then parent directory.
 pub fn source_key_for_clip(
     url: &Path,
     source_identifier: Option<&str>,
@@ -92,64 +92,57 @@ pub fn allocate(requests: &[TimelineTrackRequest]) -> HashMap<String, usize> {
         }
     }
 
-    // Phase 2: merge source lanes into shared global time lanes.
-    struct Span {
-        source: String,
+    // Phase 2: merge source lanes by their occupied intervals. A lane's
+    // first/last clip bounds include gaps that other sources can safely fill.
+    struct SourceLane<'a> {
+        source: &'a str,
         local_lane: usize,
-        start: f64,
-        end: f64,
+        intervals: Vec<(f64, f64)>,
     }
-    let mut spans: Vec<Span> = Vec::new();
+    let mut source_lanes = Vec::new();
     for source in &sources {
-        let clips = &by_source[source];
-        let mut ends: Vec<f64> = Vec::new();
-        let mut ordered = clips.clone();
-        ordered.sort_by(|a, b| a.start.total_cmp(&b.start).then_with(|| a.id.cmp(&b.id)));
-        for clip in ordered {
+        let mut intervals_by_lane: Vec<Vec<(f64, f64)>> = Vec::new();
+        for clip in &by_source[source] {
             let lane = local[clip.id.as_str()];
-            while ends.len() <= lane {
-                ends.push(0.0);
+            while intervals_by_lane.len() <= lane {
+                intervals_by_lane.push(Vec::new());
             }
-            ends[lane] = ends[lane].max(clip.start + clip.duration.max(0.0));
+            intervals_by_lane[lane].push((clip.start, clip.start + clip.duration.max(0.0)));
         }
-        for (lane, _) in ends.iter().enumerate() {
-            let start = clips
-                .iter()
-                .filter(|c| local[c.id.as_str()] == lane)
-                .map(|c| c.start)
-                .fold(None::<f64>, |acc, s| Some(acc.map_or(s, |a: f64| a.min(s))));
-            if let Some(start) = start {
-                spans.push(Span {
-                    source: (*source).to_string(),
-                    local_lane: lane,
-                    start,
-                    end: ends[lane],
-                });
-            }
+        for (local_lane, mut intervals) in intervals_by_lane.into_iter().enumerate() {
+            intervals.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+            source_lanes.push(SourceLane {
+                source,
+                local_lane,
+                intervals,
+            });
         }
     }
-    spans.sort_by(|a, b| {
-        a.start
-            .total_cmp(&b.start)
-            .then_with(|| a.source.cmp(&b.source))
+    source_lanes.sort_by(|a, b| {
+        a.intervals[0]
+            .0
+            .total_cmp(&b.intervals[0].0)
+            .then_with(|| a.source.cmp(b.source))
             .then_with(|| a.local_lane.cmp(&b.local_lane))
     });
-    let mut global_ends: Vec<f64> = Vec::new();
+    let mut global_intervals: Vec<Vec<(f64, f64)>> = Vec::new();
     let mut global_for_local: HashMap<&str, Vec<usize>> = HashMap::new();
-    for span in &spans {
-        let lane = global_ends
+    for source_lane in &source_lanes {
+        let lane = global_intervals
             .iter()
-            .position(|e| *e <= span.start + PLACEMENT_TOLERANCE)
+            .position(|occupied| intervals_fit(occupied, &source_lane.intervals))
             .unwrap_or_else(|| {
-                global_ends.push(0.0);
-                global_ends.len() - 1
+                global_intervals.push(Vec::new());
+                global_intervals.len() - 1
             });
-        global_ends[lane] = global_ends[lane].max(span.end);
-        let entry = global_for_local.entry(span.source.as_str()).or_default();
-        while entry.len() <= span.local_lane {
+        global_intervals[lane].extend_from_slice(&source_lane.intervals);
+        global_intervals[lane]
+            .sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+        let entry = global_for_local.entry(source_lane.source).or_default();
+        while entry.len() <= source_lane.local_lane {
             entry.push(0);
         }
-        entry[span.local_lane] = lane;
+        entry[source_lane.local_lane] = lane;
     }
 
     let mut out = HashMap::new();
@@ -162,6 +155,22 @@ pub fn allocate(requests: &[TimelineTrackRequest]) -> HashMap<String, usize> {
         out.insert(r.id.clone(), lane);
     }
     out
+}
+
+// Both lists are sorted by start. Advance the interval that finishes before
+// the other begins, allowing the same refinement seam as source-local packing.
+fn intervals_fit(left: &[(f64, f64)], right: &[(f64, f64)]) -> bool {
+    let (mut i, mut j) = (0, 0);
+    while i < left.len() && j < right.len() {
+        if left[i].1 <= right[j].0 + PLACEMENT_TOLERANCE {
+            i += 1;
+        } else if right[j].1 <= left[i].0 + PLACEMENT_TOLERANCE {
+            j += 1;
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -205,6 +214,33 @@ mod tests {
     fn overlapping_sources_get_distinct_lanes() {
         let a = allocate(&[req("a", "s1", 0.0, 10.0), req("b", "s2", 0.0, 10.0)]);
         assert_ne!(a["a"], a["b"]);
+    }
+
+    #[test]
+    fn another_source_can_fill_a_gap_between_clips() {
+        let requests = [
+            req("early", "/disk-a/camera", 0.0, 5.0),
+            req("later", "/disk-a/camera", 100.0, 100.0),
+            req("gap", "/disk-b/camera", 6.0, 94.0),
+        ];
+        let lanes = allocate(&requests);
+        assert_eq!(lanes["early"], lanes["later"]);
+        assert_eq!(lanes["gap"], lanes["later"]);
+        let mut reversed = requests.to_vec();
+        reversed.reverse();
+        assert_eq!(lanes, allocate(&reversed));
+    }
+
+    #[test]
+    fn gap_packing_checks_later_clips_in_both_sources() {
+        let lanes = allocate(&[
+            req("early", "a", 0.0, 5.0),
+            req("later", "a", 100.0, 20.0),
+            req("gap", "b", 6.0, 20.0),
+            req("collision", "b", 110.0, 20.0),
+        ]);
+        assert_ne!(lanes["later"], lanes["collision"]);
+        assert_eq!(lanes["gap"], lanes["collision"]);
     }
 
     #[test]

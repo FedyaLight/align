@@ -518,7 +518,7 @@ pub struct TimelinePreviewItem {
     pub matched: bool,
 }
 
-/// Live match preview for progress callbacks (mirrors `SyncMatchPreview`).
+/// Live match preview for progress callbacks.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MatchPreview {
     pub left: ClipId,

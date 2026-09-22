@@ -3025,7 +3025,7 @@ fn timeline_preview(
     root
 }
 
-/// Draggable zoom slider (mirrors the native `Slider(value:in: 0...1)`):
+/// Draggable zoom slider:
 /// press and drag along the track to set the Fit…8x level, with a thumb
 /// knob marking the current position. Step buttons and Option/Command +
 /// wheel cover the rest of the native gestures (trackpad pinch has no
@@ -3152,9 +3152,7 @@ fn timeline_lanes(
         let kind_color = theme.icon;
         let lane_id = lane.id.clone();
         let first_clip = lane.clips.first().map(|c| c.clip_id.clone());
-        // Hover tooltip keeps the source behind the number discoverable
-        // (mirrors the native `.help` on the label cell), including an
-        // active stream/channel override.
+        // The tooltip shows the source and any active stream/channel override.
         let override_suffix = match data.effective_lane_analysis_source(&lane_id) {
             AudioAnalysisSource::Automatic => String::new(),
             AudioAnalysisSource::AllMixed => " · All Mix".to_string(),
@@ -3174,7 +3172,7 @@ fn timeline_lanes(
             )
         };
         // Label cell shows nothing but V1/A1…; stream override lives on
-        // right-click (mirrors the native track header menu).
+        // right-click.
         let mut label = div()
             .id(SharedString::from(format!("lane-{lane_id}")))
             .w(px(LABEL_WIDTH))
@@ -3220,7 +3218,7 @@ fn timeline_lanes(
                 .w(px(timeline_w))
                 .h(px(TIMELINE_ROW_H))
                 .flex_shrink_0();
-            // Vertical gridlines at ruler ticks (mirrors the Canvas).
+            // Vertical gridlines at ruler ticks.
             for i in 0..=tick_count {
                 let x = timeline_w * i as f32 / tick_count as f32;
                 track = track.child(
@@ -3268,7 +3266,7 @@ fn timeline_lanes(
                         theme,
                     ));
                 }
-                // Icon + name when wide enough (mirrors w>=24 / w>=64).
+                // Icon + name when wide enough.
                 // Bar label: icon pinned top-left, text pinned to the
                 // remaining width. Absolute blocks (not flex items) hold
                 // exact bounds, so long names shape a real "…" instead of
@@ -3375,7 +3373,7 @@ fn timeline_lanes(
             }
             tracks = tracks.child(track);
         }
-        // Row separator (mirrors the Canvas horizontal gridlines).
+        // Row separator.
         labels = labels.child(div().h(px(1.)).flex_shrink_0().bg(rgb(theme.separator)));
         tracks = tracks.child(div().h(px(1.)).flex_shrink_0().bg(rgb(theme.separator)));
     }
@@ -3515,7 +3513,7 @@ fn warning_details(theme: &Theme, data: &super::state::AppData) -> impl IntoElem
     panel
 }
 
-// ---------------- bottom operation bar (mirrors OperationBar)
+// ---------------- bottom operation bar
 
 fn operation_bar(
     cx: &mut Context<AlignApp>,
@@ -4456,9 +4454,9 @@ fn search_settings_panel(
             selected == Some(SettingsSelect::Content), select_closing, settings_options(data, SettingsSelect::Content)))
 }
 
-// ---------------- diagnostics popover (mirrors DiagnosticsButton)
+// ---------------- diagnostics popover
 
-// ---------------- sequence picker (mirrors chooseSequence alert)
+// ---------------- sequence picker
 
 fn sequence_picker_panel(
     cx: &mut Context<AlignApp>,
@@ -5146,7 +5144,7 @@ fn match_threshold_section(
     panel
 }
 
-// ---------------- export sheet (mirrors ExportSheet)
+// ---------------- export sheet
 
 fn export_section_title(theme: &Theme, text: &str) -> impl IntoElement {
     div()
@@ -7202,7 +7200,7 @@ fn agent_setup_panel(cx: &mut Context<AlignApp>, theme: &Theme) -> impl IntoElem
         .child(setup_text_block(theme, AGENT_PROMPT))
 }
 
-// ---------------- error alert (mirrors .alert)
+// ---------------- error alert
 
 fn error_alert(
     cx: &mut Context<AlignApp>,

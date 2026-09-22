@@ -51,6 +51,11 @@ case "$(uname -s)" in
 esac
 cp "ffmpeg$EXE" "ffprobe$EXE" "$OUT_DIR/"
 cp COPYING.LGPLv2.1 "$OUT_DIR/FFMPEG-LICENSE.txt"
+mkdir -p "$OUT_DIR/Sources"
+cp "$TEMP_DIR/$ARCHIVE" "$OUT_DIR/Sources/"
+cp "$ROOT_DIR/script/build-ffmpeg-minimal.sh" "$OUT_DIR/Sources/"
+cp ffbuild/config.mak "$OUT_DIR/Sources/config.mak"
+printf '%s\n' "$FFMPEG_VERSION" > "$OUT_DIR/Sources/version.txt"
 strip "$OUT_DIR/ffmpeg$EXE" "$OUT_DIR/ffprobe$EXE" 2>/dev/null || true
 
 "$OUT_DIR/ffmpeg$EXE" -hide_banner -version | head -1

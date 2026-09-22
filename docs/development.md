@@ -103,10 +103,23 @@ only the native backend is being developed. CI runs the same acceptance command
 on macOS, Windows, and Linux. Release tags matching `align-rs-v*` also build
 platform bundles.
 
+### Drift diagnostics
+
+The `drift_audit` example measures additional audio windows for matched pairs in
+a single saved result:
+
+```sh
+cargo run --release -p align-decode --example drift_audit -- result.json > windows.csv
+```
+
+It requires the referenced recordings and uses the same correlation algorithm as
+the application. It is a diagnostic, not an independent measurement of device
+clocks. See [drift correction](drift.md) for interpretation.
+
 ### Editor readback tools
 
 The remaining scripts support checks that require an editor installation or a
-prepared corpus. Their module docstrings and `--help` describe inputs.
+a saved synchronization result. Their module docstrings and `--help` describe inputs.
 
 | Scripts | Purpose |
 | --- | --- |
@@ -151,8 +164,13 @@ picture operations then require system FFmpeg/ffprobe. To build the sidecars:
 That build requires a C toolchain, make, curl, tar, xz, and NASM where applicable.
 For a tag named `align-rs-vX.Y.Z` matching the workspace version, the release
 workflow also builds Velopack installers/update packages for macOS, Windows,
-and Linux and publishes them in a GitHub Release. The desktop app uses those
-checksum-verified packages for **Align → Check for Updates…**. Distribution
+and Linux and publishes them with matching source archives in a GitHub Release.
+See [distribution](distribution.md) for the source and license workflow. The desktop updater uses those
+packages for **Align → Check for Updates…** when installed through Velopack.
+Its GitHub source is configured without authentication, so release assets must
+be publicly accessible. A private repository does not provide an update feed
+for ordinary users with the current configuration. Local Cargo builds and the
+ad hoc macOS bundle are not Velopack installations. Distribution
 code signing and Apple notarization still require release credentials and are
 not configured in this repository.
 
@@ -164,5 +182,6 @@ reusable fixtures and checks with the code; write generated artifacts under
 `target/` or an ignored local directory. Avoid committing absolute machine paths,
 editor projects, or dated acceptance reports.
 
-The workspace declares MIT licensing. Preserve third-party notices when changing
-or distributing bundled components.
+The workspace uses GPL-3.0-only. Contributions must be compatible with that
+license. Preserve third-party notices and follow the
+[distribution notes](distribution.md) when publishing binaries.

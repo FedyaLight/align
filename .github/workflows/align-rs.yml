@@ -6,22 +6,26 @@ on:
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "about.toml"
       - "script/**"
       - "Support/aaf/**"
       - "docs/**"
       - "README.md"
       - "LICENSE"
+      - "THIRD_PARTY_NOTICES.txt"
       - ".github/workflows/align-rs.yml"
   pull_request:
     paths:
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "about.toml"
       - "script/**"
       - "Support/aaf/**"
       - "docs/**"
       - "README.md"
       - "LICENSE"
+      - "THIRD_PARTY_NOTICES.txt"
       - ".github/workflows/align-rs.yml"
   workflow_dispatch:
 
@@ -67,9 +71,10 @@ jobs:
         run: |
           python -m pip install -r Support/aaf/build-requirements.txt
           python -m unittest discover -s Support/aaf -v
+          python script/test-release-source.py
           python script/build-aaf-sidecar.py target/release
       - name: Build release CLI
-        run: cargo build --release -p align-cli
+        run: cargo build --locked --release -p align-cli
       - name: Verify release end to end
         shell: bash
         run: |
@@ -85,6 +90,8 @@ jobs:
 
   release:
     name: release binaries (${{ matrix.os }})
+    env:
+      VELOPACK_VERSION: 1.2.0
     needs: check-test
     if: startsWith(github.ref, 'refs/tags/align-rs-v')
     runs-on: ${{ matrix.os }}
@@ -102,15 +109,21 @@ jobs:
           msystem: MINGW64
           install: >-
             curl diffutils make mingw-w64-x86_64-gcc nasm pkgconf tar xz
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y nasm libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libasound2-dev libudev-dev libvulkan-dev
+      - name: Install assembler (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm
       - name: Build release
-        run: cargo build --release -p align-cli -p align-mcp -p align-gpui
+        run: cargo build --locked --release -p align-cli -p align-mcp -p align-gpui
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: '3.13'
       - name: Build AAF module
         run: |
           python -m pip install -r Support/aaf/build-requirements.txt
-          python script/build-aaf-sidecar.py target/release
+          python script/build-aaf-sidecar.py target/release --release-sources
       - name: Build minimal FFmpeg sidecars (Unix)
         if: runner.os != 'Windows'
         run: ./script/build-ffmpeg-minimal.sh target/ffmpeg-minimal
@@ -128,13 +141,29 @@ jobs:
           cp "target/release/align-aaf$exe" dist-bundle/
           cp -R target/release/AAF-Licenses dist-bundle/
           cp LICENSE THIRD_PARTY_NOTICES.txt dist-bundle/
-          cp target/ffmpeg-minimal/* dist-bundle/
+          cp "target/ffmpeg-minimal/ffmpeg$exe" "target/ffmpeg-minimal/ffprobe$exe" dist-bundle/
+          cp target/ffmpeg-minimal/FFMPEG-LICENSE.txt dist-bundle/
           ls -la dist-bundle/
+      - name: Install dependency license generator
+        run: cargo install cargo-about --version 0.9.2 --features cli --locked
+      - name: Prepare corresponding sources and dependency licenses
+        run: >-
+          python script/prepare-release-source.py target/release-sources
+          --platform ${{ runner.os }}
+          --licenses dist-bundle/ThirdPartyLicenses
+          --ffmpeg target/ffmpeg-minimal/Sources
+          --aaf target/release/AAF-Sources
+          --velopack-version ${{ env.VELOPACK_VERSION }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sources-${{ runner.os }}
+          path: target/release-sources/
+          if-no-files-found: error
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: "8.0.x"
       - name: Install Velopack packager
-        run: dotnet tool install --global vpk --version 1.2.0
+        run: dotnet tool install --global vpk --version ${{ env.VELOPACK_VERSION }}
       - name: Build installable update package
         shell: bash
         run: |
@@ -165,6 +194,7 @@ jobs:
         with:
           name: updates-${{ runner.os }}
           path: velopack-release/
+          if-no-files-found: error
 
   publish-release:
     name: publish GitHub release
@@ -179,7 +209,37 @@ jobs:
           pattern: updates-*
           path: release-assets
           merge-multiple: true
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: sources-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify source bundles for every platform
+        shell: bash
+        run: |
+          for platform in Linux macOS Windows; do
+            test -s "release-assets/align-source-$platform.tar.gz"
+            (cd release-assets && sha256sum -c "align-source-$platform.tar.gz.sha256")
+          done
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            Corresponding source archives for each platform are attached as
+            `align-source-<platform>.tar.gz`, with SHA-256 checksums. They include
+            Align, vendored Rust dependencies, FFmpeg, and AAF component sources.
+            Dependency notices are included in the installers.
+
+            ### macOS installation
+
+            The app is not Developer ID signed or notarized. If macOS says the
+            app is damaged, move `Align.app` to `/Applications`, then run the
+            following commands in Terminal. Only do this for a copy downloaded
+            from this project's official release.
+
+            ```sh
+            sudo xattr -dr com.apple.quarantine "/Applications/Align.app"
+            open "/Applications/Align.app"
+            ```
           files: release-assets/*

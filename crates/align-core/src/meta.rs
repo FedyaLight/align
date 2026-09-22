@@ -680,8 +680,8 @@ pub fn sony_recording_date(xml: &str) -> Option<i64> {
     parse_iso8601(attr_local(&element.attrs, "value")?)
 }
 
-/// `device:manufacturer:model:serial`, rejecting sentinel/blank serials
-/// (mirrors `isUsableSerial`: empty, "0", u32::MAX, all-F).
+/// `device:manufacturer:model:serial`, rejecting empty or sentinel serials
+/// ("0", u32::MAX, and all-F).
 pub fn sony_device_id(xml: &str) -> Option<String> {
     let elements = sony_elements(xml);
     let (_, (element, _)) = elements
