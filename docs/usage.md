@@ -61,6 +61,17 @@ not guaranteed.
 
 ## Synchronization settings
 
+Synchronization combines audio matching, links between recognized consecutive
+recording parts, and timecode overlap for otherwise unmatched clips. It is not
+limited to waveform matching. Supported source timecodes can come from container
+metadata, BWF/iXML, or LTC recorded as audio.
+
+The default `--time-source auto` uses available recording timestamps and source
+timecode. `--time-source timecode` selects timecode as the timing metadata source;
+it still runs audio matching. Missing metadata does not disable audio matching,
+and timecode does not override established audio matches. Devices need compatible
+timecodes for overlap-based alignment to be meaningful.
+
 ```sh
 align-cli sync --search-accuracy thorough --match-threshold conservative \
   /path/to/media > result.json
