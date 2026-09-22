@@ -1,87 +1,148 @@
+<div align="center">
+
+<img src="Support/AppIcon.png" width="112" height="112" alt="Align app icon">
+
 # Align
 
-Align synchronizes video and separately recorded audio by matching their
-waveforms. It exports aligned timelines for Premiere Pro, DaVinci Resolve,
-Final Cut Pro, and AAF-compatible editors, leaving the original media unchanged.
+**Sync your recordings. Keep your edit.**
 
-Use the desktop app for interactive work, the CLI for batch processing, or the
-stdio MCP server for integrations.
+Waveform-based synchronization for camera footage and separately recorded audio.
 
-## Features
+[Releases](https://github.com/FedyaLight/align/releases) ·
+[User guide](docs/usage.md) ·
+[Supported formats](docs/formats.md) ·
+[Development](docs/development.md)
 
-- Synchronizes media files, folders, and imported XML, FCPXML, or AAF timelines.
-- Uses waveform matching with timecode and recording metadata as supporting evidence.
-- Keeps unrelated recordings in separate synchronization groups.
-- Preserves selected tracks' basic edits while aligning other recordings.
-- Exports Premiere XML, Final Cut Pro FCPXML, Resolve OTIO/XML and an import
-  script, or linked AAF.
-- Saves analysis results for later export and reuses cached fingerprints.
+[![CI](https://github.com/FedyaLight/align/actions/workflows/align-rs.yml/badge.svg)](https://github.com/FedyaLight/align/actions/workflows/align-rs.yml)
+[![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 
-Format support has limits, particularly for effects, transitions, and retiming.
-See [supported formats](docs/formats.md) before processing an edited project.
+</div>
 
-## Build and run
+---
 
-Install a current stable Rust toolchain. Install FFmpeg and ffprobe for portable
-media decoding. Platform-specific build dependencies are
-listed in the [development guide](docs/development.md).
+Align finds shared sound across recordings and places them on a common timeline.
+Use the desktop app to review the result, the CLI for batch jobs, or the MCP
+server to connect it to other tools. Original recordings stay untouched.
+
+## From recordings to an edit
+
+1. **Add media** — files, folders, or an XML, FCPXML, or AAF timeline.
+2. **Synchronize** — match waveforms, then review groups and unmatched clips.
+3. **Export** — open the aligned timeline in your editor.
+
+| Editor | Export formats |
+| :--- | :--- |
+| Adobe Premiere Pro | FCP 7 XML |
+| DaVinci Resolve | XML, OpenTimelineIO, Python import script |
+| Final Cut Pro | FCPXML timeline and multicam projects |
+| AAF-compatible editors | Linked AAF |
+
+Interchange support varies by format. Effects, transitions, and retiming may not
+survive a round trip. Check the [format limits](docs/formats.md) before processing
+an existing edit.
+
+## What Align handles
+
+- **Shared audio:** waveform matching, with timecode and recording metadata as
+  supporting evidence.
+- **Existing edits:** preserve selected tracks' basic trims, duplicates,
+  positions, and gaps while aligning other recordings.
+- **Clock drift:** render corrected audio from validated time mappings without
+  changing the source files.
+- **Separate recordings:** keep unrelated material in separate synchronization
+  groups and show clips that could not be matched.
+- **Repeat work:** reuse cached fingerprints and save analysis results for later
+  export.
+
+## Get started
+
+Published installers are listed on the [Releases page](https://github.com/FedyaLight/align/releases).
+For a source build, follow the instructions below.
+
+Align is under active development. CI checks the Rust workspace and CLI workflows
+on macOS, Windows, and Linux; it does not verify every desktop environment or
+editor version. The local macOS packaging script targets Apple Silicon and
+macOS 15 or later.
+
+<details>
+<summary><strong>macOS: if the app is reported as damaged</strong></summary>
+
+The app is not Developer ID signed or notarized. For a copy downloaded from this
+project's official release, move `Align.app` to `/Applications`, then run:
 
 ```sh
-cargo build --release -p align-cli -p align-mcp -p align-gpui
-cargo run --release -p align-gpui
+sudo xattr -dr com.apple.quarantine "/Applications/Align.app"
+open "/Applications/Align.app"
 ```
 
-The desktop executable is `align`; the command-line executable is `align-cli`.
-Desktop builds installed through a Velopack package support updates from the
-**Align** menu. Updates require accessible release packages; see
-[packaging](docs/development.md#packaging).
-AAF support requires an additional [build step](docs/development.md#aaf-module).
+</details>
+
+### Build from source
+
+Install a current stable Rust toolchain, FFmpeg, and ffprobe. See the
+[development guide](docs/development.md#prerequisites) for platform dependencies.
 
 ```sh
-# Synchronize recordings and save the result.
+cargo build --locked --release -p align-cli -p align-mcp -p align-gpui
+cargo run --locked --release -p align-gpui
+```
+
+The desktop executable is `align`; the CLI is `align-cli`. AAF support needs the
+additional [AAF module](docs/development.md#aaf-module).
+
+### Use the CLI
+
+Synchronize recordings and save the result:
+
+```sh
 ./target/release/align-cli sync /path/to/media > result.json
+```
 
-# Export the saved result.
+Export it to your editor's interchange formats:
+
+```sh
 ./target/release/align-cli export-json result.json /path/to/output
+```
 
-# Or synchronize and export in one step.
+Or synchronize and export in one command:
+
+```sh
 ./target/release/align-cli export /path/to/output /path/to/media
 ```
 
-The CLI writes JSON to stdout and progress to stderr. Keep exported media folders
-with their timelines; corrected audio and precision stems may be required for
-playback. See [usage](docs/usage.md) for sequence selection, relinking, and export
-options.
+On Windows, use `align-cli.exe`. JSON goes to stdout; progress goes to stderr.
+Keep generated audio folders with the exported timelines. See the
+[user guide](docs/usage.md) for sequence selection, relinking, export options,
+and [MCP configuration](docs/usage.md#mcp-integration).
 
 ## Documentation
 
-- [Usage](docs/usage.md) — desktop workflow, CLI examples, saved results, and MCP.
-- [Formats](docs/formats.md) — import/export support, media ownership, and limitations.
-- [Development](docs/development.md) — setup, architecture, tests, and packaging.
-- [Drift correction](docs/drift.md) — clock drift, rendered audio, and export reuse.
-
-## Platform support
-
-Align is under active development. CI checks the Rust workspace and CLI workflows
-on macOS, Windows, and Linux. Those checks do not establish compatibility with
-every editor version or verify desktop interaction on every platform. The macOS
-packaging script targets Apple Silicon and macOS 15 or later.
+| Guide | Contents |
+| :--- | :--- |
+| [Usage](docs/usage.md) | Desktop workflow, CLI commands, saved results, and MCP |
+| [Formats](docs/formats.md) | Import/export support, editing limits, and media locations |
+| [Drift correction](docs/drift.md) | Clock drift, rendered audio, and export reuse |
+| [Development](docs/development.md) | Build setup, architecture, tests, and packaging |
+| [Distribution](docs/distribution.md) | Release workflow, corresponding sources, and dependency licenses |
 
 ## Contributing
 
-For bug reports, include the Align version, operating system, steps to reproduce,
-and the error message. For timeline problems, name the interchange format and
-editor version. Do not attach private recordings or project files to public
-issues. Build and verification commands are in the [development guide](docs/development.md).
+[Report an issue](https://github.com/FedyaLight/align/issues) with the Align
+version, operating system, steps to reproduce, and error message. For timeline
+problems, include the interchange format and editor version. Do not attach
+private recordings or project files to public issues.
+
+For code changes, use the [development checks](docs/development.md#verification)
+and describe the behavior you changed and how you tested it.
 
 ## License
 
 Copyright (c) 2026 Align contributors.
 
-Align is licensed under the GNU General Public License, version 3 only
-(`GPL-3.0-only`). You may use, modify, and redistribute it under those terms.
-It is provided without warranty. See [LICENSE](LICENSE).
+Align is licensed under **GNU GPL v3 only** (`GPL-3.0-only`). You may use, modify,
+and redistribute it under those terms. It is provided without warranty.
+See [LICENSE](LICENSE).
 
 Third-party components retain their own licenses. See
 [third-party notices](THIRD_PARTY_NOTICES.txt) and the
-[distribution notes](docs/distribution.md).
+[distribution guide](docs/distribution.md).
