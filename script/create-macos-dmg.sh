@@ -25,7 +25,9 @@ dmgbuild.build_dmg(output, 'Align', settings={
     'files': [app],
     'symlinks': {'Applications': '/Applications'},
     'background': background,
-    'window_rect': ((180, 120), (720, 440)),
+    # Finder bounds include its title bar and may retain the user's path bar.
+    # Leave vertical room around the 720 x 440 background on first open.
+    'window_rect': ((180, 120), (720, 500)),
     'icon_locations': {'Align.app': (190, 230), 'Applications': (530, 230)},
     'icon_size': 96,
     'text_size': 13,
