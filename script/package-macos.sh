@@ -13,6 +13,8 @@ APP_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT_DIR/Cargo.toml" | h
 BUNDLE_FFMPEG="${BUNDLE_FFMPEG:-1}"
 FFMPEG_DIR="${FFMPEG_DIR:-}"
 ALIGN_SKIP_LAUNCH_CHECK="${ALIGN_SKIP_LAUNCH_CHECK:-0}"
+AAF_DIR="${AAF_DIR:-}"
+RELEASE_LICENSES="${RELEASE_LICENSES:-}"
 
 if [[ -e "$OUT_DIR" || -L "$OUT_DIR" ]]; then
   echo "Package destination already exists: $OUT_DIR" >&2
@@ -23,9 +25,18 @@ fi
 # Build the self-contained AAF module before touching an existing package.
 AAF_BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/align-aaf-package.XXXXXX")"
 trap 'rm -rf "$AAF_BUILD_DIR"' EXIT
-python3 -m venv "$AAF_BUILD_DIR/venv"
-"$AAF_BUILD_DIR/venv/bin/python" -m pip install -r "$ROOT_DIR/Support/aaf/build-requirements.txt"
-"$AAF_BUILD_DIR/venv/bin/python" "$ROOT_DIR/script/build-aaf-sidecar.py" "$AAF_BUILD_DIR/dist"
+if [[ -z "$AAF_DIR" ]]; then
+  python3 -m venv "$AAF_BUILD_DIR/venv"
+  "$AAF_BUILD_DIR/venv/bin/python" -m pip install -r "$ROOT_DIR/Support/aaf/build-requirements.txt"
+  "$AAF_BUILD_DIR/venv/bin/python" "$ROOT_DIR/script/build-aaf-sidecar.py" "$AAF_BUILD_DIR/dist"
+  AAF_DIR="$AAF_BUILD_DIR/dist"
+fi
+test -x "$AAF_DIR/align-aaf"
+test -d "$AAF_DIR/AAF-Licenses"
+if [[ -n "$RELEASE_LICENSES" ]]; then
+  test -f "$RELEASE_LICENSES/BUILD-MANIFEST.json"
+  test -f "$RELEASE_LICENSES/Rust-Licenses.txt"
+fi
 
 if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
   if [[ -z "$FFMPEG_DIR" ]]; then
@@ -40,7 +51,7 @@ if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
 fi
 
 echo "==> building release"
-cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml" -p align-cli -p align-mcp -p align-gpui
+cargo build --locked --release --manifest-path "$ROOT_DIR/Cargo.toml" -p align-cli -p align-mcp -p align-gpui
 
 BIN_DIR="$ROOT_DIR/target/release"
 APP_BUNDLE="$OUT_DIR/$APP_NAME.app"
@@ -66,11 +77,15 @@ cp "$BIN_DIR/align-mcp" "$APP_MACOS/align-mcp"
 cp "$ROOT_DIR/THIRD_PARTY_NOTICES.txt" "$OUT_DIR/THIRD_PARTY_NOTICES.txt"
 cp "$ROOT_DIR/LICENSE" "$OUT_DIR/LICENSE"
 chmod +x "$OUT_DIR/align-cli" "$APP_MACOS/align-cli" "$OUT_DIR/align-mcp" "$APP_MACOS/align-mcp"
-cp "$AAF_BUILD_DIR/dist/align-aaf" "$APP_MACOS/align-aaf"
-cp "$AAF_BUILD_DIR/dist/align-aaf" "$OUT_DIR/align-aaf"
-cp -R "$AAF_BUILD_DIR/dist/AAF-Licenses" "$RESOURCES/AAF-Licenses"
-cp -R "$AAF_BUILD_DIR/dist/AAF-Licenses" "$OUT_DIR/AAF-Licenses"
+cp "$AAF_DIR/align-aaf" "$APP_MACOS/align-aaf"
+cp "$AAF_DIR/align-aaf" "$OUT_DIR/align-aaf"
+cp -R "$AAF_DIR/AAF-Licenses" "$RESOURCES/AAF-Licenses"
+cp -R "$AAF_DIR/AAF-Licenses" "$OUT_DIR/AAF-Licenses"
 chmod +x "$APP_MACOS/align-aaf" "$OUT_DIR/align-aaf"
+if [[ -n "$RELEASE_LICENSES" ]]; then
+  cp -R "$RELEASE_LICENSES" "$RESOURCES/ThirdPartyLicenses"
+  cp -R "$RELEASE_LICENSES" "$OUT_DIR/ThirdPartyLicenses"
+fi
 
 
 # Both entry points discover adjacent sidecars.

@@ -2,7 +2,9 @@
 
 <img src="Support/AppIcon.png" width="112" height="112" alt="Align app icon">
 
-# Align — free, open-source audio & video sync
+# Align
+
+### Free, open-source audio & video sync
 
 **Sync your recordings. Keep your edit.**
 

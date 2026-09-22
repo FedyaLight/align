@@ -58,9 +58,36 @@ license cannot be resolved under those choices. Adding a new license requires
 review rather than disabling that check. Automated collection is not a legal
 opinion about every future dependency or packaging change.
 
-The local `package-macos.sh` script makes development bundles. It does not run
-this release-source workflow; use the GitHub release workflow for published
-installers. Code signing and Apple notarization require separate credentials.
+## macOS DMG releases
+
+A standalone macOS release can use a `vX.Y.Z` tag and the local packaging scripts.
+This does not trigger the `align-rs-vX.Y.Z` multiplatform installer jobs. Match the
+workspace version, commit all changes, and prepare the corresponding sources
+with the commands above before packaging. Pass the same AAF and FFmpeg build
+directories used by source preparation. Install `dmgbuild==1.6.7` in a Python
+virtual environment and set `PYTHON` to that environment’s interpreter for the DMG
+step. Layout metadata is written directly without automating Finder:
+
+```sh
+AAF_DIR="$PWD/target/release" \
+FFMPEG_DIR="$PWD/target/ffmpeg-minimal" \
+RELEASE_LICENSES="$PWD/target/release/ThirdPartyLicenses" \
+  ./script/package-macos.sh "$PWD/target/macos-package"
+./script/create-macos-dmg.sh target/macos-package/Align.app \
+  target/Align-macOS-arm64.dmg
+```
+
+The DMG contains Align.app and an Applications shortcut with a custom Finder
+layout. CLI, MCP, AAF, FFmpeg, and license notices are inside the app bundle.
+The packaging script checks the bundle signature, CLI, MCP, and app launch.
+Run `script/check-end-to-end.py` against the packaged CLI before publishing.
+Upload the DMG, corresponding `align-source-macOS.tar.gz`, and both checksum
+files together. Include the macOS installation instructions from the README in
+the release notes. Verify uploaded assets before publishing a draft release.
+
+Without `RELEASE_LICENSES`, `package-macos.sh` only makes a development bundle;
+it does not collect release sources itself. The app is ad-hoc signed. Developer
+ID signing and Apple notarization require separate credentials.
 
 ## Component details
 
