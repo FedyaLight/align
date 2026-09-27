@@ -12,6 +12,7 @@ pub mod aaf;
 pub mod backend;
 pub mod export;
 pub mod ff;
+pub mod isobmff;
 mod ltc;
 pub mod media_assets;
 mod mix;
@@ -19,6 +20,7 @@ pub mod mono;
 pub mod pipeline;
 pub mod portable;
 pub mod provider;
+pub mod remux;
 pub mod render;
 pub mod sym;
 pub mod timeline;
@@ -55,11 +57,6 @@ pub enum DecodeError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
-
-/// Maximum concurrent decoder jobs.
-pub const MAX_PARALLEL_DECODERS: usize = 4;
-/// Fixed decode/resample block size in frames.
-pub const RESAMPLE_BLOCK: usize = 32_768;
 
 pub fn supported_extensions() -> &'static [&'static str] {
     &[

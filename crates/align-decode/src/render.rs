@@ -69,7 +69,7 @@ fn decode_render_error(error: RenderError) -> DecodeError {
     }
 }
 
-fn check_cancel(cancel: &AtomicBool) -> Result<(), RenderError> {
+pub(crate) fn check_cancel(cancel: &AtomicBool) -> Result<(), RenderError> {
     if cancel.load(Ordering::Relaxed) {
         Err(RenderError::Cancelled)
     } else {
@@ -501,6 +501,100 @@ pub fn render_drift_cancellable(
     }
 }
 
+// ------------------------------------------------------------ rate conversion
+
+/// Stream `duration` seconds of stream 0 from `source_start` as planar
+/// blocks at `target_rate`. Emits exactly `round(duration × target_rate)`
+/// frames: audio missing past the end of the source becomes silence.
+/// Returns the channel count. Native-rate sources pass through untouched.
+pub(crate) fn stream_at_rate(
+    backend: &dyn MediaBackend,
+    source: &Path,
+    source_start: f64,
+    duration: f64,
+    target_rate: f64,
+    cancel: &AtomicBool,
+    emit: &mut dyn FnMut(Vec<Vec<f32>>) -> Result<(), RenderError>,
+) -> Result<usize, RenderError> {
+    check_cancel(cancel)?;
+    let probe = backend.inspect(source).map_err(RenderError::from)?;
+    let stream = probe
+        .audio_streams
+        .first()
+        .ok_or_else(|| RenderError::NoAudio(file_name(source)))?;
+    let (sample_rate, channels) = (stream.sample_rate, stream.channels);
+    if sample_rate <= 0.0 || channels == 0 || duration.is_nan() || duration < 0.0 {
+        return Err(RenderError::UnknownFormat(file_name(source)));
+    }
+    let source_start = source_start.max(0.0);
+    let expected = (duration * target_rate).round() as usize;
+    let available = (probe.duration_seconds - source_start).clamp(0.0, duration);
+    // Source audio stops at its own end, never at a decoder block edge.
+    let audible = ((available * target_rate).round() as usize).min(expected);
+    let mut emitted = 0usize;
+    let mut forward = |mut planes: Vec<Vec<f32>>, emitted: &mut usize, limit: usize| {
+        let take = planes.first().map_or(0, |p| p.len()).min(limit - *emitted);
+        if take == 0 {
+            return Ok(());
+        }
+        for plane in &mut planes {
+            plane.truncate(take);
+        }
+        *emitted += take;
+        emit(planes)
+    };
+    if available > 0.0 && (sample_rate - target_rate).abs() < 1e-9 {
+        backend
+            .decode_native(
+                source,
+                0,
+                Some((source_start, Some(available))),
+                &mut |block: NativeBlock| {
+                    check_cancel(cancel).map_err(decode_render_error)?;
+                    forward(block.frames, &mut emitted, audible).map_err(decode_render_error)
+                },
+            )
+            .map_err(RenderError::from)?;
+    } else if available > 0.0 {
+        // Same filter and guard handling as drift segments; the ratio is
+        // simply the rate change over an unchanged duration.
+        let start_frame = (source_start * sample_rate).round() as usize;
+        let guard_frames = start_frame.min(4096);
+        let decode_start = (start_frame - guard_frames) as f64 / sample_rate;
+        let decode_end =
+            (source_start + available + 4096.0 / sample_rate).min(probe.duration_seconds);
+        let ratio = target_rate / sample_rate;
+        let mut segment = Segment::new(
+            source_start,
+            available,
+            available * ratio,
+            sample_rate,
+            channels,
+        )?;
+        segment.skip += (guard_frames as f64 * ratio).round() as usize;
+        backend
+            .decode_native(
+                source,
+                0,
+                Some((decode_start, Some((decode_end - decode_start).max(0.0)))),
+                &mut |block: NativeBlock| {
+                    check_cancel(cancel).map_err(decode_render_error)?;
+                    let out = segment.push(block.frames).map_err(decode_render_error)?;
+                    forward(out, &mut emitted, audible).map_err(decode_render_error)
+                },
+            )
+            .map_err(RenderError::from)?;
+        forward(segment.finish(cancel)?, &mut emitted, audible)?;
+    }
+    // Silence for any requested time past the end of the source.
+    while emitted < expected {
+        check_cancel(cancel)?;
+        let block = (expected - emitted).min(1 << 16);
+        forward(vec![vec![0.0; block]; channels], &mut emitted, expected)?;
+    }
+    Ok(channels)
+}
+
 // ------------------------------------------------------------ placement pad
 
 /// Placement-pad sidecar render (32-bit float, native rate/channels).
@@ -513,23 +607,6 @@ pub fn render_drift_cancellable(
 /// `start`/`end` and ignores `<subframeoffset>`. BWF extension handling
 /// mirrors drift sidecars. `selection` is a native-sample half-open range;
 /// when present, only that range follows the prepend.
-pub fn render_pad(
-    backend: &dyn MediaBackend,
-    source: &Path,
-    destination: &Path,
-    pad_samples: u64,
-    selection: Option<(u64, u64)>,
-) -> Result<(), RenderError> {
-    render_pad_cancellable(
-        backend,
-        source,
-        destination,
-        pad_samples,
-        selection,
-        &NEVER_CANCELLED,
-    )
-}
-
 pub fn render_pad_cancellable(
     backend: &dyn MediaBackend,
     source: &Path,
@@ -640,56 +717,6 @@ pub fn render_pad_cancellable(
 /// Uses int32 for 32-bit integer sources, otherwise float32. BWF
 /// TimeReference shifts by the
 /// trim offset, CodingHistory gains a channel-extraction line.
-#[allow(clippy::too_many_arguments)]
-pub fn render_channel(
-    backend: &dyn MediaBackend,
-    source: &Path,
-    destination: &Path,
-    channel: usize,
-    bit_depth: Option<u32>,
-    is_float: bool,
-    source_start: f64,
-    duration: f64,
-) -> Result<(), RenderError> {
-    render_channel_with_tail(
-        backend,
-        source,
-        destination,
-        channel,
-        bit_depth,
-        is_float,
-        source_start,
-        duration,
-        0,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn render_channel_with_tail(
-    backend: &dyn MediaBackend,
-    source: &Path,
-    destination: &Path,
-    channel: usize,
-    bit_depth: Option<u32>,
-    is_float: bool,
-    source_start: f64,
-    duration: f64,
-    tail_samples: u64,
-) -> Result<(), RenderError> {
-    render_channel_cancellable(
-        backend,
-        source,
-        destination,
-        channel,
-        bit_depth,
-        is_float,
-        source_start,
-        duration,
-        tail_samples,
-        &NEVER_CANCELLED,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn render_channel_cancellable(
     backend: &dyn MediaBackend,
@@ -826,6 +853,23 @@ pub fn render_channel_cancellable(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn render_pad(
+        backend: &dyn MediaBackend,
+        source: &Path,
+        destination: &Path,
+        pad_samples: u64,
+        selection: Option<(u64, u64)>,
+    ) -> Result<(), RenderError> {
+        render_pad_cancellable(
+            backend,
+            source,
+            destination,
+            pad_samples,
+            selection,
+            &NEVER_CANCELLED,
+        )
+    }
 
     fn write_stereo_wav(path: &Path, rate: u32, secs: u64, seed: u64) {
         let spec = hound::WavSpec {
@@ -1323,7 +1367,19 @@ mod tests {
         write_stereo_wav(&src, 48000, 4, 0xC4);
         let dst = dir.join("ch1.wav");
         let backend = crate::portable::PortableBackend;
-        render_channel(&backend, &src, &dst, 1, Some(16), false, 1.0, 2.0).expect("stem");
+        render_channel_cancellable(
+            &backend,
+            &src,
+            &dst,
+            1,
+            Some(16),
+            false,
+            1.0,
+            2.0,
+            0,
+            &NEVER_CANCELLED,
+        )
+        .expect("stem");
         let reader = hound::WavReader::open(&dst).expect("open stem");
         assert_eq!(reader.spec().channels, 1);
         assert_eq!(reader.duration(), 2 * 48000);
@@ -1337,7 +1393,7 @@ mod tests {
         let src = dir.join("src.wav");
         write_stereo_wav(&src, 48000, 3, 0xC4);
         let dst = dir.join("trim.wav");
-        render_channel(
+        render_channel_cancellable(
             &crate::apple::AppleNativeBackend,
             &src,
             &dst,
@@ -1346,6 +1402,8 @@ mod tests {
             false,
             0.4004,
             (80080.0 - 0.00001) / 48000.0,
+            0,
+            &NEVER_CANCELLED,
         )
         .unwrap();
         assert_eq!(hound::WavReader::open(&dst).unwrap().duration(), 80080);

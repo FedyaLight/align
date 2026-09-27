@@ -187,20 +187,10 @@ impl ImportedAudio {
     }
 }
 
-pub fn read_audio(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, AafError> {
-    read_response(path, cancel, "read-audio", 1)
-}
+/// Protocol version of the bridge's `read-timeline` response.
+const READ_TIMELINE_VERSION: u32 = 3;
 
 pub fn read_timeline(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, AafError> {
-    read_response(path, cancel, "read-timeline", 3)
-}
-
-fn read_response(
-    path: &Path,
-    cancel: &AtomicBool,
-    operation: &str,
-    version: u32,
-) -> Result<ImportedAudio, AafError> {
     if cancel.load(Ordering::Relaxed) {
         return Err(AafError::Cancelled);
     }
@@ -208,12 +198,10 @@ fn read_response(
     // A file avoids stdout pipe deadlocks on large compositions while retaining
     // cancellable process supervision and automatic temporary-file cleanup.
     let mut output = tempfile::tempfile()?;
-    let mut command = Command::new(executable);
-    command.arg(operation).arg(path);
-    if operation == "read-timeline" {
-        command.arg(crate::media_assets::extraction_directory()?);
-    }
-    let mut child = command
+    let mut child = Command::new(executable)
+        .arg("read-timeline")
+        .arg(path)
+        .arg(crate::media_assets::extraction_directory()?)
         .stdin(Stdio::null())
         .stdout(Stdio::from(output.try_clone()?))
         .stderr(Stdio::inherit())
@@ -232,7 +220,7 @@ fn read_response(
     output.seek(SeekFrom::Start(0))?;
     let result: ImportedAudio =
         serde_json::from_reader(output).map_err(|e| AafError::Writer(e.to_string()))?;
-    if result.version != version {
+    if result.version != READ_TIMELINE_VERSION {
         return Err(AafError::Writer(
             "AAF module protocol version mismatch".into(),
         ));
@@ -508,12 +496,18 @@ pub fn audio_manifest(
     })
 }
 
-/// Assemble linked picture tracks alongside prepared mono sound tracks.
-pub fn timeline_manifest(
-    timeline: &align_core::export::ExportTimeline,
-    cancel: &AtomicBool,
-) -> Result<serde_json::Value, AafError> {
-    timeline_manifest_with_frame_rate(timeline, None, cancel)
+/// Stream description for the AAF module's media link without FFmpeg:
+/// QuickTime/MP4 headers are read natively, and the AAF module parses MXF
+/// itself (it ignores the description for `.mxf`).
+fn picture_metadata(path: &Path) -> Option<serde_json::Value> {
+    let is_mxf = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("mxf"));
+    if is_mxf {
+        return Some(serde_json::json!({}));
+    }
+    crate::isobmff::ama_metadata(path)
 }
 
 /// Assemble an AAF manifest with an optional composition timecode rate.
@@ -583,6 +577,11 @@ pub fn timeline_manifest_with_frame_rate(
         let length = frame(item.selected_timeline_duration("video"))?;
         if length == 0 {
             return Err(fail("Empty AAF picture edit"));
+        }
+        if !metadata.contains_key(&item.clip.url) {
+            if let Some(value) = picture_metadata(&item.clip.url) {
+                metadata.insert(item.clip.url.clone(), value);
+            }
         }
         if !metadata.contains_key(&item.clip.url) {
             let probe = crate::ff::ffprobe_bin()
@@ -910,7 +909,7 @@ mod tests {
     #[test]
     fn cancelled_import_does_not_start_reader() {
         assert!(matches!(
-            read_audio(Path::new("missing.aaf"), &AtomicBool::new(true)),
+            read_timeline(Path::new("missing.aaf"), &AtomicBool::new(true)),
             Err(AafError::Cancelled)
         ));
     }

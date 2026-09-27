@@ -756,7 +756,7 @@ fn export_prepared_internal(
                 Some(plan.video_url.clone()),
                 ExportJobKind::Media,
             );
-            let file = export_media_file(&plan, cancel)?;
+            let file = export_media_file(backend, &plan, cancel)?;
             completed += 1;
             emit(
                 &mut progress,
@@ -995,12 +995,39 @@ pub(crate) fn wait_render_process(
 /// Remux one complete camera file without re-encoding its video stream. The
 /// external track is trimmed sample-accurately, padded to the camera duration,
 /// and encoded as uncompressed 32-bit float at the NLE-native 48 kHz rate.
+/// QuickTime/MP4 cameras are copied natively; other containers use FFmpeg.
 fn export_media_file(
+    backend: &dyn MediaBackend,
     plan: &MediaFilePlan,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<PathBuf, ExportError> {
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(ExportError::Cancelled);
+    }
+    let temp = plan
+        .url
+        .with_extension(format!("tmp-{}.mov", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+    let audio = crate::remux::ReplacementAudio {
+        backend,
+        source: &plan.recorder_url,
+        source_in: plan.recorder_source_in,
+        duration: plan.recorder_duration,
+        leading_silence: plan.leading_silence,
+        total: plan.video_duration,
+    };
+    match crate::remux::replace_audio(&plan.video_url, &temp, &audio, cancel) {
+        Ok(()) => return publish_media_file(&temp, &plan.url),
+        Err(crate::remux::RemuxError::Unsupported(_)) => {
+            let _ = std::fs::remove_file(&temp);
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            return Err(match error {
+                crate::remux::RemuxError::Render(error) => ExportError::from(error),
+                other => ExportError::Media(format!("{}: {other}", plan.video_url.display())),
+            });
+        }
     }
     let ffmpeg = crate::ff::ffmpeg_bin()
         .ok_or_else(|| ExportError::Media("ffmpeg not found in PATH.".into()))?;
@@ -1009,10 +1036,6 @@ fn export_media_file(
         "[1:a:0]atrim=duration={:.9},asetpts=PTS-STARTPTS,aresample=48000,adelay={delay_samples}S:all=1,apad=whole_dur={:.9},atrim=duration={:.9}[clean]",
         plan.recorder_duration, plan.video_duration, plan.video_duration
     );
-    let temp = plan
-        .url
-        .with_extension(format!("tmp-{}.mov", std::process::id()));
-    let _ = std::fs::remove_file(&temp);
     let mut child = std::process::Command::new(ffmpeg)
         .args(["-y", "-v", "error", "-i"])
         .arg(&plan.video_url)
@@ -1039,15 +1062,19 @@ fn export_media_file(
             plan.video_url.display()
         )));
     }
+    publish_media_file(&temp, &plan.url)
+}
+
+fn publish_media_file(temp: &Path, url: &Path) -> Result<PathBuf, ExportError> {
     #[cfg(windows)]
-    if plan.url.is_file() {
-        std::fs::remove_file(&plan.url).map_err(|e| ExportError::Io(e.to_string()))?;
+    if url.is_file() {
+        std::fs::remove_file(url).map_err(|e| ExportError::Io(e.to_string()))?;
     }
-    if let Err(error) = std::fs::rename(&temp, &plan.url) {
-        let _ = std::fs::remove_file(&temp);
+    if let Err(error) = std::fs::rename(temp, url) {
+        let _ = std::fs::remove_file(temp);
         return Err(ExportError::Io(error.to_string()));
     }
-    Ok(plan.url.clone())
+    Ok(url.to_path_buf())
 }
 
 fn emit(
@@ -1610,7 +1637,12 @@ mod tests {
             url: output.clone(),
         };
 
-        export_media_file(&plan, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        export_media_file(
+            &crate::portable::PortableBackend,
+            &plan,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
         let report = crate::ff::inspect(&output).unwrap();
 
         assert!(report.has_video);
