@@ -343,10 +343,11 @@ fn write_island(
         .clips
         .iter()
         .filter(|i| {
-            !i.clip.audio.is_empty()
-                && !(i.clip.video.is_some()
-                    && i.audio_enabled == Some(false)
-                    && i.linked_audio_edit.is_none())
+            // Disabled camera audio without a linked edit has nothing to place.
+            let muted_camera_audio = i.clip.video.is_some()
+                && i.audio_enabled == Some(false)
+                && i.linked_audio_edit.is_none();
+            !i.clip.audio.is_empty() && !muted_camera_audio
         })
         .collect();
     let video_assignments = allocate(
