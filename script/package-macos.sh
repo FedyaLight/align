@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Packages Align for macOS (arm64): Align.app bundle +
-# align-cli, align-mcp, AAF and FFmpeg sidecars, ad-hoc signed.
+# align-cli, align-mcp and the AAF sidecar, ad-hoc signed.
 # Usage: ./script/package-macos.sh [output-dir]   (default: ~/Downloads/Align-macOS)
 set -euo pipefail
 
@@ -9,8 +9,9 @@ OUT_DIR="${1:-$HOME/Downloads/Align-macOS}"
 APP_NAME="Align"
 BUNDLE_ID="com.align.app"
 APP_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT_DIR/Cargo.toml" | head -1)"
-# Default sidecars support portable decoding and AAF picture metadata.
-BUNDLE_FFMPEG="${BUNDLE_FFMPEG:-1}"
+# AVFoundation decodes and QuickTime export/AAF metadata are native, so
+# FFmpeg is opt-in (BUNDLE_FFMPEG=1) for the portable backend only.
+BUNDLE_FFMPEG="${BUNDLE_FFMPEG:-0}"
 FFMPEG_DIR="${FFMPEG_DIR:-}"
 ALIGN_SKIP_LAUNCH_CHECK="${ALIGN_SKIP_LAUNCH_CHECK:-0}"
 AAF_DIR="${AAF_DIR:-}"

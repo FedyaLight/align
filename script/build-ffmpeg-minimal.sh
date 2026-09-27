@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Build the two portable sidecars Align actually uses. Video is demuxed for
-# timing, audio decoding, and AAF video metadata; no network or device IO.
+# Build the two portable sidecars Align uses for containers it does not read
+# natively (MTS/M2TS, MXF, R3D, AVI, Matroska, compressed audio such as AC-3).
+# QuickTime/MP4 is handled in-process. Video is only demuxed and parsed for
+# timing and dimensions, never decoded, so no video decoders are built. The
+# mov muxer and trim/delay/pad filters serve camera-file export from those
+# containers. No network or device IO.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -37,11 +41,11 @@ JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/
   --enable-swresample \
   --enable-protocol=file,pipe \
   --enable-demuxer=mov,mpegts,mxf,mxf_d10,r3d,avi,asf,matroska,wav,aiff,mp3,flac,ogg \
-  --enable-decoder=aac,aac_fixed,ac3,eac3,alac,mp2,mp3,mp3float,flac,opus,vorbis,h264,hevc,mpeg2video,mpeg4,prores,dnxhd,mjpeg,vp8,vp9,av1,"$PCM_DECODERS" \
-  --enable-parser=aac,aac_latm,ac3,mpegaudio,opus,vorbis,h264,hevc,mpegvideo,mpeg4video,dnxhd,mjpeg,vp8,vp9,av1 \
+  --enable-decoder=aac,ac3,eac3,alac,mp2,mp3float,flac,opus,vorbis,"$PCM_DECODERS" \
+  --enable-parser=aac,aac_latm,ac3,mpegaudio,opus,vorbis,h264,hevc,mpegvideo,mpeg4video \
   --enable-encoder=pcm_f32le,pcm_s32le \
-  --enable-muxer=pcm_f32le,pcm_s32le \
-  --enable-filter=abuffer,aformat,aresample,anull,abuffersink
+  --enable-muxer=pcm_f32le,pcm_s32le,mov \
+  --enable-filter=abuffer,aformat,aresample,anull,abuffersink,atrim,asetpts,adelay,apad
 
 make -j"$JOBS" ffmpeg ffprobe
 

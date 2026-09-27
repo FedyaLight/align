@@ -21,7 +21,8 @@ def main():
     parser.add_argument('output', type=Path)
     parser.add_argument('--platform', required=True, choices=('Linux', 'macOS', 'Windows'))
     parser.add_argument('--licenses', type=Path, required=True)
-    parser.add_argument('--ffmpeg', type=Path, required=True)
+    # macOS releases decode through AVFoundation and ship no FFmpeg.
+    parser.add_argument('--ffmpeg', type=Path)
     parser.add_argument('--aaf', type=Path, required=True)
     parser.add_argument('--velopack-version', required=True)
     args = parser.parse_args()
@@ -30,10 +31,11 @@ def main():
     root = Path(__file__).resolve().parent.parent
     if run('git', 'status', '--porcelain', '--untracked-files=no', cwd=root).strip():
         raise RuntimeError('Release sources require a clean committed checkout')
-    ffmpeg_version = (args.ffmpeg / 'version.txt').read_text(encoding="utf-8").strip()
-    for name in (f'ffmpeg-{ffmpeg_version}.tar.xz', 'build-ffmpeg-minimal.sh', 'config.mak'):
-        if not (args.ffmpeg / name).is_file():
-            raise RuntimeError(f'Missing FFmpeg source file: {name}')
+    if args.ffmpeg is not None:
+        ffmpeg_version = (args.ffmpeg / 'version.txt').read_text(encoding="utf-8").strip()
+        for name in (f'ffmpeg-{ffmpeg_version}.tar.xz', 'build-ffmpeg-minimal.sh', 'config.mak'):
+            if not (args.ffmpeg / name).is_file():
+                raise RuntimeError(f'Missing FFmpeg source file: {name}')
     aaf_versions = json.loads((args.aaf / 'versions.json').read_text(encoding="utf-8"))
     if not (args.aaf / 'Licenses/Python-LICENSE.txt').is_file():
         raise RuntimeError('Missing AAF runtime licenses')
@@ -84,7 +86,10 @@ def main():
             package = tomllib.loads((crate / 'Cargo.toml').read_text(encoding="utf-8"))['package']
             inventory.append({key: package.get(key) for key in
                               ('name', 'version', 'license', 'repository', 'authors')})
-        for folder, origin in [('FFmpeg', args.ffmpeg), ('AAF', args.aaf)]:
+        components = [('AAF', args.aaf)]
+        if args.ffmpeg is not None:
+            components.insert(0, ('FFmpeg', args.ffmpeg))
+        for folder, origin in components:
             if not origin.is_dir() or not any(origin.iterdir()):
                 raise RuntimeError(f'Missing {folder} source bundle: {origin}')
             shutil.copytree(origin, source / folder)
@@ -113,12 +118,14 @@ def main():
             'component_binaries': {},
         }
         extension = '.exe' if args.platform == 'Windows' else ''
-        for path in [args.ffmpeg.parent / f'ffmpeg{extension}',
-                     args.ffmpeg.parent / f'ffprobe{extension}',
-                     args.aaf.parent / f'align-aaf{extension}']:
+        binaries = [args.aaf.parent / f'align-aaf{extension}']
+        if args.ffmpeg is not None:
+            binaries += [args.ffmpeg.parent / f'ffmpeg{extension}',
+                         args.ffmpeg.parent / f'ffprobe{extension}']
+        for path in binaries:
             with path.open('rb') as stream:
                 manifest['component_binaries'][path.name] = hashlib.file_digest(stream, 'sha256').hexdigest()
-        for folder in ('FFmpeg', 'AAF', 'Velopack'):
+        for folder in [name for name, _ in components] + ['Velopack']:
             for path in sorted((source / folder).rglob('*')):
                 if path.is_file():
                     with path.open('rb') as stream:

@@ -18,13 +18,14 @@ Each release includes:
 
 The source archives contain the exact committed Align checkout, Cargo.lock,
 vendored Rust dependencies, a Cargo configuration for offline dependency
-resolution, and a build manifest. They also contain the FFmpeg source tarball
-used for the build, its build script and configuration, the AAF component
+resolution, and a build manifest. Linux and Windows archives also contain the
+FFmpeg source tarball used for the build, its build script and configuration;
+macOS builds ship no FFmpeg. All archives contain the AAF component
 sources, Python's compression and crypto library sources, and the source of the
 pinned Velopack version. Checksums identify the included component files.
 
 Installers include LICENSE, THIRD_PARTY_NOTICES.txt, AAF-Licenses,
-FFMPEG-LICENSE.txt, and ThirdPartyLicenses. The latter contains the generated
+ThirdPartyLicenses, and on Linux and Windows FFMPEG-LICENSE.txt. The latter contains the generated
 Rust license report, upstream notice files, the Velopack license, and the build
 manifest. Keep source downloads available alongside the corresponding binaries.
 Do not replace an old release's source archive with a newer version.
@@ -39,14 +40,15 @@ cargo install cargo-about --version 0.9.2 --features cli --locked
 python script/build-aaf-sidecar.py target/release --release-sources
 ./script/build-ffmpeg-minimal.sh target/ffmpeg-minimal
 python script/prepare-release-source.py target/release-sources \
-  --platform macOS \
+  --platform Linux \
   --licenses target/release/ThirdPartyLicenses \
   --ffmpeg target/ffmpeg-minimal/Sources \
   --aaf target/release/AAF-Sources \
   --velopack-version 1.2.0
 ```
 
-Use `Linux` or `Windows` for those platforms. The source preparation script
+Use `Windows` for that platform. For `macOS`, skip the FFmpeg build and omit
+`--ffmpeg`. The source preparation script
 rejects modified tracked files and missing component sources. It uses
 `cargo vendor --locked` and checks dependency resolution with `cargo metadata
 --frozen`. Build instructions remain in [development](development.md); the
@@ -63,14 +65,13 @@ opinion about every future dependency or packaging change.
 A standalone macOS release can use a `vX.Y.Z` tag and the local packaging scripts.
 This does not trigger the `align-rs-vX.Y.Z` multiplatform installer jobs. Match the
 workspace version, commit all changes, and prepare the corresponding sources
-with the commands above before packaging. Pass the same AAF and FFmpeg build
-directories used by source preparation. Install `dmgbuild==1.6.7` in a Python
+with the commands above before packaging. Pass the same AAF build directory
+used by source preparation. Install `dmgbuild==1.6.7` in a Python
 virtual environment and set `PYTHON` to that environment’s interpreter for the DMG
 step. Layout metadata is written directly without automating Finder:
 
 ```sh
 AAF_DIR="$PWD/target/release" \
-FFMPEG_DIR="$PWD/target/ffmpeg-minimal" \
 RELEASE_LICENSES="$PWD/target/release/ThirdPartyLicenses" \
   ./script/package-macos.sh "$PWD/target/macos-package"
 ./script/create-macos-dmg.sh target/macos-package/Align.app \
@@ -78,7 +79,7 @@ RELEASE_LICENSES="$PWD/target/release/ThirdPartyLicenses" \
 ```
 
 The DMG contains Align.app and an Applications shortcut with a custom Finder
-layout. CLI, MCP, AAF, FFmpeg, and license notices are inside the app bundle.
+layout. CLI, MCP, AAF, and license notices are inside the app bundle.
 The packaging script checks the bundle signature, CLI, MCP, and app launch.
 Run `script/check-end-to-end.py` against the packaged CLI before publishing.
 Upload the DMG, corresponding `align-source-macOS.tar.gz`, and both checksum
@@ -91,8 +92,10 @@ ID signing and Apple notarization require separate credentials.
 
 ## Component details
 
-FFmpeg and ffprobe are separate executables. The default build excludes GPL and
-nonfree components and retains FFmpeg's LGPL license. See
+FFmpeg and ffprobe are separate executables, shipped on Linux and Windows for
+containers Align does not read natively (MTS, MXF, R3D, and compressed audio
+such as AC-3). The build has no video decoders: video is only parsed for timing.
+It excludes GPL and nonfree components and retains FFmpeg's LGPL license. See
 [FFmpeg's license guidance](https://ffmpeg.org/legal.html).
 
 The AAF builder records the Python and package versions and hashes the native

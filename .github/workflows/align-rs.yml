@@ -124,8 +124,10 @@ jobs:
         run: |
           python -m pip install -r Support/aaf/build-requirements.txt
           python script/build-aaf-sidecar.py target/release --release-sources
-      - name: Build minimal FFmpeg sidecars (Unix)
-        if: runner.os != 'Windows'
+      # macOS decodes and remuxes through AVFoundation and native QuickTime
+      # code, so its installer ships no FFmpeg.
+      - name: Build minimal FFmpeg sidecars (Linux)
+        if: runner.os == 'Linux'
         run: ./script/build-ffmpeg-minimal.sh target/ffmpeg-minimal
       - name: Build minimal FFmpeg sidecars (Windows)
         if: runner.os == 'Windows'
@@ -141,19 +143,26 @@ jobs:
           cp "target/release/align-aaf$exe" dist-bundle/
           cp -R target/release/AAF-Licenses dist-bundle/
           cp LICENSE THIRD_PARTY_NOTICES.txt dist-bundle/
-          cp "target/ffmpeg-minimal/ffmpeg$exe" "target/ffmpeg-minimal/ffprobe$exe" dist-bundle/
-          cp target/ffmpeg-minimal/FFMPEG-LICENSE.txt dist-bundle/
+          if [[ "${{ runner.os }}" != "macOS" ]]; then
+            cp "target/ffmpeg-minimal/ffmpeg$exe" "target/ffmpeg-minimal/ffprobe$exe" dist-bundle/
+            cp target/ffmpeg-minimal/FFMPEG-LICENSE.txt dist-bundle/
+          fi
           ls -la dist-bundle/
       - name: Install dependency license generator
         run: cargo install cargo-about --version 0.9.2 --features cli --locked
       - name: Prepare corresponding sources and dependency licenses
-        run: >-
-          python script/prepare-release-source.py target/release-sources
-          --platform ${{ runner.os }}
-          --licenses dist-bundle/ThirdPartyLicenses
-          --ffmpeg target/ffmpeg-minimal/Sources
-          --aaf target/release/AAF-Sources
-          --velopack-version ${{ env.VELOPACK_VERSION }}
+        shell: bash
+        run: |
+          ffmpeg=()
+          if [[ "${{ runner.os }}" != "macOS" ]]; then
+            ffmpeg=(--ffmpeg target/ffmpeg-minimal/Sources)
+          fi
+          python script/prepare-release-source.py target/release-sources \
+            --platform ${{ runner.os }} \
+            --licenses dist-bundle/ThirdPartyLicenses \
+            "${ffmpeg[@]}" \
+            --aaf target/release/AAF-Sources \
+            --velopack-version ${{ env.VELOPACK_VERSION }}
       - uses: actions/upload-artifact@v4
         with:
           name: sources-${{ runner.os }}
@@ -228,7 +237,8 @@ jobs:
           body: |
             Corresponding source archives for each platform are attached as
             `align-source-<platform>.tar.gz`, with SHA-256 checksums. They include
-            Align, vendored Rust dependencies, FFmpeg, and AAF component sources.
+            Align, vendored Rust dependencies, FFmpeg (Linux and Windows), and AAF
+            component sources.
             Dependency notices are included in the installers.
 
             ### macOS installation

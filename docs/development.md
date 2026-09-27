@@ -3,9 +3,10 @@
 ## Prerequisites
 
 - A current stable Rust toolchain with rustfmt and Clippy.
-- FFmpeg and ffprobe on PATH for portable decoding and test fixture generation.
-  Use a full FFmpeg build for fixtures; the packaged minimal build omits the
-  synthetic video/audio sources used by tests.
+- FFmpeg and ffprobe on PATH for test fixture generation and portable decoding
+  of containers other than WAV/AIFF/MP3/M4A/MOV/MP4. Use a full FFmpeg build for
+  fixtures; the packaged minimal build omits the synthetic sources and video
+  encoders used by tests.
 - Python 3.11 or later for AAF tooling and acceptance scripts.
 - macOS: Xcode command-line tools. The packaged application targets macOS 15+
   on Apple Silicon.
@@ -88,7 +89,8 @@ python script/check-end-to-end.py target/release/align-cli target/acceptance
 
 Run the Python commands in the AAF virtual environment. The acceptance output
 directory must not already exist. On Windows, pass `target/release/align-cli.exe`.
-The CLI must have the AAF module beside it; FFmpeg and ffprobe must be on PATH.
+The CLI must have the AAF module beside it; FFmpeg and ffprobe must be on PATH
+to generate fixtures.
 CI also builds API documentation with `RUSTDOCFLAGS="-D warnings"` to catch
 broken Rust documentation links.
 
@@ -145,17 +147,19 @@ timeline before reading them. It is not part of the unattended CLI test suite.
 ./script/package-macos.sh /path/to/new/Align-macOS
 ```
 
-The script builds the application, CLI, MCP server, and AAF module; bundles
-FFmpeg/ffprobe by default; includes the privacy manifest and license files;
+The script builds the application, CLI, MCP server, and AAF module; includes
+the privacy manifest and license files;
 signs ad hoc; and runs a brief launch check. The output directory must not exist.
 It produces a local macOS bundle, not a notarized installer.
 
 Set `ALIGN_SKIP_LAUNCH_CHECK=1` to package without opening the desktop app.
 Bundle validation and the CLI/MCP checks still run.
 
-To reuse a previously built minimal FFmpeg directory, set `FFMPEG_DIR`.
-`BUNDLE_FFMPEG=0` omits those binaries; portable container decoding and some AAF
-picture operations then require system FFmpeg/ffprobe. To build the sidecars:
+The macOS bundle has no FFmpeg: AVFoundation decodes media, and camera-file
+export and AAF picture metadata read QuickTime/MP4 natively. `BUNDLE_FFMPEG=1`
+adds the minimal sidecars for `ALIGN_BACKEND=portable`; set `FFMPEG_DIR` to
+reuse a previous build. Linux and Windows installers include them. To build the
+sidecars:
 
 ```sh
 ./script/build-ffmpeg-minimal.sh target/ffmpeg-minimal

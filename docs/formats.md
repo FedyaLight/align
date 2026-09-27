@@ -7,10 +7,14 @@ paths. An accepted extension does not guarantee that the installed decoder
 supports the file's codec. Unsupported or unreadable media produces a warning or
 an error; inspect the result before exporting.
 
-On macOS, the default backend uses AVFoundation. The portable backend uses
-Symphonia for supported audio and FFmpeg for other containers. Set
-`ALIGN_BACKEND=portable` to select it on macOS. Video metadata is inspected for
-timing; synchronization does not decode video frames.
+On macOS, the default backend uses AVFoundation. The portable backend reads
+MOV/MP4/M4V headers natively, decodes WAV, AIFF, MP3, AAC, ALAC, and PCM with
+Symphonia, and uses FFmpeg for other containers (MTS, MXF, R3D) and codecs.
+Set `ALIGN_BACKEND=portable` to select it on macOS. Video metadata is inspected
+for timing; synchronization does not decode video frames.
+
+Camera-file export copies QuickTime/MP4 video without re-encoding on every
+platform; other containers need FFmpeg.
 
 ## Timeline interchange
 
@@ -52,8 +56,8 @@ source sample boundaries and composition frame rates are kept distinct.
 
 Embedded video, compressed embedded audio, AAF effects, transitions, and retiming
 are unsupported. Unsupported structures fail explicitly. AAF export writes
-linked media rather than embedding essence. Picture metadata may require
-ffprobe even when the native Apple backend is selected.
+linked media rather than embedding essence. Picture metadata for MOV/MP4 is
+read natively; other containers except MXF need ffprobe.
 
 ## Synchronization and drift
 
