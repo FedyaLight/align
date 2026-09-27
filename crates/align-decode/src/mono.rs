@@ -109,6 +109,12 @@ where
         })
     }
 
+    /// Push owned planar channels.
+    pub fn push_owned(&mut self, planes: &[Vec<f32>]) -> Result<(), DecodeError> {
+        let refs: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
+        self.push_planar(&refs)
+    }
+
     /// Push planar channels (Symphonia `AudioBuffer.chan(i)` slices).
     pub fn push_planar(&mut self, planes: &[&[f32]]) -> Result<(), DecodeError> {
         if planes.len() != self.channels {

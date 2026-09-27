@@ -1104,7 +1104,16 @@ mod tests {
             ),
             (
                 "hevc.mp4",
-                &["-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-c:a", "aac"],
+                &[
+                    "-c:v",
+                    "libx265",
+                    "-x265-params",
+                    "log-level=error",
+                    "-pix_fmt",
+                    "yuv420p10le",
+                    "-c:a",
+                    "aac",
+                ],
             ),
             ("prores.mov", &["-c:v", "prores_ks", "-c:a", "pcm_f32le"]),
         ];

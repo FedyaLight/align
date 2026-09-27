@@ -25,6 +25,7 @@ use symphonia::core::units::{Time, TimeBase};
 
 use crate::DecodeError;
 use crate::backend::AudioStreamProbe;
+use crate::mp4pcm::PcmTrack;
 use align_core::AudioAnalysisSource;
 
 /// Open + demux, returning the reader and the audio-track shortlist.
@@ -239,7 +240,7 @@ fn open_stream(path: &Path, stream_index: usize) -> Result<Stream, DecodeError> 
 /// decode tier *before* any sample flows, so the FFmpeg fallback never
 /// double-emits after a partial Symphonia stream.
 pub fn can_decode(path: &Path, stream_index: usize) -> bool {
-    open_stream(path, stream_index).is_ok()
+    PcmTrack::open(path, stream_index).is_some() || open_stream(path, stream_index).is_ok()
 }
 
 /// Stream a whole file to 8 kHz mono through `consume` (fingerprint path).
@@ -250,6 +251,18 @@ pub fn decode_mono_8k(
     source: AudioAnalysisSource,
     consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
 ) -> Result<(), DecodeError> {
+    if let Some(mut track) = PcmTrack::open(path, source.stream_index()) {
+        let mut pipe = crate::mono::MonoPipe::new(
+            track.sample_rate,
+            8000.0,
+            track.channels,
+            source.selected_channel(),
+            source.mixes_channels(),
+            consume,
+        )?;
+        track.read_f32(0, None, &mut |planes| pipe.push_owned(&planes))?;
+        return pipe.finish();
+    }
     let mut stream = open_stream(path, source.stream_index())?;
     let explicit = source.selected_channel();
     let mut pipe = crate::mono::MonoPipe::new(
@@ -281,11 +294,31 @@ pub fn decode_window(
     duration: f64,
     source: AudioAnalysisSource,
 ) -> Result<(f64, Vec<f32>), DecodeError> {
-    let mut stream = open_stream(path, source.stream_index())?;
     let actual_start = start.max(0.0);
+    let want = (duration * 16_000.0).ceil() as usize + 64;
+    if let Some(mut track) = PcmTrack::open(path, source.stream_index()) {
+        let mut samples = Vec::with_capacity(want);
+        let mut pipe = crate::mono::MonoPipe::new(
+            track.sample_rate,
+            16_000.0,
+            track.channels,
+            source.selected_channel(),
+            source.mixes_channels(),
+            |s: &[f32]| {
+                samples.extend_from_slice(s);
+                Ok(())
+            },
+        )?;
+        let first = (actual_start * track.sample_rate).round() as u64;
+        let count = (want as f64 / 16_000.0 * track.sample_rate).ceil() as u64;
+        track.read_f32(first, Some(count), &mut |planes| pipe.push_owned(&planes))?;
+        pipe.finish()?;
+        samples.truncate(want);
+        return Ok((actual_start, samples));
+    }
+    let mut stream = open_stream(path, source.stream_index())?;
     let mut skip = position(&mut stream, actual_start)?;
     let explicit = source.selected_channel();
-    let want = (duration * 16_000.0).ceil() as usize + 64;
     // Shared collection: the closure owns the mutable borrow for the pipe's
     // lifetime, so length checks go through the cell (windows are small).
     let samples = std::cell::RefCell::new(Vec::with_capacity(want.min(16_000 * 12)));
@@ -414,6 +447,18 @@ pub fn decode_native(
     limit_frames: Option<u64>,
     consume: &mut dyn FnMut(crate::backend::NativeBlock) -> Result<(), DecodeError>,
 ) -> Result<f64, DecodeError> {
+    if let Some(mut track) = PcmTrack::open(path, stream_index) {
+        let (rate, channels) = (track.sample_rate, track.channels);
+        let wanted = (start.max(0.0) * rate).round();
+        track.read_f32(wanted as u64, limit_frames, &mut |frames| {
+            consume(crate::backend::NativeBlock {
+                sample_rate: rate,
+                channels,
+                frames,
+            })
+        })?;
+        return Ok(wanted / rate);
+    }
     let mut stream = open_stream(path, stream_index)?;
     let wanted = (start.max(0.0) * stream.sample_rate as f64).round();
     let mut skip = position(&mut stream, start)?;
@@ -455,6 +500,18 @@ pub fn decode_native_i32(
     consume: &mut dyn FnMut(crate::backend::NativeBlockI32) -> Result<(), DecodeError>,
 ) -> Result<f64, DecodeError> {
     use symphonia::core::audio::{AudioBufferRef, Signal};
+    if let Some(mut track) = PcmTrack::open(path, stream_index) {
+        let (rate, channels) = (track.sample_rate, track.channels);
+        let wanted = (start.max(0.0) * rate).round();
+        track.read_i32(wanted as u64, limit_frames, &mut |frames| {
+            consume(crate::backend::NativeBlockI32 {
+                sample_rate: rate,
+                channels,
+                frames,
+            })
+        })?;
+        return Ok(wanted / rate);
+    }
     let mut stream = open_stream(path, stream_index)?;
     let mut scratch_f32 = AudioBuffer::<f32>::unused();
     let wanted = (start.max(0.0) * stream.sample_rate as f64).round();
