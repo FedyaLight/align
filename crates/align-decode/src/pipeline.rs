@@ -230,10 +230,6 @@ impl Pipeline {
         Self { backend, cache }
     }
 
-    pub fn backend_kind(&self) -> BackendKind {
-        self.backend.kind()
-    }
-
     pub fn backend(&self) -> &dyn MediaBackend {
         &*self.backend
     }
@@ -2355,7 +2351,7 @@ mod tests {
         write_delayed_wav(&dir, "b.wav", &body, 2.0);
 
         let pipe = Pipeline::new_in(BackendKind::AppleNative, Some(dir.join(".cache")));
-        assert_eq!(pipe.backend_kind(), BackendKind::AppleNative);
+        assert_eq!(pipe.backend().kind(), BackendKind::AppleNative);
         let result = pipe
             .synchronize(
                 &[PipelineInput::Media(dir.clone())],

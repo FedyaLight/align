@@ -233,11 +233,6 @@ def repair_paths(document, source, destination):
     return changed
 
 
-def read_audio(path):
-    """Compatibility entry point for audio-only compositions."""
-    return read_timeline(path, audio_only=True)
-
-
 def read_timeline(path, audio_only=False, extract_dir=None):
     """Read linked picture/sound edits; retain each track's rational clock."""
     with aaf2.open(str(path), 'r') as container:
@@ -425,9 +420,6 @@ def main():
         return
     if len(sys.argv) in (3, 4) and sys.argv[1] == 'read-timeline':
         print(json.dumps(read_timeline(sys.argv[2], extract_dir=sys.argv[3] if len(sys.argv) == 4 else None)))
-        return
-    if len(sys.argv) == 3 and sys.argv[1] == 'read-audio':
-        print(json.dumps(read_audio(sys.argv[2])))
         return
     if len(sys.argv) != 4 or sys.argv[1] not in ('write-audio', 'write-timeline'):
         raise ValueError('Usage: align-aaf COMMAND [arguments]')

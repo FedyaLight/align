@@ -744,22 +744,6 @@ pub fn parse_iso8601(text: &str) -> Option<i64> {
     Some(days * 86_400 + hh * 3600 + mm * 60 + ss + offset_secs)
 }
 
-// ------------------------------------------------------------ timecode text
-
-/// `HH:MM:SS:FF` (`;` = drop-frame) at integer `fps` → [`SourceTimecode`].
-/// Used for ffprobe `timecode` tags; the integer rate snaps through the
-/// canonical broadcast table (`29.97` is not expressible here — rational
-/// callers use [`SourceTimecode::from_label`] directly). Ranges, DF rates
-/// and skipped DF labels validated, never guessed.
-pub fn parse_timecode_string(text: &str, fps: i64) -> Option<SourceTimecode> {
-    if fps <= 0 || fps > 120 {
-        return None;
-    }
-    let duration = crate::timing::canonical_frame_duration(fps as f64, None)
-        .unwrap_or_else(|| MediaTime::new(1, fps as i32));
-    SourceTimecode::from_label(text, duration)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -960,6 +944,8 @@ mod tests {
     #[test]
     fn timecode_strings() {
         use crate::model::SourceTimecode;
+        let parse_timecode_string =
+            |text: &str, fps: i32| SourceTimecode::from_label(text, MediaTime::new(1, fps));
         let tc = parse_timecode_string("01:02:03:12", 25).expect("tc");
         assert_eq!(tc.frame_number, 93_087);
         assert!(!tc.drop_frame);

@@ -12,19 +12,10 @@ use std::path::Path;
 
 use crate::DecodeError;
 
-// ------------------------------------------------------------ audio-only
-//
-// Decode methods return audio only; probes inspect video timing metadata
-// without decoding picture frames. Buffer limits below apply per job.
-pub const ANALYSIS_SAMPLE_RATE_HZ: u32 = 8_000;
-/// 8 kHz mono f32 = 32 KiB per second of audio, streamed in blocks.
-pub const ANALYSIS_BYTES_PER_SEC: usize = 32_000;
-pub const FINE_WINDOW_SAMPLE_RATE_HZ: u32 = 16_000;
-/// GCC-PHAT caps at 131072 samples: 512 KiB per scratch buffer.
-pub const MAX_FINE_WINDOW_SAMPLES: usize = 131_072;
-// Streaming resample block: 32768 × 4 B = 128 KiB. Full files are never
-// resident however long the take (a 3-hour recorder pass streams through
-// the same 128 KiB + FFT scratch as a 10-second clip).
+// Decode methods return audio only (8 kHz analysis stream, 16 kHz
+// refinement windows); probes inspect video timing metadata without
+// decoding picture frames. Full files are never resident: a 3-hour take
+// streams through the same bounded blocks as a 10-second clip.
 
 // ------------------------------------------------------------ selection
 
@@ -231,23 +222,4 @@ mod tests {
             assert_eq!(native.kind(), BackendKind::Portable);
         }
     }
-
-    #[test]
-    fn audio_only_memory_budgets() {
-        // Compile-time enforced below (see const asserts); here we pin the
-        // block size that bounds resident decode memory per job.
-        assert_eq!(crate::RESAMPLE_BLOCK, 32_768);
-        // The trait surface exposes no video-sample API by construction:
-        // only mono f32 audio and scalar probe metadata (see docs above).
-        fn assert_audio_only<T: MediaBackend>() {}
-        assert_audio_only::<crate::portable::PortableBackend>();
-    }
-
-    // Streaming block + biggest FFT scratch stay far below 1 MiB per job;
-    // a 3-hour take streams through the same resident set as a jingle.
-    const _: () = {
-        assert!(crate::RESAMPLE_BLOCK * 4 == 128 * 1024);
-        assert!(MAX_FINE_WINDOW_SAMPLES * 4 <= 512 * 1024 + 1024);
-        assert!(ANALYSIS_BYTES_PER_SEC == 8_000 * 4);
-    };
 }

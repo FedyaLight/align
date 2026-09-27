@@ -551,9 +551,6 @@ impl ExportItem {
             .and_then(|linked| linked.fcpxml_audio_role.as_deref())
             .or(self.fcpxml_audio_role.as_deref())
     }
-    pub fn is_retimed_media(&self, media_type: &str) -> bool {
-        self.is_retimed(media_type)
-    }
     pub fn preferred_source_key(&self, media_type: &str) -> Option<&str> {
         if media_type == "audio" {
             if let Some(linked) = &self.linked_audio_edit {
@@ -982,13 +979,6 @@ impl TimelineExportFormat {
             Self::FinalCutProXML => "fcpxml",
         }
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct ExportProgress {
-    pub completed: usize,
-    pub total: usize,
-    pub current: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1514,25 +1504,6 @@ impl ExportTimeline {
             clips: combined,
             duration,
         }
-    }
-
-    /// Chronology keys of all islands in combined order (kind, value).
-    /// The timeline ruler shows a timecode when the first key is
-    /// timecode-based (kind 1).
-    pub fn combined_chronology(&self) -> Vec<(i32, f64)> {
-        let policy = &self.temporal_policy;
-        let mut order: Vec<&ExportIsland> = self.islands.iter().collect();
-        order.sort_by(|a, b| {
-            let (ka, va) = self.chronology_key(a, policy);
-            let (kb, vb) = self.chronology_key(b, policy);
-            ka.cmp(&kb)
-                .then_with(|| va.total_cmp(&vb))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        order
-            .iter()
-            .map(|island| self.chronology_key(island, policy))
-            .collect()
     }
 
     pub fn ruler_timecode_start(&self) -> Option<f64> {
