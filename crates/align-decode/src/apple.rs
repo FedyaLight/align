@@ -559,13 +559,15 @@ impl MediaBackend for AppleNativeBackend {
             );
         }
         // AVAssetReader startup dominates sparse refinement windows. PCM/BWF
-        // WAV is accurately seekable in-process through Symphonia and still
-        // uses the identical shared mono/resample chain. Keep AVFoundation as
-        // the fallback for unusual WAV variants and every media container.
-        if path
+        // WAV and linear PCM in QuickTime/MP4 are accurately seekable
+        // in-process and still use the identical shared mono/resample chain.
+        // Keep AVFoundation as the fallback for unusual WAV variants and
+        // compressed media.
+        let is_wav = path
             .extension()
             .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"));
+        if (is_wav || crate::mp4pcm::PcmTrack::open(path, source.stream_index()).is_some())
             && let Ok(window) =
                 crate::sym::decode_window(path, start_seconds, duration_seconds, source)
         {
