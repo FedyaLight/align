@@ -18,7 +18,7 @@ use crate::DecodeError;
 use crate::isobmff::{self, TrackKind};
 
 /// Frames converted per callback block.
-const BLOCK_FRAMES: usize = 32_768;
+const BLOCK_FRAMES: usize = 8_192;
 
 pub struct PcmTrack {
     file: File,
