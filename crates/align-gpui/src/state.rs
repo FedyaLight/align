@@ -1185,6 +1185,9 @@ impl AppData {
         let Some(started) = self.sync_started.take() else {
             return;
         };
+        if self.unmatched_count() >= self.clips.len() {
+            return;
+        }
         if let Some(sentence) = self.status.strip_suffix('.') {
             self.status = format!("{sentence} in {}.", elapsed_label(started.elapsed()));
         }
@@ -1355,6 +1358,8 @@ impl AppData {
             )
         } else if unmatched == 0 {
             format!("Synchronized all {total} clips.")
+        } else if unmatched == total {
+            "No clips could be synchronized: no shared sound or timecode was found.".to_string()
         } else {
             format!("Synchronized {} of {total} clips.", total - unmatched)
         };

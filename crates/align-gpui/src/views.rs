@@ -3740,7 +3740,12 @@ fn operation_bar(
         .border_color(rgb(theme.separator));
     // Success check.
     if matches!(data.operation, Operation::Ready) && data.has_result() && !data.is_stale() {
-        bar = bar.child(svg_icon(icons().check.clone(), 14.0, theme.green));
+        // A check only for complete success; partial results get a warning.
+        bar = bar.child(if data.unmatched_count() == 0 {
+            svg_icon(icons().check.clone(), 14.0, theme.green)
+        } else {
+            svg_icon(icons().warn.clone(), 14.0, theme.orange)
+        });
     }
     // Status + progress.
     {
