@@ -116,10 +116,11 @@ fn quality_dropdown_motion<E: IntoElement + Styled + 'static>(
     child: E,
     closing: bool,
 ) -> impl IntoElement {
-    const MENU_HEIGHT: f32 = 188.;
+    // Padding and border 10, five 40 px rows, separator block 37.
+    const MENU_HEIGHT: f32 = 248.;
     let reduced = super::motion::reduced_motion();
     div()
-        .w(px(160.))
+        .w(px(QUALITY_MENU_WIDTH))
         .overflow_hidden()
         .rounded_lg()
         .shadow_md()
@@ -4515,6 +4516,20 @@ fn search_quality_button(
     control
 }
 
+const QUALITY_MENU_WIDTH: f32 = 232.;
+
+/// One-line guidance under each search level in the quality menu.
+fn search_quality_hint(accuracy: align_core::SearchAccuracy) -> &'static str {
+    use align_core::SearchAccuracy::*;
+    match accuracy {
+        Fast => "Quickest; clear shared sound",
+        Balanced => "Best for most shoots",
+        Thorough => "Noisy rooms, distant mics",
+        Deep => "Hard material, slower",
+        Exhaustive => "Last resort, slowest",
+    }
+}
+
 fn search_quality_row(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
@@ -4525,7 +4540,7 @@ fn search_quality_row(
 ) -> impl IntoElement {
     div()
         .id(id.into())
-        .h(px(28.))
+        .h(px(40.))
         .px_3()
         .flex()
         .flex_row()
@@ -4543,7 +4558,20 @@ fn search_quality_row(
             }
             this.close_search_quality(cx);
         }))
-        .child(div().min_w(px(0.)).truncate().child(label))
+        .child(
+            div()
+                .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .child(div().truncate().child(label))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(11.))
+                        .text_color(rgb(theme.dim))
+                        .child(search_quality_hint(accuracy)),
+                ),
+        )
         .child(
             div()
                 .w(px(16.))
@@ -4566,7 +4594,7 @@ fn search_quality_menu(
     let selected = data.current_effective_settings().search_accuracy;
     let mut menu = div()
         .id("search-quality-menu")
-        .w(px(160.))
+        .w(px(QUALITY_MENU_WIDTH))
         .flex()
         .flex_col()
         .p_1()
