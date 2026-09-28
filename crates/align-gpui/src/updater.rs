@@ -3,6 +3,8 @@
 use velopack::{UpdateCheck, UpdateInfo, UpdateManager, VelopackAsset, sources::GithubSource};
 
 pub const REPOSITORY_URL: &str = "https://github.com/FedyaLight/align";
+/// One-time donation, the `custom` link in `.github/FUNDING.yml`.
+pub const DONATION_URL: &str = "https://www.patreon.com/fedyalight/posts/support-once-170786295";
 
 #[derive(Default)]
 pub enum UpdateState {

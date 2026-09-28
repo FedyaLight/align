@@ -66,7 +66,7 @@ const GITHUB: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 
 /// Export destination folder.
 const FOLDER: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M1.75 4.25h4l1.5 1.5h7v6.5a1.25 1.25 0 0 1-1.25 1.25H3a1.25 1.25 0 0 1-1.25-1.25v-8z" fill="none" stroke="white" stroke-width="1.4" stroke-linejoin="round"/></svg>"#;
 
-/// Heart used for the reserved support action.
+/// Heart used for the support (donation) action.
 const HEART: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M8 13.4S2.2 10.1 2.2 5.8A2.9 2.9 0 0 1 8 5.2a2.9 2.9 0 0 1 5.8.6C13.8 10.1 8 13.4 8 13.4z" fill="none" stroke="white" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
 
 pub struct IconPaths {

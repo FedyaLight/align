@@ -6276,13 +6276,12 @@ fn export_support_button(
     id: &'static str,
     icon: String,
     label: &'static str,
-    enabled: bool,
     action: impl Fn(&mut AlignApp, &ClickEvent, &mut Window, &mut Context<AlignApp>) + 'static,
 ) -> impl IntoElement {
     let reduced = super::motion::reduced_motion();
     let accent = theme.accent;
     let separator = theme.separator;
-    let mut button = div()
+    let button = div()
         .id(id)
         .flex_1()
         .h(px(32.))
@@ -6297,20 +6296,13 @@ fn export_support_button(
         .font_weight(gpui::FontWeight(550.0))
         .text_color(rgb(theme.icon))
         .child(svg_icon(icon, 13., theme.icon))
-        .child(label);
-    if enabled {
-        button = button
-            .cursor_pointer()
-            .hover(|this| this.bg(rgb(theme.button_hover)))
-            .active(|this| this.opacity(0.62))
-            .on_click(cx.listener(move |this, event, window, cx| {
-                action(this, event, window, cx);
-            }));
-    } else {
-        button = button
-            .opacity(0.48)
-            .tooltip(hover_tip("Support options coming soon.".to_string(), theme));
-    }
+        .child(label)
+        .cursor_pointer()
+        .hover(|this| this.bg(rgb(theme.button_hover)))
+        .active(|this| this.opacity(0.62))
+        .on_click(cx.listener(move |this, event, window, cx| {
+            action(this, event, window, cx);
+        }));
 
     button.with_animation(
         SharedString::from(format!("{id}-highlight")),
@@ -6503,7 +6495,6 @@ fn export_success_sheet(
                     "export-success-star",
                     icons().github.clone(),
                     "Star on GitHub",
-                    true,
                     |_, _, _, cx| cx.open_url(updater::REPOSITORY_URL),
                 ))
                 .child(export_support_button(
@@ -6512,8 +6503,7 @@ fn export_success_sheet(
                     "export-success-support",
                     icons().heart.clone(),
                     "Support Align",
-                    false,
-                    |_, _, _, _| {},
+                    |_, _, _, cx| cx.open_url(updater::DONATION_URL),
                 )),
         );
 
