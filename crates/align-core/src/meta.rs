@@ -570,10 +570,26 @@ pub fn read_sony_tail(path: &Path) -> Option<String> {
     file.seek(SeekFrom::Start(end - count)).ok()?;
     let mut buf = vec![0u8; count as usize];
     file.read_exact(&mut buf).ok()?;
-    let raw = String::from_utf8_lossy(&buf);
-    let start = raw.find("<NonRealTimeMeta")?;
-    let end = raw[start..].find("</NonRealTimeMeta>")? + "</NonRealTimeMeta>".len();
-    Some(raw[start..start + end].to_string())
+    // Search bytes first: most camera tails are binary media data, and a
+    // lossy UTF-8 copy of the whole megabyte cost more than the search.
+    const OPEN: &[u8] = b"<NonRealTimeMeta";
+    const CLOSE: &[u8] = b"</NonRealTimeMeta>";
+    let start = find_bytes(&buf, OPEN)?;
+    let end = start + find_bytes(&buf[start..], CLOSE)? + CLOSE.len();
+    Some(String::from_utf8_lossy(&buf[start..end]).into_owned())
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    let (&first, rest) = needle.split_first()?;
+    let mut offset = 0;
+    while let Some(index) = haystack[offset..].iter().position(|&b| b == first) {
+        let at = offset + index;
+        if haystack[at + 1..].starts_with(rest) {
+            return Some(at);
+        }
+        offset = at + 1;
+    }
+    None
 }
 
 struct SonyElement {
@@ -923,6 +939,23 @@ mod tests {
             let x = SONY.replace("1234567", bad);
             assert!(sony_device_id(&x).is_none(), "{bad}");
         }
+    }
+
+    #[test]
+    fn sony_tail_is_found_after_binary_media_data() {
+        let dir = tmp("sony-tail");
+        let path = dir.join("clip.mp4");
+        let mut bytes: Vec<u8> = (0..300_000u32).map(|i| (i * 7919 % 251) as u8).collect();
+        bytes.extend_from_slice(b"<NonRealTime");
+        bytes.extend_from_slice(SONY.as_bytes());
+        bytes.extend_from_slice(&[0xff, 0xfe, 0x00]);
+        std::fs::write(&path, &bytes).unwrap();
+        let xml = read_sony_tail(&path).expect("tail");
+        assert!(xml.starts_with("<NonRealTimeMeta") && xml.ends_with("</NonRealTimeMeta>"));
+        assert!(sony_device_id(&xml).is_some());
+        std::fs::write(&path, &bytes[..300_000]).unwrap();
+        assert!(read_sony_tail(&path).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
