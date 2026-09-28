@@ -26,6 +26,10 @@ cargo run -p align-gpui
 cargo run -p align-cli -- --help
 ```
 
+On macOS, `./script/build_and_run.sh` wraps a debug build in a signed
+`dist/Align.app` and opens it; `--debug` starts it under LLDB, `--logs` streams
+its unified log, and `--verify` checks that it launched.
+
 Binaries are written to `target/release`: `align`, `align-cli`, and `align-mcp`
 (with `.exe` on Windows). Build only `align-cli` when desktop support is not
 needed. Backend selection is automatic; `ALIGN_BACKEND=portable` selects the
@@ -58,7 +62,10 @@ Build the module separately for each target OS.
 `Pipeline` expands and inspects inputs, obtains cached or newly decoded
 fingerprints, matches candidates, refines them with audio windows, and solves
 synchronization groups. `MediaBackend` separates native Apple media access from
-portable decoding. Both feed the same core algorithms.
+portable decoding. Both feed the same core algorithms. QuickTime/MP4 headers
+are read by `isobmff` (probe, timecode, AAF link metadata), linear PCM in those
+files by `mp4pcm`, and camera-file export copies video through `remux`; FFmpeg
+serves only the remaining containers.
 
 Export assembles a writer-neutral timeline, prepares required audio, retains
 temporary sources, and invokes format writers. `media_assets` owns extracted AAF
@@ -104,6 +111,19 @@ Tests that require external media tools need those tools installed even when
 only the native backend is being developed. CI runs the same acceptance command
 on macOS, Windows, and Linux. Release tags matching `align-rs-v*` also build
 platform bundles.
+
+### Performance
+
+```sh
+cargo build --release -p align-cli
+python script/bench-sync.py target/release/align-cli target/bench
+```
+
+The benchmark generates cameras with known offsets (MOV/MP4 with PCM or AAC,
+timecode) and two split recorder takes, then reports cold and warm synchronization
+time, the number of FFmpeg/ffprobe processes started, and each clip's offset
+error against the generated ground truth. `--cameras`, `--duration`, and
+`--repeat` scale it. Compare results only between runs on the same machine.
 
 ### Drift diagnostics
 

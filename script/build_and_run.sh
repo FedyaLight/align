@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# macOS development helper: build a debug Align.app under dist/ and open it.
 set -euo pipefail
 
 MODE="${1:-run}"
@@ -67,17 +68,13 @@ case "$MODE" in
     open_app
     /usr/bin/log stream --info --style compact --predicate "process == \"$APP_NAME\""
     ;;
-  --telemetry|telemetry)
-    open_app
-    /usr/bin/log stream --info --style compact --predicate "subsystem == \"$BUNDLE_ID\""
-    ;;
   --verify|verify)
     open_app
     sleep 1
     pgrep -f "^$APP_BINARY$" >/dev/null
     ;;
   *)
-    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify]" >&2
+    echo "usage: $0 [run|--debug|--logs|--verify]" >&2
     exit 2
     ;;
 esac
