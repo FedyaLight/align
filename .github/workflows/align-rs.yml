@@ -81,6 +81,16 @@ jobs:
           exe=""
           if [[ "${{ runner.os }}" == "Windows" ]]; then exe=".exe"; fi
           python script/check-end-to-end.py "target/release/align-cli$exe" release-smoke
+      - name: Show acceptance logs
+        if: failure()
+        shell: bash
+        run: |
+          for log in release-smoke/*.log; do
+            [[ -f "$log" ]] || continue
+            echo "::group::$log"
+            tail -n 80 "$log"
+            echo "::endgroup::"
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
