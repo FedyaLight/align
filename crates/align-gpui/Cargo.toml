@@ -21,6 +21,9 @@ serde_json.workspace = true
 dirs.workspace = true
 velopack = "1.2.0"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging"] }
+
 [dev-dependencies]
 # Same renderer the GPUI sprite atlas uses: the test below parses every
 # icon exactly like `SvgRenderer::render_pixmap` does.

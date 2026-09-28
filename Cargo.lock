@@ -111,6 +111,7 @@ dependencies = [
  "serde_json",
  "usvg",
  "velopack",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
