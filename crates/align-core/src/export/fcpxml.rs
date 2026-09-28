@@ -196,7 +196,7 @@ fn write_island(
             .map(xml_text::fcpxml_time)
             .unwrap_or_else(|| xml_text::fcpxml_time(MediaTime::new(0, frame_duration.timescale)));
         let name = xml_text::escape(media_url.file_name().and_then(|n| n.to_str()).unwrap_or(""));
-        let src = xml_text::escape(&format!("file://{}", media_url.to_string_lossy()));
+        let src = xml_text::escape(&crate::model::file_url(&media_url));
         if desc.audio_only || item.clip.video.is_none() {
             let channels = item.clip.audio.first().map_or(2, |a| a.channels);
             let rate = item

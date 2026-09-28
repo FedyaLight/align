@@ -930,6 +930,28 @@ pub fn file_name(path: &Path) -> String {
         .to_string()
 }
 
+/// `file://` URL for a local path in the form editors expect on every
+/// platform: `/Users/a b.wav` becomes `file:///Users/a%20b.wav` and
+/// `D:\Media\a.wav` becomes `file:///D:/Media/a.wav`. Unreserved characters,
+/// `/` and the drive colon pass through; everything else is percent-encoded
+/// as UTF-8.
+pub fn file_url(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/:".contains(&byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    if encoded.starts_with('/') {
+        format!("file://{encoded}")
+    } else {
+        format!("file:///{encoded}")
+    }
+}
+
 /// `std::fs::canonicalize` without Windows' verbatim prefix. Paths that
 /// reach projects, exported timelines or other applications must stay in
 /// the familiar `C:\…` / `\\server\share` form: editors do not resolve
@@ -953,6 +975,22 @@ fn strip_verbatim(path: &Path) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_urls_follow_the_editor_form_on_every_platform() {
+        assert_eq!(
+            file_url(Path::new("/Users/a b.wav")),
+            "file:///Users/a%20b.wav"
+        );
+        assert_eq!(
+            file_url(Path::new(r"D:\Media\Scene 1\a.wav")),
+            "file:///D:/Media/Scene%201/a.wav"
+        );
+        assert_eq!(
+            file_url(Path::new("/tmp/Café.mov")),
+            "file:///tmp/Caf%C3%A9.mov"
+        );
+    }
 
     #[test]
     fn verbatim_prefixes_are_removed_only_where_a_plain_form_exists() {

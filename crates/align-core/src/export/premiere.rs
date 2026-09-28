@@ -1136,20 +1136,6 @@ fn time_remap(
     xml
 }
 
-/// Percent-encode a filesystem path for file:// URLs (unreserved +
-/// '/' pass through, mirroring URL.absoluteString for local files).
-fn percent_encode(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    for b in path.bytes() {
-        if b.is_ascii_alphanumeric() || b"-_.~/".contains(&b) {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
 fn xml_number(value: f64) -> String {
     let rounded = value.round();
     if (value - rounded).abs() < 0.000_001 {
@@ -1176,8 +1162,7 @@ fn file_block(
 ) -> String {
     let clip = &item.clip;
     let file_name = media_url.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    // file:// URL with percent-encoding (mirrors URL.absoluteString).
-    let absolute = format!("file://{}", percent_encode(&media_url.to_string_lossy()));
+    let absolute = crate::model::file_url(media_url);
     let mut xml = format!(
         "                <file id=\"{id}\">\n                  <name>{}</name>\n                  <pathurl>{}</pathurl>\n                  <duration>{duration}</duration>\n",
         xml_text::escape(file_name),
