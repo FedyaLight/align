@@ -827,6 +827,8 @@ pub struct AlignApp {
     timeline_motion_generation: u64,
     progress_motion: ProgressMotion,
     update_state: UpdateState,
+    /// The update card was closed; the About panel still offers the update.
+    update_notice_dismissed: bool,
 }
 
 impl Focusable for AlignApp {
@@ -865,6 +867,7 @@ impl AlignApp {
             timeline_motion_generation: 0,
             progress_motion: ProgressMotion::new(),
             update_state: UpdateState::default(),
+            update_notice_dismissed: false,
         }
     }
 
@@ -891,6 +894,19 @@ impl AlignApp {
     }
 
     pub(crate) fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        self.run_update_check(false, cx);
+    }
+
+    /// Quiet check at launch: a new release shows the update card; being
+    /// offline or up to date shows nothing. Development builds skip it.
+    pub(crate) fn check_for_updates_on_launch(&mut self, cx: &mut Context<Self>) {
+        if cfg!(debug_assertions) || std::env::var_os("ALIGN_NO_UPDATE_CHECK").is_some() {
+            return;
+        }
+        self.run_update_check(true, cx);
+    }
+
+    fn run_update_check(&mut self, quiet: bool, cx: &mut Context<Self>) {
         if self.update_state.is_busy() {
             return;
         }
@@ -905,7 +921,10 @@ impl AlignApp {
         cx.spawn(async move |_, cx| {
             let state = rx.await.unwrap_or(UpdateState::Failed);
             let _ = view.update(cx, |this, cx| {
-                this.update_state = state;
+                this.update_state = match state {
+                    UpdateState::Failed | UpdateState::Current if quiet => UpdateState::Idle,
+                    state => state,
+                };
                 cx.notify();
             });
         })
@@ -914,17 +933,22 @@ impl AlignApp {
 
     fn download_update(&mut self, cx: &mut Context<Self>) {
         let state = std::mem::take(&mut self.update_state);
-        let UpdateState::Available { manager, update } = state else {
+        let UpdateState::Available(update) = state else {
             self.update_state = state;
             return;
         };
-        let version = update.TargetFullRelease.Version.clone();
+        if let updater::Update::Manual { page, .. } = &update {
+            cx.open_url(page);
+            self.update_state = UpdateState::Available(update);
+            return;
+        }
+        let version = update.version().to_owned();
         self.update_state = UpdateState::Downloading { version };
         cx.notify();
 
         let (tx, rx) = futures::channel::oneshot::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(updater::download(manager, update));
+            let _ = tx.send(updater::download(update));
         });
         let view = cx.entity();
         cx.spawn(async move |_, cx| {
@@ -937,7 +961,7 @@ impl AlignApp {
         .detach();
     }
 
-    fn restart_and_update(&mut self) {
+    fn restart_and_update(&mut self, cx: &mut Context<Self>) {
         if matches!(
             self.data.operation,
             Operation::Synchronizing | Operation::Exporting | Operation::Repairing
@@ -945,15 +969,52 @@ impl AlignApp {
             return;
         }
         let state = std::mem::take(&mut self.update_state);
-        let UpdateState::Ready { manager, asset } = state else {
+        let UpdateState::Ready(prepared) = state else {
             self.update_state = state;
             return;
         };
-        super::icons::cleanup();
-        align_decode::media_assets::cleanup();
-        if let Err(error) = manager.apply_updates_and_restart(&asset) {
-            eprintln!("Could not install the Align update: {error}");
-            self.update_state = UpdateState::Failed;
+        match prepared {
+            updater::Prepared::Velopack { manager, asset } => {
+                super::icons::cleanup();
+                align_decode::media_assets::cleanup();
+                if let Err(error) = manager.apply_updates_and_restart(&asset) {
+                    eprintln!("Could not install the Align update: {error}");
+                    self.update_state = UpdateState::Failed;
+                }
+            }
+            updater::Prepared::Package {
+                install,
+                version,
+                file,
+            } => {
+                // The package manager may wait on an authorization prompt,
+                // so it runs off the UI thread; Align restarts once it is done.
+                self.update_state = UpdateState::Installing { version };
+                cx.notify();
+                let (tx, rx) = futures::channel::oneshot::channel();
+                std::thread::spawn(move || {
+                    let result = updater::install(&install, &file)
+                        .and_then(|()| updater::relaunch(&install));
+                    let _ = tx.send(result);
+                });
+                let view = cx.entity();
+                cx.spawn(async move |_, cx| {
+                    let result = rx.await.unwrap_or_else(|_| Err("cancelled".into()));
+                    let _ = view.update(cx, |this, cx| match result {
+                        Ok(()) => {
+                            super::icons::cleanup();
+                            align_decode::media_assets::cleanup();
+                            cx.quit();
+                        }
+                        Err(error) => {
+                            eprintln!("Could not install the Align update: {error}");
+                            this.update_state = UpdateState::Failed;
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
         }
     }
 
@@ -2596,6 +2657,12 @@ impl Render for AlignApp {
         }
         if self.data.show_search_quality {
             root = root.child(search_quality_dismiss_layer(cx));
+        }
+        if !self.update_notice_dismissed && !self.data.show_about {
+            if let Some(notice) = update_notice(cx, &theme, &self.update_state, self.data.operation)
+            {
+                root = root.child(notice);
+            }
         }
         if self.data.show_stage_settings {
             root = root.child(overlay(
@@ -7168,6 +7235,139 @@ fn export_sheet(
     sheet
 }
 
+// ---------------- updates
+
+fn update_action_label(update: &updater::Update) -> String {
+    match update {
+        updater::Update::Manual { version, .. } => format!("Download {version}"),
+        update => format!("Update to {}", update.version()),
+    }
+}
+
+/// Floating card announcing a new release, with the next step inline. It
+/// works on every platform (the About panel is in the macOS menu only).
+fn update_notice(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    update_state: &UpdateState,
+    operation: Operation,
+) -> Option<impl IntoElement> {
+    let version = update_state.version()?.to_owned();
+    let restart_blocked = matches!(
+        operation,
+        Operation::Synchronizing | Operation::Exporting | Operation::Repairing
+    );
+    let (detail, action) = match update_state {
+        UpdateState::Available(update) => (
+            "A new version is ready to download.",
+            prominent_button(
+                cx,
+                theme,
+                "update-notice-action",
+                update_action_label(update),
+                true,
+                |this, _, _, cx| this.download_update(cx),
+            ),
+        ),
+        UpdateState::Downloading { .. } => (
+            "Downloading in the background.",
+            prominent_button(
+                cx,
+                theme,
+                "update-notice-action",
+                "Downloading…",
+                false,
+                |_, _, _, _| {},
+            ),
+        ),
+        UpdateState::Ready(_) => (
+            if restart_blocked {
+                "Installs when the current operation finishes."
+            } else {
+                "Downloaded. Align restarts to finish."
+            },
+            prominent_button(
+                cx,
+                theme,
+                "update-notice-action",
+                "Restart and Update",
+                !restart_blocked,
+                |this, _, _, cx| this.restart_and_update(cx),
+            ),
+        ),
+        UpdateState::Installing { .. } => (
+            "Approve the system prompt if one appears.",
+            prominent_button(
+                cx,
+                theme,
+                "update-notice-action",
+                "Installing…",
+                false,
+                |_, _, _, _| {},
+            ),
+        ),
+        _ => return None,
+    };
+    let dismissible = !update_state.is_busy();
+    let card = div()
+        .id("update-notice")
+        .w(px(300.))
+        .p_3()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap_3()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(theme.border))
+        .bg(rgb(theme.panel))
+        .shadow_lg()
+        .child(img(PathBuf::from(&icons().app)).size(px(36.)).rounded_md())
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .font_weight(gpui::FontWeight(600.0))
+                        .child(format!("Align {version}")),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(theme.dim))
+                        .child(detail),
+                )
+                .child(div().mt_2().flex().child(action)),
+        )
+        .when(dismissible, |card| {
+            card.child(
+                div()
+                    .id("update-notice-close")
+                    .cursor_pointer()
+                    .opacity(0.6)
+                    .hover(|this| this.opacity(1.))
+                    .child(svg_icon(icons().close.clone(), 12., theme.icon))
+                    .tooltip(hover_tip("Later".to_string(), theme))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.update_notice_dismissed = true;
+                        cx.notify();
+                    })),
+            )
+        });
+    Some(
+        div()
+            .absolute()
+            .right(px(16.))
+            .bottom(px(16.))
+            .child(slide_in(card, "update-notice-entrance", 0)),
+    )
+}
+
 // ---------------- about panel (Align menu → About Align)
 
 fn platform_label() -> String {
@@ -7224,14 +7424,24 @@ fn about_panel(
                 |_, _, _, _| {},
             ));
         }
-        UpdateState::Available { .. } => {
+        UpdateState::Available(update) => {
             update_actions = update_actions.child(prominent_button(
                 cx,
                 theme,
                 "about-download-update",
-                format!("Update to {update_version}"),
+                update_action_label(update),
                 true,
                 |this, _, _, cx| this.download_update(cx),
+            ));
+        }
+        UpdateState::Installing { .. } => {
+            update_actions = update_actions.child(prominent_button(
+                cx,
+                theme,
+                "about-installing-update",
+                format!("Installing {update_version}…"),
+                false,
+                |_, _, _, _| {},
             ));
         }
         UpdateState::Downloading { .. } => {
@@ -7244,7 +7454,7 @@ fn about_panel(
                 |_, _, _, _| {},
             ));
         }
-        UpdateState::Ready { .. } => {
+        UpdateState::Ready(_) => {
             update_actions = update_actions.child(prominent_button(
                 cx,
                 theme,
@@ -7255,7 +7465,7 @@ fn about_panel(
                     "Restart and Update"
                 },
                 !restart_blocked,
-                |this, _, _, _| this.restart_and_update(),
+                |this, _, _, cx| this.restart_and_update(cx),
             ));
         }
     }

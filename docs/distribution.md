@@ -31,8 +31,9 @@ and the Linux `.run` files open a GTK 4 installer (`Support/Linux/installer.c`)
 in the app's dark theme that installs the native package through polkit.
 `script/render-installer-artwork.swift` regenerates the Windows artwork and icon
 on macOS. The Windows executable carries the app icon and version details
-(`crates/align-gpui/build.rs`), and only Windows installs update through
-Velopack; Linux packages update through the package manager.
+(`crates/align-gpui/build.rs`). Windows installs update through the Velopack
+feed; the macOS app and the Linux packages update from the DMG and package assets
+named above, so keep those names and their `.sha256` files unchanged.
 
 The source archives contain the exact committed Align checkout, Cargo.lock,
 vendored Rust dependencies, a Cargo configuration for offline dependency

@@ -13,8 +13,14 @@ matching, timecode, and recording metadata.
 - **Refined interface.** Round timeline ruler steps, smoother progress,
   a real drop zone, clearer search-accuracy settings, and Ctrl shortcuts on
   Windows and Linux (F11 for full screen).
+- **Updates on every platform.** Align checks for a new release at launch and
+  offers it in a small card. One click downloads it, verifies its checksum and
+  installs it: through the Windows installer, by replacing the app on macOS, or
+  through `dnf`/`pacman` on Fedora and Arch. Copies of 0.1.0 do not check for
+  updates, so install this release manually once.
 - **Windows fixes.** Premiere Pro and Final Cut Pro exports now reference
-  Windows media with valid file URLs.
+  Windows media with valid file URLs, the app has its icon, and no console
+  windows flash while it works.
 
 ## Downloads
 
@@ -42,9 +48,9 @@ open "/Applications/Align.app"
 ### Windows
 
 Run `Align-@VERSION@-Windows-x64-Setup.exe`. It installs for the current user,
-adds Align to the Start menu, installs the Microsoft VC++ runtime if needed, and
-updates itself from later releases. The installer is unsigned, so SmartScreen may
-ask for confirmation.
+adds Align to the Start menu, and installs the Microsoft VC++ runtime if needed.
+Running it over 0.1.0 upgrades that installation. The installer is unsigned, so
+SmartScreen may ask for confirmation.
 
 ### Fedora and Omarchy / Arch
 
@@ -60,8 +66,8 @@ Or install the native package directly with
 `sudo dnf install ./Align-@VERSION@-Fedora-x86_64.rpm` or
 `sudo pacman -U ./align-@VERSION@-1-x86_64.pkg.tar.zst`. Choose one method; each
 `.run` contains the same package. Linux requires glibc 2.39+, a working Vulkan
-driver, and GTK 4 with polkit for the graphical installer. Native packages are
-updated by installing a newer package.
+driver, and GTK 4 with polkit for the graphical installer. Later versions install
+from inside Align, behind the same system authorization prompt.
 
 ## Sources and verification
 

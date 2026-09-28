@@ -360,6 +360,7 @@ fn main() {
             let view = cx.new(move |cx| {
                 let mut app = views::AlignApp::new(cx);
                 app.data.add_paths(initial_paths);
+                app.check_for_updates_on_launch(cx);
                 app
             });
             cx.set_global(AppView(view.clone()));
