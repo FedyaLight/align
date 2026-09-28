@@ -310,7 +310,9 @@ pub fn decode_window(
             },
         )?;
         let first = (actual_start * track.sample_rate).round() as u64;
-        let count = (want as f64 / 16_000.0 * track.sample_rate).ceil() as u64;
+        // Read past the window so the resampler's last outputs are filtered
+        // from real audio, as with streamed packets, not from flush padding.
+        let count = (want as f64 / 16_000.0 * track.sample_rate).ceil() as u64 + 8_192;
         track.read_f32(first, Some(count), &mut |planes| pipe.push_owned(&planes))?;
         pipe.finish()?;
         samples.truncate(want);
