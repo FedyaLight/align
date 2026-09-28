@@ -5922,8 +5922,6 @@ fn export_scrollbar(
         .h_full()
         .ml_2()
         .flex_shrink_0()
-        .rounded_full()
-        .bg(rgb(theme.separator))
         .cursor_pointer()
         .on_mouse_down(
             MouseButton::Left,
@@ -5989,12 +5987,14 @@ fn export_scrollbar(
             div()
                 .absolute()
                 .top(px(thumb_top))
-                .left(px(1.))
-                .right(px(1.))
+                // A slim overlay-style thumb on an invisible track; the
+                // full 10 px column stays the hit area.
+                .left(px(3.))
+                .right(px(3.))
                 .h(px(thumb_height))
                 .rounded_full()
-                .bg(rgb(theme.dim))
-                .hover(|this| this.bg(rgb(theme.icon))),
+                .bg(rgba((theme.dim << 8) | 0x70))
+                .hover(|this| this.bg(rgba((theme.dim << 8) | 0xC0))),
         )
 }
 
