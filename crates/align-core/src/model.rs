@@ -930,9 +930,52 @@ pub fn file_name(path: &Path) -> String {
         .to_string()
 }
 
+/// `std::fs::canonicalize` without Windows' verbatim prefix. Paths that
+/// reach projects, exported timelines or other applications must stay in
+/// the familiar `C:\…` / `\\server\share` form: editors do not resolve
+/// `file://\\?\C:\…` references.
+pub fn canonical_path(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    std::fs::canonicalize(path).map(|path| strip_verbatim(&path))
+}
+
+fn strip_verbatim(path: &Path) -> std::path::PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        return std::path::PathBuf::from(format!(r"\\{unc}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        // Only drive paths: other verbatim forms have no plain equivalent.
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => std::path::PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verbatim_prefixes_are_removed_only_where_a_plain_form_exists() {
+        use std::path::PathBuf;
+        let strip = |text: &str| strip_verbatim(Path::new(text));
+        assert_eq!(strip(r"\\?\D:\a\b.wav"), PathBuf::from(r"D:\a\b.wav"));
+        assert_eq!(
+            strip(r"\\?\UNC\server\share\x"),
+            PathBuf::from(r"\\server\share\x")
+        );
+        assert_eq!(
+            strip(r"\\?\Volume{1234}\x"),
+            PathBuf::from(r"\\?\Volume{1234}\x")
+        );
+        assert_eq!(strip("/tmp/a.wav"), PathBuf::from("/tmp/a.wav"));
+        let here = std::env::current_dir().unwrap();
+        assert!(
+            !canonical_path(&here)
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(r"\\?\")
+        );
+    }
 
     #[test]
     fn source_timecode_constructors_validate() {
