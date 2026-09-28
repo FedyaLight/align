@@ -415,6 +415,30 @@ mod motion_tests {
     }
 
     #[test]
+    fn progress_glides_forward_continuously_and_snaps_back() {
+        let start = Instant::now();
+        let mut motion = ProgressMotion::new();
+        motion.track(0.4, start);
+        assert_eq!(motion.presented(start), 0.);
+        let mid = start + Duration::from_millis(PROGRESS_MOVE_MS / 2);
+        let shown = motion.presented(mid);
+        assert!(shown > 0. && shown < 0.4);
+        // Retargeting mid-flight continues from the shown width.
+        motion.track(0.9, mid);
+        assert!((motion.presented(mid) - shown).abs() < 1e-6);
+        let end = mid + Duration::from_millis(PROGRESS_MOVE_MS);
+        assert!((motion.presented(end) - 0.9).abs() < 1e-6);
+        // A new operation restarts at its own value without animating back.
+        let generation = motion.generation;
+        motion.track(0.05, end);
+        assert_eq!(motion.presented(end), 0.05);
+        assert_eq!(motion.generation, generation + 1);
+        // Repeated identical reports do not restart the animation.
+        motion.track(0.05, end);
+        assert_eq!(motion.generation, generation + 1);
+    }
+
+    #[test]
     fn long_destination_paths_keep_both_ends() {
         assert_eq!(
             middle_ellipsis("/projects/client/episode/final-deliverables", 21),
@@ -532,6 +556,52 @@ impl SettingsSelect {
 
 const TIMELINE_MOVE_MS: u64 = 360;
 const TIMELINE_ROW_H: f32 = 60.;
+const PROGRESS_MOVE_MS: u64 = 320;
+
+/// Progress bar fill that glides between reported values instead of jumping
+/// between coarse phase updates. A retarget starts from the currently shown
+/// width, so rapid updates stay continuous; a lower value (a new operation)
+/// snaps back.
+#[derive(Clone, Copy, Debug)]
+struct ProgressMotion {
+    from: f32,
+    to: f32,
+    started: Instant,
+    generation: u64,
+}
+
+impl ProgressMotion {
+    fn new() -> Self {
+        Self {
+            from: 0.,
+            to: 0.,
+            started: Instant::now(),
+            generation: 0,
+        }
+    }
+
+    fn presented(&self, now: Instant) -> f32 {
+        let elapsed = now.duration_since(self.started).as_secs_f32();
+        let progress =
+            (elapsed / Duration::from_millis(PROGRESS_MOVE_MS).as_secs_f32()).clamp(0., 1.);
+        self.from + (self.to - self.from) * motion_ease(progress)
+    }
+
+    fn track(&mut self, target: f32, now: Instant) {
+        let target = target.clamp(0., 1.);
+        if (target - self.to).abs() < 0.0005 {
+            return;
+        }
+        self.from = if target < self.to {
+            target
+        } else {
+            self.presented(now)
+        };
+        self.to = target;
+        self.started = now;
+        self.generation += 1;
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct TimelinePose {
@@ -734,6 +804,7 @@ pub struct AlignApp {
     export_reveal_generation: u64,
     timeline_transitions: HashMap<ClipId, TimelineTransition>,
     timeline_motion_generation: u64,
+    progress_motion: ProgressMotion,
     update_state: UpdateState,
 }
 
@@ -771,6 +842,7 @@ impl AlignApp {
             export_reveal_generation: 0,
             timeline_transitions: HashMap::new(),
             timeline_motion_generation: 0,
+            progress_motion: ProgressMotion::new(),
             update_state: UpdateState::default(),
         }
     }
@@ -2366,8 +2438,10 @@ impl Render for AlignApp {
         }
         // No bottom bar over the empty drop zone either.
         if !self.data.clips.is_empty() {
+            self.progress_motion
+                .track(self.data.progress, Instant::now());
             content = content.child(toolbar_entrance(
-                operation_bar(cx, &theme, &self.data, content_active),
+                operation_bar(cx, &theme, &self.data, self.progress_motion, content_active),
                 "bottom-toolbar-entrance",
             ));
         }
@@ -3519,6 +3593,7 @@ fn operation_bar(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &super::state::AppData,
+    progress: ProgressMotion,
     active: bool,
 ) -> Div {
     use super::state::Operation;
@@ -3553,19 +3628,26 @@ fn operation_bar(
             status = status.child(data.status.clone());
         }
         if busy {
+            let fill = div().h_full().rounded_full().bg(rgb(theme.accent));
+            let fill = if super::motion::reduced_motion() {
+                fill.w(gpui::relative(progress.to)).into_any_element()
+            } else {
+                let ProgressMotion { from, to, .. } = progress;
+                fill.w(gpui::relative(from))
+                    .with_animation(
+                        SharedString::from(format!("progress-{}", progress.generation)),
+                        entrance(PROGRESS_MOVE_MS),
+                        move |fill, eased| fill.w(gpui::relative(from + (to - from) * eased)),
+                    )
+                    .into_any_element()
+            };
             status = status.child(
                 div()
                     .w(px(280.))
                     .h(px(4.))
                     .rounded_full()
                     .bg(rgb(theme.border))
-                    .child(
-                        div()
-                            .h_full()
-                            .rounded_full()
-                            .bg(rgb(theme.accent))
-                            .w(gpui::relative(data.progress.clamp(0.0, 1.0))),
-                    ),
+                    .child(fill),
             );
         }
         bar = bar.child(status);
@@ -3629,7 +3711,7 @@ fn operation_bar(
                 cx,
                 theme,
                 "btn-reveal",
-                "Show in Finder",
+                export_reveal_label(),
                 true,
                 |this, _, _, cx| {
                     this.data.reveal_export();
