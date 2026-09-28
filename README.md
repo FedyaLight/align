@@ -30,6 +30,15 @@ place clips on a common timeline.
 Use the desktop app to review the result, the CLI for batch jobs, or the MCP
 server to connect it to other tools. Original recordings stay untouched.
 
+## Support development
+
+Align is free and open source. If you find it useful, you can support FedyaLight’s work on Align and future projects:
+
+- [Sponsor monthly on Patreon](https://www.patreon.com/fedyalight)
+- [Support once on Patreon ($5)](https://www.patreon.com/fedyalight/posts/support-once-170786295)
+
+Support is optional and does not unlock exclusive software features or guarantee a release schedule.
+
 ## From recordings to an edit
 
 1. **Add media** — files, folders, or an XML, FCPXML, or AAF timeline.
