@@ -28,6 +28,20 @@ For an existing edit, enable Preserve basic editing on the tracks that should
 remain fixed. This preserves their trims, duplicates, positions, and gaps while
 other tracks align to them. See [format limits](formats.md) for unsupported edits.
 
+### Keyboard shortcuts
+
+| Action | macOS | Windows and Linux |
+| --- | --- | --- |
+| Add media | Cmd+O | Ctrl+O |
+| Synchronize again | Cmd+R | Ctrl+R |
+| Export | Cmd+E | Ctrl+E |
+| Zoom the timeline | Cmd or Option + scroll | Ctrl or Alt + scroll |
+| Pan the timeline | Arrow keys (Shift for larger steps), Home, End | same |
+| Full screen | Ctrl+Cmd+F | F11 |
+| Quit | Cmd+Q | Ctrl+Q |
+
+Escape closes the open menu, panel, or dialog.
+
 ## CLI basics
 
 Examples assume `align-cli` is on PATH. When running from a source checkout,
