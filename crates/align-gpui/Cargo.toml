@@ -20,9 +20,16 @@ serde.workspace = true
 serde_json.workspace = true
 dirs.workspace = true
 velopack = "1.2.0"
+# Same HTTP client and version parser Velopack uses; no extra crates.
+ureq = "3"
+semver = "1"
+sha2.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0.11"
 
 [dev-dependencies]
 # Same renderer the GPUI sprite atlas uses: the test below parses every

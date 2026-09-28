@@ -1,4 +1,6 @@
 //! align: native GPUI desktop app (Metal / DirectX / Vulkan via Blade).
+// Release builds on Windows are GUI programs: no console window behind them.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -358,6 +360,7 @@ fn main() {
             let view = cx.new(move |cx| {
                 let mut app = views::AlignApp::new(cx);
                 app.data.add_paths(initial_paths);
+                app.check_for_updates_on_launch(cx);
                 app
             });
             cx.set_global(AppView(view.clone()));

@@ -109,8 +109,8 @@ open desktop or editor applications.
 
 Tests that require external media tools need those tools installed even when
 only the native backend is being developed. CI runs the same acceptance command
-on macOS, Windows, and Linux. Release tags matching `align-rs-v*` also build
-platform bundles.
+on macOS, Windows, and Linux. Release tags matching `v*` also build and
+publish the installers.
 
 ### Performance
 
@@ -186,17 +186,24 @@ sidecars:
 ```
 
 That build requires a C toolchain, make, curl, tar, xz, and NASM where applicable.
-For a tag named `align-rs-vX.Y.Z` matching the workspace version, the release
-workflow also builds Velopack installers/update packages for macOS, Windows,
-and Linux and publishes them with matching source archives in a GitHub Release.
-See [distribution](distribution.md) for the source and license workflow. The desktop updater uses those
-packages for **Align → Check for Updates…** when installed through Velopack.
-Its GitHub source is configured without authentication, so release assets must
-be publicly accessible. A private repository does not provide an update feed
-for ordinary users with the current configuration. Local Cargo builds and the
-ad hoc macOS bundle are not Velopack installations. Distribution
-code signing and Apple notarization still require release credentials and are
-not configured in this repository.
+For a tag named `vX.Y.Z` matching the workspace version, the release workflow
+builds the macOS DMG, the Windows installer with its Velopack update feed, and
+Fedora and Arch packages with their graphical installers, and publishes them with
+matching source archives in a GitHub Release. See [distribution](distribution.md)
+for the installers and the source and license workflow.
+
+Release builds check for a newer release at launch (`crates/align-gpui/src/updater.rs`)
+and show an update card; **Align → Check for Updates…** does the same on demand.
+Windows Setup installations update through the Velopack feed. Otherwise Align reads
+the latest GitHub release: the macOS app downloads the DMG and replaces its bundle
+when its folder is writable, and the Fedora and Arch packages download the package
+and install it with `pkexec dnf`/`pkexec pacman`. Each download is checked against
+its `.sha256` asset. Any other copy (a portable build, the app run from the DMG)
+gets a link to the release page. Development builds and runs with
+`ALIGN_NO_UPDATE_CHECK` set skip the launch check. The GitHub requests are not
+authenticated, so release assets must be publicly accessible. Distribution code
+signing and Apple notarization still require release credentials and are not
+configured in this repository.
 
 ## Repository conventions
 

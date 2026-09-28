@@ -47,12 +47,12 @@ JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/
   --enable-muxer=pcm_f32le,pcm_s32le,mov \
   --enable-filter=abuffer,aformat,aresample,anull,abuffersink,atrim,asetpts,adelay,apad
 
-make -j"$JOBS" ffmpeg ffprobe
-
+# Make targets carry the executable suffix (ffmpeg.exe on MSYS2).
 EXE=""
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) EXE=".exe" ;;
 esac
+make -j"$JOBS" "ffmpeg$EXE" "ffprobe$EXE"
 cp "ffmpeg$EXE" "ffprobe$EXE" "$OUT_DIR/"
 cp COPYING.LGPLv2.1 "$OUT_DIR/FFMPEG-LICENSE.txt"
 mkdir -p "$OUT_DIR/Sources"

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.align.app</id>
+  <name>Align</name>
+  <summary>Sync your recordings. Keep your edit.</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <description>
+    <p>Synchronize camera footage and separately recorded audio using waveforms,
+    timecode, and recording metadata. Review your timeline and export it to
+    Premiere Pro, DaVinci Resolve, Final Cut Pro, or an AAF-compatible editor.</p>
+    <p>Align works locally. Original recordings stay untouched. The desktop app,
+    command-line tools, AAF module, FFmpeg, and ffprobe are included.</p>
+  </description>
+  <launchable type="desktop-id">com.align.app.desktop</launchable>
+  <url type="homepage">https://github.com/FedyaLight/align</url>
+  <url type="bugtracker">https://github.com/FedyaLight/align/issues</url>
+  <provides><binary>align</binary></provides>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.2.0" date="2026-09-28"/>
+    <release version="0.1.0" date="2026-09-27"/>
+  </releases>
+</component>
