@@ -98,13 +98,16 @@ pub fn replace_audio(
         }
     }
 
-    let mut out = BufWriter::with_capacity(1 << 20, File::create(output)?);
+    let mut out = Counted {
+        inner: BufWriter::with_capacity(1 << 20, File::create(output)?),
+        position: 0,
+    };
     // ftyp: QuickTime brand (linear PCM is a QuickTime sample description).
     out.write_all(&boxed(
         b"ftyp",
         &[b"qt  ".as_slice(), &0x0200_0000u32.to_be_bytes(), b"qt  "].concat(),
     ))?;
-    let mdat_start = out.stream_position()?;
+    let mdat_start = out.position;
     out.write_all(&1u32.to_be_bytes())?;
     out.write_all(b"mdat")?;
     out.write_all(&0u64.to_be_bytes())?; // 64-bit size, patched below
@@ -118,7 +121,7 @@ pub fn replace_audio(
         let mut buffer = Vec::new();
         for (offset, length, _) in chunks {
             crate::render::check_cancel(cancel)?;
-            offsets.push(out.stream_position()?);
+            offsets.push(out.position);
             buffer.resize(length as usize, 0);
             input.seek(SeekFrom::Start(offset))?;
             input.read_exact(&mut buffer)?;
@@ -157,10 +160,11 @@ pub fn replace_audio(
     sink.silence(total_frames.saturating_sub(written))?;
     let (audio_chunks, audio_frames) = sink.finish()?;
 
-    let mdat_end = out.stream_position()?;
-    out.seek(SeekFrom::Start(mdat_start + 8))?;
-    out.write_all(&(mdat_end - mdat_start).to_be_bytes())?;
-    out.seek(SeekFrom::Start(mdat_end))?;
+    let mdat_end = out.position;
+    out.inner.seek(SeekFrom::Start(mdat_start + 8))?;
+    out.inner
+        .write_all(&(mdat_end - mdat_start).to_be_bytes())?;
+    out.inner.seek(SeekFrom::Start(mdat_end))?;
 
     // Movie header: source mvhd with the new duration and next track id.
     let movie_scale = movie.timescale.max(1);
@@ -207,8 +211,26 @@ fn self_contained(trak: &[u8]) -> bool {
 }
 
 /// Streams interleaved f32le frames into fixed one-second chunks.
-struct AudioSink<'a, W: Write + Seek> {
-    out: &'a mut W,
+/// Writer that tracks its own offset, so recording chunk positions never
+/// forces a buffer flush.
+struct Counted<W: Write> {
+    inner: W,
+    position: u64,
+}
+
+impl<W: Write> Write for Counted<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.position += written as u64;
+        Ok(written)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct AudioSink<'a, W: Write> {
+    out: &'a mut Counted<W>,
     chunks: Vec<(u64, u32)>,
     current: u32,
     frames: u64,
@@ -216,8 +238,8 @@ struct AudioSink<'a, W: Write + Seek> {
     bytes: Vec<u8>,
 }
 
-impl<'a, W: Write + Seek> AudioSink<'a, W> {
-    fn new(out: &'a mut W, channels: usize) -> Self {
+impl<'a, W: Write> AudioSink<'a, W> {
+    fn new(out: &'a mut Counted<W>, channels: usize) -> Self {
         Self {
             out,
             chunks: Vec::new(),
@@ -230,7 +252,7 @@ impl<'a, W: Write + Seek> AudioSink<'a, W> {
 
     fn frame(&mut self, samples: impl Iterator<Item = f32>) -> std::io::Result<()> {
         if self.current == 0 {
-            self.chunks.push((self.out.stream_position()?, 0));
+            self.chunks.push((self.out.position, 0));
         }
         for sample in samples {
             self.bytes.extend_from_slice(&sample.to_le_bytes());
