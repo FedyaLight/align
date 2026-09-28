@@ -1,4 +1,6 @@
 //! align: native GPUI desktop app (Metal / DirectX / Vulkan via Blade).
+// Release builds on Windows are GUI programs: no console window behind them.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

@@ -1036,7 +1036,7 @@ fn export_media_file(
         "[1:a:0]atrim=duration={:.9},asetpts=PTS-STARTPTS,aresample=48000,adelay={delay_samples}S:all=1,apad=whole_dur={:.9},atrim=duration={:.9}[clean]",
         plan.recorder_duration, plan.video_duration, plan.video_duration
     );
-    let mut child = std::process::Command::new(ffmpeg)
+    let mut child = crate::ff::command(ffmpeg)
         .args(["-y", "-v", "error", "-i"])
         .arg(&plan.video_url)
         .args(["-ss", &format!("{:.9}", plan.recorder_source_in), "-i"])

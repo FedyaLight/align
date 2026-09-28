@@ -24,6 +24,9 @@ velopack = "1.2.0"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging"] }
 
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0.11"
+
 [dev-dependencies]
 # Same renderer the GPUI sprite atlas uses: the test below parses every
 # icon exactly like `SvgRenderer::render_pixmap` does.

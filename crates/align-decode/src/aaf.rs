@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -198,7 +198,7 @@ pub fn read_timeline(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, 
     // A file avoids stdout pipe deadlocks on large compositions while retaining
     // cancellable process supervision and automatic temporary-file cleanup.
     let mut output = tempfile::tempfile()?;
-    let mut child = Command::new(executable)
+    let mut child = crate::ff::command(executable)
         .arg("read-timeline")
         .arg(path)
         .arg(crate::media_assets::extraction_directory()?)
@@ -292,7 +292,7 @@ pub fn write_audio(
         return Err(AafError::Cancelled);
     }
     let executable = crate::ff::resolve_bin("ALIGN_AAF", "align-aaf").ok_or(AafError::Missing)?;
-    let mut child = Command::new(executable)
+    let mut child = crate::ff::command(executable)
         .arg("write-audio")
         .arg(manifest)
         .arg(destination)
@@ -347,7 +347,7 @@ pub fn repair_paths(
     serde_json::to_writer(manifest.as_file_mut(), &document)
         .map_err(|error| AafError::Writer(error.to_string()))?;
     let mut output = tempfile::tempfile()?;
-    let mut child = Command::new(executable)
+    let mut child = crate::ff::command(executable)
         .arg("repair-paths")
         .arg(manifest.path())
         .arg(source)
@@ -587,7 +587,7 @@ pub fn timeline_manifest_with_frame_rate(
             let probe = crate::ff::ffprobe_bin()
                 .ok_or_else(|| fail("AAF picture export requires ffprobe"))?;
             let mut output = tempfile::tempfile()?;
-            let mut child = Command::new(probe)
+            let mut child = crate::ff::command(probe)
                 .args([
                     "-v",
                     "error",

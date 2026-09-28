@@ -16,6 +16,21 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use crate::DecodeError;
 use crate::backend::{AudioStreamProbe, ProbeReport, VideoProbe};
 
+/// A child process that never opens a console window. The Windows desktop
+/// app has no console, so each helper (FFmpeg, the AAF module) would
+/// otherwise flash one; elsewhere this is `Command::new`.
+pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 /// Locate `ffprobe`/`ffmpeg`: explicit env override → executable's dir
 /// (bundled sidecar layout) → PATH.
 pub fn resolve_bin(env_var: &str, name: &str) -> Option<PathBuf> {
@@ -66,7 +81,7 @@ pub fn ffmpeg_bin() -> Option<PathBuf> {
 pub fn inspect(path: &Path) -> Result<ProbeReport, DecodeError> {
     let bin =
         ffprobe_bin().ok_or_else(|| DecodeError::FfmpegMissing("ffprobe not found".into()))?;
-    let out = Command::new(bin)
+    let out = command(bin)
         .args([
             "-v",
             "error",
@@ -291,7 +306,7 @@ fn video_timing_uncached(
     use align_core::canonical_frame_duration;
     use std::io::BufRead;
 
-    let mut child = Command::new(bin)
+    let mut child = command(bin)
         .args([
             "-v",
             "error",
@@ -311,7 +326,7 @@ fn video_timing_uncached(
     let stdout = child.stdout.take().ok_or(DecodeError::UnsupportedOutput)?;
 
     // Nominal rate + dimensions from the header call.
-    let header_json = Command::new(bin)
+    let header_json = command(bin)
         .args([
             "-v",
             "error",
@@ -369,7 +384,7 @@ fn video_timing_uncached(
 /// Full video probe: header facts + timing walk + timecode tag.
 /// `None` when the container has no usable video stream.
 pub fn inspect_video(path: &Path) -> Option<VideoProbe> {
-    let header_json = Command::new(ffprobe_bin()?)
+    let header_json = command(ffprobe_bin()?)
         .args([
             "-v",
             "error",
@@ -423,7 +438,7 @@ impl AudioPipe {
     ) -> Result<Self, DecodeError> {
         let bin =
             ffmpeg_bin().ok_or_else(|| DecodeError::FfmpegMissing("ffmpeg not found".into()))?;
-        let mut cmd = Command::new(bin);
+        let mut cmd = command(bin);
         cmd.args(["-v", "error", "-hide_banner", "-i"]).arg(path);
         if let Some((start, duration)) = window {
             cmd.args([
@@ -524,7 +539,7 @@ impl AudioPipeI32 {
     ) -> Result<Self, DecodeError> {
         let bin =
             ffmpeg_bin().ok_or_else(|| DecodeError::FfmpegMissing("ffmpeg not found".into()))?;
-        let mut cmd = Command::new(bin);
+        let mut cmd = command(bin);
         cmd.args(["-v", "error", "-hide_banner", "-i"]).arg(path);
         if let Some((start, duration)) = window {
             cmd.args([
