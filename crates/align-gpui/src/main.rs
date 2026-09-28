@@ -342,7 +342,7 @@ fn main() {
             ]);
             cx.set_menus(app_menus(theme::AppearancePreference::load()));
 
-            let bounds = Bounds::centered(None, size(px(880.), px(540.)), cx);
+            let bounds = Bounds::centered(None, size(px(1120.), px(700.)), cx);
             let view = cx.new(move |cx| {
                 let mut app = views::AlignApp::new(cx);
                 app.data.add_paths(initial_paths);

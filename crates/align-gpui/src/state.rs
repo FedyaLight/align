@@ -746,7 +746,7 @@ impl AppData {
         self.reset_preview();
         self.exported_files.clear();
         self.operation = Operation::Idle;
-        self.status = format!("Ready to analyze {} source items.", self.clips.len());
+        self.status = ready_status(self.clips.len());
         self.error = None;
     }
 
@@ -786,7 +786,7 @@ impl AppData {
         self.status = if self.clips.is_empty() {
             "Drop media or choose files to begin.".to_string()
         } else {
-            format!("Ready to analyze {} source items.", self.clips.len())
+            ready_status(self.clips.len())
         };
     }
 
@@ -2099,6 +2099,11 @@ fn imported_preview(result: &SyncResult) -> ImportedPreview {
         .map(|b| (b.clip_id.clone(), b.confidence, MatchEvidence::Waveform))
         .collect();
     (bars, states, timeline.ruler_timecode_start())
+}
+
+fn ready_status(count: usize) -> String {
+    let noun = if count == 1 { "item" } else { "items" };
+    format!("Ready to analyze {count} source {noun}.")
 }
 
 #[cfg(test)]

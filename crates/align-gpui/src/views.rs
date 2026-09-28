@@ -439,6 +439,26 @@ mod motion_tests {
     }
 
     #[test]
+    fn ruler_ticks_land_on_round_clock_values() {
+        // 240 s across 880 px: 30 s steps.
+        let ticks = ruler_ticks(240., 880. / 240., 0.);
+        assert_eq!(ticks.first(), Some(&0.));
+        assert!(ticks.windows(2).all(|pair| pair[1] - pair[0] == 30.));
+        assert_eq!(ticks.last(), Some(&240.));
+        // Timecode 01:00:07 origin: ticks sit on whole 10 s timecodes.
+        let ticks = ruler_ticks(60., 12., 3607.);
+        assert_eq!(ticks[0], 3.);
+        assert!(ticks.iter().all(|t| ((t + 3607.) % 10.).abs() < 1e-9));
+        // Zoomed far in never goes below one-second labels.
+        assert!(
+            ruler_ticks(10., 10_000., 0.)
+                .windows(2)
+                .all(|p| p[1] - p[0] == 1.)
+        );
+        assert!(ruler_ticks(0., 10., 0.).is_empty());
+    }
+
+    #[test]
     fn long_destination_paths_keep_both_ends() {
         assert_eq!(
             middle_ellipsis("/projects/client/episode/final-deliverables", 21),
@@ -2263,6 +2283,54 @@ fn fmt_duration(seconds: f64) -> String {
     )
 }
 
+/// Approximate width reserved for one ruler label.
+const RULER_LABEL_W: f32 = 76.;
+
+/// Ruler positions (seconds from the timeline start) on round values of
+/// the displayed clock: the smallest 1–2–5 style step (seconds, minutes,
+/// hours) that keeps labels about 110 px apart, aligned to multiples of
+/// the step on the timecode when one is shown.
+fn ruler_ticks(duration: f64, px_per_sec: f64, origin: f64) -> Vec<f64> {
+    const STEPS: [f64; 16] = [
+        1., 2., 5., 10., 15., 30., 60., 120., 300., 600., 900., 1800., 3600., 7200., 14400., 28800.,
+    ];
+    if !(duration > 0. && px_per_sec > 0.) {
+        return Vec::new();
+    }
+    let wanted = 110. / px_per_sec;
+    let step = STEPS
+        .iter()
+        .copied()
+        .find(|step| *step >= wanted)
+        .unwrap_or(STEPS[STEPS.len() - 1]);
+    let first = (origin / step).ceil() * step - origin;
+    let count = ((duration - first) / step).floor().max(-1.) as i64 + 1;
+    (0..count).map(|i| first + i as f64 * step).collect()
+}
+
+/// Clip fill: matched clips follow editor convention (picture violet, sound
+/// green); pending and unmatched states keep their signal colors. Tones are
+/// deep enough for white labels.
+fn clip_color(state: super::lane::BarMatchState, kind: MediaKind) -> u32 {
+    use super::lane::BarMatchState;
+    match (state, kind) {
+        (BarMatchState::Pending, _) => 0x3D7FE0,
+        (BarMatchState::Unmatched, _) => 0xE8870E,
+        (BarMatchState::Matched, MediaKind::Video) => 0x6A5ACD,
+        (BarMatchState::Matched, MediaKind::Audio) => 0x2E9E5B,
+    }
+}
+
+/// Linear blend of two `0xRRGGBB` colors.
+fn mix(from: u32, to: u32, amount: f32) -> u32 {
+    let channel = |shift: u32| {
+        let a = ((from >> shift) & 0xFF) as f32;
+        let b = ((to >> shift) & 0xFF) as f32;
+        ((a + (b - a) * amount).round() as u32) << shift
+    };
+    channel(16) | channel(8) | channel(0)
+}
+
 fn fmt_timecode(start: f64, at: f64) -> String {
     let t = start + at;
     let h = (t / 3600.0).floor() as i64 % 24;
@@ -3035,7 +3103,11 @@ fn file_list(
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(kind_badge(video, badge_color, None)),
+                    .child(if clip.url.is_dir() {
+                        svg_icon(icons().folder.clone(), 13.0, badge_color).into_any_element()
+                    } else {
+                        kind_badge(video, badge_color, None).into_any_element()
+                    }),
             )
             .child(
                 div()
@@ -3177,7 +3249,7 @@ fn timeline_lanes(
     let duration = timeline_duration(data);
     let zoom = data.zoom();
     let (px_per_sec, timeline_w) = timeline_scale(duration, zoom, fit_width);
-    let tick_count = ((timeline_w / 160.0).floor() as usize).max(5);
+    let tick_times = ruler_ticks(duration, px_per_sec, data.ruler_timecode.unwrap_or(0.));
     let target_poses = timeline_poses(data);
 
     // Labels stay fixed while only the ruler and clips scroll horizontally.
@@ -3196,24 +3268,36 @@ fn timeline_lanes(
         .h(px(RULER_H))
         .flex_shrink_0()
         .w(px(timeline_w));
-    for i in 0..=tick_count {
-        let at = duration * i as f64 / tick_count as f64;
+    for &at in &tick_times {
+        let x = (at * px_per_sec) as f32;
         let label = match data.ruler_timecode {
             Some(start) => fmt_timecode(start, at),
             None => fmt_duration(at),
         };
-        let tick = div()
-            .absolute()
-            .top(px(8.))
-            .text_xs()
-            .whitespace_nowrap()
-            .text_color(rgb(theme.dim))
-            .child(label);
-        ticks = ticks.child(if i == tick_count {
-            tick.right(px(0.))
-        } else {
-            tick.left(px(timeline_w * i as f32 / tick_count as f32))
-        });
+        ticks = ticks
+            .child(
+                div()
+                    .absolute()
+                    .left(px(x))
+                    .bottom(px(0.))
+                    .w(px(1.))
+                    .h(px(6.))
+                    .bg(rgb(theme.border)),
+            )
+            // Labels that would run past the end are left out rather than
+            // clipped mid-glyph.
+            .when(x + RULER_LABEL_W <= timeline_w, |ticks| {
+                ticks.child(
+                    div()
+                        .absolute()
+                        .top(px(8.))
+                        .left(px(x + 4.))
+                        .text_xs()
+                        .whitespace_nowrap()
+                        .text_color(rgb(theme.dim))
+                        .child(label),
+                )
+            });
     }
     tracks = tracks.child(ticks);
 
@@ -3293,8 +3377,8 @@ fn timeline_lanes(
                 .h(px(TIMELINE_ROW_H))
                 .flex_shrink_0();
             // Vertical gridlines at ruler ticks.
-            for i in 0..=tick_count {
-                let x = timeline_w * i as f32 / tick_count as f32;
+            for &at in &tick_times {
+                let x = (at * px_per_sec) as f32;
                 track = track.child(
                     div()
                         .absolute()
@@ -3308,11 +3392,7 @@ fn timeline_lanes(
             let geometry = bar_row_geometry(&lane.clips, px_per_sec);
             for (bar, (x, width)) in lane.clips.iter().zip(geometry.iter()) {
                 let (x, width) = (*x, *width);
-                let color = match bar.match_state {
-                    super::lane::BarMatchState::Pending => 0x007AFF,
-                    super::lane::BarMatchState::Matched => 0x34C759,
-                    super::lane::BarMatchState::Unmatched => 0xFF9500,
-                };
+                let color = clip_color(bar.match_state, bar.kind);
                 let ink = 0xFFFFFF;
                 let clip_id = bar.clip_id.clone();
                 // Keep narrow slivers square; cap other corner radii at 4 px.
@@ -3327,14 +3407,23 @@ fn timeline_lanes(
                     el = el.rounded_md();
                 }
                 el = el
-                    .bg(rgb(color))
+                    // Lit from above: a lighter top edge and a darker rim
+                    // give the fill depth without competing with the
+                    // waveform.
+                    .bg(gpui::linear_gradient(
+                        180.,
+                        gpui::linear_color_stop(rgb(mix(color, 0xFFFFFF, 0.14)), 0.),
+                        gpui::linear_color_stop(rgb(color), 1.),
+                    ))
                     .border_1()
-                    .border_color(rgba(0x00000018))
+                    .border_color(rgb(mix(color, 0x000000, 0.22)))
+                    .shadow_sm()
                     .text_color(rgb(ink))
                     .px_1()
                     .overflow_hidden()
                     .cursor_default();
                 if active {
+                    el = el.hover(move |style| style.border_color(rgb(mix(color, 0xFFFFFF, 0.55))));
                     el = el.tooltip(hover_tip(
                         format!("{} · {}", bar.url.display(), fmt_duration(bar.duration)),
                         theme,
