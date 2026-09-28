@@ -278,7 +278,11 @@ fn main() {
     let initial_paths: Vec<std::path::PathBuf> = std::env::args_os()
         .skip(1)
         .map(std::path::PathBuf::from)
-        .filter(|path| !path.as_os_str().to_string_lossy().starts_with('-'))
+        .filter(|path| {
+            // Launchers may pass empty or option-like arguments; neither is media.
+            let text = path.as_os_str().to_string_lossy();
+            !text.is_empty() && !text.starts_with('-')
+        })
         .collect();
     Application::new()
         .with_assets(icons::FileAssets)

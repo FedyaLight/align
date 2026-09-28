@@ -2890,14 +2890,26 @@ fn drop_zone(
     _data: &super::state::AppData,
     active: bool,
 ) -> impl IntoElement {
+    let accent = theme.accent;
+    // The whole card is the drop target; it lights up while files hover.
     let panel = div()
         .id("dropzone")
-        .w(px(480.))
+        .w(px(520.))
         .flex()
         .flex_col()
         .items_center()
         .gap_1()
-        .p_6();
+        .px_8()
+        .py_10()
+        .rounded_2xl()
+        .border_2()
+        .border_dashed()
+        .border_color(rgb(theme.border))
+        .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| {
+            style
+                .border_color(rgb(accent))
+                .bg(rgba((accent << 8) | 0x14))
+        });
     div()
         .flex_1()
         .flex()
@@ -2906,10 +2918,19 @@ fn drop_zone(
         .p_8()
         .child(
             panel
-                .child(svg_icon(icons().drop.clone(), 28.0, theme.icon))
                 .child(
                     div()
-                        .mt_4()
+                        .size(px(64.))
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(rgba((accent << 8) | 0x1A))
+                        .child(svg_icon(icons().drop.clone(), 28.0, accent)),
+                )
+                .child(
+                    div()
+                        .mt_5()
                         .text_size(px(20.))
                         .font_weight(gpui::FontWeight(600.0))
                         .child("Add media to sync"),
@@ -2923,7 +2944,7 @@ fn drop_zone(
                         .text_color(rgb(theme.dim))
                         .child("Drop audio, video, folders, or a timeline here."),
                 )
-                .child(div().h(px(12.)))
+                .child(div().h(px(14.)))
                 .child(prominent_button(
                     cx,
                     theme,
@@ -2931,9 +2952,25 @@ fn drop_zone(
                     "Add media…",
                     active,
                     |this, _, _, cx| this.add_media(cx),
-                )),
+                ))
+                .child(
+                    div()
+                        .mt_6()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_0p5()
+                        .text_xs()
+                        .text_color(rgb(theme.dim))
+                        .child(MEDIA_FORMATS_HINT)
+                        .child(TIMELINE_FORMATS_HINT),
+                ),
         )
 }
+
+/// Shown under the empty-state call to action.
+const MEDIA_FORMATS_HINT: &str = "WAV · AIFF · MP3 · M4A · MOV · MP4 · MXF · MTS · R3D";
+const TIMELINE_FORMATS_HINT: &str = "Timelines: FCP XML · FCPXML · AAF";
 
 // ---------------- source list (selectable rows with a stable header slot)
 
