@@ -2143,6 +2143,53 @@ fn button(
     el
 }
 
+/// Two-state segmented control: a sunken track with the selected segment
+/// raised, as in native settings panes.
+fn segmented_control(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    segments: [(&'static str, &'static str, bool, SettingsScope); 2],
+) -> impl IntoElement + use<> {
+    let theme = *theme;
+    let mut track = div()
+        .flex()
+        .flex_row()
+        .p(px(2.))
+        .gap(px(2.))
+        .rounded_lg()
+        .bg(rgb(theme.button_hover))
+        .border_1()
+        .border_color(rgb(theme.separator));
+    for (id, label, selected, scope) in segments {
+        let segment = div()
+            .id(id)
+            .px_3()
+            .h(px(24.))
+            .flex()
+            .items_center()
+            .rounded_md()
+            .text_size(px(12.))
+            .cursor_pointer();
+        let segment = if selected {
+            segment
+                .bg(rgb(theme.panel))
+                .shadow_sm()
+                .text_color(rgb(theme.text))
+                .font_weight(gpui::FontWeight(500.0))
+        } else {
+            segment
+                .text_color(rgb(theme.dim))
+                .hover(move |this| this.text_color(rgb(theme.text)))
+        };
+        track = track.child(
+            segment
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_settings_scope(scope, cx))),
+        );
+    }
+    div().flex().child(track)
+}
+
 fn prominent_button(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
@@ -4608,34 +4655,24 @@ fn search_settings_panel(
     } else {
         Some(common.track_content)
     };
-    let scope_row = div()
-        .flex()
-        .flex_row()
-        .gap_2()
-        .child(button(
-            cx,
-            theme,
-            "settings-scope-common",
-            if current_scope {
-                "Common"
-            } else {
-                "✓ Common"
-            },
-            true,
-            |this, _, _, cx| this.set_settings_scope(SettingsScope::Common, cx),
-        ))
-        .child(button(
-            cx,
-            theme,
-            "settings-scope-sequence",
-            if current_scope {
-                "✓ Current sequence"
-            } else {
-                "Current sequence"
-            },
-            true,
-            |this, _, _, cx| this.set_settings_scope(SettingsScope::CurrentSequence, cx),
-        ));
+    let scope_row = segmented_control(
+        cx,
+        theme,
+        [
+            (
+                "settings-scope-common",
+                "Common",
+                !current_scope,
+                SettingsScope::Common,
+            ),
+            (
+                "settings-scope-sequence",
+                "Current sequence",
+                current_scope,
+                SettingsScope::CurrentSequence,
+            ),
+        ],
+    );
     div()
         .id("search-settings")
         .w(px(560.))
