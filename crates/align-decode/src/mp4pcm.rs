@@ -94,13 +94,13 @@ impl PcmTrack {
         })
     }
 
-    /// Stream presented frames `[start, start + count)` as planar blocks of
-    /// raw integer or float samples, converted by `convert`.
-    fn read<T: Copy + Default>(
+    /// Stream presented frames `[start, start + count)` as planar blocks,
+    /// converting each sample with `convert` (monomorphized per layout).
+    fn read_with<T: Copy, F: Fn(&[u8]) -> T>(
         &mut self,
         start: u64,
         count: Option<u64>,
-        convert: impl Fn(&[u8], u32, bool, bool) -> T,
+        convert: F,
         consume: &mut dyn FnMut(Vec<Vec<T>>) -> Result<(), DecodeError>,
     ) -> Result<(), DecodeError> {
         let first = start + self.lead;
@@ -127,12 +127,14 @@ impl PcmTrack {
                 let take = remaining.min(BLOCK_FRAMES);
                 bytes.resize(take * frame_bytes, 0);
                 self.file.read_exact(&mut bytes)?;
-                let mut planes = vec![Vec::with_capacity(take); self.channels];
-                for frame_bytes in bytes.chunks_exact(frame_bytes) {
-                    for (plane, sample) in planes.iter_mut().zip(frame_bytes.chunks_exact(width)) {
-                        plane.push(convert(sample, self.bits, self.float, self.big_endian));
-                    }
-                }
+                let planes = (0..self.channels)
+                    .map(|channel| {
+                        bytes[channel * width..]
+                            .chunks(frame_bytes)
+                            .map(|frame| convert(&frame[..width]))
+                            .collect()
+                    })
+                    .collect();
                 consume(planes)?;
                 remaining -= take;
                 frame += take as u64;
@@ -147,7 +149,29 @@ impl PcmTrack {
         count: Option<u64>,
         consume: &mut dyn FnMut(Vec<Vec<f32>>) -> Result<(), DecodeError>,
     ) -> Result<(), DecodeError> {
-        self.read(start, count, sample_f32, consume)
+        const SCALE: f32 = 1.0 / 2_147_483_648.0;
+        macro_rules! int {
+            ($w:literal, $be:literal) => {
+                self.read_with(
+                    start,
+                    count,
+                    |s| integer::<$w, $be>(s) as f32 * SCALE,
+                    consume,
+                )
+            };
+        }
+        match (self.bits, self.float, self.big_endian) {
+            (16, false, false) => int!(2, false),
+            (16, false, true) => int!(2, true),
+            (24, false, false) => int!(3, false),
+            (24, false, true) => int!(3, true),
+            (32, false, false) => int!(4, false),
+            (32, false, true) => int!(4, true),
+            (_, true, big_endian) => {
+                self.read_with(start, count, |s| float(s, big_endian) as f32, consume)
+            }
+            _ => Err(DecodeError::InvalidPcm),
+        }
     }
 
     pub fn read_i32(
@@ -156,7 +180,25 @@ impl PcmTrack {
         count: Option<u64>,
         consume: &mut dyn FnMut(Vec<Vec<i32>>) -> Result<(), DecodeError>,
     ) -> Result<(), DecodeError> {
-        self.read(start, count, sample_i32, consume)
+        match (self.bits, self.float, self.big_endian) {
+            (16, false, false) => self.read_with(start, count, integer::<2, false>, consume),
+            (16, false, true) => self.read_with(start, count, integer::<2, true>, consume),
+            (24, false, false) => self.read_with(start, count, integer::<3, false>, consume),
+            (24, false, true) => self.read_with(start, count, integer::<3, true>, consume),
+            (32, false, false) => self.read_with(start, count, integer::<4, false>, consume),
+            (32, false, true) => self.read_with(start, count, integer::<4, true>, consume),
+            (_, true, big_endian) => self.read_with(
+                start,
+                count,
+                |s| {
+                    (float(s, big_endian) * 2_147_483_648.0)
+                        .round()
+                        .clamp(-2_147_483_648.0, 2_147_483_647.0) as i32
+                },
+                consume,
+            ),
+            _ => Err(DecodeError::InvalidPcm),
+        }
     }
 }
 
@@ -175,20 +217,21 @@ fn one_frame_per_sample(entry: &[u8]) -> bool {
     }
 }
 
-/// Signed integer sample widened to the top of an i32.
-fn integer(sample: &[u8], big_endian: bool) -> i32 {
+/// Signed `W`-byte integer sample widened to the top of an i32.
+#[inline(always)]
+fn integer<const W: usize, const BIG_ENDIAN: bool>(sample: &[u8]) -> i32 {
     let mut word = [0u8; 4];
-    let width = sample.len();
-    if big_endian {
-        word[..width].copy_from_slice(sample);
-    } else {
-        for (slot, byte) in word[..width].iter_mut().zip(sample.iter().rev()) {
-            *slot = *byte;
-        }
+    for (index, slot) in word[..W].iter_mut().enumerate() {
+        *slot = if BIG_ENDIAN {
+            sample[index]
+        } else {
+            sample[W - 1 - index]
+        };
     }
     i32::from_be_bytes(word)
 }
 
+#[inline(always)]
 fn float(sample: &[u8], big_endian: bool) -> f64 {
     match (sample.len(), big_endian) {
         (4, true) => f32::from_be_bytes(sample.try_into().unwrap_or_default()) as f64,
@@ -198,36 +241,19 @@ fn float(sample: &[u8], big_endian: bool) -> f64 {
     }
 }
 
-fn sample_f32(sample: &[u8], _bits: u32, is_float: bool, big_endian: bool) -> f32 {
-    if is_float {
-        float(sample, big_endian) as f32
-    } else {
-        integer(sample, big_endian) as f32 / 2_147_483_648.0
-    }
-}
-
-fn sample_i32(sample: &[u8], _bits: u32, is_float: bool, big_endian: bool) -> i32 {
-    if is_float {
-        (float(sample, big_endian) * 2_147_483_648.0)
-            .round()
-            .clamp(-2_147_483_648.0, 2_147_483_647.0) as i32
-    } else {
-        integer(sample, big_endian)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn integer_widths_and_byte_orders_widen_to_i32() {
-        assert_eq!(integer(&[0x01, 0x80], false), i32::MIN + 0x0001_0000);
-        assert_eq!(integer(&[0x80, 0x01], true), i32::MIN + 0x0001_0000);
-        assert_eq!(integer(&[0xff, 0xff, 0x7f], false), 0x7fff_ff00);
-        assert_eq!(integer(&[0x7f, 0xff, 0xff], true), 0x7fff_ff00);
-        assert_eq!(sample_f32(&[0x00, 0x40], 16, false, false), 0.5);
-        assert_eq!(sample_i32(&0.25f32.to_be_bytes(), 32, true, true), 1 << 29);
+        assert_eq!(integer::<2, false>(&[0x01, 0x80]), i32::MIN + 0x0001_0000);
+        assert_eq!(integer::<2, true>(&[0x80, 0x01]), i32::MIN + 0x0001_0000);
+        assert_eq!(integer::<3, false>(&[0xff, 0xff, 0x7f]), 0x7fff_ff00);
+        assert_eq!(integer::<3, true>(&[0x7f, 0xff, 0xff]), 0x7fff_ff00);
+        assert_eq!(integer::<4, false>(&[1, 0, 0, 0x80]), i32::MIN + 1);
+        assert_eq!(float(&0.25f32.to_be_bytes(), true), 0.25);
+        assert_eq!(float(&(-0.5f64).to_le_bytes(), false), -0.5);
     }
 
     /// Every layout FFmpeg writes must decode to the same samples through
