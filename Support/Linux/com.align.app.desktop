@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Align
+GenericName=Audio and video synchronization
+Comment=Sync your recordings. Keep your edit.
+Comment[ru]=Синхронизация аудио и видео для монтажа
+Exec=/opt/align/align
+Icon=com.align.app
+Terminal=false
+Categories=AudioVideo;AudioVideoEditing;
+Keywords=audio;video;sync;timecode;multicam;
+StartupNotify=true
+StartupWMClass=Align

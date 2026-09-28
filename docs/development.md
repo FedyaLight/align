@@ -109,8 +109,8 @@ open desktop or editor applications.
 
 Tests that require external media tools need those tools installed even when
 only the native backend is being developed. CI runs the same acceptance command
-on macOS, Windows, and Linux. Release tags matching `align-rs-v*` also build
-platform bundles.
+on macOS, Windows, and Linux. Release tags matching `v*` also build and
+publish the installers.
 
 ### Performance
 
@@ -186,11 +186,12 @@ sidecars:
 ```
 
 That build requires a C toolchain, make, curl, tar, xz, and NASM where applicable.
-For a tag named `align-rs-vX.Y.Z` matching the workspace version, the release
-workflow also builds Velopack installers/update packages for macOS, Windows,
-and Linux and publishes them with matching source archives in a GitHub Release.
-See [distribution](distribution.md) for the source and license workflow. The desktop updater uses those
-packages for **Align → Check for Updates…** when installed through Velopack.
+For a tag named `vX.Y.Z` matching the workspace version, the release workflow
+builds the macOS DMG, the Windows installer with its Velopack update feed, and
+Fedora and Arch packages with their graphical installers, and publishes them with
+matching source archives in a GitHub Release. See [distribution](distribution.md)
+for the installers and the source and license workflow. The desktop updater uses
+the Windows feed for **Align → Check for Updates…** in Velopack installations.
 Its GitHub source is configured without authentication, so release assets must
 be publicly accessible. A private repository does not provide an update feed
 for ordinary users with the current configuration. Local Cargo builds and the

@@ -8,7 +8,7 @@ on:
       - "Cargo.lock"
       - "about.toml"
       - "script/**"
-      - "Support/aaf/**"
+      - "Support/**"
       - "docs/**"
       - "README.md"
       - "LICENSE"
@@ -21,7 +21,7 @@ on:
       - "Cargo.lock"
       - "about.toml"
       - "script/**"
-      - "Support/aaf/**"
+      - "Support/**"
       - "docs/**"
       - "README.md"
       - "LICENSE"
@@ -104,19 +104,32 @@ jobs:
           path: release-smoke/
 
 
+  # Tags vX.Y.Z build and publish every installer. A manual run on any
+  # branch builds the same installers as artifacts without publishing.
   release:
     name: release binaries (${{ matrix.os }})
     env:
       VELOPACK_VERSION: 1.2.0
     needs: check-test
-    if: startsWith(github.ref, 'refs/tags/align-rs-v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest, ubuntu-latest]
+        # Linux binaries are built against the oldest glibc the packages
+        # support (2.39), so they run on current Fedora and Arch.
+        os: [macos-latest, windows-latest, ubuntu-24.04]
     steps:
       - uses: actions/checkout@v4
+      - name: Check the tag matches the workspace version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          workspace_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          if [[ "${GITHUB_REF_NAME#v}" != "$workspace_version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $workspace_version" >&2
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: msys2/setup-msys2@v2
@@ -127,7 +140,10 @@ jobs:
             curl diffutils make mingw-w64-x86_64-gcc nasm pkgconf tar xz
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y nasm libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libasound2-dev libudev-dev libvulkan-dev
+        run: >-
+          sudo apt-get update && sudo apt-get install -y nasm libxkbcommon-dev
+          libxkbcommon-x11-dev libwayland-dev libasound2-dev libudev-dev libvulkan-dev
+          libgtk-4-dev rpm
       - name: Install assembler (macOS)
         if: runner.os == 'macOS'
         run: brew install nasm
@@ -184,54 +200,126 @@ jobs:
           name: sources-${{ runner.os }}
           path: target/release-sources/
           if-no-files-found: error
-      - uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: "8.0.x"
-      - name: Install Velopack packager
-        run: dotnet tool install --global vpk --version ${{ env.VELOPACK_VERSION }}
-      - name: Build installable update package
+
+      - name: Build DMG (macOS)
+        if: runner.os == 'macOS'
         shell: bash
         run: |
-          version="${GITHUB_REF_NAME#align-rs-v}"
-          workspace_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
-          if [[ "$version" != "$workspace_version" ]]; then
-            echo "Tag version $version does not match Cargo.toml version $workspace_version" >&2
-            exit 1
-          fi
-          exe=""
-          icon="Support/AppIcon.png"
-          extra=()
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            exe=".exe"
-            icon=""
-          elif [[ "${{ runner.os }}" == "macOS" ]]; then
-            icon="Support/AppIcon.icns"
-            extra+=(--bundleId com.align.app)
-          fi
-          args=(pack --packId com.align.app --packTitle Align --packVersion "$version" --packDir dist-bundle --mainExe "align$exe" --outputDir velopack-release)
-          if [[ -n "$icon" ]]; then args+=(--icon "$icon"); fi
-          vpk "${args[@]}" "${extra[@]}"
-      - uses: actions/upload-artifact@v4
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          python -m venv target/dmg-venv
+          target/dmg-venv/bin/python -m pip install dmgbuild==1.6.7
+          AAF_DIR="$PWD/target/release" \
+          RELEASE_LICENSES="$PWD/dist-bundle/ThirdPartyLicenses" \
+          ALIGN_SKIP_LAUNCH_CHECK=1 \
+            ./script/package-macos.sh "$PWD/target/macos-package"
+          mkdir -p installers
+          PYTHON="$PWD/target/dmg-venv/bin/python" ./script/create-macos-dmg.sh \
+            target/macos-package/Align.app "installers/Align-$version-macOS-arm64.dmg"
+      - uses: actions/setup-dotnet@v5
+        if: runner.os == 'Windows'
         with:
-          name: align-${{ runner.os }}
-          path: dist-bundle/
+          dotnet-version: "8.0.x"
+      - name: Build installer and update feed (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          dotnet tool install --global vpk --version ${{ env.VELOPACK_VERSION }}
+          ./script/package-windows.sh dist-bundle installers
+          # The update feed lets installed copies update in place; the
+          # generic Setup name duplicates the versioned installer.
+          rm installers/updates/com.align.app-win-Setup.exe
+          mv installers/updates/* installers/
+          rmdir installers/updates
+      - name: Build Fedora package and installer (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          ./script/package-fedora.sh dist-bundle installers
+          ./script/package-fedora-gui.sh "installers/Align-$version-Fedora-x86_64.rpm" \
+            "installers/Align-$version-Fedora-x86_64-Setup.run"
+          # Artifacts drop Unix permissions; the Arch job unpacks this.
+          tar -czf linux-stage.tar.gz -C dist-bundle .
       - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
         with:
-          name: updates-${{ runner.os }}
-          path: velopack-release/
+          name: linux-stage
+          path: linux-stage.tar.gz
           if-no-files-found: error
+      - name: List installers
+        shell: bash
+        run: ls -la installers/ && cat installers/*.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ runner.os }}
+          path: installers/
+          if-no-files-found: error
+
+  arch:
+    name: Omarchy / Arch package
+    needs: release
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      - name: Install packaging tools
+        run: pacman -Syu --noconfirm --needed base-devel gtk4 pkgconf
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v5
+        with:
+          name: linux-stage
+      - name: Build package and installer
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          mkdir stage out
+          tar -xzf linux-stage.tar.gz -C stage
+          # makepkg refuses to run as root.
+          useradd --create-home builder
+          chown -R builder "$PWD"
+          su builder -c "bash ./script/package-arch.sh stage out"
+          bash ./script/package-arch-gui.sh "out/align-$version-1-x86_64.pkg.tar.zst" \
+            "out/Align-$version-Omarchy-x86_64-Setup.run"
+          mkdir installers
+          mv out/*.pkg.tar.zst* out/*.run* installers/
+      - name: Install and run the package
+        run: |
+          pacman -U --noconfirm installers/*.pkg.tar.zst
+          align-cli --help >/dev/null
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | align-mcp | grep -q align_sync
+          pacman -Qkk align
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers-Arch
+          path: installers/
+          if-no-files-found: error
+
+  fedora:
+    name: Fedora package check
+    needs: release
+    runs-on: ubuntu-24.04
+    container: fedora:latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: installers-Linux
+      - name: Install and run the package
+        run: |
+          dnf install -y ./Align-*-Fedora-x86_64.rpm
+          align-cli --help >/dev/null
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | align-mcp | grep -q align_sync
+          rpm -V align
+          sha256sum -c ./*.sha256
 
   publish-release:
     name: publish GitHub release
-    needs: release
-    if: startsWith(github.ref, 'refs/tags/align-rs-v')
+    needs: [release, arch, fedora]
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v5
         with:
-          pattern: updates-*
+          pattern: installers-*
           path: release-assets
           merge-multiple: true
       - uses: actions/download-artifact@v5
@@ -239,33 +327,28 @@ jobs:
           pattern: sources-*
           path: release-assets
           merge-multiple: true
-      - name: Verify source bundles for every platform
+      - name: Verify every download
         shell: bash
         run: |
-          for platform in Linux macOS Windows; do
-            test -s "release-assets/align-source-$platform.tar.gz"
-            (cd release-assets && sha256sum -c "align-source-$platform.tar.gz.sha256")
+          version="${GITHUB_REF_NAME#v}"
+          cd release-assets
+          for asset in \
+            "Align-$version-macOS-arm64.dmg" \
+            "Align-$version-Windows-x64-Setup.exe" \
+            "Align-$version-Fedora-x86_64-Setup.run" \
+            "Align-$version-Fedora-x86_64.rpm" \
+            "Align-$version-Omarchy-x86_64-Setup.run" \
+            "align-$version-1-x86_64.pkg.tar.zst" \
+            align-source-Linux.tar.gz align-source-macOS.tar.gz align-source-Windows.tar.gz; do
+            test -s "$asset"
           done
+          sha256sum -c ./*.sha256
+          test -s releases.win.json
+          sed "s/@VERSION@/$version/g" ../.github/release-notes.md > ../release-notes.md
       - uses: softprops/action-gh-release@v2
         with:
+          name: Align ${{ github.ref_name }}
+          body_path: release-notes.md
           generate_release_notes: true
           fail_on_unmatched_files: true
-          body: |
-            Corresponding source archives for each platform are attached as
-            `align-source-<platform>.tar.gz`, with SHA-256 checksums. They include
-            Align, vendored Rust dependencies, FFmpeg (Linux and Windows), and AAF
-            component sources.
-            Dependency notices are included in the installers.
-
-            ### macOS installation
-
-            The app is not Developer ID signed or notarized. If macOS says the
-            app is damaged, move `Align.app` to `/Applications`, then run the
-            following commands in Terminal. Only do this for a copy downloaded
-            from this project's official release.
-
-            ```sh
-            sudo xattr -dr com.apple.quarantine "/Applications/Align.app"
-            open "/Applications/Align.app"
-            ```
           files: release-assets/*

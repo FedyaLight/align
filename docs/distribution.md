@@ -5,16 +5,34 @@ licenses. The full GPL text is in [LICENSE](../LICENSE).
 
 ## GitHub releases
 
-A tag named `align-rs-vX.Y.Z` must match the workspace version in Cargo.toml.
-The release workflow first runs the checks, then builds each platform's binaries,
-source archive, dependency notices, and Velopack installers. It publishes only
-after all platform jobs succeed and the source archive checksums pass.
+Push a tag named `vX.Y.Z` that matches the workspace version in Cargo.toml.
+The release workflow runs the checks, then builds each platform's binaries,
+source archive, dependency notices, and installers. Fedora and Arch packages are
+installed and run in clean containers. The release is published only after every
+job succeeds and all checksums pass; its notes come from
+`.github/release-notes.md`. Running the workflow manually on a branch builds the
+same installers as workflow artifacts without publishing anything.
 
 Each release includes:
 
-- Velopack installers and update packages.
-- `align-source-Linux.tar.gz`, `align-source-macOS.tar.gz`, and
-  `align-source-Windows.tar.gz`, each with a `.sha256` file.
+| Platform | Installer | Built by |
+| --- | --- | --- |
+| macOS (Apple Silicon) | `Align-X.Y.Z-macOS-arm64.dmg` | `package-macos.sh`, `create-macos-dmg.sh` |
+| Windows x64 | `Align-X.Y.Z-Windows-x64-Setup.exe` and the Velopack update feed | `package-windows.sh` |
+| Fedora x86_64 | `Align-X.Y.Z-Fedora-x86_64.rpm` and `-Setup.run` | `package-fedora.sh`, `package-fedora-gui.sh` |
+| Omarchy / Arch x86_64 | `align-X.Y.Z-1-x86_64.pkg.tar.zst` and `Align-X.Y.Z-Omarchy-x86_64-Setup.run` | `package-arch.sh`, `package-arch-gui.sh` |
+
+Also `align-source-Linux.tar.gz`, `align-source-macOS.tar.gz`, and
+`align-source-Windows.tar.gz`, each with a `.sha256` file like every installer.
+
+The installers share Align's look: the DMG window has a drag-to-Applications
+layout, the Windows installer shows an animated splash (`Support/Installer`),
+and the Linux `.run` files open a GTK 4 installer (`Support/Linux/installer.c`)
+in the app's dark theme that installs the native package through polkit.
+`script/render-installer-artwork.swift` regenerates the Windows artwork and icon
+on macOS. The Windows executable carries the app icon and version details
+(`crates/align-gpui/build.rs`), and only Windows installs update through
+Velopack; Linux packages update through the package manager.
 
 The source archives contain the exact committed Align checkout, Cargo.lock,
 vendored Rust dependencies, a Cargo configuration for offline dependency
@@ -60,15 +78,11 @@ license cannot be resolved under those choices. Adding a new license requires
 review rather than disabling that check. Automated collection is not a legal
 opinion about every future dependency or packaging change.
 
-## macOS DMG releases
+## Packaging locally
 
-A standalone macOS release can use a `vX.Y.Z` tag and the local packaging scripts.
-This does not trigger the `align-rs-vX.Y.Z` multiplatform installer jobs. Match the
-workspace version, commit all changes, and prepare the corresponding sources
-with the commands above before packaging. Pass the same AAF build directory
-used by source preparation. Install `dmgbuild==1.6.7` in a Python
-virtual environment and set `PYTHON` to that environment’s interpreter for the DMG
-step. Layout metadata is written directly without automating Finder:
+The packaging scripts also run outside CI on a staged release directory (the
+`dist-bundle` layout the workflow builds). The DMG needs macOS and
+`dmgbuild==1.6.7` in a virtual environment passed as `PYTHON`:
 
 ```sh
 AAF_DIR="$PWD/target/release" \
@@ -78,17 +92,11 @@ RELEASE_LICENSES="$PWD/target/release/ThirdPartyLicenses" \
   target/Align-macOS-arm64.dmg
 ```
 
-The DMG contains Align.app and an Applications shortcut with a custom Finder
-layout. CLI, MCP, AAF, and license notices are inside the app bundle.
-The packaging script checks the bundle signature, CLI, MCP, and app launch.
-Run `script/check-end-to-end.py` against the packaged CLI before publishing.
-Upload the DMG, corresponding `align-source-macOS.tar.gz`, and both checksum
-files together. Include the macOS installation instructions from the README in
-the release notes. Verify uploaded assets before publishing a draft release.
-
-Without `RELEASE_LICENSES`, `package-macos.sh` only makes a development bundle;
-it does not collect release sources itself. The app is ad-hoc signed. Developer
-ID signing and Apple notarization require separate credentials.
+The Fedora scripts need `rpmbuild` and GTK 4 development files; the Arch script
+needs `makepkg` and runs as an unprivileged user. The Windows installer needs the
+`vpk` tool and can be built on any OS. Without `RELEASE_LICENSES`,
+`package-macos.sh` only makes a development bundle. The app is ad-hoc signed.
+Developer ID signing and Apple notarization require separate credentials.
 
 ## Component details
 
