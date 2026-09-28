@@ -25,7 +25,7 @@ use symphonia::core::units::{Time, TimeBase};
 
 use crate::DecodeError;
 use crate::backend::AudioStreamProbe;
-use crate::mp4pcm::PcmTrack;
+use crate::pcm::PcmTrack;
 use align_core::AudioAnalysisSource;
 
 /// Open + demux, returning the reader and the audio-track shortlist.
@@ -33,12 +33,12 @@ use align_core::AudioAnalysisSource;
 /// fail here and are never touched).
 fn open(path: &Path) -> Result<(Box<dyn FormatReader>, Vec<u32>), DecodeError> {
     let mut file = File::open(path).map_err(DecodeError::Io)?;
-    // Symphonia 0.5 recognizes RIFF WAVE but not RF64/BW64. Its generic
-    // signature search otherwise scans a multi-gigabyte file before
-    // allowing the portable backend's FFmpeg fallback to handle it.
+    // Symphonia 0.5 recognizes RIFF WAVE but not RF64/BW64; its generic
+    // signature search would scan a multi-gigabyte file. Those files are
+    // read by `crate::pcm` instead.
     let mut signature = [0u8; 4];
     if file.read_exact(&mut signature).is_ok() && matches!(&signature, b"RF64" | b"BW64") {
-        return Err(DecodeError::Symphonia("RF64/BW64 requires FFmpeg".into()));
+        return Err(DecodeError::Symphonia("RF64/BW64 is read directly".into()));
     }
     file.seek(SeekFrom::Start(0)).map_err(DecodeError::Io)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());

@@ -1,10 +1,14 @@
-//! Direct linear-PCM reads from QuickTime/MP4 camera files.
+//! Direct linear-PCM reads from WAVE (RIFF, RF64, BW64) and QuickTime/MP4.
 //!
 //! Uncompressed camera audio (Sony, Panasonic, Canon, Blackmagic, ARRI) is
 //! stored one frame per sample. Generic demuxing then yields one packet per
 //! audio frame; reading whole chunks through the sample tables instead is
 //! sample-accurate, seek-free and allocation-light. Stream indices count
 //! every sound track in file order, like the header probe.
+//!
+//! Recorder files are read the same way. This also covers RF64/BW64, which
+//! Symphonia does not demux and which Align itself writes for renders over
+//! 4 GiB, so no external decoder is needed for any uncompressed WAVE.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -31,9 +35,12 @@ pub struct PcmTrack {
 }
 
 impl PcmTrack {
-    /// `None` when the stream is not plain interleaved PCM in a QuickTime
-    /// or MP4 file (callers then use the general decoder).
+    /// `None` when the stream is not plain interleaved PCM in a WAVE,
+    /// QuickTime or MP4 file (callers then use the general decoder).
     pub fn open(path: &Path, stream_index: usize) -> Option<Self> {
+        if let Some(wave) = Self::open_wave(path) {
+            return (stream_index == 0).then_some(wave);
+        }
         if !isobmff::is_candidate(path) {
             return None;
         }
@@ -92,6 +99,104 @@ impl PcmTrack {
             chunks,
             total: frame,
         })
+    }
+
+    /// RIFF/RF64/BW64 WAVE with 16/24/32-bit integer or 32/64-bit float
+    /// samples (`WAVE_FORMAT_EXTENSIBLE` included).
+    fn open_wave(path: &Path) -> Option<Self> {
+        let mut file = File::open(path).ok()?;
+        let length = file.metadata().ok()?.len();
+        let mut header = [0u8; 12];
+        file.read_exact(&mut header).ok()?;
+        let large = match &header[..4] {
+            b"RIFF" => false,
+            b"RF64" | b"BW64" => true,
+            _ => return None,
+        };
+        if &header[8..] != b"WAVE" {
+            return None;
+        }
+        let mut ds64_data = None;
+        let mut format = None;
+        let mut offset = 12u64;
+        while offset + 8 <= length {
+            file.seek(SeekFrom::Start(offset)).ok()?;
+            let mut chunk = [0u8; 8];
+            file.read_exact(&mut chunk).ok()?;
+            let size = u32::from_le_bytes(chunk[4..].try_into().ok()?) as u64;
+            let body = offset + 8;
+            match &chunk[..4] {
+                b"ds64" if large && size >= 24 => {
+                    let mut sizes = [0u8; 16];
+                    file.read_exact(&mut sizes).ok()?;
+                    ds64_data = Some(u64::from_le_bytes(sizes[8..].try_into().ok()?));
+                }
+                b"fmt " if size >= 16 => {
+                    let mut fmt = vec![0u8; size.min(40) as usize];
+                    file.read_exact(&mut fmt).ok()?;
+                    format = Some(fmt);
+                }
+                b"data" => {
+                    let fmt = format?;
+                    let field = |at: usize| u16::from_le_bytes([fmt[at], fmt[at + 1]]);
+                    let mut tag = field(0);
+                    if tag == 0xfffe && fmt.len() >= 26 {
+                        tag = field(24); // SubFormat GUID starts with the tag
+                    }
+                    let channels = field(2) as usize;
+                    let sample_rate = u32::from_le_bytes(fmt[4..8].try_into().ok()?);
+                    let block_align = field(12) as u64;
+                    if channels == 0 || sample_rate == 0 || block_align % channels as u64 != 0 {
+                        return None;
+                    }
+                    let bits = (block_align / channels as u64 * 8) as u32;
+                    let float = match (tag, bits) {
+                        (1, 16 | 24 | 32) => false,
+                        (3, 32 | 64) => true,
+                        _ => return None,
+                    };
+                    let declared = match (large, size) {
+                        (true, 0xffff_ffff) => ds64_data?,
+                        _ => size,
+                    };
+                    // Interrupted recordings keep a header larger than the file.
+                    let frames = declared.min(length.saturating_sub(body)) / block_align;
+                    return Some(Self {
+                        file,
+                        sample_rate: sample_rate as f64,
+                        channels,
+                        bits,
+                        float,
+                        big_endian: false,
+                        lead: 0,
+                        chunks: vec![(body, 0, frames)],
+                        total: frames,
+                    });
+                }
+                _ => {}
+            }
+            let size = match (&chunk[..4], large, size) {
+                (b"data", true, 0xffff_ffff) => ds64_data?,
+                _ => size,
+            };
+            offset = body + size + (size & 1);
+        }
+        None
+    }
+
+    /// Stream format and duration without decoding.
+    pub fn probe(&self) -> crate::backend::ProbeReport {
+        crate::backend::ProbeReport {
+            duration_seconds: self.total.saturating_sub(self.lead) as f64 / self.sample_rate,
+            audio_streams: vec![crate::backend::AudioStreamProbe {
+                sample_rate: self.sample_rate,
+                channels: self.channels,
+                bit_depth: Some(self.bits),
+                is_float: Some(self.float),
+            }],
+            has_video: false,
+            video: None,
+        }
     }
 
     /// Stream presented frames `[start, start + count)` as planar blocks,
@@ -254,6 +359,82 @@ mod tests {
         assert_eq!(integer::<4, false>(&[1, 0, 0, 0x80]), i32::MIN + 1);
         assert_eq!(float(&0.25f32.to_be_bytes(), true), 0.25);
         assert_eq!(float(&(-0.5f64).to_le_bytes(), false), -0.5);
+    }
+
+    fn wave(large: bool, extensible: bool, samples: &[i32]) -> Vec<u8> {
+        let data: Vec<u8> = samples
+            .iter()
+            .flat_map(|s| s.to_le_bytes()[1..].to_vec())
+            .collect();
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&(if extensible { 0xfffeu16 } else { 1 }).to_le_bytes());
+        fmt.extend_from_slice(&2u16.to_le_bytes());
+        fmt.extend_from_slice(&48_000u32.to_le_bytes());
+        fmt.extend_from_slice(&(48_000u32 * 6).to_le_bytes());
+        fmt.extend_from_slice(&6u16.to_le_bytes());
+        fmt.extend_from_slice(&24u16.to_le_bytes());
+        if extensible {
+            fmt.extend_from_slice(&22u16.to_le_bytes());
+            fmt.extend_from_slice(&24u16.to_le_bytes());
+            fmt.extend_from_slice(&3u32.to_le_bytes());
+            fmt.extend_from_slice(&1u16.to_le_bytes());
+            fmt.extend_from_slice(&[0; 14]);
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(if large { b"RF64" } else { b"RIFF" });
+        out.extend_from_slice(&u32::MAX.to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        if large {
+            out.extend_from_slice(b"ds64");
+            out.extend_from_slice(&28u32.to_le_bytes());
+            out.extend_from_slice(&0u64.to_le_bytes());
+            out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            out.extend_from_slice(&0u64.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+        }
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+        out.extend_from_slice(&fmt);
+        out.extend_from_slice(b"data");
+        let size = if large { u32::MAX } else { data.len() as u32 };
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&data);
+        out
+    }
+
+    #[test]
+    fn wave_variants_read_the_same_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples: Vec<i32> = (0..2_000)
+            .map(|i| (i * 40_503 % 16_777_216 - 8_388_608) << 8)
+            .collect();
+        for (name, large, extensible) in [
+            ("riff.wav", false, false),
+            ("extensible.wav", false, true),
+            ("rf64.wav", true, false),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, wave(large, extensible, &samples)).unwrap();
+            let mut track = PcmTrack::open(&path, 0).unwrap_or_else(|| panic!("{name}"));
+            assert!(PcmTrack::open(&path, 1).is_none());
+            let probe = track.probe();
+            assert_eq!(probe.audio_streams[0].channels, 2);
+            assert_eq!(probe.audio_streams[0].bit_depth, Some(24));
+            assert!((probe.duration_seconds - 1_000.0 / 48_000.0).abs() < 1e-12);
+            let mut read = Vec::new();
+            track
+                .read_i32(100, Some(300), &mut |planes| {
+                    read.extend(planes[0].iter().zip(&planes[1]).flat_map(|(l, r)| [*l, *r]));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(read, samples[200..800], "{name}");
+        }
+        // A truncated recording reads what exists instead of failing.
+        let path = dir.path().join("truncated.wav");
+        let bytes = wave(false, false, &samples);
+        std::fs::write(&path, &bytes[..bytes.len() - 600]).unwrap();
+        assert_eq!(PcmTrack::open(&path, 0).unwrap().total, 900);
     }
 
     /// Every layout FFmpeg writes must decode to the same samples through

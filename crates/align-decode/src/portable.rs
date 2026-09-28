@@ -158,20 +158,24 @@ impl MediaBackend for PortableBackend {
                 has_video: false,
                 video: None,
             }),
-            _ => crate::ff::inspect(path).or_else(|ff_err| {
-                // No ffprobe binary? A Symphonia probe with streams but no
-                // duration is still usable for decode (duration estimated
-                // from decode). Prefer partial truth over failure.
-                match crate::sym::inspect(path) {
-                    Ok(probe) if !probe.streams.is_empty() => Ok(ProbeReport {
-                        duration_seconds: probe.duration_seconds.unwrap_or(0.0),
-                        audio_streams: probe.streams,
-                        has_video: false,
-                        video: None,
-                    }),
-                    _ => Err(ff_err),
-                }
-            }),
+            // RF64/BW64 and other WAVE layouts Symphonia rejects.
+            _ => match crate::pcm::PcmTrack::open(path, 0) {
+                Some(track) => Ok(track.probe()),
+                None => crate::ff::inspect(path).or_else(|ff_err| {
+                    // No ffprobe binary? A Symphonia probe with streams but no
+                    // duration is still usable for decode (duration estimated
+                    // from decode). Prefer partial truth over failure.
+                    match crate::sym::inspect(path) {
+                        Ok(probe) if !probe.streams.is_empty() => Ok(ProbeReport {
+                            duration_seconds: probe.duration_seconds.unwrap_or(0.0),
+                            audio_streams: probe.streams,
+                            has_video: false,
+                            video: None,
+                        }),
+                        _ => Err(ff_err),
+                    }
+                }),
+            },
         }
     }
 

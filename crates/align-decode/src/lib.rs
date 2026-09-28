@@ -17,7 +17,7 @@ mod ltc;
 pub mod media_assets;
 mod mix;
 pub mod mono;
-mod mp4pcm;
+mod pcm;
 pub mod pipeline;
 pub mod portable;
 pub mod provider;

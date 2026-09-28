@@ -567,7 +567,7 @@ impl MediaBackend for AppleNativeBackend {
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"));
-        if (is_wav || crate::mp4pcm::PcmTrack::open(path, source.stream_index()).is_some())
+        if (is_wav || crate::pcm::PcmTrack::open(path, source.stream_index()).is_some())
             && let Ok(window) =
                 crate::sym::decode_window(path, start_seconds, duration_seconds, source)
         {
