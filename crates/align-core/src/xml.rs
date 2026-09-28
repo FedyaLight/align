@@ -858,7 +858,7 @@ pub fn rewrite_media_paths(
         };
         replacements
             .iter()
-            .find_map(|(old, new)| (old == &path).then(|| local_file_url(new)))
+            .find_map(|(old, new)| (old == &path).then(|| crate::model::file_url(new)))
     };
     let mut reader = Reader::from_reader(source);
     reader.config_mut().trim_text(false);
@@ -995,23 +995,6 @@ where
                 Event::Start(tag)
             })
             .map_err(|_| ImportError::Unreadable(String::new()))
-    }
-}
-
-fn local_file_url(path: &Path) -> String {
-    let path = path.to_string_lossy().replace('\\', "/");
-    let mut encoded = String::with_capacity(path.len());
-    for byte in path.bytes() {
-        if byte.is_ascii_alphanumeric() || b"-._~/:".contains(&byte) {
-            encoded.push(byte as char);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    if encoded.starts_with('/') {
-        format!("file://{encoded}")
-    } else {
-        format!("file:///{encoded}")
     }
 }
 

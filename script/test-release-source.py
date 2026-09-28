@@ -13,10 +13,12 @@ spec.loader.exec_module(release)
 
 
 class SourceRequirements(unittest.TestCase):
-    def invoke(self, root, status=''):
-        args = ['prepare-release-source', str(root / 'output'), '--platform', 'macOS',
-                '--licenses', str(root / 'licenses'), '--ffmpeg', str(root / 'ffmpeg'),
+    def invoke(self, root, status='', ffmpeg=True):
+        args = ['prepare-release-source', str(root / 'output'), '--platform', 'Linux',
+                '--licenses', str(root / 'licenses'),
                 '--aaf', str(root / 'aaf'), '--velopack-version', '1.2.0']
+        if ffmpeg:
+            args += ['--ffmpeg', str(root / 'ffmpeg')]
         with patch('sys.argv', args), patch.object(release, 'run', return_value=status) as run:
             try:
                 release.main()
@@ -53,6 +55,13 @@ class SourceRequirements(unittest.TestCase):
             }))
             with self.assertRaisesRegex(RuntimeError, 'pyaaf2 1.7.1'):
                 self.invoke(root)
+
+    def test_release_without_ffmpeg_still_requires_aaf_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'aaf').mkdir()
+            with self.assertRaises(FileNotFoundError):
+                self.invoke(root, ffmpeg=False)
 
 
 if __name__ == '__main__':

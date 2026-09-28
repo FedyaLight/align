@@ -213,7 +213,7 @@ fn parse_rational(value: &serde_json::Value) -> Option<f64> {
 /// Packet order follows decoding, which can differ from presentation
 /// order for B-frames. Store timestamps only (8 bytes per frame), then
 /// compare adjacent presentation times after sorting. No video is decoded.
-struct PacketTiming {
+pub(crate) struct PacketTiming {
     durations: align_core::RangeAccumulator,
     presentation_times: Vec<f64>,
 }
@@ -228,14 +228,14 @@ impl Default for PacketTiming {
 }
 
 impl PacketTiming {
-    fn observe(&mut self, pts: f64, duration: f64) {
+    pub(crate) fn observe(&mut self, pts: f64, duration: f64) {
         self.durations.observe(duration);
         if pts.is_finite() {
             self.presentation_times.push(pts);
         }
     }
 
-    fn mode(mut self) -> align_core::VideoFrameRateMode {
+    pub(crate) fn mode(mut self) -> align_core::VideoFrameRateMode {
         use align_core::{RangeAccumulator, VideoFrameRateMode};
         self.presentation_times.sort_unstable_by(f64::total_cmp);
         let mut deltas = RangeAccumulator::new();

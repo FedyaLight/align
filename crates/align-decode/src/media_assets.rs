@@ -25,7 +25,7 @@ pub fn extraction_directory() -> io::Result<PathBuf> {
                 .tempdir()?,
         );
     }
-    session.as_ref().unwrap().path().canonicalize()
+    align_core::model::canonical_path(session.as_ref().unwrap().path())
 }
 
 /// Called after workers stop or immediately before the application exits.
@@ -79,7 +79,7 @@ fn active_directory() -> io::Result<Option<PathBuf>> {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .as_ref()
-        .map(|directory| directory.path().canonicalize())
+        .map(|directory| align_core::model::canonical_path(directory.path()))
         .transpose()
 }
 
@@ -93,7 +93,7 @@ fn retain_from<'a>(
     for path in paths {
         if path
             .parent()
-            .and_then(|parent| parent.canonicalize().ok())
+            .and_then(|parent| align_core::model::canonical_path(parent).ok())
             .as_deref()
             != Some(session)
         {
@@ -106,7 +106,7 @@ fn retain_from<'a>(
         check_cancel(cancel)?;
         std::fs::create_dir_all(destination)?;
         // Use absolute paths even when the export directory was relative.
-        let saved = destination.canonicalize()?.join(
+        let saved = align_core::model::canonical_path(destination)?.join(
             path.file_name()
                 .ok_or_else(|| io::Error::other("Embedded media has no filename"))?,
         );
@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn saved_media_outlives_session_and_external_sources_are_untouched() {
         let temporary = tempfile::tempdir().unwrap();
-        let session = temporary.path().canonicalize().unwrap();
+        let session = align_core::model::canonical_path(temporary.path()).unwrap();
         let output = tempfile::tempdir().unwrap();
         let source = session.join("content.wav");
         std::fs::write(&source, b"embedded PCM").unwrap();
@@ -174,7 +174,7 @@ mod tests {
     #[test]
     fn cancelled_copy_preserves_existing_destination_and_original_path() {
         let temporary = tempfile::tempdir().unwrap();
-        let session = temporary.path().canonicalize().unwrap();
+        let session = align_core::model::canonical_path(temporary.path()).unwrap();
         let source = session.join("content.wav");
         std::fs::write(&source, b"new PCM").unwrap();
         let output = tempfile::tempdir().unwrap();

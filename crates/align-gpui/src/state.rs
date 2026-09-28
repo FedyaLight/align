@@ -251,6 +251,8 @@ pub struct AppData {
     pub warnings: Vec<String>,
     pub operation: Operation,
     pub progress: f32,
+    /// Start of the running synchronization, reported with its result.
+    pub sync_started: Option<std::time::Instant>,
     pub status: String,
     pub error: Option<String>,
     pub exported_files: Vec<PathBuf>,
@@ -341,6 +343,7 @@ impl Default for AppData {
             warnings: Vec::new(),
             operation: Operation::Idle,
             progress: 0.0,
+            sync_started: None,
             status: "Drop media or choose files to begin.".to_string(),
             error: None,
             exported_files: Vec::new(),
@@ -746,7 +749,7 @@ impl AppData {
         self.reset_preview();
         self.exported_files.clear();
         self.operation = Operation::Idle;
-        self.status = format!("Ready to analyze {} source items.", self.clips.len());
+        self.status = ready_status(self.clips.len());
         self.error = None;
     }
 
@@ -786,7 +789,7 @@ impl AppData {
         self.status = if self.clips.is_empty() {
             "Drop media or choose files to begin.".to_string()
         } else {
-            format!("Ready to analyze {} source items.", self.clips.len())
+            ready_status(self.clips.len())
         };
     }
 
@@ -888,6 +891,7 @@ impl AppData {
         self.cancel_run();
         self.operation = Operation::Synchronizing;
         self.progress = 0.0;
+        self.sync_started = Some(std::time::Instant::now());
         self.error = None;
         self.exported_files.clear();
         self.island_count = 0;
@@ -989,6 +993,7 @@ impl AppData {
     }
 
     pub fn cancel_run(&mut self) {
+        self.sync_started = None;
         let cancelled = std::mem::replace(
             &mut self.cancel,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1172,6 +1177,20 @@ impl AppData {
         self.sync_dirty = false;
         self.quality_only_dirty = false;
         self.incremental_quality_run = false;
+        self.report_sync_duration();
+    }
+
+    /// "Synchronized all 8 clips." → "Synchronized all 8 clips in 0.4 s."
+    fn report_sync_duration(&mut self) {
+        let Some(started) = self.sync_started.take() else {
+            return;
+        };
+        if self.unmatched_count() >= self.clips.len() {
+            return;
+        }
+        if let Some(sentence) = self.status.strip_suffix('.') {
+            self.status = format!("{sentence} in {}.", elapsed_label(started.elapsed()));
+        }
     }
 
     pub fn apply_results(&mut self, mut results: Vec<SyncResult>) {
@@ -1195,8 +1214,13 @@ impl AppData {
         self.quality_only_dirty = false;
         self.incremental_quality_run = false;
         if count > 1 {
+            let took = self
+                .sync_started
+                .take()
+                .map(|started| format!(" in {}", elapsed_label(started.elapsed())))
+                .unwrap_or_default();
             self.status = format!(
-                "Synchronized {count} sequences. Showing sequence {} of {count}.",
+                "Synchronized {count} sequences{took}. Showing sequence {} of {count}.",
                 active + 1
             );
         }
@@ -1334,6 +1358,8 @@ impl AppData {
             )
         } else if unmatched == 0 {
             format!("Synchronized all {total} clips.")
+        } else if unmatched == total {
+            "No clips could be synchronized: no shared sound or timecode was found.".to_string()
         } else {
             format!("Synchronized {} of {total} clips.", total - unmatched)
         };
@@ -2101,6 +2127,23 @@ fn imported_preview(result: &SyncResult) -> ImportedPreview {
     (bars, states, timeline.ruler_timecode_start())
 }
 
+fn elapsed_label(elapsed: std::time::Duration) -> String {
+    let seconds = elapsed.as_secs_f64();
+    if seconds < 10. {
+        format!("{seconds:.1} s")
+    } else if seconds < 60. {
+        format!("{} s", seconds.round() as u64)
+    } else {
+        let whole = seconds.round() as u64;
+        format!("{} min {} s", whole / 60, whole % 60)
+    }
+}
+
+fn ready_status(count: usize) -> String {
+    let noun = if count == 1 { "item" } else { "items" };
+    format!("Ready to analyze {count} source {noun}.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2380,10 +2423,14 @@ mod tests {
             },
         ];
         result.selected_stage = Some(1);
-        let mut data = AppData::default();
+        let mut data = AppData {
+            sync_started: Some(std::time::Instant::now()),
+            ..AppData::default()
+        };
         data.apply_result(result);
-        assert_eq!(
-            data.status, "Synchronized 2 of 3 clips.",
+        assert!(
+            data.status.starts_with("Synchronized 2 of 3 clips in ")
+                && data.status.ends_with(" s."),
             "status={}",
             data.status
         );

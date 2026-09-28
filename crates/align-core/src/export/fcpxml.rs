@@ -196,7 +196,7 @@ fn write_island(
             .map(xml_text::fcpxml_time)
             .unwrap_or_else(|| xml_text::fcpxml_time(MediaTime::new(0, frame_duration.timescale)));
         let name = xml_text::escape(media_url.file_name().and_then(|n| n.to_str()).unwrap_or(""));
-        let src = xml_text::escape(&format!("file://{}", media_url.to_string_lossy()));
+        let src = xml_text::escape(&crate::model::file_url(&media_url));
         if desc.audio_only || item.clip.video.is_none() {
             let channels = item.clip.audio.first().map_or(2, |a| a.channels);
             let rate = item
@@ -343,10 +343,11 @@ fn write_island(
         .clips
         .iter()
         .filter(|i| {
-            !i.clip.audio.is_empty()
-                && !(i.clip.video.is_some()
-                    && i.audio_enabled == Some(false)
-                    && i.linked_audio_edit.is_none())
+            // Disabled camera audio without a linked edit has nothing to place.
+            let muted_camera_audio = i.clip.video.is_some()
+                && i.audio_enabled == Some(false)
+                && i.linked_audio_edit.is_none();
+            !i.clip.audio.is_empty() && !muted_camera_audio
         })
         .collect();
     let video_assignments = allocate(

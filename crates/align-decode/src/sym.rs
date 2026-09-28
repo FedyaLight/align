@@ -25,6 +25,7 @@ use symphonia::core::units::{Time, TimeBase};
 
 use crate::DecodeError;
 use crate::backend::AudioStreamProbe;
+use crate::pcm::PcmTrack;
 use align_core::AudioAnalysisSource;
 
 /// Open + demux, returning the reader and the audio-track shortlist.
@@ -32,12 +33,12 @@ use align_core::AudioAnalysisSource;
 /// fail here and are never touched).
 fn open(path: &Path) -> Result<(Box<dyn FormatReader>, Vec<u32>), DecodeError> {
     let mut file = File::open(path).map_err(DecodeError::Io)?;
-    // Symphonia 0.5 recognizes RIFF WAVE but not RF64/BW64. Its generic
-    // signature search otherwise scans a multi-gigabyte file before
-    // allowing the portable backend's FFmpeg fallback to handle it.
+    // Symphonia 0.5 recognizes RIFF WAVE but not RF64/BW64; its generic
+    // signature search would scan a multi-gigabyte file. Those files are
+    // read by `crate::pcm` instead.
     let mut signature = [0u8; 4];
     if file.read_exact(&mut signature).is_ok() && matches!(&signature, b"RF64" | b"BW64") {
-        return Err(DecodeError::Symphonia("RF64/BW64 requires FFmpeg".into()));
+        return Err(DecodeError::Symphonia("RF64/BW64 is read directly".into()));
     }
     file.seek(SeekFrom::Start(0)).map_err(DecodeError::Io)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -170,6 +171,11 @@ struct Stream {
     time_base: TimeBase,
     sample_rate: u32,
     channels: usize,
+    /// Decoded frames before presentation time zero (MP4 edit list, e.g.
+    /// AAC encoder priming). Symphonia 0.5 does not apply edit lists.
+    lead: u64,
+    /// Frames decoded before a seek target so lapped codecs settle.
+    preroll: u64,
     decoder: Box<dyn Decoder>,
     scratch_spec: Option<SignalSpec>,
     scratch_cap: usize,
@@ -189,7 +195,29 @@ fn open_stream(path: &Path, stream_index: usize) -> Result<Stream, DecodeError> 
         .time_base
         .unwrap_or_else(|| TimeBase::new(1, 1));
     let sample_rate = track.codec_params.sample_rate.unwrap_or(0);
-    let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(0);
+    // Symphonia's MP4 reader leaves the channel count of AAC tracks to the
+    // decoder and ignores edit lists. The movie header (track ids are movie
+    // track indices) supplies both, keeping camera AAC in-process.
+    let movie_track = crate::isobmff::is_candidate(path)
+        .then(|| crate::isobmff::read(path))
+        .flatten()
+        .and_then(|movie| movie.tracks.into_iter().nth(track.id as usize));
+    let channels = track
+        .codec_params
+        .channels
+        .map(|c| c.count())
+        .or_else(|| Some(movie_track.as_ref()?.audio.as_ref()?.channels))
+        .unwrap_or(0);
+    let lead = movie_track
+        .as_ref()
+        .filter(|t| t.timescale > 0)
+        .map_or(0, |t| {
+            (t.media_start as f64 * sample_rate as f64 / t.timescale as f64).round() as u64
+        });
+    let is_pcm = symphonia::default::get_codecs()
+        .get_codec(track.codec_params.codec)
+        .is_some_and(|codec| codec.short_name.starts_with("pcm"));
+    let preroll = if is_pcm { 0 } else { 4 * 1024 };
     if sample_rate == 0 || channels == 0 {
         return Err(DecodeError::Symphonia("unknown audio format".into()));
     }
@@ -199,6 +227,8 @@ fn open_stream(path: &Path, stream_index: usize) -> Result<Stream, DecodeError> 
         time_base,
         sample_rate,
         channels,
+        lead,
+        preroll,
         decoder,
         scratch_spec: None,
         scratch_cap: 0,
@@ -210,7 +240,7 @@ fn open_stream(path: &Path, stream_index: usize) -> Result<Stream, DecodeError> 
 /// decode tier *before* any sample flows, so the FFmpeg fallback never
 /// double-emits after a partial Symphonia stream.
 pub fn can_decode(path: &Path, stream_index: usize) -> bool {
-    open_stream(path, stream_index).is_ok()
+    PcmTrack::open(path, stream_index).is_some() || open_stream(path, stream_index).is_ok()
 }
 
 /// Stream a whole file to 8 kHz mono through `consume` (fingerprint path).
@@ -221,6 +251,18 @@ pub fn decode_mono_8k(
     source: AudioAnalysisSource,
     consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
 ) -> Result<(), DecodeError> {
+    if let Some(mut track) = PcmTrack::open(path, source.stream_index()) {
+        let mut pipe = crate::mono::MonoPipe::new(
+            track.sample_rate,
+            8000.0,
+            track.channels,
+            source.selected_channel(),
+            source.mixes_channels(),
+            consume,
+        )?;
+        track.read_f32(0, None, &mut |planes| pipe.push_owned(&planes))?;
+        return pipe.finish();
+    }
     let mut stream = open_stream(path, source.stream_index())?;
     let explicit = source.selected_channel();
     let mut pipe = crate::mono::MonoPipe::new(
@@ -231,10 +273,12 @@ pub fn decode_mono_8k(
         source.mixes_channels(),
         consume,
     )?;
+    let mut skip = stream.lead;
     loop {
         match decode_packet_planes(&mut stream)? {
             None => break,
-            Some(planes) => {
+            Some(mut planes) => {
+                trim_native_packet(&mut planes, &mut skip, None);
                 let refs: Vec<&[f32]> = planes.iter().map(|v| v.as_slice()).collect();
                 pipe.push_planar(&refs)?;
             }
@@ -250,21 +294,33 @@ pub fn decode_window(
     duration: f64,
     source: AudioAnalysisSource,
 ) -> Result<(f64, Vec<f32>), DecodeError> {
-    let mut stream = open_stream(path, source.stream_index())?;
-    let seeked = stream
-        .format
-        .seek(
-            SeekMode::Accurate,
-            SeekTo::Time {
-                time: Time::from(start.max(0.0)),
-                track_id: Some(stream.track_id),
-            },
-        )
-        .map_err(|e| DecodeError::Unseekable(e.to_string()))?;
-    let seek_time = stream.time_base.calc_time(seeked.actual_ts);
-    let actual_start = seek_time.seconds as f64 + seek_time.frac;
-    let explicit = source.selected_channel();
+    let actual_start = start.max(0.0);
     let want = (duration * 16_000.0).ceil() as usize + 64;
+    if let Some(mut track) = PcmTrack::open(path, source.stream_index()) {
+        let mut samples = Vec::with_capacity(want);
+        let mut pipe = crate::mono::MonoPipe::new(
+            track.sample_rate,
+            16_000.0,
+            track.channels,
+            source.selected_channel(),
+            source.mixes_channels(),
+            |s: &[f32]| {
+                samples.extend_from_slice(s);
+                Ok(())
+            },
+        )?;
+        let first = (actual_start * track.sample_rate).round() as u64;
+        // Read past the window so the resampler's last outputs are filtered
+        // from real audio, as with streamed packets, not from flush padding.
+        let count = (want as f64 / 16_000.0 * track.sample_rate).ceil() as u64 + 8_192;
+        track.read_f32(first, Some(count), &mut |planes| pipe.push_owned(&planes))?;
+        pipe.finish()?;
+        samples.truncate(want);
+        return Ok((actual_start, samples));
+    }
+    let mut stream = open_stream(path, source.stream_index())?;
+    let mut skip = position(&mut stream, actual_start)?;
+    let explicit = source.selected_channel();
     // Shared collection: the closure owns the mutable borrow for the pipe's
     // lifetime, so length checks go through the cell (windows are small).
     let samples = std::cell::RefCell::new(Vec::with_capacity(want.min(16_000 * 12)));
@@ -279,15 +335,16 @@ pub fn decode_window(
             Ok(())
         },
     )?;
-    // Accurate seeks land on/before target; leading audio is truthfully
-    // included (window.start reports it) and bounded by the want-cap.
+    // Pre-roll and seek-packet lead are discarded: the window starts at the
+    // requested sample.
     loop {
         if samples.borrow().len() >= want {
             break;
         }
         match decode_packet_planes(&mut stream)? {
             None => break,
-            Some(planes) => {
+            Some(mut planes) => {
+                trim_native_packet(&mut planes, &mut skip, None);
                 let refs: Vec<&[f32]> = planes.iter().map(|v| v.as_slice()).collect();
                 pipe.push_planar(&refs)?;
             }
@@ -341,21 +398,34 @@ fn decode_packet_planes(stream: &mut Stream) -> Result<Option<Vec<Vec<f32>>>, De
 
 // ------------------------------------------------------------ native render path
 
-/// Seek helper shared by window + native decode. Returns actual stream
-/// time (Accurate lands on/before target).
-fn seek_to(stream: &mut Stream, start: f64) -> Result<f64, DecodeError> {
+/// Position the stream for presentation time `start` (seconds). Seeks to
+/// the pre-roll point (Accurate lands on/before it) and returns how many
+/// decoded frames to discard before the requested sample.
+fn position(stream: &mut Stream, start: f64) -> Result<u64, DecodeError> {
+    let rate = stream.sample_rate as f64;
+    let target = (start.max(0.0) * rate).round() as u64 + stream.lead;
+    let seek_frame = target.saturating_sub(stream.preroll);
+    if seek_frame == 0 {
+        return Ok(target);
+    }
     let seeked = stream
         .format
         .seek(
             SeekMode::Accurate,
             SeekTo::Time {
-                time: Time::from(start.max(0.0)),
+                time: Time::from(seek_frame as f64 / rate),
                 track_id: Some(stream.track_id),
             },
         )
         .map_err(|e| DecodeError::Unseekable(e.to_string()))?;
     let t = stream.time_base.calc_time(seeked.actual_ts);
-    Ok(t.seconds as f64 + t.frac)
+    let actual = ((t.seconds as f64 + t.frac) * rate).round() as u64;
+    if actual > target {
+        return Err(DecodeError::Unseekable(
+            "seek passed requested sample".into(),
+        ));
+    }
+    Ok(target - actual)
 }
 
 fn trim_native_packet<T>(planes: &mut [Vec<T>], skip: &mut u64, remaining: Option<u64>) {
@@ -379,20 +449,21 @@ pub fn decode_native(
     limit_frames: Option<u64>,
     consume: &mut dyn FnMut(crate::backend::NativeBlock) -> Result<(), DecodeError>,
 ) -> Result<f64, DecodeError> {
-    let mut stream = open_stream(path, stream_index)?;
-    let actual = if start > 0.0 {
-        seek_to(&mut stream, start).unwrap_or(0.0)
-    } else {
-        0.0
-    };
-    let wanted = (start.max(0.0) * stream.sample_rate as f64).round();
-    let actual_frame = (actual * stream.sample_rate as f64).round();
-    if actual_frame > wanted {
-        return Err(DecodeError::Unseekable(
-            "native seek passed requested sample".into(),
-        ));
+    if let Some(mut track) = PcmTrack::open(path, stream_index) {
+        let (rate, channels) = (track.sample_rate, track.channels);
+        let wanted = (start.max(0.0) * rate).round();
+        track.read_f32(wanted as u64, limit_frames, &mut |frames| {
+            consume(crate::backend::NativeBlock {
+                sample_rate: rate,
+                channels,
+                frames,
+            })
+        })?;
+        return Ok(wanted / rate);
     }
-    let mut skip = (wanted - actual_frame) as u64;
+    let mut stream = open_stream(path, stream_index)?;
+    let wanted = (start.max(0.0) * stream.sample_rate as f64).round();
+    let mut skip = position(&mut stream, start)?;
     let mut emitted = 0u64;
     loop {
         if limit_frames.is_some_and(|lim| emitted >= lim) {
@@ -431,21 +502,22 @@ pub fn decode_native_i32(
     consume: &mut dyn FnMut(crate::backend::NativeBlockI32) -> Result<(), DecodeError>,
 ) -> Result<f64, DecodeError> {
     use symphonia::core::audio::{AudioBufferRef, Signal};
+    if let Some(mut track) = PcmTrack::open(path, stream_index) {
+        let (rate, channels) = (track.sample_rate, track.channels);
+        let wanted = (start.max(0.0) * rate).round();
+        track.read_i32(wanted as u64, limit_frames, &mut |frames| {
+            consume(crate::backend::NativeBlockI32 {
+                sample_rate: rate,
+                channels,
+                frames,
+            })
+        })?;
+        return Ok(wanted / rate);
+    }
     let mut stream = open_stream(path, stream_index)?;
-    let actual = if start > 0.0 {
-        seek_to(&mut stream, start).unwrap_or(0.0)
-    } else {
-        0.0
-    };
     let mut scratch_f32 = AudioBuffer::<f32>::unused();
     let wanted = (start.max(0.0) * stream.sample_rate as f64).round();
-    let actual_frame = (actual * stream.sample_rate as f64).round();
-    if actual_frame > wanted {
-        return Err(DecodeError::Unseekable(
-            "native seek passed requested sample".into(),
-        ));
-    }
-    let mut skip = (wanted - actual_frame) as u64;
+    let mut skip = position(&mut stream, start)?;
     let mut emitted = 0u64;
     loop {
         if limit_frames.is_some_and(|lim| emitted >= lim) {
@@ -563,5 +635,67 @@ mod native_range_tests {
             assert!((*got - *want as f32 / 2147483648.0).abs() < 1e-7);
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod edit_list_tests {
+    use super::*;
+
+    fn first_click(samples: &[f32]) -> Option<usize> {
+        samples.iter().position(|s| s.abs() > 0.3)
+    }
+
+    /// AAC in MP4 carries encoder priming in the edit list. In-process
+    /// decoding must place audio exactly where FFmpeg (which applies the
+    /// edit list) does, both from the head and after a seek.
+    #[test]
+    fn aac_priming_matches_ffmpeg_timing() {
+        let Some(ffmpeg) = crate::ff::ffmpeg_bin() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("camera.mp4");
+        let ok = std::process::Command::new(ffmpeg)
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("aevalsrc='if(between(t,1.5,1.502),0.9,0)':s=48000:d=4")
+            .args(["-ac", "2", "-c:a", "aac"])
+            .arg(&clip)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!("SKIP: no AAC encoder");
+            return;
+        }
+        assert!(can_decode(&clip, 0), "AAC must decode in-process");
+        let reference = {
+            let mut out = Vec::new();
+            let mut pipe = crate::ff::AudioPipe::spawn(&clip, 0, None, 2).unwrap();
+            pipe.pump(&mut |frames| {
+                out.extend(frames.iter().step_by(2).copied());
+                Ok(())
+            })
+            .unwrap();
+            first_click(&out).unwrap()
+        };
+        assert!((71_990..72_010).contains(&reference), "{reference}");
+        for start in [0.0, 0.7, 1.4] {
+            let mut out = Vec::new();
+            decode_native(&clip, 0, start, Some(96_000), &mut |block| {
+                out.extend_from_slice(&block.frames[0]);
+                Ok(())
+            })
+            .unwrap();
+            let click = first_click(&out).unwrap() + (start * 48_000.0) as usize;
+            assert!(
+                click.abs_diff(reference) <= 2,
+                "start {start}: {click} vs {reference}"
+            );
+        }
+        let (window_start, window) =
+            decode_window(&clip, 1.0, 1.0, AudioAnalysisSource::default()).unwrap();
+        assert_eq!(window_start, 1.0);
+        let click = first_click(&window).unwrap() as f64 / 16.0 + 1000.0;
+        assert!((click - 1500.0).abs() < 0.3, "window click at {click} ms");
     }
 }

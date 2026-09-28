@@ -930,9 +930,90 @@ pub fn file_name(path: &Path) -> String {
         .to_string()
 }
 
+/// `file://` URL for a local path in the form editors expect on every
+/// platform: `/Users/a b.wav` becomes `file:///Users/a%20b.wav` and
+/// `D:\Media\a.wav` becomes `file:///D:/Media/a.wav`. Unreserved characters,
+/// `/` and the drive colon pass through; everything else is percent-encoded
+/// as UTF-8.
+pub fn file_url(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/:".contains(&byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    if encoded.starts_with('/') {
+        format!("file://{encoded}")
+    } else {
+        format!("file:///{encoded}")
+    }
+}
+
+/// `std::fs::canonicalize` without Windows' verbatim prefix. Paths that
+/// reach projects, exported timelines or other applications must stay in
+/// the familiar `C:\…` / `\\server\share` form: editors do not resolve
+/// `file://\\?\C:\…` references.
+pub fn canonical_path(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    std::fs::canonicalize(path).map(|path| strip_verbatim(&path))
+}
+
+fn strip_verbatim(path: &Path) -> std::path::PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        return std::path::PathBuf::from(format!(r"\\{unc}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        // Only drive paths: other verbatim forms have no plain equivalent.
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => std::path::PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_urls_follow_the_editor_form_on_every_platform() {
+        assert_eq!(
+            file_url(Path::new("/Users/a b.wav")),
+            "file:///Users/a%20b.wav"
+        );
+        assert_eq!(
+            file_url(Path::new(r"D:\Media\Scene 1\a.wav")),
+            "file:///D:/Media/Scene%201/a.wav"
+        );
+        assert_eq!(
+            file_url(Path::new("/tmp/Café.mov")),
+            "file:///tmp/Caf%C3%A9.mov"
+        );
+    }
+
+    #[test]
+    fn verbatim_prefixes_are_removed_only_where_a_plain_form_exists() {
+        use std::path::PathBuf;
+        let strip = |text: &str| strip_verbatim(Path::new(text));
+        assert_eq!(strip(r"\\?\D:\a\b.wav"), PathBuf::from(r"D:\a\b.wav"));
+        assert_eq!(
+            strip(r"\\?\UNC\server\share\x"),
+            PathBuf::from(r"\\server\share\x")
+        );
+        assert_eq!(
+            strip(r"\\?\Volume{1234}\x"),
+            PathBuf::from(r"\\?\Volume{1234}\x")
+        );
+        assert_eq!(strip("/tmp/a.wav"), PathBuf::from("/tmp/a.wav"));
+        let here = std::env::current_dir().unwrap();
+        assert!(
+            !canonical_path(&here)
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(r"\\?\")
+        );
+    }
 
     #[test]
     fn source_timecode_constructors_validate() {

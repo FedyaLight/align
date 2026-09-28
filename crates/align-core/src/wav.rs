@@ -131,7 +131,7 @@ fn updated_bext(
     while history.last() == Some(&0) {
         history.pop();
     }
-    if !history.is_empty() && !(history.len() >= 2 && history[history.len() - 2..] == [13, 10]) {
+    if !history.is_empty() && !history.ends_with(&[13, 10]) {
         history.extend_from_slice(&[13, 10]);
     }
     let mode = match channels {

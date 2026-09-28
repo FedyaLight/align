@@ -116,10 +116,11 @@ fn quality_dropdown_motion<E: IntoElement + Styled + 'static>(
     child: E,
     closing: bool,
 ) -> impl IntoElement {
-    const MENU_HEIGHT: f32 = 188.;
+    // Padding and border 10, five 40 px rows, separator block 37.
+    const MENU_HEIGHT: f32 = 248.;
     let reduced = super::motion::reduced_motion();
     div()
-        .w(px(160.))
+        .w(px(QUALITY_MENU_WIDTH))
         .overflow_hidden()
         .rounded_lg()
         .shadow_md()
@@ -415,6 +416,50 @@ mod motion_tests {
     }
 
     #[test]
+    fn progress_glides_forward_continuously_and_snaps_back() {
+        let start = Instant::now();
+        let mut motion = ProgressMotion::new();
+        motion.track(0.4, start);
+        assert_eq!(motion.presented(start), 0.);
+        let mid = start + Duration::from_millis(PROGRESS_MOVE_MS / 2);
+        let shown = motion.presented(mid);
+        assert!(shown > 0. && shown < 0.4);
+        // Retargeting mid-flight continues from the shown width.
+        motion.track(0.9, mid);
+        assert!((motion.presented(mid) - shown).abs() < 1e-6);
+        let end = mid + Duration::from_millis(PROGRESS_MOVE_MS);
+        assert!((motion.presented(end) - 0.9).abs() < 1e-6);
+        // A new operation restarts at its own value without animating back.
+        let generation = motion.generation;
+        motion.track(0.05, end);
+        assert_eq!(motion.presented(end), 0.05);
+        assert_eq!(motion.generation, generation + 1);
+        // Repeated identical reports do not restart the animation.
+        motion.track(0.05, end);
+        assert_eq!(motion.generation, generation + 1);
+    }
+
+    #[test]
+    fn ruler_ticks_land_on_round_clock_values() {
+        // 240 s across 880 px: 30 s steps.
+        let ticks = ruler_ticks(240., 880. / 240., 0.);
+        assert_eq!(ticks.first(), Some(&0.));
+        assert!(ticks.windows(2).all(|pair| pair[1] - pair[0] == 30.));
+        assert_eq!(ticks.last(), Some(&240.));
+        // Timecode 01:00:07 origin: ticks sit on whole 10 s timecodes.
+        let ticks = ruler_ticks(60., 12., 3607.);
+        assert_eq!(ticks[0], 3.);
+        assert!(ticks.iter().all(|t| ((t + 3607.) % 10.).abs() < 1e-9));
+        // Zoomed far in never goes below one-second labels.
+        assert!(
+            ruler_ticks(10., 10_000., 0.)
+                .windows(2)
+                .all(|p| p[1] - p[0] == 1.)
+        );
+        assert!(ruler_ticks(0., 10., 0.).is_empty());
+    }
+
+    #[test]
     fn long_destination_paths_keep_both_ends() {
         assert_eq!(
             middle_ellipsis("/projects/client/episode/final-deliverables", 21),
@@ -532,6 +577,52 @@ impl SettingsSelect {
 
 const TIMELINE_MOVE_MS: u64 = 360;
 const TIMELINE_ROW_H: f32 = 60.;
+const PROGRESS_MOVE_MS: u64 = 320;
+
+/// Progress bar fill that glides between reported values instead of jumping
+/// between coarse phase updates. A retarget starts from the currently shown
+/// width, so rapid updates stay continuous; a lower value (a new operation)
+/// snaps back.
+#[derive(Clone, Copy, Debug)]
+struct ProgressMotion {
+    from: f32,
+    to: f32,
+    started: Instant,
+    generation: u64,
+}
+
+impl ProgressMotion {
+    fn new() -> Self {
+        Self {
+            from: 0.,
+            to: 0.,
+            started: Instant::now(),
+            generation: 0,
+        }
+    }
+
+    fn presented(&self, now: Instant) -> f32 {
+        let elapsed = now.duration_since(self.started).as_secs_f32();
+        let progress =
+            (elapsed / Duration::from_millis(PROGRESS_MOVE_MS).as_secs_f32()).clamp(0., 1.);
+        self.from + (self.to - self.from) * motion_ease(progress)
+    }
+
+    fn track(&mut self, target: f32, now: Instant) {
+        let target = target.clamp(0., 1.);
+        if (target - self.to).abs() < 0.0005 {
+            return;
+        }
+        self.from = if target < self.to {
+            target
+        } else {
+            self.presented(now)
+        };
+        self.to = target;
+        self.started = now;
+        self.generation += 1;
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct TimelinePose {
@@ -734,6 +825,7 @@ pub struct AlignApp {
     export_reveal_generation: u64,
     timeline_transitions: HashMap<ClipId, TimelineTransition>,
     timeline_motion_generation: u64,
+    progress_motion: ProgressMotion,
     update_state: UpdateState,
 }
 
@@ -771,6 +863,7 @@ impl AlignApp {
             export_reveal_generation: 0,
             timeline_transitions: HashMap::new(),
             timeline_motion_generation: 0,
+            progress_motion: ProgressMotion::new(),
             update_state: UpdateState::default(),
         }
     }
@@ -2051,6 +2144,53 @@ fn button(
     el
 }
 
+/// Two-state segmented control: a sunken track with the selected segment
+/// raised, as in native settings panes.
+fn segmented_control(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    segments: [(&'static str, &'static str, bool, SettingsScope); 2],
+) -> impl IntoElement + use<> {
+    let theme = *theme;
+    let mut track = div()
+        .flex()
+        .flex_row()
+        .p(px(2.))
+        .gap(px(2.))
+        .rounded_lg()
+        .bg(rgb(theme.button_hover))
+        .border_1()
+        .border_color(rgb(theme.separator));
+    for (id, label, selected, scope) in segments {
+        let segment = div()
+            .id(id)
+            .px_3()
+            .h(px(24.))
+            .flex()
+            .items_center()
+            .rounded_md()
+            .text_size(px(12.))
+            .cursor_pointer();
+        let segment = if selected {
+            segment
+                .bg(rgb(theme.panel))
+                .shadow_sm()
+                .text_color(rgb(theme.text))
+                .font_weight(gpui::FontWeight(500.0))
+        } else {
+            segment
+                .text_color(rgb(theme.dim))
+                .hover(move |this| this.text_color(rgb(theme.text)))
+        };
+        track = track.child(
+            segment
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_settings_scope(scope, cx))),
+        );
+    }
+    div().flex().child(track)
+}
+
 fn prominent_button(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
@@ -2189,6 +2329,42 @@ fn fmt_duration(seconds: f64) -> String {
         (total / 60) % 60,
         total % 60
     )
+}
+
+/// Approximate width reserved for one ruler label.
+const RULER_LABEL_W: f32 = 76.;
+
+/// Ruler positions (seconds from the timeline start) on round values of
+/// the displayed clock: the smallest 1–2–5 style step (seconds, minutes,
+/// hours) that keeps labels about 110 px apart, aligned to multiples of
+/// the step on the timecode when one is shown.
+fn ruler_ticks(duration: f64, px_per_sec: f64, origin: f64) -> Vec<f64> {
+    const STEPS: [f64; 16] = [
+        1., 2., 5., 10., 15., 30., 60., 120., 300., 600., 900., 1800., 3600., 7200., 14400., 28800.,
+    ];
+    if !(duration > 0. && px_per_sec > 0.) {
+        return Vec::new();
+    }
+    let wanted = 110. / px_per_sec;
+    let step = STEPS
+        .iter()
+        .copied()
+        .find(|step| *step >= wanted)
+        .unwrap_or(STEPS[STEPS.len() - 1]);
+    let first = (origin / step).ceil() * step - origin;
+    let count = ((duration - first) / step).floor().max(-1.) as i64 + 1;
+    (0..count).map(|i| first + i as f64 * step).collect()
+}
+
+/// Clip fill tracks synchronization: pending while analysis runs, then
+/// matched or unmatched.
+fn clip_color(state: super::lane::BarMatchState) -> u32 {
+    use super::lane::BarMatchState;
+    match state {
+        BarMatchState::Pending => 0x007AFF,
+        BarMatchState::Matched => 0x34C759,
+        BarMatchState::Unmatched => 0xFF9500,
+    }
 }
 
 fn fmt_timecode(start: f64, at: f64) -> String {
@@ -2366,8 +2542,10 @@ impl Render for AlignApp {
         }
         // No bottom bar over the empty drop zone either.
         if !self.data.clips.is_empty() {
+            self.progress_motion
+                .track(self.data.progress, Instant::now());
             content = content.child(toolbar_entrance(
-                operation_bar(cx, &theme, &self.data, content_active),
+                operation_bar(cx, &theme, &self.data, self.progress_motion, content_active),
                 "bottom-toolbar-entrance",
             ));
         }
@@ -2748,14 +2926,26 @@ fn drop_zone(
     _data: &super::state::AppData,
     active: bool,
 ) -> impl IntoElement {
+    let accent = theme.accent;
+    // The whole card is the drop target; it lights up while files hover.
     let panel = div()
         .id("dropzone")
-        .w(px(480.))
+        .w(px(520.))
         .flex()
         .flex_col()
         .items_center()
         .gap_1()
-        .p_6();
+        .px_8()
+        .py_10()
+        .rounded_2xl()
+        .border_2()
+        .border_dashed()
+        .border_color(rgb(theme.border))
+        .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| {
+            style
+                .border_color(rgb(accent))
+                .bg(rgba((accent << 8) | 0x14))
+        });
     div()
         .flex_1()
         .flex()
@@ -2764,10 +2954,19 @@ fn drop_zone(
         .p_8()
         .child(
             panel
-                .child(svg_icon(icons().drop.clone(), 28.0, theme.icon))
                 .child(
                     div()
-                        .mt_4()
+                        .size(px(64.))
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(rgba((accent << 8) | 0x1A))
+                        .child(svg_icon(icons().drop.clone(), 28.0, accent)),
+                )
+                .child(
+                    div()
+                        .mt_5()
                         .text_size(px(20.))
                         .font_weight(gpui::FontWeight(600.0))
                         .child("Add media to sync"),
@@ -2781,7 +2980,7 @@ fn drop_zone(
                         .text_color(rgb(theme.dim))
                         .child("Drop audio, video, folders, or a timeline here."),
                 )
-                .child(div().h(px(12.)))
+                .child(div().h(px(14.)))
                 .child(prominent_button(
                     cx,
                     theme,
@@ -2789,9 +2988,25 @@ fn drop_zone(
                     "Add media…",
                     active,
                     |this, _, _, cx| this.add_media(cx),
-                )),
+                ))
+                .child(
+                    div()
+                        .mt_6()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_0p5()
+                        .text_xs()
+                        .text_color(rgb(theme.dim))
+                        .child(MEDIA_FORMATS_HINT)
+                        .child(TIMELINE_FORMATS_HINT),
+                ),
         )
 }
+
+/// Shown under the empty-state call to action.
+const MEDIA_FORMATS_HINT: &str = "WAV · AIFF · MP3 · M4A · MOV · MP4 · MXF · MTS · R3D";
+const TIMELINE_FORMATS_HINT: &str = "Timelines: FCP XML · FCPXML · AAF";
 
 // ---------------- source list (selectable rows with a stable header slot)
 
@@ -2961,7 +3176,11 @@ fn file_list(
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(kind_badge(video, badge_color, None)),
+                    .child(if clip.url.is_dir() {
+                        svg_icon(icons().folder.clone(), 13.0, badge_color).into_any_element()
+                    } else {
+                        kind_badge(video, badge_color, None).into_any_element()
+                    }),
             )
             .child(
                 div()
@@ -3103,7 +3322,7 @@ fn timeline_lanes(
     let duration = timeline_duration(data);
     let zoom = data.zoom();
     let (px_per_sec, timeline_w) = timeline_scale(duration, zoom, fit_width);
-    let tick_count = ((timeline_w / 160.0).floor() as usize).max(5);
+    let tick_times = ruler_ticks(duration, px_per_sec, data.ruler_timecode.unwrap_or(0.));
     let target_poses = timeline_poses(data);
 
     // Labels stay fixed while only the ruler and clips scroll horizontally.
@@ -3122,24 +3341,36 @@ fn timeline_lanes(
         .h(px(RULER_H))
         .flex_shrink_0()
         .w(px(timeline_w));
-    for i in 0..=tick_count {
-        let at = duration * i as f64 / tick_count as f64;
+    for &at in &tick_times {
+        let x = (at * px_per_sec) as f32;
         let label = match data.ruler_timecode {
             Some(start) => fmt_timecode(start, at),
             None => fmt_duration(at),
         };
-        let tick = div()
-            .absolute()
-            .top(px(8.))
-            .text_xs()
-            .whitespace_nowrap()
-            .text_color(rgb(theme.dim))
-            .child(label);
-        ticks = ticks.child(if i == tick_count {
-            tick.right(px(0.))
-        } else {
-            tick.left(px(timeline_w * i as f32 / tick_count as f32))
-        });
+        ticks = ticks
+            .child(
+                div()
+                    .absolute()
+                    .left(px(x))
+                    .bottom(px(0.))
+                    .w(px(1.))
+                    .h(px(6.))
+                    .bg(rgb(theme.border)),
+            )
+            // Labels that would run past the end are left out rather than
+            // clipped mid-glyph.
+            .when(x + RULER_LABEL_W <= timeline_w, |ticks| {
+                ticks.child(
+                    div()
+                        .absolute()
+                        .top(px(8.))
+                        .left(px(x + 4.))
+                        .text_xs()
+                        .whitespace_nowrap()
+                        .text_color(rgb(theme.dim))
+                        .child(label),
+                )
+            });
     }
     tracks = tracks.child(ticks);
 
@@ -3219,8 +3450,8 @@ fn timeline_lanes(
                 .h(px(TIMELINE_ROW_H))
                 .flex_shrink_0();
             // Vertical gridlines at ruler ticks.
-            for i in 0..=tick_count {
-                let x = timeline_w * i as f32 / tick_count as f32;
+            for &at in &tick_times {
+                let x = (at * px_per_sec) as f32;
                 track = track.child(
                     div()
                         .absolute()
@@ -3234,11 +3465,7 @@ fn timeline_lanes(
             let geometry = bar_row_geometry(&lane.clips, px_per_sec);
             for (bar, (x, width)) in lane.clips.iter().zip(geometry.iter()) {
                 let (x, width) = (*x, *width);
-                let color = match bar.match_state {
-                    super::lane::BarMatchState::Pending => 0x007AFF,
-                    super::lane::BarMatchState::Matched => 0x34C759,
-                    super::lane::BarMatchState::Unmatched => 0xFF9500,
-                };
+                let color = clip_color(bar.match_state);
                 let ink = 0xFFFFFF;
                 let clip_id = bar.clip_id.clone();
                 // Keep narrow slivers square; cap other corner radii at 4 px.
@@ -3385,7 +3612,8 @@ fn timeline_lanes(
         .overflow_x_scroll()
         .track_scroll(&data.timeline_scroll)
         .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
-            if !(event.modifiers.alt || event.modifiers.platform) {
+            // Zoom: Option/Alt or Cmd (Ctrl off macOS) + wheel.
+            if !(event.modifiers.alt || event.modifiers.secondary()) {
                 return;
             }
             let dy: f32 = match event.delta {
@@ -3519,6 +3747,7 @@ fn operation_bar(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &super::state::AppData,
+    progress: ProgressMotion,
     active: bool,
 ) -> Div {
     use super::state::Operation;
@@ -3539,7 +3768,12 @@ fn operation_bar(
         .border_color(rgb(theme.separator));
     // Success check.
     if matches!(data.operation, Operation::Ready) && data.has_result() && !data.is_stale() {
-        bar = bar.child(svg_icon(icons().check.clone(), 14.0, theme.green));
+        // A check only for complete success; partial results get a warning.
+        bar = bar.child(if data.unmatched_count() == 0 {
+            svg_icon(icons().check.clone(), 14.0, theme.green)
+        } else {
+            svg_icon(icons().warn.clone(), 14.0, theme.orange)
+        });
     }
     // Status + progress.
     {
@@ -3553,19 +3787,26 @@ fn operation_bar(
             status = status.child(data.status.clone());
         }
         if busy {
+            let fill = div().h_full().rounded_full().bg(rgb(theme.accent));
+            let fill = if super::motion::reduced_motion() {
+                fill.w(gpui::relative(progress.to)).into_any_element()
+            } else {
+                let ProgressMotion { from, to, .. } = progress;
+                fill.w(gpui::relative(from))
+                    .with_animation(
+                        SharedString::from(format!("progress-{}", progress.generation)),
+                        entrance(PROGRESS_MOVE_MS),
+                        move |fill, eased| fill.w(gpui::relative(from + (to - from) * eased)),
+                    )
+                    .into_any_element()
+            };
             status = status.child(
                 div()
                     .w(px(280.))
                     .h(px(4.))
                     .rounded_full()
                     .bg(rgb(theme.border))
-                    .child(
-                        div()
-                            .h_full()
-                            .rounded_full()
-                            .bg(rgb(theme.accent))
-                            .w(gpui::relative(data.progress.clamp(0.0, 1.0))),
-                    ),
+                    .child(fill),
             );
         }
         bar = bar.child(status);
@@ -3629,7 +3870,7 @@ fn operation_bar(
                 cx,
                 theme,
                 "btn-reveal",
-                "Show in Finder",
+                export_reveal_label(),
                 true,
                 |this, _, _, cx| {
                     this.data.reveal_export();
@@ -4254,6 +4495,20 @@ fn search_quality_button(
     control
 }
 
+const QUALITY_MENU_WIDTH: f32 = 232.;
+
+/// One-line guidance under each search level in the quality menu.
+fn search_quality_hint(accuracy: align_core::SearchAccuracy) -> &'static str {
+    use align_core::SearchAccuracy::*;
+    match accuracy {
+        Fast => "Quickest; clear shared sound",
+        Balanced => "Best for most shoots",
+        Thorough => "Noisy rooms, distant mics",
+        Deep => "Hard material, slower",
+        Exhaustive => "Last resort, slowest",
+    }
+}
+
 fn search_quality_row(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
@@ -4264,7 +4519,7 @@ fn search_quality_row(
 ) -> impl IntoElement {
     div()
         .id(id.into())
-        .h(px(28.))
+        .h(px(40.))
         .px_3()
         .flex()
         .flex_row()
@@ -4282,7 +4537,20 @@ fn search_quality_row(
             }
             this.close_search_quality(cx);
         }))
-        .child(div().min_w(px(0.)).truncate().child(label))
+        .child(
+            div()
+                .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .child(div().truncate().child(label))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(11.))
+                        .text_color(rgb(theme.dim))
+                        .child(search_quality_hint(accuracy)),
+                ),
+        )
         .child(
             div()
                 .w(px(16.))
@@ -4305,7 +4573,7 @@ fn search_quality_menu(
     let selected = data.current_effective_settings().search_accuracy;
     let mut menu = div()
         .id("search-quality-menu")
-        .w(px(160.))
+        .w(px(QUALITY_MENU_WIDTH))
         .flex()
         .flex_col()
         .p_1()
@@ -4394,34 +4662,24 @@ fn search_settings_panel(
     } else {
         Some(common.track_content)
     };
-    let scope_row = div()
-        .flex()
-        .flex_row()
-        .gap_2()
-        .child(button(
-            cx,
-            theme,
-            "settings-scope-common",
-            if current_scope {
-                "Common"
-            } else {
-                "✓ Common"
-            },
-            true,
-            |this, _, _, cx| this.set_settings_scope(SettingsScope::Common, cx),
-        ))
-        .child(button(
-            cx,
-            theme,
-            "settings-scope-sequence",
-            if current_scope {
-                "✓ Current sequence"
-            } else {
-                "Current sequence"
-            },
-            true,
-            |this, _, _, cx| this.set_settings_scope(SettingsScope::CurrentSequence, cx),
-        ));
+    let scope_row = segmented_control(
+        cx,
+        theme,
+        [
+            (
+                "settings-scope-common",
+                "Common",
+                !current_scope,
+                SettingsScope::Common,
+            ),
+            (
+                "settings-scope-sequence",
+                "Current sequence",
+                current_scope,
+                SettingsScope::CurrentSequence,
+            ),
+        ],
+    );
     div()
         .id("search-settings")
         .w(px(560.))
@@ -5714,8 +5972,6 @@ fn export_scrollbar(
         .h_full()
         .ml_2()
         .flex_shrink_0()
-        .rounded_full()
-        .bg(rgb(theme.separator))
         .cursor_pointer()
         .on_mouse_down(
             MouseButton::Left,
@@ -5781,12 +6037,14 @@ fn export_scrollbar(
             div()
                 .absolute()
                 .top(px(thumb_top))
-                .left(px(1.))
-                .right(px(1.))
+                // A slim overlay-style thumb on an invisible track; the
+                // full 10 px column stays the hit area.
+                .left(px(3.))
+                .right(px(3.))
                 .h(px(thumb_height))
                 .rounded_full()
-                .bg(rgb(theme.dim))
-                .hover(|this| this.bg(rgb(theme.icon))),
+                .bg(rgba((theme.dim << 8) | 0x70))
+                .hover(|this| this.bg(rgba((theme.dim << 8) | 0xC0))),
         )
 }
 

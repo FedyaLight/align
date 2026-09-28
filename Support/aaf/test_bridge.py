@@ -6,7 +6,7 @@ import subprocess
 import json
 from pathlib import Path
 
-from bridge import write_audio, read_audio, read_timeline, locator_path, repair_paths
+from bridge import write_audio, read_timeline, locator_path, repair_paths
 import aaf2
 
 
@@ -294,7 +294,7 @@ class SourceValidation(unittest.TestCase):
             self.assertEqual(track['clips'], [{'path': str(media), 'start': 7,
                 'source_in': 11, 'length': 101, 'channel': None}])
             with self.assertRaises(ValueError):
-                read_audio(path)
+                read_timeline(path, audio_only=True)
 
     def test_locator_paths(self):
         self.assertEqual(locator_path('file:///C:/Media/My%20Clip.wav'), 'C:/Media/My Clip.wav')
@@ -317,7 +317,7 @@ class SourceValidation(unittest.TestCase):
             }]}
             output = root / 'test.aaf'
             write_audio(manifest, output)
-            restored = read_audio(output)['sequences'][0]
+            restored = read_timeline(output, audio_only=True)['sequences'][0]
             generalized = read_timeline(output)['sequences'][0]['tracks'][0]
             self.assertEqual(generalized['media_kind'], 'sound')
             self.assertEqual(generalized['edit_rate'], {'numerator': 48000, 'denominator': 1})
@@ -355,7 +355,7 @@ class SourceValidation(unittest.TestCase):
             write_audio({'version': 3, 'sequences': [
                 sequence('Morning'), sequence('Evening'),
             ]}, output)
-            result = read_audio(output)
+            result = read_timeline(output, audio_only=True)
             self.assertEqual([item['name'] for item in result['sequences']],
                              ['Morning', 'Evening'])
 

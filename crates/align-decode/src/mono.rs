@@ -5,7 +5,7 @@
 //! channel while it remains within 90% of the loudest. Mixed mode averages
 //! channels explicitly; automatic mode avoids opposite-phase cancellation.
 //!
-//! 4096-frame chunks pass through `rubato::FftFixedIn`; equal sample rates
+//! 4608-frame chunks pass through `rubato::FftFixedIn`; equal sample rates
 //! bypass resampling. The filter tail is flushed and its group delay removed
 //! so output sample positions remain aligned across sample-rate pairs.
 
@@ -13,7 +13,12 @@ use rubato::{FftFixedIn, Resampler};
 
 use crate::DecodeError;
 
-const CHUNK: usize = 4096;
+/// Input frames per resampler call. Split in two sub-chunks, 4608 gives
+/// FFT lengths with only small prime factors for the common rate pairs
+/// (48 kHz → 8 kHz: 384 × 6, → 16 kHz: 768 × 3; 44.1 kHz: 6 × 441). With
+/// 4096, 48 → 16 kHz needed a 683-point prime FFT (Rader's algorithm) that
+/// dominated analysis time.
+const CHUNK: usize = 4608;
 
 /// Interleaved → planar (render path; decode chains stay interleaved for
 /// zero-copy streaming).
@@ -107,6 +112,12 @@ where
             out_total: 0,
             consume: (consume),
         })
+    }
+
+    /// Push owned planar channels.
+    pub fn push_owned(&mut self, planes: &[Vec<f32>]) -> Result<(), DecodeError> {
+        let refs: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
+        self.push_planar(&refs)
     }
 
     /// Push planar channels (Symphonia `AudioBuffer.chan(i)` slices).

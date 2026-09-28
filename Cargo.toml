@@ -41,6 +41,23 @@ dirs = "6"
 gpui = "0.2.2"
 mimalloc = { version = "0.1", default-features = false }
 
+# DSP dependencies (FFT, resampling, decoding, hashing) dominate test run
+# time when unoptimized. Optimizing just these keeps debug builds quick to
+# compile and workspace code debuggable.
+[profile.dev.package]
+rustfft = { opt-level = 3 }
+realfft = { opt-level = 3 }
+rubato = { opt-level = 3 }
+symphonia-core = { opt-level = 3 }
+symphonia-bundle-mp3 = { opt-level = 3 }
+symphonia-codec-aac = { opt-level = 3 }
+symphonia-codec-alac = { opt-level = 3 }
+symphonia-codec-pcm = { opt-level = 3 }
+symphonia-format-isomp4 = { opt-level = 3 }
+symphonia-format-riff = { opt-level = 3 }
+blake3 = { opt-level = 3 }
+sha2 = { opt-level = 3 }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

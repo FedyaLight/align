@@ -1,7 +1,8 @@
 //! Portable engine: Symphonia first, FFmpeg pipe as fallback.
 //!
-//! - inspect: video containers (MOV/MP4/MTS/MXF/R3D/M4V) go straight to
-//!   ffprobe (headers only); audio formats try Symphonia, then ffprobe.
+//! - inspect: MOV/MP4/M4V headers are read natively ([`crate::isobmff`]);
+//!   other video containers (MTS/MXF/R3D) go to ffprobe (headers only);
+//!   audio formats try Symphonia, then ffprobe.
 //! - decode: try Symphonia; anything it cannot demux falls through to the
 //!   FFmpeg stdout pipe. Both tiers feed the same [`crate::mono`] chain,
 //!   so numerics never depend on which tier won.
@@ -31,7 +32,7 @@ impl PortableBackend {
     /// belongs to import, never to each audio window or render block.
     fn audio_probe(&self, path: &Path) -> Result<ProbeReport, DecodeError> {
         if is_video_container(path) {
-            crate::ff::inspect(path)
+            crate::isobmff::inspect_audio(path).map_or_else(|| crate::ff::inspect(path), Ok)
         } else {
             self.inspect(path)
         }
@@ -146,8 +147,9 @@ impl MediaBackend for PortableBackend {
 
     fn inspect(&self, path: &Path) -> Result<ProbeReport, DecodeError> {
         if is_video_container(path) {
-            // Headers + packet-timing walk + timecode tag (no frame decode).
-            return crate::ff::inspect_full(path);
+            // QuickTime/MP4 headers natively; other containers through
+            // ffprobe (headers + packet-timing walk + timecode tag).
+            return crate::isobmff::inspect(path).map_or_else(|| crate::ff::inspect_full(path), Ok);
         }
         match crate::sym::inspect(path) {
             Ok(probe) if probe.duration_seconds.is_some() => Ok(ProbeReport {
@@ -156,20 +158,24 @@ impl MediaBackend for PortableBackend {
                 has_video: false,
                 video: None,
             }),
-            _ => crate::ff::inspect(path).or_else(|ff_err| {
-                // No ffprobe binary? A Symphonia probe with streams but no
-                // duration is still usable for decode (duration estimated
-                // from decode). Prefer partial truth over failure.
-                match crate::sym::inspect(path) {
-                    Ok(probe) if !probe.streams.is_empty() => Ok(ProbeReport {
-                        duration_seconds: probe.duration_seconds.unwrap_or(0.0),
-                        audio_streams: probe.streams,
-                        has_video: false,
-                        video: None,
-                    }),
-                    _ => Err(ff_err),
-                }
-            }),
+            // RF64/BW64 and other WAVE layouts Symphonia rejects.
+            _ => match crate::pcm::PcmTrack::open(path, 0) {
+                Some(track) => Ok(track.probe()),
+                None => crate::ff::inspect(path).or_else(|ff_err| {
+                    // No ffprobe binary? A Symphonia probe with streams but no
+                    // duration is still usable for decode (duration estimated
+                    // from decode). Prefer partial truth over failure.
+                    match crate::sym::inspect(path) {
+                        Ok(probe) if !probe.streams.is_empty() => Ok(ProbeReport {
+                            duration_seconds: probe.duration_seconds.unwrap_or(0.0),
+                            audio_streams: probe.streams,
+                            has_video: false,
+                            video: None,
+                        }),
+                        _ => Err(ff_err),
+                    }
+                }),
+            },
         }
     }
 

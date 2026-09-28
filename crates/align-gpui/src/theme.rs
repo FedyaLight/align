@@ -244,11 +244,9 @@ mod tests {
 
     #[test]
     fn appearance_preference_roundtrips_and_defaults_to_auto() {
-        let path = std::env::temp_dir().join(format!(
-            "align-appearance-test-{}-{}.json",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("thread")
-        ));
+        // Test thread names contain "::", which Windows rejects in paths.
+        let path =
+            std::env::temp_dir().join(format!("align-appearance-test-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
         assert_eq!(load_from(&path), AppearancePreference::Auto);
         save_to(&path, AppearancePreference::Dark).unwrap();
