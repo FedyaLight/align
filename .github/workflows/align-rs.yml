@@ -29,6 +29,12 @@ on:
       - ".github/workflows/align-rs.yml"
   workflow_dispatch:
 
+# A newer push to the same branch supersedes a running check; release
+# tags always run to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   check-test:
     name: test · clippy (${{ matrix.os }})
