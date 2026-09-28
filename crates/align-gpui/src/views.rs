@@ -2356,27 +2356,15 @@ fn ruler_ticks(duration: f64, px_per_sec: f64, origin: f64) -> Vec<f64> {
     (0..count).map(|i| first + i as f64 * step).collect()
 }
 
-/// Clip fill: matched clips follow editor convention (picture violet, sound
-/// green); pending and unmatched states keep their signal colors. Tones are
-/// deep enough for white labels.
-fn clip_color(state: super::lane::BarMatchState, kind: MediaKind) -> u32 {
+/// Clip fill tracks synchronization: pending while analysis runs, then
+/// matched or unmatched.
+fn clip_color(state: super::lane::BarMatchState) -> u32 {
     use super::lane::BarMatchState;
-    match (state, kind) {
-        (BarMatchState::Pending, _) => 0x3D7FE0,
-        (BarMatchState::Unmatched, _) => 0xE8870E,
-        (BarMatchState::Matched, MediaKind::Video) => 0x6A5ACD,
-        (BarMatchState::Matched, MediaKind::Audio) => 0x2E9E5B,
+    match state {
+        BarMatchState::Pending => 0x007AFF,
+        BarMatchState::Matched => 0x34C759,
+        BarMatchState::Unmatched => 0xFF9500,
     }
-}
-
-/// Linear blend of two `0xRRGGBB` colors.
-fn mix(from: u32, to: u32, amount: f32) -> u32 {
-    let channel = |shift: u32| {
-        let a = ((from >> shift) & 0xFF) as f32;
-        let b = ((to >> shift) & 0xFF) as f32;
-        ((a + (b - a) * amount).round() as u32) << shift
-    };
-    channel(16) | channel(8) | channel(0)
 }
 
 fn fmt_timecode(start: f64, at: f64) -> String {
@@ -3477,7 +3465,7 @@ fn timeline_lanes(
             let geometry = bar_row_geometry(&lane.clips, px_per_sec);
             for (bar, (x, width)) in lane.clips.iter().zip(geometry.iter()) {
                 let (x, width) = (*x, *width);
-                let color = clip_color(bar.match_state, bar.kind);
+                let color = clip_color(bar.match_state);
                 let ink = 0xFFFFFF;
                 let clip_id = bar.clip_id.clone();
                 // Keep narrow slivers square; cap other corner radii at 4 px.
@@ -3492,23 +3480,14 @@ fn timeline_lanes(
                     el = el.rounded_md();
                 }
                 el = el
-                    // Lit from above: a lighter top edge and a darker rim
-                    // give the fill depth without competing with the
-                    // waveform.
-                    .bg(gpui::linear_gradient(
-                        180.,
-                        gpui::linear_color_stop(rgb(mix(color, 0xFFFFFF, 0.14)), 0.),
-                        gpui::linear_color_stop(rgb(color), 1.),
-                    ))
+                    .bg(rgb(color))
                     .border_1()
-                    .border_color(rgb(mix(color, 0x000000, 0.22)))
-                    .shadow_sm()
+                    .border_color(rgba(0x00000018))
                     .text_color(rgb(ink))
                     .px_1()
                     .overflow_hidden()
                     .cursor_default();
                 if active {
-                    el = el.hover(move |style| style.border_color(rgb(mix(color, 0xFFFFFF, 0.55))));
                     el = el.tooltip(hover_tip(
                         format!("{} · {}", bar.url.display(), fmt_duration(bar.duration)),
                         theme,
