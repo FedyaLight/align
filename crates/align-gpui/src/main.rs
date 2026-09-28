@@ -334,16 +334,24 @@ fn main() {
             cx.on_action(|_: &HideApp, cx| cx.hide());
             cx.on_action(|_: &HideOthersApp, cx| cx.hide_other_apps());
             cx.on_action(|_: &ShowAllApps, cx| cx.unhide_other_apps());
+            // "secondary" is Cmd on macOS and Ctrl elsewhere; "cmd" alone
+            // would be the Windows/Super key on other platforms.
             cx.bind_keys([
-                KeyBinding::new("cmd-q", QuitApp, None),
-                KeyBinding::new("cmd-h", HideApp, None),
-                KeyBinding::new("alt-cmd-h", HideOthersApp, None),
-                KeyBinding::new("cmd-m", MinimizeWindow, None),
-                KeyBinding::new("cmd-o", AddMedia, None),
-                KeyBinding::new("cmd-r", ReloadAndSynchronize, None),
-                KeyBinding::new("cmd-e", ExportTimeline, None),
-                KeyBinding::new("ctrl-cmd-f", ToggleFullscreen, None),
+                KeyBinding::new("secondary-q", QuitApp, None),
+                KeyBinding::new("secondary-o", AddMedia, None),
+                KeyBinding::new("secondary-r", ReloadAndSynchronize, None),
+                KeyBinding::new("secondary-e", ExportTimeline, None),
             ]);
+            if cfg!(target_os = "macos") {
+                cx.bind_keys([
+                    KeyBinding::new("cmd-h", HideApp, None),
+                    KeyBinding::new("alt-cmd-h", HideOthersApp, None),
+                    KeyBinding::new("cmd-m", MinimizeWindow, None),
+                    KeyBinding::new("ctrl-cmd-f", ToggleFullscreen, None),
+                ]);
+            } else {
+                cx.bind_keys([KeyBinding::new("f11", ToggleFullscreen, None)]);
+            }
             cx.set_menus(app_menus(theme::AppearancePreference::load()));
 
             let bounds = Bounds::centered(None, size(px(1120.), px(700.)), cx);

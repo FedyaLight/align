@@ -3585,7 +3585,8 @@ fn timeline_lanes(
         .overflow_x_scroll()
         .track_scroll(&data.timeline_scroll)
         .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
-            if !(event.modifiers.alt || event.modifiers.platform) {
+            // Zoom: Option/Alt or Cmd (Ctrl off macOS) + wheel.
+            if !(event.modifiers.alt || event.modifiers.secondary()) {
                 return;
             }
             let dy: f32 = match event.delta {
