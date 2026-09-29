@@ -3,24 +3,15 @@ matching, timecode, and recording metadata.
 
 ## What's new in @VERSION@
 
-- **Much faster synchronization.** MOV, MP4 and WAV (including RF64/BW64) are
-  read natively instead of through FFmpeg. On a 22-file test set, a full
-  synchronization dropped from about 11 s to under 1 s with the same accuracy.
-- **Faster media export.** Camera files with replacement audio are written
-  natively, in a fraction of a second instead of several seconds.
-- **Smaller macOS app.** macOS no longer bundles FFmpeg; Linux and Windows ship
-  a slimmer FFmpeg build (about 9 MB instead of 19 MB).
-- **Refined interface.** Round timeline ruler steps, smoother progress,
-  a real drop zone, clearer search-accuracy settings, and Ctrl shortcuts on
-  Windows and Linux (F11 for full screen).
-- **Updates on every platform.** Align checks for a new release at launch and
-  offers it in a small card. One click downloads it, verifies its checksum and
-  installs it: through the Windows installer, by replacing the app on macOS, or
-  through `dnf`/`pacman` on Fedora and Arch. Copies of 0.1.0 do not check for
-  updates, so install this release manually once.
-- **Windows fixes.** Premiere Pro and Final Cut Pro exports now reference
-  Windows media with valid file URLs, the app has its icon, and no console
-  windows flash while it works.
+- **Application menu on Windows and Linux.** The Menu button is available in
+  the top toolbar and on the empty start screen. It opens About, Check for
+  Updates, Use with AI Agents, Path Fixer, analysis-cache settings, and theme
+  selection using the same actions as the native macOS menu.
+- **Consistent menu contents.** The in-window menu follows the registered
+  application menus, including the selected theme. macOS system items such as
+  Services, Hide, and Window are omitted.
+- **Escape to dismiss.** Escape closes the application menu, timeline context
+  menu, and About panel. Clicking outside the application menu also closes it.
 
 ## Downloads
 
@@ -49,8 +40,8 @@ open "/Applications/Align.app"
 
 Run `Align-@VERSION@-Windows-x64-Setup.exe`. It installs for the current user,
 adds Align to the Start menu, and installs the Microsoft VC++ runtime if needed.
-Running it over 0.1.0 upgrades that installation. The installer is unsigned, so
-SmartScreen may ask for confirmation.
+Running it over an earlier version upgrades that installation. The installer is
+unsigned, so SmartScreen may ask for confirmation.
 
 ### Fedora and Omarchy / Arch
 

@@ -14,9 +14,10 @@ use futures::StreamExt;
 use gpui::{
     AnchoredPositionMode, Animation, AnimationExt, AnyView, App, BoxShadow, ClickEvent,
     ClipboardItem, Context, Corner, Div, DragMoveEvent, Entity, FocusHandle, Focusable,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
-    PathPromptOptions, Pixels, Point, Render, ScrollHandle, SharedString, Stateful, Styled, Window,
-    anchored, deferred, div, img, point, prelude::*, px, rgb, rgba,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, OwnedMenu,
+    OwnedMenuItem, ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollHandle,
+    SharedString, Stateful, Styled, Window, anchored, deferred, div, img, point, prelude::*, px,
+    rgb, rgba,
 };
 
 use super::icons::{icons, kind_badge, svg_icon};
@@ -805,6 +806,7 @@ pub struct AlignApp {
     export_inputs: ExportInputs,
     path_fixer_inputs: PathFixerInputs,
     pan_origin: Option<Point<Pixels>>,
+    app_menu_position: Option<Point<Pixels>>,
     export_scroll: ScrollHandle,
     export_scroll_drag: Option<(f32, f32)>,
     export_sidebar_closing: bool,
@@ -845,6 +847,7 @@ impl AlignApp {
             export_inputs: ExportInputs::new(cx),
             path_fixer_inputs: PathFixerInputs::new(cx),
             pan_origin: None,
+            app_menu_position: None,
             export_scroll: ScrollHandle::new(),
             export_scroll_drag: None,
             export_sidebar_closing: false,
@@ -2459,7 +2462,8 @@ impl Render for AlignApp {
         // While a modal or context menu is open the content below keeps
         // its layout but loses hover/cursor feedback (clicks are already
         // swallowed by the overlay layers).
-        let content_active = self.data.menu.is_none()
+        let content_active = self.app_menu_position.is_none()
+            && self.data.menu.is_none()
             && !self.data.show_path_fixer
             && self.data.error.is_none()
             && self.data.sequence_picker.is_none()
@@ -2498,6 +2502,22 @@ impl Render for AlignApp {
             // export text field owns keyboard focus.
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
                 let key: &str = &e.keystroke.key;
+                if key == "escape" && this.app_menu_position.take().is_some() {
+                    cx.notify();
+                    return;
+                }
+                if key == "escape" && this.data.menu.take().is_some() {
+                    cx.notify();
+                    return;
+                }
+                if key == "escape" && this.data.show_about {
+                    this.data.show_about = false;
+                    cx.notify();
+                    return;
+                }
+                if this.app_menu_position.is_some() || this.data.show_about {
+                    return;
+                }
                 if key == "escape" && this.export_select.is_some() {
                     this.close_export_select(cx);
                     return;
@@ -2614,6 +2634,38 @@ impl Render for AlignApp {
             content = content.child(sidebar_scrim(&theme, self.export_sidebar_closing));
         }
         root = root.child(content);
+        if let Some(position) = self.app_menu_position {
+            root = root.child(
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(0.))
+                    .size_full()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.app_menu_position = None;
+                            cx.notify();
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, _, _, cx| {
+                            this.app_menu_position = None;
+                            cx.notify();
+                            cx.stop_propagation();
+                        }),
+                    ),
+            );
+            root = root.child(deferred(
+                anchored()
+                    .anchor(Corner::TopLeft)
+                    .position(position)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(app_menu_panel(cx, &theme, window)),
+            ));
+        }
         if self.data.show_export {
             root = root
                 .child(export_sidebar(
@@ -2733,6 +2785,103 @@ impl Render for AlignApp {
 
 // ---------------- top toolbar (sources / sync / export)
 
+fn app_menu_button(cx: &mut Context<AlignApp>, theme: &Theme, active: bool) -> impl IntoElement {
+    button(
+        cx,
+        theme,
+        "btn-app-menu",
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child("Menu")
+            .child(svg_icon(icons().chevron_down.clone(), 12., theme.icon)),
+        active,
+        |this, event, window, cx| {
+            this.data.menu = None;
+            this.app_menu_position = Some(event.position() + point(px(0.), px(12.)));
+            this.focus_handle.focus(window);
+            cx.notify();
+            cx.stop_propagation();
+        },
+    )
+}
+
+fn app_menu_panel(cx: &mut Context<AlignApp>, theme: &Theme, window: &Window) -> Stateful<Div> {
+    let menus = super::app_menu::in_window_menus(cx.get_menus().unwrap_or_default());
+    let mut panel = div()
+        .id("app-menu")
+        .flex()
+        .flex_col()
+        .p_1()
+        .min_w(px(260.))
+        .max_h(px(
+            (f32::from(window.viewport_size().height) - 32.).clamp(100., 560.)
+        ))
+        .overflow_y_scroll()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(theme.border))
+        .bg(rgb(theme.panel))
+        .shadow_md()
+        .occlude()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation());
+    for menu in menus {
+        panel = append_app_menu(cx, theme, panel, menu, String::new());
+    }
+    panel
+}
+
+fn append_app_menu(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    mut panel: Stateful<Div>,
+    menu: OwnedMenu,
+    parent: String,
+) -> Stateful<Div> {
+    let path = if parent.is_empty() {
+        menu.name.to_string()
+    } else {
+        format!("{parent} › {}", menu.name)
+    };
+    panel = panel.child(menu_header(theme, path.clone()));
+    for (index, item) in menu.items.into_iter().enumerate() {
+        match item {
+            OwnedMenuItem::Action { name, action, .. } => {
+                panel = panel.child(menu_row(
+                    cx,
+                    theme,
+                    format!("app-menu-{path}-{index}"),
+                    name,
+                    false,
+                    move |this, _, window, cx| {
+                        this.app_menu_position = None;
+                        cx.notify();
+                        window.dispatch_action(action.boxed_clone(), cx);
+                        cx.stop_propagation();
+                    },
+                ));
+            }
+            OwnedMenuItem::Submenu(submenu) => {
+                panel = append_app_menu(cx, theme, panel, submenu, path.clone());
+            }
+            OwnedMenuItem::Separator => {
+                panel = panel.child(
+                    div()
+                        .flex_shrink_0()
+                        .my_1()
+                        .h(px(1.))
+                        .bg(rgb(theme.separator)),
+                );
+            }
+            OwnedMenuItem::SystemMenu(_) => {}
+        }
+    }
+    panel
+}
+
 fn toolbar(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
@@ -2758,6 +2907,7 @@ fn toolbar(
         .border_b_1()
         .border_color(rgb(theme.separator))
         .bg(rgb(theme.panel));
+    bar = bar.child(app_menu_button(cx, theme, active));
     bar = bar.child(icon_button(
         cx,
         theme,
@@ -3014,11 +3164,19 @@ fn drop_zone(
                 .bg(rgba((accent << 8) | 0x14))
         });
     div()
+        .relative()
         .flex_1()
         .flex()
         .items_center()
         .justify_center()
         .p_8()
+        .child(
+            div()
+                .absolute()
+                .top(px(9.))
+                .left(px(12.))
+                .child(app_menu_button(cx, theme, active)),
+        )
         .child(
             panel
                 .child(
@@ -7245,7 +7403,7 @@ fn update_action_label(update: &updater::Update) -> String {
 }
 
 /// Floating card announcing a new release, with the next step inline. It
-/// works on every platform (the About panel is in the macOS menu only).
+/// works on every platform, alongside the About panel's update controls.
 fn update_notice(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
