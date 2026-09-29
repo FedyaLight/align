@@ -11,6 +11,11 @@
 Synchronize camera footage and separately recorded audio using waveforms,
 timecode, and recording metadata.
 
+<a href="https://github.com/FedyaLight/align/releases/download/v0.2.0/Align-0.2.0-macOS-arm64.dmg"><img src="docs/assets/download-macos.svg" alt="Download for macOS" height="60"></a>&nbsp;
+<a href="https://github.com/FedyaLight/align/releases/download/v0.2.0/Align-0.2.0-Windows-x64-Setup.exe"><img src="docs/assets/download-windows.svg" alt="Download for Windows" height="60"></a>
+
+Version 0.2.0 · [Linux (Fedora, Arch) and all downloads](https://github.com/FedyaLight/align/releases/latest)
+
 [Releases](https://github.com/FedyaLight/align/releases) ·
 [User guide](docs/usage.md) ·
 [Supported formats](docs/formats.md) ·
