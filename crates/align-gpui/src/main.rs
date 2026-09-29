@@ -5,6 +5,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod app_menu;
 mod icons;
 mod lane;
 mod motion;

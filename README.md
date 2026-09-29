@@ -11,10 +11,10 @@
 Synchronize camera footage and separately recorded audio using waveforms,
 timecode, and recording metadata.
 
-<a href="https://github.com/FedyaLight/align/releases/download/v0.2.0/Align-0.2.0-macOS-arm64.dmg"><img src="docs/assets/download-macos.svg" alt="Download for macOS" height="60"></a>&nbsp;
-<a href="https://github.com/FedyaLight/align/releases/download/v0.2.0/Align-0.2.0-Windows-x64-Setup.exe"><img src="docs/assets/download-windows.svg" alt="Download for Windows" height="60"></a>
+<a href="https://github.com/FedyaLight/align/releases/download/v0.3.0/Align-0.3.0-macOS-arm64.dmg"><img src="docs/assets/download-macos.svg" alt="Download for macOS" height="60"></a>&nbsp;
+<a href="https://github.com/FedyaLight/align/releases/download/v0.3.0/Align-0.3.0-Windows-x64-Setup.exe"><img src="docs/assets/download-windows.svg" alt="Download for Windows" height="60"></a>
 
-Version 0.2.0 · [Linux (Fedora, Arch) and all downloads](https://github.com/FedyaLight/align/releases/latest)
+Version 0.3.0 · [Linux (Fedora, Arch) and all downloads](https://github.com/FedyaLight/align/releases/latest)
 
 <a href="https://github.com/FedyaLight/align/raw/main/docs/assets/Align-demo.mp4"><img src="docs/assets/align-demo.gif" width="760" alt="Align synchronizing a multicam shoot: cameras and recorders dropped in, clips turn green on one timeline"></a>
 
