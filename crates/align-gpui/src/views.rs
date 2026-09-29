@@ -829,6 +829,8 @@ pub struct AlignApp {
     update_state: UpdateState,
     /// The update card was closed; the About panel still offers the update.
     update_notice_dismissed: bool,
+    /// The in-window app menu (Windows and Linux have no native menu bar).
+    show_app_menu: bool,
 }
 
 impl Focusable for AlignApp {
@@ -868,6 +870,7 @@ impl AlignApp {
             progress_motion: ProgressMotion::new(),
             update_state: UpdateState::default(),
             update_notice_dismissed: false,
+            show_app_menu: false,
         }
     }
 
@@ -2498,6 +2501,16 @@ impl Render for AlignApp {
             // export text field owns keyboard focus.
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
                 let key: &str = &e.keystroke.key;
+                if key == "escape" && this.show_app_menu {
+                    this.show_app_menu = false;
+                    cx.notify();
+                    return;
+                }
+                if key == "escape" && this.data.show_about {
+                    this.data.show_about = false;
+                    cx.notify();
+                    return;
+                }
                 if key == "escape" && this.export_select.is_some() {
                     this.close_export_select(cx);
                     return;
@@ -2658,6 +2671,43 @@ impl Render for AlignApp {
         if self.data.show_search_quality {
             root = root.child(search_quality_dismiss_layer(cx));
         }
+        if IN_WINDOW_MENU {
+            // The toolbar carries the menu button; the empty drop zone has
+            // no toolbar, so the button sits in the same corner there.
+            if self.data.lanes.is_empty() && self.data.clips.is_empty() {
+                root = root.child(
+                    div()
+                        .absolute()
+                        .top(px(9.))
+                        .left(px(12.))
+                        .child(app_menu_button(cx, &theme)),
+                );
+            }
+            if self.show_app_menu {
+                root = root
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(0.))
+                            .left(px(0.))
+                            .size_full()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.show_app_menu = false;
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    )
+                    .child(deferred(
+                        anchored()
+                            .position(point(px(12.), px(44.)))
+                            .snap_to_window_with_margin(px(8.))
+                            .child(app_menu_panel(cx, &theme)),
+                    ));
+            }
+        }
         if !self.update_notice_dismissed && !self.data.show_about {
             if let Some(notice) = update_notice(cx, &theme, &self.update_state, self.data.operation)
             {
@@ -2733,6 +2783,100 @@ impl Render for AlignApp {
 
 // ---------------- top toolbar (sources / sync / export)
 
+/// macOS shows the app menu in the system menu bar. GPUI draws none on
+/// Windows or Linux, so there the same menu opens from a toolbar button.
+const IN_WINDOW_MENU: bool = !cfg!(target_os = "macos");
+
+/// Menu entries that only make sense in the macOS menu bar.
+const MAC_ONLY_MENU_ITEMS: [&str; 5] = ["Hide Align", "Hide Others", "Show All", "Minimize", "Zoom"];
+
+fn app_menu_button(cx: &mut Context<AlignApp>, theme: &Theme) -> impl IntoElement {
+    icon_button(
+        cx,
+        theme,
+        "btn-app-menu",
+        icons().menu.clone(),
+        "Menu",
+        true,
+        |this, _, _, cx| {
+            this.show_app_menu = !this.show_app_menu;
+            cx.notify();
+        },
+    )
+}
+
+/// The in-window app menu, built from the same menus macOS shows, so both
+/// stay in step (appearance checkmarks included).
+fn app_menu_panel(cx: &mut Context<AlignApp>, theme: &Theme) -> impl IntoElement {
+    let mut panel = div()
+        .id("app-menu")
+        .flex()
+        .flex_col()
+        .p_1()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(theme.border))
+        .bg(rgb(theme.panel))
+        .shadow_md()
+        .occlude()
+        .w(px(260.))
+        .max_h(px(560.))
+        .overflow_y_scroll();
+    let menus = cx.get_menus().unwrap_or_default();
+    let mut row = 0usize;
+    let mut first_section = true;
+    let mut section = |panel: Div, title: &str, items: &[gpui::OwnedMenuItem], cx: &mut Context<AlignApp>| {
+        let actions: Vec<_> = items
+            .iter()
+            .filter_map(|item| match item {
+                gpui::OwnedMenuItem::Action { name, action, .. }
+                    if !MAC_ONLY_MENU_ITEMS.contains(&name.as_str()) =>
+                {
+                    Some((name.clone(), action.boxed_clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        if actions.is_empty() {
+            return panel;
+        }
+        let mut panel = panel;
+        if !first_section {
+            panel = panel.child(div().mx_2().my_1().h(px(1.)).bg(rgb(theme.separator)));
+        }
+        first_section = false;
+        panel = panel.child(menu_header(theme, title.to_string()));
+        for (name, action) in actions {
+            row += 1;
+            panel = panel.child(menu_row(
+                cx,
+                theme,
+                format!("app-menu-{row}"),
+                name,
+                false,
+                move |this, _, window, cx| {
+                    this.show_app_menu = false;
+                    cx.notify();
+                    window.dispatch_action(action.boxed_clone(), cx);
+                },
+            ));
+        }
+        panel
+    };
+    for menu in &menus {
+        if menu.name.as_ref() == "Window" {
+            continue;
+        }
+        panel = section(panel, menu.name.as_ref(), &menu.items, cx);
+        for item in &menu.items {
+            if let gpui::OwnedMenuItem::Submenu(sub) = item {
+                panel = section(panel, sub.name.as_ref(), &sub.items, cx);
+            }
+        }
+    }
+    panel
+}
+
 fn toolbar(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
@@ -2758,6 +2902,9 @@ fn toolbar(
         .border_b_1()
         .border_color(rgb(theme.separator))
         .bg(rgb(theme.panel));
+    if IN_WINDOW_MENU {
+        bar = bar.child(app_menu_button(cx, theme));
+    }
     bar = bar.child(icon_button(
         cx,
         theme,
