@@ -2907,7 +2907,9 @@ fn toolbar(
         .border_b_1()
         .border_color(rgb(theme.separator))
         .bg(rgb(theme.panel));
-    bar = bar.child(app_menu_button(cx, theme, active));
+    if cfg!(any(target_os = "windows", target_os = "linux")) {
+        bar = bar.child(app_menu_button(cx, theme, active));
+    }
     bar = bar.child(icon_button(
         cx,
         theme,
@@ -3170,12 +3172,17 @@ fn drop_zone(
         .items_center()
         .justify_center()
         .p_8()
-        .child(
-            div()
-                .absolute()
-                .top(px(9.))
-                .left(px(12.))
-                .child(app_menu_button(cx, theme, active)),
+        .when(
+            cfg!(any(target_os = "windows", target_os = "linux")),
+            |zone| {
+                zone.child(
+                    div()
+                        .absolute()
+                        .top(px(9.))
+                        .left(px(12.))
+                        .child(app_menu_button(cx, theme, active)),
+                )
+            },
         )
         .child(
             panel

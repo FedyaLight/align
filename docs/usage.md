@@ -40,10 +40,10 @@ other tracks align to them. See [format limits](formats.md) for unsupported edit
 | Full screen | Ctrl+Cmd+F | F11 |
 | Quit | Cmd+Q | Ctrl+Q |
 
-The **Menu** button is available in the top toolbar and on the empty start
-screen. It provides About, Check for Updates, Use with AI Agents, Path Fixer,
-analysis-cache settings, and appearance selection on every platform. macOS
-also provides the native menu bar.
+On Windows and Linux, the **Menu** button is available in the top toolbar and
+on the empty start screen. It provides About, Check for Updates, Use with AI
+Agents, Path Fixer, analysis-cache settings, and appearance selection. On macOS,
+these commands are available in the native menu bar.
 
 Escape closes the open menu, panel, or dialog.
 

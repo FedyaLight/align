@@ -6,7 +6,8 @@ matching, timecode, and recording metadata.
 - **Application menu on Windows and Linux.** The Menu button is available in
   the top toolbar and on the empty start screen. It opens About, Check for
   Updates, Use with AI Agents, Path Fixer, analysis-cache settings, and theme
-  selection using the same actions as the native macOS menu.
+  selection using the same actions as the native macOS menu. macOS continues
+  to use its native menu bar without an in-window Menu button.
 - **Consistent menu contents.** The in-window menu follows the registered
   application menus, including the selected theme. macOS system items such as
   Services, Hide, and Window are omitted.
