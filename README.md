@@ -16,6 +16,10 @@ timecode, and recording metadata.
 
 Version 0.2.0 · [Linux (Fedora, Arch) and all downloads](https://github.com/FedyaLight/align/releases/latest)
 
+<a href="https://github.com/FedyaLight/align/raw/main/docs/assets/Align-demo.mp4"><img src="docs/assets/align-demo.gif" width="760" alt="Align synchronizing a multicam shoot: cameras and recorders dropped in, clips turn green on one timeline"></a>
+
+[▶ Watch the full demo (52 s)](https://github.com/FedyaLight/align/raw/main/docs/assets/Align-demo.mp4)
+
 [Releases](https://github.com/FedyaLight/align/releases) ·
 [User guide](docs/usage.md) ·
 [Supported formats](docs/formats.md) ·
