@@ -781,10 +781,15 @@ fn clip_item(
     end_override: Option<i64>,
 ) -> String {
     let item = entry.item;
+    let resolve = format == TimelineExportFormat::ResolveXML;
     let stable_start = (item.timeline_start(media_type) * 100_000.0).round() / 100_000.0;
+    // Resolve drops `<subframeoffset>` and places clips on whole frames, so
+    // a floored audio start lands up to a frame early there (camera audio a
+    // frame ahead of its picture). Round audio like video and like the OTIO
+    // writer instead; the precision script restores sample placement.
     let mut start = rate.frames(
         stable_start,
-        if media_type == "video" {
+        if media_type == "video" || resolve {
             Rounding::Nearest
         } else {
             Rounding::Down
@@ -794,7 +799,7 @@ fn clip_item(
     // adjacent integer frame so near-exact starts encode exactly instead of
     // as floor + a full-frame subframeoffset Premiere would drop.
     let mut start_frac = 0.0;
-    if media_type == "audio" {
+    if media_type == "audio" && !resolve {
         let sample_rate = item.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);
         let raw_frac = stable_start * rate.fps - start as f64;
         let (adjustment, effective) =
@@ -977,6 +982,7 @@ fn clip_item(
             file_duration,
             source_rate,
             padded,
+            format,
         );
     } else {
         xml += &format!("                <file id=\"{file_id}\"/>\n");
@@ -1151,6 +1157,7 @@ fn xml_number(value: f64) -> String {
     s
 }
 
+#[allow(clippy::too_many_arguments)]
 fn file_block(
     item: &ExportItem,
     media_url: &Path,
@@ -1159,6 +1166,7 @@ fn file_block(
     duration: i64,
     rate: SequenceRate,
     padded: bool,
+    format: TimelineExportFormat,
 ) -> String {
     let clip = &item.clip;
     let file_name = media_url.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -1171,6 +1179,13 @@ fn file_block(
     xml += &rate.xml("                  ");
     let timecode = if media_type == "video" {
         clip.video.as_ref().and_then(|v| v.source_timecode.clone())
+    } else if format == TimelineExportFormat::ResolveXML && clip.video.is_none() {
+        // Resolve derives an audio file's start timecode from its BWF time
+        // reference itself (at NTSC timeline rates it differs from the
+        // sample-exact label) and then offsets `<in>` by the difference
+        // between that and this label: seconds of slip that grow with the
+        // timecode. Without the label `<in>` counts from the file start.
+        None
     } else {
         clip.audio.first().and_then(|a| a.source_timecode.clone())
     };
@@ -1299,9 +1314,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_bootstrap_ignores_pads_byte_identical() {
-        // The Resolve bootstrap keeps the historical encoding even when a
-        // pad sidecar exists: pads are a PremiereXML-only essence swap.
+    fn resolve_bootstrap_ignores_pads() {
+        // Pads are a PremiereXML-only essence swap; Resolve keeps the
+        // original file at the nearest whole frame (it ignores
+        // subframeoffset): 0.5 s = 12.5 frames at 25 fps rounds to 13.
         let mut timeline = fixture_timeline();
         let rec = timeline.islands[0]
             .clips
@@ -1313,8 +1329,35 @@ mod tests {
             .with_placement_pad(PathBuf::from("/pad/rec-pad.wav"), 960.0 / 48_000.0);
         let xml = write(&timeline, TimelineExportFormat::ResolveXML, false);
         assert!(!xml.contains("rec-pad.wav"));
-        assert!(xml.contains("<subframeoffset>40</subframeoffset>"));
+        assert!(!xml.contains("subframeoffset"));
+        assert!(xml.contains("<name>rec.wav</name>"));
+        assert!(xml.contains("<start>13</start>"));
         assert!(xml.contains("<pathurl>file:///v/rec.wav</pathurl>"));
+    }
+
+    #[test]
+    fn resolve_audio_files_carry_no_timecode_label() {
+        // Resolve offsets `<in>` by the gap between this label and the BWF
+        // timecode it reads itself; Premiere keeps the label.
+        let mut timeline = fixture_timeline();
+        let rec = timeline.islands[0]
+            .clips
+            .iter_mut()
+            .find(|i| i.clip.id.0 == "rec")
+            .expect("recorder item");
+        rec.clip.audio[0].source_timecode = Some(crate::model::SourceTimecode {
+            text: "01:26:57:00".into(),
+            frame_number: 5_217 * 48_000,
+            frame_duration: crate::model::MediaTime::new(1, 48_000),
+            drop_frame: false,
+        });
+        let resolve = write(&timeline, TimelineExportFormat::ResolveXML, false);
+        assert!(!resolve.contains("01:26:57:00"));
+        assert!(!resolve.contains("<timebase>48000</timebase>"));
+        // Camera files keep their timecode.
+        assert!(resolve.contains("<timecode><string>"));
+        let premiere = write(&timeline, TimelineExportFormat::PremiereXML, false);
+        assert!(premiere.contains("01:26:57:00"));
     }
 
     #[test]
