@@ -14,6 +14,8 @@ for notice in LICENSE THIRD_PARTY_NOTICES.txt FFMPEG-LICENSE.txt; do
   test -s "$STAGE/$notice"
 done
 test -d "$STAGE/AAF-Licenses"
+# align-aaf.exe loads its Python runtime from this folder.
+test -d "$STAGE/align-aaf-runtime"
 test -d "$STAGE/ThirdPartyLicenses"
 # Velopack needs the [win] directive only when packing on another OS.
 target=()

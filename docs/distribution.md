@@ -108,7 +108,13 @@ It excludes GPL and nonfree components and retains FFmpeg's LGPL license. See
 [FFmpeg's license guidance](https://ffmpeg.org/legal.html).
 
 The AAF builder records the Python and package versions and hashes the native
-binaries collected by PyInstaller. It includes the Python, pyaaf2, and
+binaries collected by PyInstaller. On Windows the module is a folder build
+(`align-aaf.exe` beside `align-aaf-runtime`) with version details, and CI
+compiles PyInstaller's bootloader from source: one-file builds that unpack a
+runtime to `%TEMP%`, and the prebuilt bootloader that malware also reuses, are
+what antivirus heuristics such as Defender's `Trojan:Win32/Bearfoos.A!ml`
+match. Release binaries are still unsigned; Authenticode signing would remove
+the remaining reputation warnings. It includes the Python, pyaaf2, and
 PyInstaller license texts, including PyInstaller's distribution exception.
 The source bundle records matching native library versions and includes their
 licenses. A failure to identify a required version stops source preparation.

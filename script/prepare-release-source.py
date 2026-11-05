@@ -122,9 +122,14 @@ def main():
         if args.ffmpeg is not None:
             binaries += [args.ffmpeg.parent / f'ffmpeg{extension}',
                          args.ffmpeg.parent / f'ffprobe{extension}']
+        runtime = args.aaf.parent / 'align-aaf-runtime'
+        if args.platform == 'Windows' and runtime.is_dir():
+            binaries += sorted(path for path in runtime.rglob('*')
+                               if path.is_file() and path.suffix.lower() in ('.exe', '.dll', '.pyd'))
         for path in binaries:
+            name = path.relative_to(args.aaf.parent).as_posix() if path.is_relative_to(args.aaf.parent) else path.name
             with path.open('rb') as stream:
-                manifest['component_binaries'][path.name] = hashlib.file_digest(stream, 'sha256').hexdigest()
+                manifest['component_binaries'][name] = hashlib.file_digest(stream, 'sha256').hexdigest()
         for folder in [name for name, _ in components] + ['Velopack']:
             for path in sorted((source / folder).rglob('*')):
                 if path.is_file():

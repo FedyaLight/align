@@ -47,6 +47,9 @@ python script/build-aaf-sidecar.py target/release
 On Windows, activate `.venv\Scripts\Activate.ps1` in PowerShell instead.
 The builder creates `align-aaf` and `AAF-Licenses` beside the CLI. It freezes
 Python and pyaaf2 with PyInstaller, so end users do not need Python installed.
+On Windows it also creates `align-aaf-runtime`, which must stay beside
+`align-aaf.exe`; set `PYINSTALLER_COMPILE_BOOTLOADER=1` and install with
+`--no-binary pyinstaller` to match the release build.
 Build the module separately for each target OS.
 
 ## Architecture
