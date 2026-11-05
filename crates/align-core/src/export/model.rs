@@ -1427,7 +1427,7 @@ impl ExportTimeline {
                             .preserve_editing_tracks
                             .contains(&imported_track_key(MediaKind::Audio, index))
                 }),
-                transition_after: edit.transition_after.as_ref().map(&mk_transition),
+                transition_after: edit.transition_after.as_ref().map(mk_transition),
                 audio_transition_after: edit.audio_transition_after.as_ref().map(|t| {
                     let mut e = mk_transition(t);
                     e.is_otio_portable = false;
