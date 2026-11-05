@@ -81,6 +81,38 @@ def collect_native_sources(sources, licenses, python_archive, python_version):
     return {name: version for name, version, _ in components}
 
 
+# Windows ships the frozen runtime in this folder next to align-aaf.exe.
+WINDOWS_RUNTIME = 'align-aaf-runtime'
+
+
+def windows_version_info(root):
+    version = re.search(r'^version = "([^"]+)"', (root / 'Cargo.toml').read_text(encoding='utf-8'), re.M).group(1)
+    numbers = (re.findall(r'\d+', version) + ['0', '0', '0'])[:3]
+    tuple_text = ', '.join(numbers + ['0'])
+    strings = {
+        'CompanyName': 'Align contributors',
+        'FileDescription': 'Align AAF module',
+        'FileVersion': version,
+        'InternalName': 'align-aaf',
+        'LegalCopyright': 'GPL-3.0-only',
+        'OriginalFilename': 'align-aaf.exe',
+        'ProductName': 'Align',
+        'ProductVersion': version,
+    }
+    entries = ',\n'.join(f'        StringStruct({key!r}, {value!r})' for key, value in strings.items())
+    return f"""VSVersionInfo(
+  ffi=FixedFileInfo(filevers=({tuple_text}), prodvers=({tuple_text}),
+    mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[
+    StringFileInfo([StringTable('040904B0', [
+{entries}
+    ])]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)
+"""
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
@@ -90,13 +122,35 @@ def main():
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     bundled_binaries = []
+    windows = sys.platform == 'win32'
     with tempfile.TemporaryDirectory(prefix='align-aaf-build-') as temporary:
-        subprocess.run([
+        command = [
             sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean',
-            '--onefile', '--name', 'align-aaf', '--distpath', str(output),
+            '--name', 'align-aaf',
             '--workpath', str(Path(temporary) / 'work'), '--specpath', temporary,
-            '--collect-all', 'aaf2', str(root / 'Support/aaf/bridge.py'),
-        ], check=True)
+            '--collect-all', 'aaf2',
+        ]
+        if windows:
+            # A one-file build unpacks a Python runtime to %TEMP% and runs it
+            # from there, which antivirus heuristics treat as a dropper
+            # (Defender reported Trojan:Win32/Bearfoos.A!ml). Ship the
+            # runtime as a folder beside the executable instead, with
+            # version details like Align's own executables.
+            version_file = Path(temporary) / 'version.txt'
+            version_file.write_text(windows_version_info(root), encoding='utf-8')
+            command += ['--onedir', '--contents-directory', WINDOWS_RUNTIME,
+                        '--distpath', str(Path(temporary) / 'dist'),
+                        '--version-file', str(version_file)]
+        else:
+            command += ['--onefile', '--distpath', str(output)]
+        subprocess.run(command + [str(root / 'Support/aaf/bridge.py')], check=True)
+        if windows:
+            built = Path(temporary) / 'dist' / 'align-aaf'
+            runtime = output / WINDOWS_RUNTIME
+            if runtime.exists():
+                shutil.rmtree(runtime)
+            shutil.move(built / WINDOWS_RUNTIME, runtime)
+            shutil.copy2(built / 'align-aaf.exe', output / 'align-aaf.exe')
         analysis = ast.literal_eval((Path(temporary) / 'work/align-aaf/Analysis-00.toc').read_text(encoding="utf-8"))
         for section in analysis:
             if not isinstance(section, list):

@@ -73,9 +73,20 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
+      - name: Install AAF build requirements
+        shell: bash
+        env:
+          # On Windows, build PyInstaller's bootloader from source instead of
+          # shipping the prebuilt one, which malware also uses and antivirus
+          # engines therefore flag.
+          PYINSTALLER_COMPILE_BOOTLOADER: ${{ runner.os == 'Windows' && '1' || '' }}
+        run: |
+          no_binary=()
+          if [[ "${{ runner.os }}" == "Windows" ]]; then no_binary=(--no-binary pyinstaller); fi
+          python -m pip install "${no_binary[@]}" -r Support/aaf/build-requirements.txt
+      # The default shell keeps Windows-style temporary paths for the tests.
       - name: Build AAF module
         run: |
-          python -m pip install -r Support/aaf/build-requirements.txt
           python -m unittest discover -s Support/aaf -v
           python script/test-release-source.py
           python script/build-aaf-sidecar.py target/release
@@ -152,10 +163,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Build AAF module
+      - name: Install AAF build requirements
+        shell: bash
+        env:
+          PYINSTALLER_COMPILE_BOOTLOADER: ${{ runner.os == 'Windows' && '1' || '' }}
         run: |
-          python -m pip install -r Support/aaf/build-requirements.txt
-          python script/build-aaf-sidecar.py target/release --release-sources
+          no_binary=()
+          if [[ "${{ runner.os }}" == "Windows" ]]; then no_binary=(--no-binary pyinstaller); fi
+          python -m pip install "${no_binary[@]}" -r Support/aaf/build-requirements.txt
+      - name: Build AAF module
+        run: python script/build-aaf-sidecar.py target/release --release-sources
       # macOS decodes and remuxes through AVFoundation and native QuickTime
       # code, so its installer ships no FFmpeg.
       - name: Build minimal FFmpeg sidecars (Linux)
@@ -173,6 +190,10 @@ jobs:
           mkdir -p dist-bundle
           cp "target/release/align-cli$exe" "target/release/align-mcp$exe" "target/release/align$exe" dist-bundle/
           cp "target/release/align-aaf$exe" dist-bundle/
+          # Windows ships the AAF module's Python runtime as a folder.
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp -R target/release/align-aaf-runtime dist-bundle/
+          fi
           cp -R target/release/AAF-Licenses dist-bundle/
           cp LICENSE THIRD_PARTY_NOTICES.txt dist-bundle/
           if [[ "${{ runner.os }}" != "macOS" ]]; then
