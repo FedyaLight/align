@@ -3,16 +3,21 @@ matching, timecode, and recording metadata.
 
 ## What's new in @VERSION@
 
-- **Application menu on Windows and Linux.** The Menu button is available in
-  the top toolbar and on the empty start screen. It opens About, Check for
-  Updates, Use with AI Agents, Path Fixer, analysis-cache settings, and theme
-  selection using the same actions as the native macOS menu. macOS continues
-  to use its native menu bar without an in-window Menu button.
-- **Consistent menu contents.** The in-window menu follows the registered
-  application menus, including the selected theme. macOS system items such as
-  Services, Hide, and Window are omitted.
-- **Escape to dismiss.** Escape closes the application menu, timeline context
-  menu, and About panel. Clicking outside the application menu also closes it.
+- **DaVinci Resolve XML stays in sync.** Resolve reads a recorder WAV's start
+  timecode from its BWF metadata itself, and at 23.976 and 29.97 fps it gets a
+  different value than the one Align wrote into the XML. Recorder audio then
+  slipped by several seconds, more for later timecodes. The Resolve XML now
+  places audio from the start of the file, so it imports exactly like the OTIO
+  export. Camera audio also no longer lands one frame ahead of its picture in
+  Resolve.
+- **No more Windows Defender false positive.** Defender reported the Windows
+  build as `Trojan:Win32/Bearfoos.A!ml`. The AAF module no longer unpacks a
+  Python runtime to a temporary folder at launch: it now ships as a regular
+  program folder with version details, built with a bootloader compiled from
+  source.
+
+Re-export Resolve XML files made with an earlier version. Premiere Pro, Final
+Cut Pro, OTIO and AAF exports are unchanged.
 
 ## Downloads
 
