@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/align-core", "crates/align-decode", "crates/align-cli", "crates/align-gpui", "crates/align-mcp"]
+members = ["crates/align-core", "crates/align-decode", "crates/align-cli", "crates/align-gpui", "crates/align-mcp", "crates/align-ui", "crates/align-rune"]
 resolver = "2"
 
 [workspace.package]
@@ -9,6 +9,7 @@ license = "GPL-3.0-only"
 version = "0.3.1"
 
 [workspace.dependencies]
+align-ui = { path = "crates/align-ui" }
 align-core = { path = "crates/align-core" }
 align-decode = { path = "crates/align-decode" }
 bincode = "1"

@@ -361,6 +361,10 @@ fn main() {
             let view = cx.new(move |cx| {
                 let mut app = views::AlignApp::new(cx);
                 app.data.add_paths(initial_paths);
+                align_ui::experiment::load(&mut app.data);
+                if std::env::var_os("ALIGN_EXPERIMENT_SYNC").is_some() {
+                    app.start_sync(cx);
+                }
                 app.check_for_updates_on_launch(cx);
                 app
             });

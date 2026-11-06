@@ -1,0 +1,12 @@
+[package]
+name = "align-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+align-core.workspace = true
+align-decode.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true

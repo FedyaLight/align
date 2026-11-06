@@ -52,6 +52,9 @@ On Windows it also creates `align-aaf-runtime`, which must stay beside
 `--no-binary pyinstaller` to match the release build.
 Build the module separately for each target OS.
 
+The optional [Rune experiment](rune-experiment.md) builds a second desktop
+frontend and provides paired resource-measurement scripts.
+
 ## Architecture
 
 | Crate | Responsibility |

@@ -11,6 +11,7 @@ name = "align"
 path = "src/main.rs"
 
 [dependencies]
+align-ui.workspace = true
 align-core.workspace = true
 align-decode.workspace = true
 gpui.workspace = true

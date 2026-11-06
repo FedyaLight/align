@@ -828,6 +828,7 @@ pub struct AlignApp {
     timeline_transitions: HashMap<ClipId, TimelineTransition>,
     timeline_motion_generation: u64,
     progress_motion: ProgressMotion,
+    experiment_started: Option<Instant>,
     update_state: UpdateState,
     /// The update card was closed; the About panel still offers the update.
     update_notice_dismissed: bool,
@@ -869,6 +870,8 @@ impl AlignApp {
             timeline_transitions: HashMap::new(),
             timeline_motion_generation: 0,
             progress_motion: ProgressMotion::new(),
+            experiment_started: std::env::var_os("ALIGN_EXPERIMENT_ANIMATE")
+                .map(|_| Instant::now()),
             update_state: UpdateState::default(),
             update_notice_dismissed: false,
         }
@@ -1051,7 +1054,7 @@ impl AlignApp {
             .collect();
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<SyncMsg>();
         std::thread::spawn(move || {
-            let pipeline = Pipeline::default_backend();
+            let pipeline = align_ui::experiment::pipeline();
             let sequence_count = input_sets.len();
             let mut results = Vec::with_capacity(sequence_count);
             for (sequence_index, (inputs, (constraints, options, targets, target_urls))) in
@@ -1240,7 +1243,13 @@ impl AlignApp {
                 }
             }
             SyncMsg::Done(boxed) => match *boxed {
-                Ok(results) => self.data.apply_results(results),
+                Ok(results) => {
+                    if let Some(result) = results.first() {
+                        align_ui::experiment::save(result);
+                    }
+                    self.data.apply_results(results);
+                    eprintln!("ALIGN_EXPERIMENT_SYNC_DONE");
+                }
                 Err(error) => {
                     if error == "Cancelled." {
                         self.data.restore_after_sync_cancel();
@@ -2455,6 +2464,10 @@ fn waveform_columns(waveform: &[f32], width: f32) -> (Vec<f32>, f32) {
 
 impl Render for AlignApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(started) = self.experiment_started {
+            self.data.zoom_level = align_ui::experiment::zoom(started.elapsed().as_secs_f64());
+            window.request_animation_frame();
+        }
         let theme = Theme::current(window.appearance());
         // Fit width excludes the label column and content padding.
         let fit_width =

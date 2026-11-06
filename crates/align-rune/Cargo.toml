@@ -1,0 +1,21 @@
+[package]
+name = "align-rune"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Experimental Rune desktop frontend for Align"
+
+[[bin]]
+name = "align-rune"
+path = "src/main.rs"
+
+[dependencies]
+align-ui.workspace = true
+align-core.workspace = true
+align-decode.workspace = true
+mimalloc.workspace = true
+serde_json.workspace = true
+rune = { git = "https://github.com/anomalyco/rune", rev = "781e2b6d87cd5f32d6f4365956fad4baaf24ee50", default-features = false, features = ["accessibility", "embedded-fonts", "metal-backend", "native-file-dialog"] }
+
+[dev-dependencies]
+hound.workspace = true
