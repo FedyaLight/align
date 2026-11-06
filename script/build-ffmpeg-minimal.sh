@@ -16,7 +16,7 @@ trap 'rm -rf "$TEMP_DIR"' EXIT
 
 mkdir -p "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"
-curl --fail --location --silent --show-error \
+curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
   "https://ffmpeg.org/releases/$ARCHIVE" \
   --output "$TEMP_DIR/$ARCHIVE"
 tar -xf "$TEMP_DIR/$ARCHIVE" -C "$TEMP_DIR"

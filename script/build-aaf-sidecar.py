@@ -22,9 +22,18 @@ import tarfile
 import zlib
 
 
-def download(url, destination):
-    subprocess.run(['curl', '--fail', '--location', '--retry', '3',
-                    url, '--output', str(destination)], check=True)
+def download(urls, destination):
+    # Accepts one URL or several mirrors of the same file, tried in order.
+    urls = [urls] if isinstance(urls, str) else urls
+    for index, url in enumerate(urls):
+        result = subprocess.run(['curl', '--fail', '--location', '--retry', '3',
+                                 '--retry-all-errors', '--connect-timeout', '20',
+                                 url, '--output', str(destination)])
+        if result.returncode == 0:
+            return
+        if index == len(urls) - 1:
+            raise subprocess.CalledProcessError(result.returncode, result.args)
+        print(f'Download from {url} failed, trying next mirror', file=sys.stderr)
 
 
 def native_version(module, symbol, windows_source, pattern):
@@ -57,7 +66,10 @@ def collect_native_sources(sources, licenses, python_archive, python_version):
     z = zlib.ZLIB_RUNTIME_VERSION
     components = [
         ('bzip2', bz, f'https://sourceware.org/pub/bzip2/bzip2-{bz}.tar.gz'),
-        ('xz', xz, f'https://tukaani.org/xz/xz-{xz}.tar.gz'),
+        # tukaani.org is often unreachable from CI runners; SourceForge is the
+        # project's official mirror and serves byte-identical archives.
+        ('xz', xz, [f'https://tukaani.org/xz/xz-{xz}.tar.gz',
+                    f'https://downloads.sourceforge.net/project/lzmautils/xz-{xz}.tar.gz']),
         ('openssl', openssl, f'https://www.openssl.org/source/openssl-{openssl}.tar.gz'),
         ('zlib', z, f'https://zlib.net/fossils/zlib-{z}.tar.gz'),
     ]
