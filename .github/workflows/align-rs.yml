@@ -143,6 +143,14 @@ jobs:
           fi
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Remove packaging outputs restored from cache
+        # rust-cache saves all of target/, including folders the packaging steps
+        # create and refuse to overwrite. Re-running a tag would restore them.
+        shell: bash
+        run: |
+          rm -rf target/macos-package target/dmg-venv target/release-sources \
+            target/ffmpeg-minimal target/release/AAF-Sources \
+            target/release/align-aaf-runtime target/release/ThirdPartyLicenses
       - uses: msys2/setup-msys2@v2
         if: runner.os == 'Windows'
         with:
