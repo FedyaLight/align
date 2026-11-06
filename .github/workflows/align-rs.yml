@@ -227,14 +227,14 @@ jobs:
         shell: bash
         run: |
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
-          python -m venv target/dmg-venv
-          target/dmg-venv/bin/python -m pip install dmgbuild==1.6.7
+          python -m venv --clear "$RUNNER_TEMP/dmg-venv"
+          "$RUNNER_TEMP/dmg-venv/bin/python" -m pip install dmgbuild==1.6.7
           AAF_DIR="$PWD/target/release" \
           RELEASE_LICENSES="$PWD/dist-bundle/ThirdPartyLicenses" \
           ALIGN_SKIP_LAUNCH_CHECK=1 \
             ./script/package-macos.sh "$PWD/target/macos-package"
           mkdir -p installers
-          PYTHON="$PWD/target/dmg-venv/bin/python" ./script/create-macos-dmg.sh \
+          PYTHON="$RUNNER_TEMP/dmg-venv/bin/python" ./script/create-macos-dmg.sh \
             target/macos-package/Align.app "installers/Align-$version-macOS-arm64.dmg"
       - uses: actions/setup-dotnet@v5
         if: runner.os == 'Windows'
