@@ -3,21 +3,19 @@ matching, timecode, and recording metadata.
 
 ## What's new in @VERSION@
 
-- **DaVinci Resolve XML stays in sync.** Resolve reads a recorder WAV's start
-  timecode from its BWF metadata itself, and at 23.976 and 29.97 fps it gets a
-  different value than the one Align wrote into the XML. Recorder audio then
-  slipped by several seconds, more for later timecodes. The Resolve XML now
-  places audio from the start of the file, so it imports exactly like the OTIO
-  export. Camera audio also no longer lands one frame ahead of its picture in
-  Resolve.
-- **No more Windows Defender false positive.** Defender reported the Windows
-  build as `Trojan:Win32/Bearfoos.A!ml`. The AAF module no longer unpacks a
-  Python runtime to a temporary folder at launch: it now ships as a regular
-  program folder with version details, built with a bootloader compiled from
-  source.
-
-Re-export Resolve XML files made with an earlier version. Premiere Pro, Final
-Cut Pro, OTIO and AAF exports are unchanged.
+- **Media loads again on Windows.** Adding media on Windows could fail with
+  repeated "libwinpthread-1.dll was not found" errors, and reinstalling did not
+  help. The bundled FFmpeg tools needed a library the installer did not
+  include. They are now self-contained, and every Windows build is checked in a
+  clean folder before release.
+- **Report a Problem.** Help → Report a Problem… (in the Menu button on Windows
+  and Linux), About, and error dialogs open a GitHub bug form with the Align
+  version, operating system, and architecture already filled in. You review
+  and submit the issue yourself; recordings, file paths, and logs are not sent.
+  A small reminder appears once after each installation or update.
+- **Stricter CLI arguments.** `align-cli` no longer ignores extra paths after a
+  command: `export-json result.json out extra.wav` and `clear-cache extra.wav`
+  now stop with a usage error before doing anything.
 
 ## Downloads
 
