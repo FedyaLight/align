@@ -53,6 +53,6 @@ pub use spanned::{SpannedAnalysis, analyze_spans};
 pub use timecode::analyze_timecodes;
 pub use timing::{RangeAccumulator, VideoTimingInspection, canonical_frame_duration, classify};
 pub use xml::{
-    DraftEdit, DraftMediaKind, DraftTransition, ImportError, TimelineDraft, XmlDoc, read_timeline,
-    rewrite_media_paths, timeline_sequence_summaries,
+    DraftEdit, DraftMediaKind, DraftTransition, ImportError, Relocation, TimelineDraft, XmlDoc,
+    read_timeline, rewrite_media_paths, timeline_sequence_summaries,
 };
