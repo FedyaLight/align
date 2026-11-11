@@ -713,6 +713,35 @@ pub fn decode_window(
     Ok((actual_start, samples))
 }
 
+/// Write stereo 48 kHz AC-3 in MPEG-TS, silent except for a 2 ms click at
+/// `click` seconds. False (the test skips) without an AC-3 encoder.
+#[cfg(test)]
+pub(crate) fn write_ac3_transport_stream(path: &Path, click: f64, seconds: f64) -> bool {
+    let Some(ffmpeg) = ffmpeg_bin() else {
+        return false;
+    };
+    let source = format!(
+        "aevalsrc='if(between(t,{click},{}),0.9,0)':s=48000:d={seconds}",
+        click + 0.002
+    );
+    let ok = command(&ffmpeg)
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", &source])
+        .args(["-ac", "2", "-c:a", "ac3", "-b:a", "448k", "-f", "mpegts"])
+        .arg(path)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        eprintln!("SKIP: no AC-3 encoder");
+    }
+    ok
+}
+
+/// Index of the first sample of a `write_ac3_transport_stream` click.
+#[cfg(test)]
+pub(crate) fn click_at(samples: &[f32]) -> usize {
+    samples.iter().position(|s| s.abs() > 0.3).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     /// AC-3 decodes 256 samples late, and MPEG-TS records it nowhere (MP4
@@ -721,24 +750,12 @@ mod tests {
     #[test]
     fn ac3_in_transport_streams_starts_on_time() {
         use crate::backend::MediaBackend;
-        let Some(ffmpeg) = ffmpeg_bin() else {
-            return;
-        };
         let dir = tempfile::tempdir().unwrap();
         let clip = dir.path().join("00001.MTS");
-        let ok = command(&ffmpeg)
-            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
-            .arg("aevalsrc='if(between(t,1.5,1.502),0.9,0)':s=48000:d=4")
-            .args(["-ac", "2", "-c:a", "ac3", "-b:a", "448k", "-f", "mpegts"])
-            .arg(&clip)
-            .status()
-            .is_ok_and(|s| s.success());
-        if !ok {
-            eprintln!("SKIP: no AC-3 encoder");
+        if !write_ac3_transport_stream(&clip, 1.5, 4.0) {
             return;
         }
         let backend = crate::portable::PortableBackend;
-        let click = |samples: &[f32]| samples.iter().position(|s| s.abs() > 0.3).unwrap();
         for start in [0.0, 0.7] {
             let mut left = Vec::new();
             let actual = backend
@@ -747,13 +764,13 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
-            let at = click(&left) + (actual * 48_000.0).round() as usize;
+            let at = click_at(&left) + (actual * 48_000.0).round() as usize;
             assert!(at.abs_diff(72_000) <= 2, "from {start} s: click at {at}");
         }
         let (window_start, window) = backend
             .decode_window_16k(&clip, 1.0, 1.0, align_core::AudioAnalysisSource::default())
             .unwrap();
-        let at = window_start * 1000.0 + click(&window) as f64 / 16.0;
+        let at = window_start * 1000.0 + click_at(&window) as f64 / 16.0;
         assert!((at - 1500.0).abs() < 0.3, "window click at {at} ms");
     }
 
