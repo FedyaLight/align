@@ -327,6 +327,7 @@ impl Movie {
                 channels: a.channels,
                 bit_depth: a.bit_depth,
                 is_float: a.is_float,
+                decoder_delay: 0.0,
             })
             .collect();
         let video = self.video().map(|track| VideoProbe {

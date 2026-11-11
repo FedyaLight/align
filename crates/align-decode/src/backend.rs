@@ -76,6 +76,11 @@ pub struct AudioStreamProbe {
     pub channels: usize,
     pub bit_depth: Option<u32>,
     pub is_float: Option<bool>,
+    /// Seconds of decoder output before the stream's audio starts, which the
+    /// FFmpeg tier trims. Nonzero only for AC-3 and E-AC-3 in MPEG-TS
+    /// (AVCHD): their 256-sample codec delay is recorded nowhere, and
+    /// AVFoundation trims it, so both engines place the audio alike.
+    pub decoder_delay: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]

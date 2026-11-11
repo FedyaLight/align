@@ -144,6 +144,7 @@ pub fn inspect(path: &Path) -> Result<SymphoniaProbe, DecodeError> {
             channels: p.channels.map(|c| c.count()).unwrap_or(0),
             bit_depth: bits.map(|(b, _)| b),
             is_float: bits.map(|(_, f)| f),
+            decoder_delay: 0.0,
         });
         if duration_seconds.is_none() {
             if let (Some(n), Some(rate)) = (p.n_frames, p.sample_rate) {
