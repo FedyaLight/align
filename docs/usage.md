@@ -42,10 +42,25 @@ other tracks align to them. See [format limits](formats.md) for unsupported edit
 
 On Windows and Linux, the **Menu** button is available in the top toolbar and
 on the empty start screen. It provides About, Check for Updates, Use with AI
-Agents, Path Fixer, analysis-cache settings, and appearance selection. On macOS,
-these commands are available in the native menu bar.
+Agents, Path Fixer, analysis-cache settings, appearance selection, and Report a
+Problem. On macOS, these commands are available in the native menu bar.
 
 Escape closes the open menu, panel, or dialog.
+
+## Reporting a problem
+
+Use **Help → Report a Problem…**, the same button in **About Align**, or the
+button in an error dialog. Align also shows a dismissible reminder once per
+installed release. The Help command remains available after you close it.
+
+The report opens GitHub's bug form with the Environment field already filled
+in: the Align version, the operating system and its version, and the
+architecture, exactly as the app shows them. Describe what happened and, if
+you can, how to reproduce it. Check existing issues first in case the problem
+is already being investigated. GitHub sign-in is required; you review and
+submit the issue there. Recordings and logs are not uploaded. Error details can
+be copied separately; remove private filenames and paths before posting them
+publicly.
 
 ## CLI basics
 
@@ -64,6 +79,10 @@ Inspect without synchronizing by supplying paths without a subcommand:
 ```sh
 align-cli /path/to/media > project.json
 ```
+
+Put the subcommand first when synchronizing or exporting. `export-json` accepts
+exactly a result file and an output directory; `clear-cache` takes no media paths.
+Unexpected arguments exit with code 2 before the operation runs.
 
 Inspection returns a project, not a synchronization result. To produce JSON that
 `export-json` can consume, use `sync`:
