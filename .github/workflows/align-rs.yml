@@ -90,6 +90,29 @@ jobs:
           python -m unittest discover -s Support/aaf -v
           python script/test-release-source.py
           python script/build-aaf-sidecar.py target/release
+      # Rebuild the sidecars only when their build script changes. Release
+      # builds always compile them fresh and verify the staged files, which
+      # also catches MSYS2 toolchain changes before anything is published.
+      - name: Restore FFmpeg sidecars (Windows)
+        id: ffmpeg-sidecars
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: target/ffmpeg-minimal
+          key: ffmpeg-sidecars-windows-${{ hashFiles('script/build-ffmpeg-minimal.sh') }}
+      - uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows' && steps.ffmpeg-sidecars.outputs.cache-hit != 'true'
+        with:
+          msystem: MINGW64
+          install: >-
+            curl diffutils make mingw-w64-x86_64-gcc nasm pkgconf tar xz
+      - name: Build minimal FFmpeg sidecars (Windows)
+        if: runner.os == 'Windows' && steps.ffmpeg-sidecars.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: ./script/build-ffmpeg-minimal.sh target/ffmpeg-minimal
+      - name: Verify standalone sidecars (Windows)
+        if: runner.os == 'Windows'
+        run: python script/check-windows-sidecars.py target/ffmpeg-minimal
       - name: Build release CLI
         run: cargo build --locked --release -p align-cli
       - name: Verify release end to end
@@ -209,6 +232,10 @@ jobs:
             cp target/ffmpeg-minimal/FFMPEG-LICENSE.txt dist-bundle/
           fi
           ls -la dist-bundle/
+      - name: Verify staged sidecars without MSYS2 (Windows)
+        if: runner.os == 'Windows'
+        # Native Python and a clean child PATH expose missing runtime DLLs.
+        run: python script/check-windows-sidecars.py dist-bundle
       - name: Install dependency license generator
         run: cargo install cargo-about --version 0.9.2 --features cli --locked
       - name: Prepare corresponding sources and dependency licenses

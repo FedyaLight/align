@@ -25,7 +25,23 @@ cd "$TEMP_DIR/ffmpeg-$FFMPEG_VERSION"
 PCM_DECODERS="$(./configure --list-decoders | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^pcm_/) { printf "%s%s", sep, $i; sep="," } }')"
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 2)"
 
+# MinGW-w64 implements clock_gettime and nanosleep, which FFmpeg's timers
+# use, in winpthreads. A default MSYS2 build therefore imports
+# libwinpthread-1.dll even though FFmpeg already uses native Win32 threads.
+# Linking statically leaves only Windows system DLLs, so the sidecars run on
+# machines without MSYS2. Make targets also need the .exe suffix there.
+EXE=""
+platform_options=()
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    EXE=".exe"
+    platform_options=(--extra-ldflags=-static)
+    ;;
+esac
+
+# The guarded expansion keeps an empty array valid under `set -u` in bash 3.2.
 ./configure \
+  ${platform_options[@]+"${platform_options[@]}"} \
   --disable-everything \
   --disable-autodetect \
   --disable-doc \
@@ -47,14 +63,17 @@ JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/
   --enable-muxer=pcm_f32le,pcm_s32le,mov \
   --enable-filter=abuffer,aformat,aresample,anull,abuffersink,atrim,asetpts,adelay,apad
 
-# Make targets carry the executable suffix (ffmpeg.exe on MSYS2).
-EXE=""
-case "$(uname -s)" in
-  MINGW*|MSYS*|CYGWIN*) EXE=".exe" ;;
-esac
 make -j"$JOBS" "ffmpeg$EXE" "ffprobe$EXE"
 cp "ffmpeg$EXE" "ffprobe$EXE" "$OUT_DIR/"
 cp COPYING.LGPLv2.1 "$OUT_DIR/FFMPEG-LICENSE.txt"
+if [[ -n "$EXE" ]]; then
+  # The static link embeds winpthreads (MIT AND BSD-3-Clause); binary
+  # redistribution must carry its notice. A missing notice stops the build.
+  {
+    printf '\n\nffmpeg.exe and ffprobe.exe statically include winpthreads from the mingw-w64 project:\n\n'
+    cat "${MINGW_PREFIX:-/mingw64}/share/licenses/winpthreads/COPYING"
+  } >> "$OUT_DIR/FFMPEG-LICENSE.txt"
+fi
 mkdir -p "$OUT_DIR/Sources"
 cp "$TEMP_DIR/$ARCHIVE" "$OUT_DIR/Sources/"
 cp "$ROOT_DIR/script/build-ffmpeg-minimal.sh" "$OUT_DIR/Sources/"

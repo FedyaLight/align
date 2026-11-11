@@ -189,6 +189,12 @@ sidecars:
 ```
 
 That build requires a C toolchain, make, curl, tar, xz, and NASM where applicable.
+
+On Windows, use MSYS2 MINGW64 to build the sidecars, then native Windows Python
+to run `python script/check-windows-sidecars.py target/ffmpeg-minimal`. The check
+runs isolated copies with a clean PATH, preventing the build machine's MSYS2
+libraries from hiding missing runtime dependencies.
+
 For a tag named `vX.Y.Z` matching the workspace version, the release workflow
 builds the macOS DMG, the Windows installer with its Velopack update feed, and
 Fedora and Arch packages with their graphical installers, and publishes them with
