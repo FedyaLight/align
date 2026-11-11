@@ -205,9 +205,9 @@ jobs:
       - name: Build AAF module
         run: python script/build-aaf-sidecar.py target/release --release-sources
       # macOS decodes and remuxes through AVFoundation and native QuickTime
-      # code, so its installer ships no FFmpeg.
-      - name: Build minimal FFmpeg sidecars (Linux)
-        if: runner.os == 'Linux'
+      # code; its FFmpeg reads only MXF, which AVFoundation cannot open.
+      - name: Build minimal FFmpeg sidecars (Linux, macOS)
+        if: runner.os != 'Windows'
         run: ./script/build-ffmpeg-minimal.sh target/ffmpeg-minimal
       - name: Build minimal FFmpeg sidecars (Windows)
         if: runner.os == 'Windows'
@@ -227,10 +227,8 @@ jobs:
           fi
           cp -R target/release/AAF-Licenses dist-bundle/
           cp LICENSE THIRD_PARTY_NOTICES.txt dist-bundle/
-          if [[ "${{ runner.os }}" != "macOS" ]]; then
-            cp "target/ffmpeg-minimal/ffmpeg$exe" "target/ffmpeg-minimal/ffprobe$exe" dist-bundle/
-            cp target/ffmpeg-minimal/FFMPEG-LICENSE.txt dist-bundle/
-          fi
+          cp "target/ffmpeg-minimal/ffmpeg$exe" "target/ffmpeg-minimal/ffprobe$exe" dist-bundle/
+          cp target/ffmpeg-minimal/FFMPEG-LICENSE.txt dist-bundle/
           ls -la dist-bundle/
       - name: Verify staged sidecars without MSYS2 (Windows)
         if: runner.os == 'Windows'
@@ -241,14 +239,10 @@ jobs:
       - name: Prepare corresponding sources and dependency licenses
         shell: bash
         run: |
-          ffmpeg=()
-          if [[ "${{ runner.os }}" != "macOS" ]]; then
-            ffmpeg=(--ffmpeg target/ffmpeg-minimal/Sources)
-          fi
           python script/prepare-release-source.py target/release-sources \
             --platform ${{ runner.os }} \
             --licenses dist-bundle/ThirdPartyLicenses \
-            "${ffmpeg[@]}" \
+            --ffmpeg target/ffmpeg-minimal/Sources \
             --aaf target/release/AAF-Sources \
             --velopack-version ${{ env.VELOPACK_VERSION }}
       - uses: actions/upload-artifact@v4
@@ -266,6 +260,8 @@ jobs:
           "$RUNNER_TEMP/dmg-venv/bin/python" -m pip install dmgbuild==1.6.7
           AAF_DIR="$PWD/target/release" \
           RELEASE_LICENSES="$PWD/dist-bundle/ThirdPartyLicenses" \
+          BUNDLE_FFMPEG=1 \
+          FFMPEG_DIR="$PWD/target/ffmpeg-minimal" \
           ALIGN_SKIP_LAUNCH_CHECK=1 \
             ./script/package-macos.sh "$PWD/target/macos-package"
           mkdir -p installers

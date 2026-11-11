@@ -33,6 +33,11 @@ JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/
 EXE=""
 platform_options=()
 case "$(uname -s)" in
+  Darwin)
+    # The tools must run on the oldest macOS Align supports (Info.plist
+    # LSMinimumSystemVersion), not only on the build machine's.
+    export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
+    ;;
   MINGW*|MSYS*|CYGWIN*)
     EXE=".exe"
     platform_options=(--extra-ldflags=-static)

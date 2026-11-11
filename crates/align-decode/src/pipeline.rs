@@ -129,20 +129,6 @@ struct FingerprintRun {
     warnings: Vec<SyncWarning>,
 }
 
-/// Errors that end the whole run rather than one file's analysis: a
-/// cancellation, or a missing decoder that every such file needs.
-fn ends_run(error: &PipelineError) -> bool {
-    matches!(
-        error,
-        PipelineError::Cancelled
-            | PipelineError::Decode(
-                crate::DecodeError::Cancelled
-                    | crate::DecodeError::FfmpegMissing(_)
-                    | crate::DecodeError::BackendUnavailable(_)
-            )
-    )
-}
-
 struct FingerprintRunOptions<'a> {
     accuracy: align_core::SearchAccuracy,
     overrides: &'a HashMap<ClipId, align_core::SearchAccuracy>,
@@ -897,6 +883,23 @@ impl Pipeline {
         })
     }
 
+    /// Errors that end the whole run rather than one file's analysis: a
+    /// cancellation, or a missing decoder that every such file needs. FFmpeg
+    /// ships with Align except on macOS, where AVFoundation decodes and FFmpeg
+    /// reads only MXF; there a missing FFmpeg leaves out those files alone.
+    fn ends_run(&self, error: &PipelineError) -> bool {
+        match error {
+            PipelineError::Cancelled
+            | PipelineError::Decode(
+                crate::DecodeError::Cancelled | crate::DecodeError::BackendUnavailable(_),
+            ) => true,
+            PipelineError::Decode(crate::DecodeError::FfmpegMissing(_)) => {
+                self.backend.kind() != BackendKind::AppleNative
+            }
+            _ => false,
+        }
+    }
+
     /// Decodes one audio source to 8 kHz mono into state that `start` creates.
     /// When the in-process decoder (Symphonia, or AVFoundation on macOS)
     /// fails on the file's content, FFmpeg decodes it again into fresh state,
@@ -1085,7 +1088,7 @@ impl Pipeline {
                 // clip fails only when none of its streams can be read.
                 match variant {
                     Ok(variant) => variants.push(variant),
-                    Err(error) if ends_run(&error) => return Err(error),
+                    Err(error) if self.ends_run(&error) => return Err(error),
                     Err(error) => {
                         failure.get_or_insert(error);
                     }
@@ -1102,7 +1105,7 @@ impl Pipeline {
             align_core::par_map(clips, 4, |clip| {
                 let outcome = analyse(clip);
                 if let Some(p) = &progress
-                    && !outcome.as_ref().is_err_and(ends_run)
+                    && !outcome.as_ref().is_err_and(|error| self.ends_run(error))
                 {
                     let mut event = PipelineProgress::basic(
                         Phase::Fingerprint,
@@ -1136,7 +1139,7 @@ impl Pipeline {
         for (clip, outcome) in clips.iter().zip(outcomes) {
             match outcome {
                 Ok(variants) => analysed.push((*clip, variants)),
-                Err(error) if ends_run(&error) => return Err(error),
+                Err(error) if self.ends_run(&error) => return Err(error),
                 Err(error) => warnings.push(SyncWarning {
                     url: clip.url.clone(),
                     message: format!(
@@ -1987,6 +1990,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(counts.into_inner().unwrap(), (1..=16).collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FFmpeg ships with Align on Windows and Linux, so its absence is a
+    /// broken installation that ends the run. On macOS it reads only MXF and
+    /// development builds may lack it; those files are left out instead.
+    #[test]
+    fn missing_ffmpeg_ends_the_run_only_where_it_ships() {
+        let missing = PipelineError::Decode(crate::DecodeError::FfmpegMissing("ffmpeg".into()));
+        let dir = fixture_dir("ffmpeg-policy");
+        let portable = Pipeline::new_in(BackendKind::Portable, Some(dir.join(".cache")));
+        assert!(portable.ends_run(&missing));
+        assert!(portable.ends_run(&PipelineError::Cancelled));
+        #[cfg(target_os = "macos")]
+        {
+            let apple = Pipeline::new_in(BackendKind::AppleNative, Some(dir.join(".cache")));
+            assert!(!apple.ends_run(&missing));
+            assert!(apple.ends_run(&PipelineError::Cancelled));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -67,7 +67,7 @@ from inside Align, behind the same system authorization prompt.
 ## Sources and verification
 
 `align-source-<platform>.tar.gz` contains the corresponding Align source, locked
-and vendored Rust dependencies, the FFmpeg source used on Linux and Windows, and
+and vendored Rust dependencies, the FFmpeg source used for the bundled tools, and
 the AAF component sources. License notices are included in every installer.
 Align is licensed under GPL-3.0-only.
 

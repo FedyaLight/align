@@ -37,14 +37,14 @@ named above, so keep those names and their `.sha256` files unchanged.
 
 The source archives contain the exact committed Align checkout, Cargo.lock,
 vendored Rust dependencies, a Cargo configuration for offline dependency
-resolution, and a build manifest. Linux and Windows archives also contain the
-FFmpeg source tarball used for the build, its build script and configuration;
-macOS builds ship no FFmpeg. All archives contain the AAF component
+resolution, and a build manifest. They also contain the FFmpeg source tarball
+used for the build, its build script and configuration. All archives contain
+the AAF component
 sources, Python's compression and crypto library sources, and the source of the
 pinned Velopack version. Checksums identify the included component files.
 
 Installers include LICENSE, THIRD_PARTY_NOTICES.txt, AAF-Licenses,
-ThirdPartyLicenses, and on Linux and Windows FFMPEG-LICENSE.txt. The latter contains the generated
+ThirdPartyLicenses, and FFMPEG-LICENSE.txt. ThirdPartyLicenses contains the generated
 Rust license report, upstream notice files, the Velopack license, and the build
 manifest. Keep source downloads available alongside the corresponding binaries.
 Do not replace an old release's source archive with a newer version.
@@ -66,8 +66,7 @@ python script/prepare-release-source.py target/release-sources \
   --velopack-version 1.2.0
 ```
 
-Use `Windows` for that platform. For `macOS`, skip the FFmpeg build and omit
-`--ffmpeg`. The source preparation script
+Use `Windows` or `macOS` for those platforms. The source preparation script
 rejects modified tracked files and missing component sources. It uses
 `cargo vendor --locked` and checks dependency resolution with `cargo metadata
 --frozen`. Build instructions remain in [development](development.md); the
@@ -88,6 +87,7 @@ The packaging scripts also run outside CI on a staged release directory (the
 ```sh
 AAF_DIR="$PWD/target/release" \
 RELEASE_LICENSES="$PWD/target/release/ThirdPartyLicenses" \
+BUNDLE_FFMPEG=1 FFMPEG_DIR="$PWD/target/ffmpeg-minimal" \
   ./script/package-macos.sh "$PWD/target/macos-package"
 ./script/create-macos-dmg.sh target/macos-package/Align.app \
   target/Align-macOS-arm64.dmg
@@ -103,7 +103,13 @@ Developer ID signing and Apple notarization require separate credentials.
 
 FFmpeg and ffprobe are separate executables, shipped on Linux and Windows for
 containers Align does not read natively (MTS, MXF, R3D, and compressed audio
-such as AC-3). The build has no video decoders: video is only parsed for timing.
+such as AC-3). On macOS, AVFoundation reads everything else; the macOS engine
+uses the bundled tools for MXF, which AVFoundation cannot open, and analysis
+uses them to retry a file AVFoundation fails on. `package-macos.sh` bundles
+them with `BUNDLE_FFMPEG=1`; the build targets the app's minimum macOS (15.0),
+and packaging rejects tools for another architecture or minimum version, or
+linking libraries outside macOS. The build manifest's component hashes
+describe the tools as built; macOS packaging re-signs its copies. The build has no video decoders: video is only parsed for timing.
 On Windows, the tools are linked statically against the MinGW-w64 runtime,
 including the winpthreads library that provides FFmpeg's clock and sleep
 functions, so they need only Windows system DLLs and run without MSYS2 or

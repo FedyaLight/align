@@ -9,11 +9,13 @@ OUT_DIR="${1:-$HOME/Downloads/Align-macOS}"
 APP_NAME="Align"
 BUNDLE_ID="com.align.app"
 APP_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT_DIR/Cargo.toml" | head -1)"
-# AVFoundation decodes and QuickTime export/AAF metadata are native, so
-# FFmpeg is opt-in (BUNDLE_FFMPEG=1) for the portable backend only.
+# AVFoundation decodes and QuickTime export/AAF metadata are native. FFmpeg
+# reads MXF, which AVFoundation cannot open; releases bundle it
+# (BUNDLE_FFMPEG=1), development bundles skip the build by default.
 BUNDLE_FFMPEG="${BUNDLE_FFMPEG:-0}"
 FFMPEG_DIR="${FFMPEG_DIR:-}"
 ALIGN_SKIP_LAUNCH_CHECK="${ALIGN_SKIP_LAUNCH_CHECK:-0}"
+MIN_MACOS="15.0"
 AAF_DIR="${AAF_DIR:-}"
 RELEASE_LICENSES="${RELEASE_LICENSES:-}"
 
@@ -47,6 +49,18 @@ if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
   for tool in ffmpeg ffprobe; do
     test -x "$FFMPEG_DIR/$tool"
     "$FFMPEG_DIR/$tool" -version >/dev/null
+    # Only macOS system libraries: a Homebrew or local dylib would be
+    # missing on users' Macs.
+    if otool -L "$FFMPEG_DIR/$tool" | tail -n +2 | grep -v -E '^[[:space:]]+(/usr/lib/|/System/Library/)'; then
+      echo "$tool links libraries outside macOS" >&2
+      exit 1
+    fi
+    # Built for arm64 and for the app's minimum macOS, like the app itself.
+    minos="$(vtool -show-build "$FFMPEG_DIR/$tool" | awk '$1 == "minos" { print $2; exit }')"
+    if [[ "$(lipo -archs "$FFMPEG_DIR/$tool")" != "arm64" || "$minos" != "$MIN_MACOS" ]]; then
+      echo "$tool is built for $(lipo -archs "$FFMPEG_DIR/$tool"), macOS $minos; need arm64, macOS $MIN_MACOS" >&2
+      exit 1
+    fi
   done
   test -f "$FFMPEG_DIR/FFMPEG-LICENSE.txt"
 fi
@@ -122,7 +136,7 @@ cat >"$APP_CONTENTS/Info.plist" <<PLIST
   <key>CFBundleVersion</key>
   <string>1</string>
   <key>LSMinimumSystemVersion</key>
-  <string>15.0</string>
+  <string>$MIN_MACOS</string>
   <key>NSHighResolutionCapable</key>
   <true/>
 </dict>
@@ -138,9 +152,9 @@ Align — audio synchronization for video editing
   align-aaf            — self-contained AAF module (no Python installation needed)
   LICENSE              — Align license
   THIRD_PARTY_NOTICES.txt — third-party license notices
-$([ "$BUNDLE_FFMPEG" == "1" ] && echo "  ffmpeg, ffprobe      — bundled media tools
-                         (discovered beside the executables)" || echo "  (FFmpeg omitted: macOS uses the Apple backend;
-   portable decoding requires ffmpeg/ffprobe on PATH)")
+$([ "$BUNDLE_FFMPEG" == "1" ] && echo "  ffmpeg, ffprobe      — bundled media tools for MXF
+  FFMPEG-LICENSE.txt   — FFmpeg license (LGPL)" || echo "  (FFmpeg omitted: MXF and the portable backend
+   need ffmpeg/ffprobe on PATH)")
 
 CLI:
   ./align-cli sync /path/to/media > result.json

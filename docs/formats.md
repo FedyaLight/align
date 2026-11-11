@@ -10,7 +10,8 @@ named in a warning and left out of synchronization only when its media or
 audio still cannot be read; the other files are still synchronized. Inspect
 the warnings before exporting.
 
-On macOS, the default backend uses AVFoundation. The portable backend reads
+On macOS, the default backend uses AVFoundation, and reads MXF, which
+AVFoundation cannot open, with the bundled FFmpeg. The portable backend reads
 MOV/MP4/M4V headers natively, decodes WAV, AIFF, MP3, AAC, ALAC, and PCM with
 Symphonia, and uses FFmpeg for other containers (MTS, MXF, R3D) and for
 streams Symphonia decodes incorrectly, such as HE-AAC. When Symphonia decodes,
