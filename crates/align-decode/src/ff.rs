@@ -77,8 +77,10 @@ pub fn ffmpeg_bin() -> Option<PathBuf> {
     resolve_bin("ALIGN_FFMPEG", "ffmpeg")
 }
 
-/// Header-only inspect. No sample data is read (audio-only invariant).
-pub fn inspect(path: &Path) -> Result<ProbeReport, DecodeError> {
+/// Format and stream headers as ffprobe JSON. Each ffprobe start analyses
+/// the opening packets (about 0.3 s for 4:2:2 10-bit camera video), so
+/// inspection asks once and parses this for audio and video alike.
+fn probe_json(path: &Path) -> Result<Vec<u8>, DecodeError> {
     let bin =
         ffprobe_bin().ok_or_else(|| DecodeError::FfmpegMissing("ffprobe not found".into()))?;
     let out = command(bin)
@@ -99,7 +101,12 @@ pub fn inspect(path: &Path) -> Result<ProbeReport, DecodeError> {
             path.display()
         )));
     }
-    parse_ffprobe_json(&out.stdout)
+    Ok(out.stdout)
+}
+
+/// Header-only inspect. No sample data is read (audio-only invariant).
+pub fn inspect(path: &Path) -> Result<ProbeReport, DecodeError> {
+    parse_ffprobe_json(&probe_json(path)?)
         .ok_or_else(|| DecodeError::Incomplete(format!("ffprobe JSON for {}", path.display())))
 }
 
@@ -165,16 +172,22 @@ pub fn parse_ffprobe_json(json: &[u8]) -> Option<ProbeReport> {
         duration_seconds,
         audio_streams,
         has_video,
-        video: None, // filled by inspect_video() below, not the pure parser
+        video: None, // filled by inspect_full() from the same JSON
     })
 }
 
 /// Header inspect + video timing walk. Pure-header fast path when the
 /// container has no video track.
 pub fn inspect_full(path: &Path) -> Result<ProbeReport, DecodeError> {
-    let mut report = inspect(path)?;
+    // Taken before the header is read: the cached timing walk includes the
+    // header's frame rate.
+    let revision = media_revision(path);
+    let json = probe_json(path)?;
+    let mut report = parse_ffprobe_json(&json)
+        .ok_or_else(|| DecodeError::Incomplete(format!("ffprobe JSON for {}", path.display())))?;
     if report.has_video {
-        report.video = inspect_video(path);
+        report.video =
+            parse_video_stream(&json).and_then(|header| video_probe(path, &header, revision));
     }
     Ok(report)
 }
@@ -186,7 +199,8 @@ struct FfVideoStream {
     timecode: Option<String>,
 }
 
-/// First video stream's header facts + optional `timecode` tag.
+/// First video stream's header facts + optional `timecode` tag. MXF keeps
+/// the timecode in the format tags, which need `-show_format`.
 fn parse_video_stream(json: &[u8]) -> Option<FfVideoStream> {
     let v: serde_json::Value = serde_json::from_slice(json).ok()?;
     let stream = v.get("streams")?.as_array()?.iter().find(|s| {
@@ -271,6 +285,43 @@ impl PacketTiming {
 /// the shared [`align_core::classify`]. Early-exits once variability is
 /// proven; constant-rate classification requires the full walk.
 pub fn video_timing(path: &Path) -> Result<align_core::VideoTimingInspection, DecodeError> {
+    cached_video_timing(path, media_revision(path), |bin| {
+        let header = command(bin)
+            .args([
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_streams",
+                "-select_streams",
+                "v:0",
+            ])
+            .arg(path)
+            .output()
+            .map_err(DecodeError::Io)?;
+        Ok(parse_video_stream(&header.stdout)
+            .as_ref()
+            .and_then(header_frame_duration))
+    })
+}
+
+/// Nominal rate from the header, snapped through the broadcast table.
+fn header_frame_duration(header: &FfVideoStream) -> Option<align_core::MediaTime> {
+    align_core::canonical_frame_duration(header.avg_fps?, None)
+}
+
+fn media_revision(path: &Path) -> Option<String> {
+    align_core::cache::media_revision(path).ok()
+}
+
+/// The walk is cached per file revision; `frame_duration` runs only when
+/// it is not. `revision` is the file's revision from before its header was
+/// read, so a header and a walk of different versions are never cached.
+fn cached_video_timing(
+    path: &Path,
+    revision: Option<String>,
+    frame_duration: impl FnOnce(&Path) -> Result<Option<align_core::MediaTime>, DecodeError>,
+) -> Result<align_core::VideoTimingInspection, DecodeError> {
     let bin =
         ffprobe_bin().ok_or_else(|| DecodeError::FfmpegMissing("ffprobe not found".into()))?;
     let decoder = bin.canonicalize().ok().and_then(|bin| {
@@ -280,18 +331,16 @@ pub fn video_timing(path: &Path) -> Result<align_core::VideoTimingInspection, De
             align_core::cache::media_revision(&bin).ok()?
         ))
     });
-    let identity = |path: &Path| align_core::cache::media_revision(path).ok();
-    let before = identity(path);
     let cache = align_core::FingerprintCache::with_backend(None, "portable-timing1");
     if let Some(decoder) = &decoder
         && let Some(timing) = cache.load_video_timing(path, decoder)
     {
         return Ok(timing);
     }
-    let timing = video_timing_uncached(path, &bin)?;
+    let timing = video_timing_uncached(path, &bin, frame_duration(&bin)?)?;
     // A scan racing a media rewrite must not publish a cached classification.
-    if before.is_some()
-        && before == identity(path)
+    if revision.is_some()
+        && revision == media_revision(path)
         && let Some(decoder) = &decoder
     {
         cache.save_video_timing(path, decoder, timing);
@@ -302,8 +351,8 @@ pub fn video_timing(path: &Path) -> Result<align_core::VideoTimingInspection, De
 fn video_timing_uncached(
     path: &Path,
     bin: &Path,
+    frame_duration: Option<align_core::MediaTime>,
 ) -> Result<align_core::VideoTimingInspection, DecodeError> {
-    use align_core::canonical_frame_duration;
     use std::io::BufRead;
 
     let mut child = command(bin)
@@ -324,26 +373,6 @@ fn video_timing_uncached(
         .spawn()
         .map_err(DecodeError::Io)?;
     let stdout = child.stdout.take().ok_or(DecodeError::UnsupportedOutput)?;
-
-    // Nominal rate + dimensions from the header call.
-    let header_json = command(bin)
-        .args([
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_streams",
-            "-select_streams",
-            "v:0",
-        ])
-        .arg(path)
-        .output()
-        .map_err(DecodeError::Io)?;
-    let header = parse_video_stream(&header_json.stdout);
-    let frame_duration = header
-        .as_ref()
-        .and_then(|h| h.avg_fps)
-        .and_then(|fps| canonical_frame_duration(fps, None));
 
     let mut timing = PacketTiming::default();
     let read_result = (|| {
@@ -382,32 +411,18 @@ fn video_timing_uncached(
 }
 
 /// Full video probe: header facts + timing walk + timecode tag.
-/// `None` when the container has no usable video stream.
-pub fn inspect_video(path: &Path) -> Option<VideoProbe> {
-    let header_json = command(ffprobe_bin()?)
-        .args([
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_streams",
-            "-select_streams",
-            "v:0",
-        ])
-        .arg(path)
-        .output()
-        .ok()?;
-    if !header_json.status.success() {
-        return None;
-    }
-    let header = parse_video_stream(&header_json.stdout)?;
-    let timing = video_timing(path).ok()?;
+fn video_probe(
+    path: &Path,
+    header: &FfVideoStream,
+    revision: Option<String>,
+) -> Option<VideoProbe> {
+    let timing = cached_video_timing(path, revision, |_| Ok(header_frame_duration(header))).ok()?;
     Some(VideoProbe {
         width: header.width,
         height: header.height,
         frame_duration: timing.frame_duration,
         mode: timing.mode,
-        source_timecode: timecode_from_header(&header),
+        source_timecode: timecode_from_header(header),
     })
 }
 
@@ -416,7 +431,7 @@ pub fn inspect_video(path: &Path) -> Option<VideoProbe> {
 /// `1/30`), then the label validates as NDF/DF. `None` when the rate is
 /// unknown or the label is forbidden — never guessed. Pure (no binary).
 fn timecode_from_header(header: &FfVideoStream) -> Option<align_core::SourceTimecode> {
-    let duration = align_core::canonical_frame_duration(header.avg_fps?, None)?;
+    let duration = header_frame_duration(header)?;
     align_core::SourceTimecode::from_label(header.timecode.as_deref()?, duration)
 }
 pub struct AudioPipe {
@@ -876,5 +891,44 @@ mod tests {
         let peak = got.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         assert!((peak - 1.0).abs() < 0.01, "peak={peak}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// MXF stores its start timecode with the material package, which
+    /// ffprobe reports in the format tags rather than on the video stream.
+    #[test]
+    fn mxf_timecode_comes_from_the_format_tags() {
+        let (Some(ffmpeg), Some(_)) = (ffmpeg_bin(), ffprobe_bin()) else {
+            return;
+        };
+        let lists = |kind: &str| {
+            command(&ffmpeg)
+                .args(["-hide_banner", kind])
+                .output()
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+                .unwrap_or_default()
+        };
+        if !lists("-muxers").contains(" mxf ") || !lists("-encoders").contains(" mpeg2video ") {
+            eprintln!("SKIP: FFmpeg without MXF or MPEG-2 support");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("A001C001.MXF");
+        let ok = command(&ffmpeg)
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc2=size=320x240:rate=25")
+            .args(["-f", "lavfi", "-i", "sine=r=48000", "-t", "1"])
+            .args(["-c:v", "mpeg2video", "-c:a", "pcm_s16le"])
+            .args(["-timecode", "10:20:30:12"])
+            .arg(&clip)
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "FFmpeg could not write the MXF fixture");
+        let video = inspect_full(&clip).unwrap().video.expect("video probe");
+        let timecode = video.source_timecode.expect("container timecode");
+        assert_eq!(timecode.text, "10:20:30:12");
+        assert_eq!(
+            video.frame_duration,
+            Some(align_core::MediaTime::new(1, 25))
+        );
     }
 }
