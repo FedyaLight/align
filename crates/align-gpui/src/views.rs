@@ -829,6 +829,11 @@ pub struct AlignApp {
     timeline_motion_generation: u64,
     progress_motion: ProgressMotion,
     update_state: UpdateState,
+    show_problem_report: bool,
+    feedback_notice_pending: bool,
+    /// Error shown when the report opened, offered for copying (SharedString:
+    /// the panel clones it every frame).
+    feedback_error: Option<SharedString>,
     /// The update card was closed; the About panel still offers the update.
     update_notice_dismissed: bool,
 }
@@ -870,6 +875,9 @@ impl AlignApp {
             timeline_motion_generation: 0,
             progress_motion: ProgressMotion::new(),
             update_state: UpdateState::default(),
+            show_problem_report: false,
+            feedback_notice_pending: super::feedback::notice_pending(),
+            feedback_error: None,
             update_notice_dismissed: false,
         }
     }
@@ -894,6 +902,28 @@ impl AlignApp {
             });
         })
         .detach();
+    }
+
+    /// Opens the report over whatever modal is showing; that modal is hidden
+    /// meanwhile and returns when the report closes.
+    pub(crate) fn show_problem_report(&mut self, cx: &mut Context<Self>) {
+        self.feedback_error = self.data.error.clone().map(SharedString::from);
+        self.show_problem_report = true;
+        self.dismiss_feedback_notice();
+        cx.notify();
+    }
+
+    fn close_problem_report(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_problem_report = false;
+        self.feedback_error = None;
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn dismiss_feedback_notice(&mut self) {
+        if std::mem::take(&mut self.feedback_notice_pending) {
+            super::feedback::dismiss_notice();
+        }
     }
 
     pub(crate) fn check_for_updates(&mut self, cx: &mut Context<Self>) {
@@ -2462,7 +2492,8 @@ impl Render for AlignApp {
         // While a modal or context menu is open the content below keeps
         // its layout but loses hover/cursor feedback (clicks are already
         // swallowed by the overlay layers).
-        let content_active = self.app_menu_position.is_none()
+        let content_active = !self.show_problem_report
+            && self.app_menu_position.is_none()
             && self.data.menu.is_none()
             && !self.data.show_path_fixer
             && self.data.error.is_none()
@@ -2502,6 +2533,12 @@ impl Render for AlignApp {
             // export text field owns keyboard focus.
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
                 let key: &str = &e.keystroke.key;
+                if this.show_problem_report {
+                    if key == "escape" {
+                        this.close_problem_report(window, cx);
+                    }
+                    return;
+                }
                 if key == "escape" && this.app_menu_position.take().is_some() {
                     cx.notify();
                     return;
@@ -2684,11 +2721,14 @@ impl Render for AlignApp {
         if self.export_select.is_some() {
             root = root.child(export_select_dismiss_layer(cx));
         }
-        if let Some(picker) = self.data.sequence_picker.clone() {
+        // The problem report temporarily replaces the open modal, keeping a
+        // single dim layer; that modal returns when the report closes.
+        let modals_visible = !self.show_problem_report;
+        if let (true, Some(picker)) = (modals_visible, self.data.sequence_picker.as_ref()) {
             root = root.child(overlay(
                 &theme,
                 "overlay-seq",
-                sequence_picker_panel(cx, &theme, picker),
+                sequence_picker_panel(cx, &theme, picker.clone()),
             ));
         }
         if let Some(menu) = self.data.menu.clone() {
@@ -2716,21 +2756,31 @@ impl Render for AlignApp {
                 root = root.child(notice);
             }
         }
-        if self.data.show_stage_settings {
+        // Same corner as the update card, so it waits until that is gone, and
+        // it would cover the export sidebar's settings. Modals only dim it:
+        // removing it would replay its entrance every time one closes.
+        if self.feedback_notice_pending
+            && !self.data.show_about
+            && !self.data.show_export
+            && (self.update_notice_dismissed || self.update_state.version().is_none())
+        {
+            root = root.child(feedback_notice(cx, &theme));
+        }
+        if modals_visible && self.data.show_stage_settings {
             root = root.child(overlay(
                 &theme,
                 "overlay-stages",
                 stage_settings_panel(cx, &theme, &self.data),
             ));
         }
-        if self.data.show_sequence_results {
+        if modals_visible && self.data.show_sequence_results {
             root = root.child(overlay(
                 &theme,
                 "overlay-sequence-results",
                 sequence_results_panel(cx, &theme, &self.data),
             ));
         }
-        if self.data.show_search_settings {
+        if modals_visible && self.data.show_search_settings {
             root = root.child(overlay(
                 &theme,
                 "overlay-search",
@@ -2745,7 +2795,7 @@ impl Render for AlignApp {
                 ),
             ));
         }
-        if self.data.show_path_fixer {
+        if modals_visible && self.data.show_path_fixer {
             root = root.child(overlay(
                 &theme,
                 "overlay-path-fixer",
@@ -2758,25 +2808,32 @@ impl Render for AlignApp {
                 ),
             ));
         }
-        if self.data.error.is_some() {
+        if modals_visible && self.data.error.is_some() {
             root = root.child(overlay(
                 &theme,
                 "overlay-error",
                 error_alert(cx, &theme, &self.data),
             ));
         }
-        if self.data.show_about {
+        if modals_visible && self.data.show_about {
             root = root.child(overlay(
                 &theme,
                 "overlay-about",
                 about_panel(cx, &theme, &self.update_state, self.data.operation),
             ));
         }
-        if self.data.show_agent_setup {
+        if modals_visible && self.data.show_agent_setup {
             root = root.child(overlay(
                 &theme,
                 "overlay-agent-setup",
                 agent_setup_panel(cx, &theme),
+            ));
+        }
+        if self.show_problem_report {
+            root = root.child(overlay(
+                &theme,
+                "overlay-problem-report",
+                problem_report_panel(cx, &theme, self.feedback_error.clone()),
             ));
         }
         root
@@ -7473,9 +7530,35 @@ fn update_notice(
         ),
         _ => return None,
     };
-    let dismissible = !update_state.is_busy();
+    let dismiss: Option<NoticeDismiss> =
+        (!update_state.is_busy()).then_some(("Later", |this| this.update_notice_dismissed = true));
+    Some(floating_notice(
+        cx,
+        theme,
+        "update-notice",
+        format!("Align {version}"),
+        detail,
+        action,
+        dismiss,
+    ))
+}
+
+/// Close-button tooltip and what closing a floating notice records.
+type NoticeDismiss = (&'static str, fn(&mut AlignApp));
+
+/// Bottom-right card shared by the update and feedback notices: app icon,
+/// title, detail, one action, and an optional close button.
+fn floating_notice(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    id: &'static str,
+    title: impl Into<SharedString>,
+    detail: impl Into<SharedString>,
+    action: impl IntoElement,
+    dismiss: Option<NoticeDismiss>,
+) -> impl IntoElement {
     let card = div()
-        .id("update-notice")
+        .id(id)
         .w(px(300.))
         .p_3()
         .flex()
@@ -7499,50 +7582,149 @@ fn update_notice(
                     div()
                         .text_size(px(13.))
                         .font_weight(gpui::FontWeight(600.0))
-                        .child(format!("Align {version}")),
+                        .child(title.into()),
                 )
                 .child(
                     div()
                         .text_size(px(11.))
                         .text_color(rgb(theme.dim))
-                        .child(detail),
+                        .child(detail.into()),
                 )
                 .child(div().mt_2().flex().child(action)),
         )
-        .when(dismissible, |card| {
+        .when_some(dismiss, |card, (tip, dismiss)| {
             card.child(
                 div()
-                    .id("update-notice-close")
+                    .id((id, 0usize))
                     .cursor_pointer()
                     .opacity(0.6)
                     .hover(|this| this.opacity(1.))
                     .child(svg_icon(icons().close.clone(), 12., theme.icon))
-                    .tooltip(hover_tip("Later".to_string(), theme))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.update_notice_dismissed = true;
+                    .tooltip(hover_tip(tip.to_string(), theme))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        dismiss(this);
                         cx.notify();
                     })),
             )
         });
-    Some(
+    div()
+        .absolute()
+        .right(px(16.))
+        .bottom(px(16.))
+        .child(slide_in(card, (id, 1usize), 0))
+}
+
+// ---------------- user-initiated feedback
+
+fn feedback_notice(cx: &mut Context<AlignApp>, theme: &Theme) -> impl IntoElement {
+    let action = button(
+        cx,
+        theme,
+        "feedback-notice-report",
+        "Report a Problem…",
+        true,
+        |this, _, _, cx| this.show_problem_report(cx),
+    )
+    // Ends the opaque type's borrow of `cx`.
+    .into_any_element();
+    floating_notice(
+        cx,
+        theme,
+        "feedback-notice",
+        "Something not working?",
+        "Tell us and we will look into it. Report a Problem is always in the Help menu.",
+        action,
+        Some(("Dismiss", |this| this.dismiss_feedback_notice())),
+    )
+}
+
+fn problem_report_panel(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    error: Option<SharedString>,
+) -> impl IntoElement {
+    let mut panel = div()
+        .id("problem-report-panel")
+        .w(px(460.))
+        .max_h_full()
+        .m_4()
+        .p_5()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(theme.border))
+        .bg(rgb(theme.panel))
+        .shadow_md()
+        .child(modal_header(
+            cx,
+            theme,
+            "Report a Problem",
+            "problem-report-close",
+            |this, _, window, cx| this.close_problem_report(window, cx),
+        ))
+        .child("Tell us what happened and how to reproduce it. Your report helps us investigate and fix Align.")
+        .child(setup_text_block(theme, super::feedback::environment()))
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(rgb(theme.dim))
+                .child("Continue to a prefilled issue on GitHub, where you can add details and screenshots. A GitHub account is required. Nothing is posted until you submit it there."),
+        );
+    if let Some(error) = error {
+        panel = panel
+            .child(button(
+                cx,
+                theme,
+                "problem-report-copy-error",
+                "Copy error details",
+                true,
+                move |_, _, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(error.to_string()));
+                },
+            ))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(theme.dim))
+                    .child("Error details may contain filenames and paths. Remove anything private before pasting them into your public report."),
+            );
+    }
+    panel.child(
         div()
-            .absolute()
-            .right(px(16.))
-            .bottom(px(16.))
-            .child(slide_in(card, "update-notice-entrance", 0)),
+            .flex()
+            .gap_2()
+            .child(button(
+                cx,
+                theme,
+                "problem-report-existing",
+                "View existing issues",
+                true,
+                |_, _, _, cx| cx.open_url(super::feedback::ISSUES_URL),
+            ))
+            .child(prominent_button(
+                cx,
+                theme,
+                "problem-report-continue",
+                "Continue on GitHub",
+                true,
+                |this, _, window, cx| {
+                    cx.open_url(&super::feedback::issue_url());
+                    this.close_problem_report(window, cx);
+                },
+            )),
     )
 }
 
 // ---------------- about panel (Align menu → About Align)
 
 fn platform_label() -> String {
-    let operating_system = match std::env::consts::OS {
-        "macos" => "macOS",
-        "windows" => "Windows",
-        "linux" => "Linux",
-        other => other,
-    };
-    format!("{operating_system} · {}", std::env::consts::ARCH)
+    format!(
+        "{} · {}",
+        super::feedback::os_name(),
+        std::env::consts::ARCH
+    )
 }
 
 fn about_panel(
@@ -7694,6 +7876,14 @@ fn about_panel(
                 .child("Star on GitHub"),
             true,
             |_, _, _, cx| cx.open_url(updater::REPOSITORY_URL),
+        ))
+        .child(button(
+            cx,
+            theme,
+            "about-report-problem",
+            "Report a Problem…",
+            true,
+            |this, _, _, cx| this.show_problem_report(cx),
         ))
         .child(
             div()
@@ -7857,16 +8047,31 @@ fn error_alert(
                 .clone()
                 .unwrap_or_else(|| "Unknown error".to_string()),
         );
-    if data.can_locate_timeline_media() {
-        panel.child(button(
+    // Recovery comes first; reporting is the fallback when it does not help.
+    panel
+        .when(data.can_locate_timeline_media(), |panel| {
+            panel.child(button(
+                cx,
+                theme,
+                "btn-error-relink-media",
+                "Locate media…",
+                true,
+                |this, _, _, cx| this.choose_missing_media(cx),
+            ))
+        })
+        .child(
+            div()
+                .mt_1()
+                .text_size(px(12.))
+                .text_color(rgb(theme.dim))
+                .child("If this looks like a bug, report it and we will look into it."),
+        )
+        .child(button(
             cx,
             theme,
-            "btn-error-relink-media",
-            "Locate media…",
+            "error-report-problem",
+            "Report a Problem…",
             true,
-            |this, _, _, cx| this.choose_missing_media(cx),
+            |this, _, _, cx| this.show_problem_report(cx),
         ))
-    } else {
-        panel
-    }
 }

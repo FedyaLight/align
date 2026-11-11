@@ -1,0 +1,44 @@
+name: Bug report
+description: Something in Align does not work as expected.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Please check [existing issues](https://github.com/FedyaLight/align/issues) first.
+        Reports are public: remove private file names and paths before submitting.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Include the exact error message if one appeared.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Add two camera folders
+        2. Click Sync
+        3. …
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Filled in by Help → Report a Problem in Align. Otherwise add the Align version, operating system, and architecture.
+      placeholder: |
+        Align 0.3.1
+        OS: Windows 11 (build 26100)
+        Architecture: x86_64
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Error details, logs, or screenshots
+      description: Optional. Drag images here or paste text copied from Align.

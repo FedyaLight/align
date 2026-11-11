@@ -104,6 +104,14 @@ Developer ID signing and Apple notarization require separate credentials.
 FFmpeg and ffprobe are separate executables, shipped on Linux and Windows for
 containers Align does not read natively (MTS, MXF, R3D, and compressed audio
 such as AC-3). The build has no video decoders: video is only parsed for timing.
+On Windows, the tools are linked statically against the MinGW-w64 runtime,
+including the winpthreads library that provides FFmpeg's clock and sleep
+functions, so they need only Windows system DLLs and run without MSYS2 or
+`libwinpthread-1.dll`. FFMPEG-LICENSE.txt carries the winpthreads notice
+(MIT and BSD-3-Clause) after the LGPL text. CI runs both executables from an
+isolated directory with only Windows system directories on PATH, checking media
+inspection and PCM decoding. The same check runs against the staged release
+files before packaging.
 It excludes GPL and nonfree components and retains FFmpeg's LGPL license. See
 [FFmpeg's license guidance](https://ffmpeg.org/legal.html).
 

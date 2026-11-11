@@ -14,12 +14,11 @@ use clap::{Args, Parser, Subcommand};
 mod export_job;
 
 #[derive(Parser)]
-#[command(name = "align-cli", version)]
+#[command(name = "align-cli", version, args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
     /// Inspect media, folders, or timeline projects without synchronizing.
-    #[arg(global = true)]
     paths: Vec<PathBuf>,
 }
 
@@ -817,6 +816,31 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unexpected_paths_are_rejected_before_running_a_subcommand() {
+        for arguments in [
+            vec![
+                "align-cli",
+                "export-json",
+                "result.json",
+                "out",
+                "extra.wav",
+            ],
+            vec!["align-cli", "clear-cache", "extra.wav"],
+        ] {
+            let error = Cli::try_parse_from(&arguments)
+                .err()
+                .unwrap_or_else(|| panic!("unexpected paths accepted: {arguments:?}"));
+            assert_eq!(error.exit_code(), 2);
+        }
+        assert_eq!(
+            Cli::try_parse_from(["align-cli", "camera.wav", "recorder.wav"])
+                .expect("bare-path inspection")
+                .paths,
+            vec![PathBuf::from("camera.wav"), PathBuf::from("recorder.wav")],
+        );
+    }
 
     #[test]
     fn export_accepts_the_same_sync_settings_as_sync() {

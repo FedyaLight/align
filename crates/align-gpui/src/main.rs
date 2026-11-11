@@ -6,6 +6,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod app_menu;
+mod feedback;
 mod icons;
 mod lane;
 mod motion;
@@ -24,6 +25,7 @@ actions!(
     align,
     [
         AboutAlign,
+        ReportProblem,
         CheckForUpdates,
         UseWithAiAgents,
         LightAppearance,
@@ -256,6 +258,10 @@ fn app_menus(appearance: theme::AppearancePreference) -> Vec<Menu> {
             })],
         },
         Menu {
+            name: "Help".into(),
+            items: vec![MenuItem::action("Report a Problem…", ReportProblem)],
+        },
+        Menu {
             name: "Window".into(),
             items: vec![
                 MenuItem::action("Minimize", MinimizeWindow),
@@ -301,6 +307,9 @@ fn main() {
             // System commands: without registered actions + bindings + menus
             // macOS swallows keys like Cmd+Q and the menu bar stays empty.
             cx.on_action(|_: &AboutAlign, cx| show_about(cx));
+            cx.on_action(|_: &ReportProblem, cx| {
+                update_view(cx, |this, cx| this.show_problem_report(cx));
+            });
             cx.on_action(|_: &CheckForUpdates, cx| check_for_updates(cx));
             cx.on_action(|_: &UseWithAiAgents, cx| show_agent_setup(cx));
             cx.on_action(|_: &LightAppearance, cx| {
