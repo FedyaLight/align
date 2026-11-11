@@ -122,6 +122,27 @@ impl WaveformPreview {
     }
 }
 
+struct FingerprintRun {
+    features: Vec<align_core::ClipFingerprints>,
+    selected_sources: HashMap<ClipId, AudioAnalysisSource>,
+    /// Clips left out because their audio could not be read.
+    warnings: Vec<SyncWarning>,
+}
+
+/// Errors that end the whole run rather than one file's analysis: a
+/// cancellation, or a missing decoder that every such file needs.
+fn ends_run(error: &PipelineError) -> bool {
+    matches!(
+        error,
+        PipelineError::Cancelled
+            | PipelineError::Decode(
+                crate::DecodeError::Cancelled
+                    | crate::DecodeError::FfmpegMissing(_)
+                    | crate::DecodeError::BackendUnavailable(_)
+            )
+    )
+}
+
 struct FingerprintRunOptions<'a> {
     accuracy: align_core::SearchAccuracy,
     overrides: &'a HashMap<ClipId, align_core::SearchAccuracy>,
@@ -518,7 +539,11 @@ impl Pipeline {
                 .entry(clip.id.clone())
                 .or_insert(options.audio_source);
         }
-        let (features, selected_sources) = self.fingerprints(
+        let FingerprintRun {
+            features,
+            selected_sources,
+            warnings: unreadable,
+        } = self.fingerprints(
             &usable,
             &audio_sources,
             FingerprintRunOptions {
@@ -529,6 +554,7 @@ impl Pipeline {
             progress,
             cancel,
         )?;
+        warnings.extend(unreadable);
         let mut source_map = audio_sources;
         source_map.extend(selected_sources);
 
@@ -871,6 +897,82 @@ impl Pipeline {
         })
     }
 
+    /// Decodes one audio source to 8 kHz mono into state that `start` creates.
+    /// When the in-process decoder (Symphonia, or AVFoundation on macOS)
+    /// fails on the file's content, FFmpeg decodes it again into fresh state,
+    /// so a file is reported unreadable only when FFmpeg cannot read it
+    /// either.
+    fn decode_mono_8k_into<S>(
+        &self,
+        clip: &Clip,
+        source: AudioAnalysisSource,
+        cancel: &std::sync::atomic::AtomicBool,
+        start: impl Fn() -> S,
+        feed: impl Fn(&mut S, &[f32]),
+    ) -> Result<S, PipelineError> {
+        use crate::DecodeError;
+        use crate::mix::Consumer;
+        let run = |decode: &dyn Fn(Consumer) -> Result<(), DecodeError>| {
+            let mut state = start();
+            decode(&mut |block| {
+                if cancelled(cancel) {
+                    return Err(DecodeError::Cancelled);
+                }
+                feed(&mut state, block);
+                Ok(())
+            })
+            .map(|()| state)
+        };
+        let error = match run(&|consume| self.backend.decode_mono_8k(&clip.url, source, consume)) {
+            Ok(state) => return Ok(state),
+            Err(error @ (DecodeError::Symphonia(_) | DecodeError::Apple(_))) => error,
+            Err(DecodeError::Cancelled) => return Err(PipelineError::Cancelled),
+            Err(error) => return Err(PipelineError::Decode(error)),
+        };
+        let channels = |index: usize| {
+            clip.audio
+                .get(index)
+                .map(|stream| stream.channels)
+                .ok_or_else(|| DecodeError::NoAudio(clip.url.display().to_string()))
+        };
+        let ffmpeg_stream = |index: usize, mix: bool, channel: Option<usize>, consume: Consumer| {
+            crate::ff::decode_mono_8k(&clip.url, index, channels(index)?, channel, mix, consume)
+        };
+        let ffmpeg = if source == AudioAnalysisSource::AllMixed {
+            run(&|consume| {
+                crate::mix::mix_streams_mono_8k(
+                    &clip.url,
+                    clip.audio.len(),
+                    &|index, consume| ffmpeg_stream(index, true, None, consume),
+                    consume,
+                )
+            })
+        } else {
+            run(&|consume| {
+                ffmpeg_stream(
+                    source.stream_index(),
+                    source.mixes_channels(),
+                    source.selected_channel(),
+                    consume,
+                )
+            })
+        };
+        match ffmpeg {
+            Ok(state) => Ok(state),
+            Err(DecodeError::Cancelled) => Err(PipelineError::Cancelled),
+            // FFmpeg ships with Align except on macOS, where AVFoundation
+            // decodes and FFmpeg is optional: there the in-process decoder
+            // has the only verdict. Elsewhere a missing FFmpeg is a broken
+            // installation and ends the run.
+            Err(DecodeError::FfmpegMissing(_))
+                if self.backend.kind() == BackendKind::AppleNative =>
+            {
+                Err(PipelineError::Decode(error))
+            }
+            Err(ffmpeg) => Err(PipelineError::Decode(ffmpeg)),
+        }
+    }
+
     fn fingerprints(
         &self,
         clips: &[&Clip],
@@ -878,50 +980,47 @@ impl Pipeline {
         options: FingerprintRunOptions<'_>,
         progress: Option<&(dyn Fn(PipelineProgress) + Send + Sync)>,
         cancel: &std::sync::atomic::AtomicBool,
-    ) -> Result<
-        (
-            Vec<align_core::ClipFingerprints>,
-            HashMap<ClipId, AudioAnalysisSource>,
-        ),
-        PipelineError,
-    > {
+    ) -> Result<FingerprintRun, PipelineError> {
         use align_core::Fingerprint;
-        use std::sync::atomic::Ordering;
         struct Variant {
             source: AudioAnalysisSource,
             fingerprints: Vec<Fingerprint>,
             waveform: Option<Vec<f32>>,
         }
         let total = clips.len();
-        let done = std::sync::atomic::AtomicUsize::new(0);
+        // Counting and publishing under one lock keeps the completed count
+        // monotonic for listeners such as the progress bar.
+        let done = std::sync::Mutex::new(0_usize);
         let accuracy = options.accuracy;
         let overrides = options.overrides;
         let generate_waveform_previews = options.generate_waveform_previews;
-        // Four streaming readers avoid saturating external media while
-        // variants of one clip stay sequential and results keep input order.
-        let all_variants: Vec<Result<Vec<Variant>, PipelineError>> =
-            align_core::par_map(clips, 4, |clip| {
-                if cancelled(cancel) {
-                    return Err(PipelineError::Cancelled);
-                }
-                let accuracy = overrides.get(&clip.id).copied().unwrap_or(accuracy);
-                let req = requested
-                    .get(&clip.id)
-                    .copied()
-                    .unwrap_or(AudioAnalysisSource::Automatic);
-                let sources: Vec<AudioAnalysisSource> =
-                    if req == AudioAnalysisSource::Automatic && clip.audio.len() > 1 {
-                        (0..clip.audio.len())
-                            .map(|idx| AudioAnalysisSource::Stream {
-                                index: idx,
-                                channel: None,
-                            })
-                            .collect()
-                    } else {
-                        vec![req]
-                    };
-                let mut variants = Vec::with_capacity(sources.len());
-                for source in sources {
+        if let Some(p) = &progress {
+            p(PipelineProgress::basic(Phase::Fingerprint, 0, total, None));
+        }
+        let analyse = |clip: &&Clip| -> Result<Vec<Variant>, PipelineError> {
+            if cancelled(cancel) {
+                return Err(PipelineError::Cancelled);
+            }
+            let accuracy = overrides.get(&clip.id).copied().unwrap_or(accuracy);
+            let req = requested
+                .get(&clip.id)
+                .copied()
+                .unwrap_or(AudioAnalysisSource::Automatic);
+            let sources: Vec<AudioAnalysisSource> =
+                if req == AudioAnalysisSource::Automatic && clip.audio.len() > 1 {
+                    (0..clip.audio.len())
+                        .map(|idx| AudioAnalysisSource::Stream {
+                            index: idx,
+                            channel: None,
+                        })
+                        .collect()
+                } else {
+                    vec![req]
+                };
+            let mut variants = Vec::with_capacity(sources.len());
+            let mut failure = None;
+            for source in sources {
+                let variant = (|| -> Result<Variant, PipelineError> {
                     let cache_key = accuracy.cache_key(&source.cache_key());
                     if let Some(cached) = self.cache.load(&clip.url, &cache_key) {
                         let waveform = if generate_waveform_previews {
@@ -929,19 +1028,13 @@ impl Pipeline {
                             {
                                 Some(waveform)
                             } else {
-                                let mut preview = WaveformPreview::new(clip.duration.as_seconds());
-                                self.backend
-                                    .decode_mono_8k(&clip.url, source, &mut |block| {
-                                        if cancelled(cancel) {
-                                            return Err(crate::DecodeError::Cancelled);
-                                        }
-                                        preview.consume(block);
-                                        Ok(())
-                                    })
-                                    .map_err(|error| match error {
-                                        crate::DecodeError::Cancelled => PipelineError::Cancelled,
-                                        other => PipelineError::Decode(other),
-                                    })?;
+                                let preview = self.decode_mono_8k_into(
+                                    clip,
+                                    source,
+                                    cancel,
+                                    || WaveformPreview::new(clip.duration.as_seconds()),
+                                    |preview, block| preview.consume(block),
+                                )?;
                                 let waveform = preview.finish();
                                 self.cache.save_waveform(&waveform, &clip.url, &cache_key);
                                 Some(waveform)
@@ -949,31 +1042,30 @@ impl Pipeline {
                         } else {
                             None
                         };
-                        variants.push(Variant {
+                        return Ok(Variant {
                             source,
                             fingerprints: cached,
                             waveform,
                         });
-                        continue;
                     }
-                    let mut extractor = FingerprintExtractor::with_accuracy(accuracy);
-                    let mut preview = generate_waveform_previews
-                        .then(|| WaveformPreview::new(clip.duration.as_seconds()));
-                    self.backend
-                        .decode_mono_8k(&clip.url, source, &mut |block| {
-                            if cancelled(cancel) {
-                                return Err(crate::DecodeError::Cancelled);
-                            }
+                    let (extractor, preview) = self.decode_mono_8k_into(
+                        clip,
+                        source,
+                        cancel,
+                        || {
+                            (
+                                FingerprintExtractor::with_accuracy(accuracy),
+                                generate_waveform_previews
+                                    .then(|| WaveformPreview::new(clip.duration.as_seconds())),
+                            )
+                        },
+                        |(extractor, preview), block| {
                             extractor.consume(block);
-                            if let Some(preview) = &mut preview {
+                            if let Some(preview) = preview {
                                 preview.consume(block);
                             }
-                            Ok(())
-                        })
-                        .map_err(|error| match error {
-                            crate::DecodeError::Cancelled => PipelineError::Cancelled,
-                            other => PipelineError::Decode(other),
-                        })?;
+                        },
+                    )?;
                     if cancelled(cancel) {
                         return Err(PipelineError::Cancelled);
                     }
@@ -983,21 +1075,42 @@ impl Pipeline {
                     if let Some(waveform) = &waveform {
                         self.cache.save_waveform(waveform, &clip.url, &cache_key);
                     }
-                    variants.push(Variant {
+                    Ok(Variant {
                         source,
                         fingerprints,
                         waveform,
-                    });
+                    })
+                })();
+                // A stream that cannot be read leaves the others; the
+                // clip fails only when none of its streams can be read.
+                match variant {
+                    Ok(variant) => variants.push(variant),
+                    Err(error) if ends_run(&error) => return Err(error),
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
                 }
-                if let Some(p) = &progress {
-                    let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
+            }
+            match failure {
+                Some(error) if variants.is_empty() => Err(error),
+                _ => Ok(variants),
+            }
+        };
+        // Four streaming readers avoid saturating external media while
+        // variants of one clip stay sequential and results keep input order.
+        let outcomes: Vec<Result<Vec<Variant>, PipelineError>> =
+            align_core::par_map(clips, 4, |clip| {
+                let outcome = analyse(clip);
+                if let Some(p) = &progress
+                    && !outcome.as_ref().is_err_and(ends_run)
+                {
                     let mut event = PipelineProgress::basic(
                         Phase::Fingerprint,
-                        completed,
+                        0,
                         total,
                         Some(clip.url.clone()),
                     );
-                    if generate_waveform_previews {
+                    if generate_waveform_previews && let Ok(variants) = &outcome {
                         let mut waveform = vec![0.0_f32; WAVEFORM_PREVIEW_BINS];
                         for preview in variants
                             .iter()
@@ -1009,15 +1122,29 @@ impl Pipeline {
                         }
                         event.waveform = Some((clip.id.clone(), waveform));
                     }
+                    let mut done = done.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *done += 1;
+                    event.completed = *done;
                     p(event);
                 }
-                Ok(variants)
+                outcome
             });
-        let mut collected = Vec::with_capacity(clips.len());
-        for variants in all_variants {
-            collected.push(variants?);
+        // One unreadable file is reported and left unmatched; the others
+        // still synchronize. Results stay in input order.
+        let mut analysed = Vec::with_capacity(clips.len());
+        let mut warnings = Vec::new();
+        for (clip, outcome) in clips.iter().zip(outcomes) {
+            match outcome {
+                Ok(variants) => analysed.push((*clip, variants)),
+                Err(error) if ends_run(&error) => return Err(error),
+                Err(error) => warnings.push(SyncWarning {
+                    url: clip.url.clone(),
+                    message: format!(
+                        "The audio could not be read, so this file was left out of synchronization: {error}"
+                    ),
+                }),
+            }
         }
-        let all_variants = collected;
         if let Some(p) = &progress {
             p(PipelineProgress::basic(
                 Phase::Fingerprint,
@@ -1027,25 +1154,40 @@ impl Pipeline {
             ));
         }
 
-        if all_variants.iter().all(|variants| variants.len() == 1) {
-            return Ok((
-                clips
-                    .iter()
-                    .zip(all_variants)
-                    .map(|(clip, mut variants)| align_core::ClipFingerprints {
-                        clip_id: clip.id.clone(),
-                        fingerprints: variants.pop().unwrap().fingerprints,
-                    })
-                    .collect(),
-                HashMap::new(),
-            ));
+        // Refinement decodes the requested source again, so a stream chosen
+        // here must be recorded, including the only stream of several that
+        // could be read.
+        let requested_source = |clip: &Clip| {
+            requested
+                .get(&clip.id)
+                .copied()
+                .unwrap_or(AudioAnalysisSource::Automatic)
+        };
+        if analysed.iter().all(|(_, variants)| variants.len() == 1) {
+            let mut selected = HashMap::new();
+            let mut features = Vec::with_capacity(analysed.len());
+            for (clip, mut variants) in analysed {
+                let variant = variants.pop().unwrap();
+                if variant.source != requested_source(clip) {
+                    selected.insert(clip.id.clone(), variant.source);
+                }
+                features.push(align_core::ClipFingerprints {
+                    clip_id: clip.id.clone(),
+                    fingerprints: variant.fingerprints,
+                });
+            }
+            return Ok(FingerprintRun {
+                features,
+                selected_sources: selected,
+                warnings,
+            });
         }
 
         // Automatic multi-stream selection: most shared hashes wins.
         // Ties select the lowest channel index.
         let mut first_owner: HashMap<u64, &ClipId> = HashMap::new();
         let mut shared: HashSet<u64> = HashSet::new();
-        for (clip, variants) in clips.iter().zip(all_variants.iter()) {
+        for (clip, variants) in &analysed {
             let hashes: HashSet<u64> = variants
                 .iter()
                 .flat_map(|v| v.fingerprints.iter().map(|f| f.hash))
@@ -1064,7 +1206,7 @@ impl Pipeline {
         }
         let mut features = Vec::with_capacity(clips.len());
         let mut selected = HashMap::new();
-        for (clip, variants) in clips.iter().zip(all_variants) {
+        for (clip, variants) in analysed {
             let mut best = None::<(usize, usize)>;
             for (idx, v) in variants.iter().enumerate() {
                 let score = v
@@ -1079,7 +1221,7 @@ impl Pipeline {
             if let Some((idx, _)) = best {
                 let mut variants = variants;
                 let v = variants.swap_remove(idx);
-                if !variants.is_empty() {
+                if v.source != requested_source(clip) {
                     selected.insert(clip.id.clone(), v.source);
                 }
                 features.push(align_core::ClipFingerprints {
@@ -1088,7 +1230,11 @@ impl Pipeline {
                 });
             }
         }
-        Ok((features, selected))
+        Ok(FingerprintRun {
+            features,
+            selected_sources: selected,
+            warnings,
+        })
     }
 }
 
@@ -1565,6 +1711,282 @@ mod tests {
         assert!(fixed.contains("/found/A.wav</pathurl>"));
         assert!(fixed.contains("/found/B.wav</pathurl>"));
         assert!(!fixed.contains("/gone/"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file whose audio cannot be read used to stop the whole run with a
+    /// bare decoder message. It is now a warning naming the file, and the
+    /// other files still synchronize.
+    #[test]
+    fn unreadable_audio_is_reported_and_the_rest_still_synchronizes() {
+        let dir = fixture_dir("unreadable-audio");
+        let body = noise(12 * 44100, 0x5EED);
+        let a = write_delayed_wav(&dir, "a.wav", &body, 0.0);
+        let b = write_delayed_wav(&dir, "b.wav", &body, 1.024);
+        let Some(broken) = crate::sym::test_media::aac_noise(&dir, "broken.mp4", 9) else {
+            return;
+        };
+        // The movie header survives; the audio it describes does not, so
+        // neither Symphonia nor FFmpeg can decode it.
+        let data = std::fs::read(&broken).unwrap();
+        let mdat = data.windows(4).position(|w| w == b"mdat").unwrap();
+        std::fs::write(&broken, &data[..mdat + 64]).unwrap();
+        let pipe = Pipeline::new_in(BackendKind::Portable, Some(dir.join(".cache")));
+        let result = pipe
+            .synchronize(
+                &[
+                    PipelineInput::Media(a),
+                    PipelineInput::Media(b),
+                    PipelineInput::Media(broken.clone()),
+                ],
+                &[],
+                &PipelineOptions::default(),
+                None,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .expect("one unreadable file does not stop synchronization");
+        let warning = result
+            .project
+            .warnings
+            .iter()
+            .find(|warning| warning.url == broken)
+            .expect("the unreadable file is named");
+        assert!(
+            warning.message.contains("left out of synchronization"),
+            "{}",
+            warning.message
+        );
+        let broken_id = &result
+            .project
+            .clips
+            .iter()
+            .find(|clip| clip.url == broken)
+            .unwrap()
+            .id;
+        assert!(result.unmatched.contains(broken_id));
+        assert_eq!(result.matches.len(), 1, "the readable files match");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The portable backend, except that analysing chosen files and sources
+    /// fails like a decoder part way through the audio, after passing some
+    /// samples on.
+    struct FaultyAnalysis {
+        fails: fn(&Path, AudioAnalysisSource) -> Option<crate::DecodeError>,
+        /// Whether refinement windows of those sources fail too.
+        windows_fail: bool,
+    }
+
+    impl MediaBackend for FaultyAnalysis {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Portable
+        }
+
+        fn inspect(&self, path: &Path) -> Result<crate::backend::ProbeReport, crate::DecodeError> {
+            crate::portable::PortableBackend.inspect(path)
+        }
+
+        fn decode_mono_8k(
+            &self,
+            path: &Path,
+            source: AudioAnalysisSource,
+            consume: &mut dyn FnMut(&[f32]) -> Result<(), crate::DecodeError>,
+        ) -> Result<(), crate::DecodeError> {
+            if let Some(error) = (self.fails)(path, source) {
+                consume(&noise(8000, 99))?;
+                return Err(error);
+            }
+            crate::portable::PortableBackend.decode_mono_8k(path, source, consume)
+        }
+
+        fn decode_window_16k(
+            &self,
+            path: &Path,
+            start: f64,
+            duration: f64,
+            source: AudioAnalysisSource,
+        ) -> Result<(f64, Vec<f32>), crate::DecodeError> {
+            match (self.fails)(path, source) {
+                Some(error) if self.windows_fail => Err(error),
+                _ => crate::portable::PortableBackend
+                    .decode_window_16k(path, start, duration, source),
+            }
+        }
+
+        fn decode_native(
+            &self,
+            path: &Path,
+            stream: usize,
+            range: Option<(f64, Option<f64>)>,
+            consume: &mut dyn FnMut(crate::backend::NativeBlock) -> Result<(), crate::DecodeError>,
+        ) -> Result<f64, crate::DecodeError> {
+            crate::portable::PortableBackend.decode_native(path, stream, range, consume)
+        }
+
+        fn decode_native_i32(
+            &self,
+            path: &Path,
+            stream: usize,
+            range: Option<(f64, Option<f64>)>,
+            consume: &mut dyn FnMut(
+                crate::backend::NativeBlockI32,
+            ) -> Result<(), crate::DecodeError>,
+        ) -> Result<f64, crate::DecodeError> {
+            crate::portable::PortableBackend.decode_native_i32(path, stream, range, consume)
+        }
+    }
+
+    fn faulty_pipeline(dir: &Path, backend: FaultyAnalysis) -> Pipeline {
+        Pipeline {
+            backend: Box::new(backend),
+            cache: FingerprintCache::with_backend(Some(dir.join(".cache")), "faulty-test"),
+        }
+    }
+
+    fn named(path: &Path, name: &str) -> bool {
+        path.file_name().is_some_and(|file| file == name)
+    }
+
+    /// When the in-process decoder fails, FFmpeg decodes the file from the
+    /// start into fresh state, for one stream and for a mix of all streams.
+    /// Only one of the two files fails: samples it passed on before failing
+    /// would shift it against the other.
+    #[test]
+    fn in_process_decode_failures_are_retried_with_ffmpeg() {
+        if crate::ff::ffmpeg_bin().is_none() {
+            return;
+        }
+        let dir = fixture_dir("ffmpeg-retry");
+        let body = noise(12 * 44100, 0xFA11);
+        write_delayed_wav(&dir, "a.wav", &body, 0.0);
+        write_delayed_wav(&dir, "b.wav", &body, 1.024);
+        for audio_source in [
+            AudioAnalysisSource::Automatic,
+            AudioAnalysisSource::AllMixed,
+        ] {
+            let _ = std::fs::remove_dir_all(dir.join(".cache"));
+            let pipe = faulty_pipeline(
+                &dir,
+                FaultyAnalysis {
+                    fails: |path, _| {
+                        named(path, "a.wav").then(|| {
+                            crate::DecodeError::Symphonia("unexpected end of bitstream".into())
+                        })
+                    },
+                    windows_fail: false,
+                },
+            );
+            let options = PipelineOptions {
+                audio_source,
+                ..Default::default()
+            };
+            let result = pipe
+                .synchronize(
+                    &[PipelineInput::Media(dir.clone())],
+                    &[],
+                    &options,
+                    None,
+                    &std::sync::atomic::AtomicBool::new(false),
+                )
+                .unwrap();
+            assert!(
+                result.project.warnings.is_empty(),
+                "{audio_source:?}: {:?}",
+                result.project.warnings
+            );
+            assert_eq!(result.matches.len(), 1, "{audio_source:?}");
+            let offset = result.matches[0].offset.as_seconds().abs();
+            assert!((offset - 1.024).abs() < 0.001, "{audio_source:?}: {offset}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Automatic analysis of a file with several streams keeps the streams
+    /// it can read. Refinement must decode the stream that was kept, not the
+    /// first stream again.
+    #[test]
+    fn refinement_uses_the_stream_that_could_be_read() {
+        let dir = fixture_dir("surviving-stream");
+        let body = noise(12 * 44100, 0x57E4);
+        write_delayed_wav(&dir, "a.wav", &body, 0.0);
+        let delayed = write_delayed_wav(&dir, "b.wav", &body, 1.024);
+        let Some(_) = ffmpeg_clip(
+            &dir,
+            "two-streams.mov",
+            &[
+                "-i",
+                &delayed.to_string_lossy(),
+                "-i",
+                &delayed.to_string_lossy(),
+                "-map",
+                "0:a",
+                "-map",
+                "1:a",
+                "-c:a",
+                "pcm_s16le",
+            ],
+        ) else {
+            return;
+        };
+        std::fs::remove_file(&delayed).unwrap();
+        let pipe = faulty_pipeline(
+            &dir,
+            FaultyAnalysis {
+                fails: |path, source| {
+                    (named(path, "two-streams.mov") && source.stream_index() == 0)
+                        .then(|| crate::DecodeError::Incomplete("stream 0 is unreadable".into()))
+                },
+                windows_fail: true,
+            },
+        );
+        let result = pipe
+            .synchronize(
+                &[PipelineInput::Media(dir.clone())],
+                &[],
+                &PipelineOptions::default(),
+                None,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(
+            result.project.warnings.is_empty(),
+            "{:?}",
+            result.project.warnings
+        );
+        assert_eq!(result.matches.len(), 1);
+        assert!((result.matches[0].offset.as_seconds().abs() - 1.024).abs() < 0.001);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Clips finish analysis in any order; the completed count the progress
+    /// bar shows must still only grow. The listener holds odd counts for a
+    /// moment: if two workers could publish at once, the next count would
+    /// overtake it.
+    #[test]
+    fn analysis_progress_never_goes_backwards() {
+        let dir = fixture_dir("analysis-progress");
+        for index in 0..16 {
+            write_mono_wav(&dir, &format!("{index:03}.wav"), &noise(4_800, index));
+        }
+        let pipe = Pipeline::new_in(BackendKind::Portable, Some(dir.join(".cache")));
+        let counts = std::sync::Mutex::new(Vec::new());
+        let progress = |event: PipelineProgress| {
+            if event.phase == Phase::Fingerprint && event.current.is_some() {
+                if event.completed % 2 == 1 {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                counts.lock().unwrap().push(event.completed);
+            }
+        };
+        pipe.synchronize(
+            &[PipelineInput::Media(dir.clone())],
+            &[],
+            &PipelineOptions::default(),
+            Some(&progress),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(counts.into_inner().unwrap(), (1..=16).collect::<Vec<_>>());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

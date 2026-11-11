@@ -4,12 +4,18 @@
 
 Align discovers WAV, AIF/AIFF, M4A, MP3, M4V, MOV, MP4, MTS, MXF, and R3D
 paths. An accepted extension does not guarantee that the installed decoder
-supports the file's codec. Unsupported or unreadable media produces a warning or
-an error; inspect the result before exporting.
+supports the file's codec. When the built-in decoder fails on a file's audio
+during analysis, FFmpeg decodes it again where FFmpeg is available. A file is
+named in a warning and left out of synchronization only when its media or
+audio still cannot be read; the other files are still synchronized. Inspect
+the warnings before exporting.
 
 On macOS, the default backend uses AVFoundation. The portable backend reads
 MOV/MP4/M4V headers natively, decodes WAV, AIFF, MP3, AAC, ALAC, and PCM with
-Symphonia, and uses FFmpeg for other containers (MTS, MXF, R3D) and codecs.
+Symphonia, and uses FFmpeg for other containers (MTS, MXF, R3D) and for
+streams Symphonia decodes incorrectly, such as HE-AAC. When Symphonia decodes,
+a damaged audio packet becomes silence of the same length, so the rest of the
+file keeps its timing.
 Set `ALIGN_BACKEND=portable` to select it on macOS. Video metadata is inspected
 for timing; synchronization does not decode video frames.
 

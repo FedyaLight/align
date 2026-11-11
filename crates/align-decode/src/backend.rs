@@ -35,7 +35,7 @@ impl BackendKind {
     /// must not assume it).
     pub fn cache_tag(&self) -> &'static str {
         match self {
-            BackendKind::Portable => "portable3",
+            BackendKind::Portable => "portable4",
             BackendKind::AppleNative => "apple3",
         }
     }

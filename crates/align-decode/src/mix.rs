@@ -11,17 +11,37 @@ use crate::backend::MediaBackend;
 const SAMPLE_RATE_16K: f64 = 16_000.0;
 const IO_SAMPLES: usize = 32_768;
 
+pub(crate) type Consumer<'a> = &'a mut dyn FnMut(&[f32]) -> Result<(), DecodeError>;
+
 pub(crate) fn decode_all_streams_mono_8k(
     backend: &dyn MediaBackend,
     path: &Path,
     stream_count: usize,
-    consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
+    consume: Consumer,
+) -> Result<(), DecodeError> {
+    mix_streams_mono_8k(
+        path,
+        stream_count,
+        &|index, consume| {
+            backend.decode_mono_8k(path, AudioAnalysisSource::MixedStream(index), consume)
+        },
+        consume,
+    )
+}
+
+/// Mixes every stream, each decoded to 8 kHz mono with its channels mixed by
+/// `decode_stream`.
+pub(crate) fn mix_streams_mono_8k(
+    path: &Path,
+    stream_count: usize,
+    decode_stream: &dyn Fn(usize, Consumer) -> Result<(), DecodeError>,
+    consume: Consumer,
 ) -> Result<(), DecodeError> {
     if stream_count == 0 {
         return Err(DecodeError::NoAudio(path.display().to_string()));
     }
     if stream_count == 1 {
-        return backend.decode_mono_8k(path, AudioAnalysisSource::MixedStream(0), consume);
+        return decode_stream(0, consume);
     }
 
     // Decode streams sequentially so one clip still occupies one media-reader
@@ -31,38 +51,34 @@ pub(crate) fn decode_all_streams_mono_8k(
     for index in 0..stream_count {
         let mut cursor = 0_u64;
         let mut bytes = Vec::new();
-        backend.decode_mono_8k(
-            path,
-            AudioAnalysisSource::MixedStream(index),
-            &mut |samples| {
-                if samples.is_empty() {
-                    return Ok(());
+        decode_stream(index, &mut |samples| {
+            if samples.is_empty() {
+                return Ok(());
+            }
+            bytes.resize(samples.len() * 4, 0);
+            sum.seek(SeekFrom::Start(cursor * 4))?;
+            let mut read = 0;
+            while read < bytes.len() {
+                match sum.read(&mut bytes[read..])? {
+                    0 => break,
+                    count => read += count,
                 }
-                bytes.resize(samples.len() * 4, 0);
-                sum.seek(SeekFrom::Start(cursor * 4))?;
-                let mut read = 0;
-                while read < bytes.len() {
-                    match sum.read(&mut bytes[read..])? {
-                        0 => break,
-                        count => read += count,
-                    }
-                }
-                sum.seek(SeekFrom::Start(cursor * 4))?;
-                for (sample_index, sample) in samples.iter().enumerate() {
-                    let offset = sample_index * 4;
-                    let previous = if offset + 4 <= read {
-                        f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
-                    } else {
-                        0.0
-                    };
-                    bytes[offset..offset + 4].copy_from_slice(&(previous + sample).to_le_bytes());
-                }
-                sum.write_all(&bytes)?;
-                cursor += samples.len() as u64;
-                max_samples = max_samples.max(cursor);
-                Ok(())
-            },
-        )?;
+            }
+            sum.seek(SeekFrom::Start(cursor * 4))?;
+            for (sample_index, sample) in samples.iter().enumerate() {
+                let offset = sample_index * 4;
+                let previous = if offset + 4 <= read {
+                    f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+                } else {
+                    0.0
+                };
+                bytes[offset..offset + 4].copy_from_slice(&(previous + sample).to_le_bytes());
+            }
+            sum.write_all(&bytes)?;
+            cursor += samples.len() as u64;
+            max_samples = max_samples.max(cursor);
+            Ok(())
+        })?;
     }
 
     sum.seek(SeekFrom::Start(0))?;
