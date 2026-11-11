@@ -18,6 +18,10 @@ platform; other containers need FFmpeg.
 
 ## Timeline interchange
 
+An XML file is imported as a timeline only when it is an FCP 7 XML or FCPXML
+document. The XML metadata that cameras write beside each clip is skipped,
+like other files that are not media.
+
 | Format | Import | Export | Notes |
 | --- | --- | --- | --- |
 | FCP 7 XML | Yes | Yes | Separate Premiere and Resolve writers; selected editing metadata can be preserved. |

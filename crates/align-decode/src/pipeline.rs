@@ -178,7 +178,7 @@ impl std::fmt::Display for PipelineError {
             Self::NoMedia => write!(f, "No readable audio or video media was found."),
             Self::Inaccessible(p) => write!(f, "Cannot access {}.", p.display()),
             Self::MultipleTimelines => write!(f, "Add one timeline at a time."),
-            Self::Timeline(msg) => write!(f, "Timeline import: {msg}."),
+            Self::Timeline(msg) => write!(f, "Timeline import: {}.", msg.trim_end_matches('.')),
             Self::Cancelled => write!(f, "Cancelled."),
             Self::Decode(e) => write!(f, "Decode error: {e}."),
         }
@@ -1269,25 +1269,16 @@ fn expand(inputs: &[PipelineInput]) -> Result<ExpandedInputs, PipelineError> {
                     visit_dir(path, &mut media)?;
                     continue;
                 }
-                match path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.to_lowercase())
-                {
-                    Some(e) if e == "xml" || e == "fcpxml" || e == "aaf" => {
-                        if timeline.is_some() {
-                            return Err(PipelineError::MultipleTimelines);
-                        }
-                        timeline = Some(TimelineRequest {
-                            path: path.clone(),
-                            sequence: None,
-                        });
+                if crate::timeline::is_supported(path) {
+                    if timeline.is_some() {
+                        return Err(PipelineError::MultipleTimelines);
                     }
-                    _ => {
-                        if crate::is_supported(path) {
-                            media.push(normalize(path));
-                        }
-                    }
+                    timeline = Some(TimelineRequest {
+                        path: path.clone(),
+                        sequence: None,
+                    });
+                } else if crate::is_supported(path) {
+                    media.push(normalize(path));
                 }
             }
         }
@@ -2829,16 +2820,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Canon writes clip metadata as XML beside each clip. Selecting a clip
+    /// with its XML used to import the XML as a timeline and stop the run.
+    #[test]
+    fn camera_metadata_xml_beside_media_is_not_a_timeline() {
+        let dir = fixture_dir("camera-xml");
+        let body = noise(12 * 44100, 0xCA70);
+        let a = write_delayed_wav(&dir, "A001C001.wav", &body, 0.0);
+        let b = write_delayed_wav(&dir, "recorder.wav", &body, 1.024);
+        let xml = dir.join("A001C001_220129AB_CANON.XML");
+        std::fs::write(
+            &xml,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Clip><ClipName>A001C001</ClipName></Clip>\n",
+        )
+        .unwrap();
+        let pipe = Pipeline::new_in(BackendKind::Portable, Some(dir.join(".cache")));
+        let result = pipe
+            .synchronize(
+                &[
+                    PipelineInput::Media(a),
+                    PipelineInput::Media(xml),
+                    PipelineInput::Media(b),
+                ],
+                &[],
+                &PipelineOptions::default(),
+                None,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .expect("camera XML is skipped like other non-media files");
+        assert!(result.project.imported_timeline.is_none());
+        assert_eq!(result.matches.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Timeline import reads only UTF-8. A UTF-16 project added beside media
+    /// must say so rather than be skipped like camera metadata, or the run
+    /// would continue without the project.
+    #[test]
+    fn timelines_in_other_encodings_are_reported_not_skipped() {
+        let dir = fixture_dir("utf16-timeline");
+        let media = write_mono_wav(&dir, "tone.wav", &noise(48_000, 3));
+        let project = dir.join("edit.xml");
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<xmeml version=\"5\"/>"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        );
+        std::fs::write(&project, bytes).unwrap();
+        let pipe = Pipeline::new_in(BackendKind::Portable, Some(dir.join(".cache")));
+        let error = pipe
+            .open(&[PipelineInput::Media(media), PipelineInput::Media(project)])
+            .expect_err("the project is not skipped");
+        assert_eq!(
+            error.to_string(),
+            "Timeline import: Cannot read timeline edit.xml."
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn xml_inputs_are_explicit_not_silent() {
         let dir = fixture_dir("xml");
         let xml = dir.join("edit.xml");
         std::fs::write(&xml, "<xmeml></xmeml>").unwrap();
         let pipe = Pipeline::new_in(BackendKind::Portable, Some(dir.join(".cache")));
-        // A sequence-less file errors explicitly (no silent empty result).
+        // A sequence-less file added as a path is still recognized as a
+        // timeline and errors explicitly (no silent empty result).
         let err = pipe
             .synchronize(
-                &[PipelineInput::Timeline(xml)],
+                &[PipelineInput::Media(xml)],
                 &[],
                 &PipelineOptions::default(),
                 None,
@@ -2846,6 +2897,10 @@ mod tests {
             )
             .expect_err("xml must not silently pass");
         assert!(matches!(err, PipelineError::Timeline(_)));
+        assert_eq!(
+            err.to_string(),
+            "Timeline import: No FCP 7 XML sequence was found in edit.xml."
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

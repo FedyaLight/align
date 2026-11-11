@@ -241,6 +241,10 @@ pub struct AppData {
     pub show_sequence_results: bool,
     pub appearance: crate::theme::AppearancePreference,
     pub inputs: Vec<PathBuf>,
+    /// Inputs recognized as editing timelines when they were added.
+    /// Recognizing an XML timeline reads the file, so rendering and later
+    /// checks use this instead.
+    pub timeline_inputs: HashSet<PathBuf>,
     pub clips: Vec<ClipRow>,
     pub selection: HashSet<PathBuf>,
     pub island_count: usize,
@@ -320,6 +324,7 @@ impl Default for AppData {
     fn default() -> Self {
         Self {
             inputs: Vec::new(),
+            timeline_inputs: HashSet::new(),
             appearance: crate::theme::AppearancePreference::load(),
             common_settings: Default::default(),
             sequence_settings: HashMap::new(),
@@ -701,11 +706,13 @@ impl AppData {
     pub fn add_paths(&mut self, paths: Vec<PathBuf>) {
         let existing: HashSet<PathBuf> = self.clips.iter().map(|c| c.url.clone()).collect();
         let mut additions = Vec::new();
+        let mut timelines = Vec::new();
         for path in paths.iter().cloned() {
             if existing.contains(&path) || additions.iter().any(|r: &ClipRow| r.url == path) {
                 continue;
             }
-            if is_timeline(&path)
+            let timeline = is_timeline(&path);
+            if timeline
                 && !self.timeline_choices.contains_key(&path)
                 && let Ok(summaries) = align_decode::timeline::sequences(
                     &path,
@@ -718,6 +725,9 @@ impl AppData {
                     options: summaries,
                 });
                 continue;
+            }
+            if timeline {
+                timelines.push(path.clone());
             }
             additions.push(ClipRow {
                 clip_id: None,
@@ -736,6 +746,7 @@ impl AppData {
             return;
         }
         self.inputs.extend(additions.iter().map(|r| r.url.clone()));
+        self.timeline_inputs.extend(timelines);
         self.clips.extend(additions.iter().cloned());
         self.clips
             .sort_by(|a, b| a.url.to_string_lossy().cmp(&b.url.to_string_lossy()));
@@ -774,6 +785,7 @@ impl AppData {
         self.waveform_previews
             .retain(|clip_id, _| !removed_ids.contains(clip_id));
         self.inputs.retain(|u| !selected.contains(u));
+        self.timeline_inputs.retain(|u| !selected.contains(u));
         for url in &selected {
             self.timeline_choices.remove(url);
         }
@@ -862,6 +874,7 @@ impl AppData {
             });
             self.clips
                 .sort_by(|a, b| a.url.to_string_lossy().cmp(&b.url.to_string_lossy()));
+            self.timeline_inputs.insert(url.clone());
             self.inputs.push(url);
             self.pending_count += 1;
         }
@@ -1797,7 +1810,7 @@ impl AppData {
     }
 
     pub fn can_locate_timeline_media(&self) -> bool {
-        self.inputs.iter().any(|path| is_timeline(path))
+        !self.timeline_inputs.is_empty()
             && (self.has_missing_media_warning()
                 || self.error.as_deref() == Some("No readable audio or video media was found."))
     }
@@ -1878,7 +1891,7 @@ impl AppData {
             .chain(
                 self.clips
                     .iter()
-                    .filter(|clip| !is_timeline(&clip.url))
+                    .filter(|clip| !self.timeline_inputs.contains(&clip.url))
                     .map(|clip| clip.url.clone()),
             )
             .collect();
@@ -1895,7 +1908,7 @@ impl AppData {
     pub fn path_repair_source(&self) -> Option<&std::path::Path> {
         self.inputs
             .iter()
-            .find(|path| align_decode::timeline::is_supported(path))
+            .find(|path| self.timeline_inputs.contains(*path))
             .map(PathBuf::as_path)
     }
 
@@ -1962,7 +1975,7 @@ impl AppData {
         self.inputs
             .iter()
             .map(|path| {
-                if !is_timeline(path) {
+                if !self.timeline_inputs.contains(path) {
                     return PipelineInput::Media(path.clone());
                 }
                 match selected.or_else(|| {
@@ -2559,6 +2572,8 @@ mod tests {
         packed_other_source.source_key = "/other".to_string();
         let mut data = AppData::default();
         data.inputs.push(PathBuf::from("/tmp/project.xml"));
+        data.timeline_inputs
+            .insert(PathBuf::from("/tmp/project.xml"));
         data.timeline_choices
             .insert(PathBuf::from("/tmp/project.xml"), vec![3, 8]);
         data.lanes = vec![LaneVisual {
@@ -2665,6 +2680,7 @@ mod tests {
 
         let mut data = AppData {
             inputs: vec![PathBuf::from("/tmp/project.xml")],
+            timeline_inputs: [PathBuf::from("/tmp/project.xml")].into_iter().collect(),
             timeline_choices: [(PathBuf::from("/tmp/project.xml"), vec![3, 8])]
                 .into_iter()
                 .collect(),
@@ -2952,6 +2968,7 @@ mod tests {
             vec!["jpg", "png", "wav"]
         );
         data.inputs.insert(0, PathBuf::from("/v/edit.fcpxml"));
+        data.timeline_inputs.insert(PathBuf::from("/v/edit.fcpxml"));
         assert_eq!(
             data.path_repair_source(),
             Some(std::path::Path::new("/v/edit.fcpxml"))
@@ -2986,6 +3003,7 @@ mod tests {
     fn only_actionable_missing_media_warnings_offer_relink() {
         let mut data = AppData::default();
         data.inputs.push(PathBuf::from("/v/cut.xml"));
+        data.timeline_inputs.insert(PathBuf::from("/v/cut.xml"));
         data.warnings
             .push("camera.mov: Variable frame rate detected.".into());
         assert!(!data.has_missing_media_warning());
