@@ -327,12 +327,20 @@ fn open_stream(path: &Path, stream_index: usize) -> Result<Stream, DecodeError> 
         .map(|c| c.count())
         .or_else(|| Some(movie_track.as_ref()?.audio.as_ref()?.channels))
         .unwrap_or(0);
-    let lead = movie_track
-        .as_ref()
-        .filter(|t| t.timescale > 0)
-        .map_or(0, |t| {
-            (t.media_start as f64 * sample_rate as f64 / t.timescale as f64).round() as u64
-        });
+    // MP3's LAME header records the encoder and decoder delay, which
+    // Symphonia reports and FFmpeg trims. Only the start is trimmed here:
+    // Symphonia's gapless mode would also cut the end at a frame count that
+    // files without a Xing header merely estimate.
+    let lead = if is_iso_media(path) {
+        movie_track
+            .as_ref()
+            .filter(|t| t.timescale > 0)
+            .map_or(0, |t| {
+                (t.media_start as f64 * sample_rate as f64 / t.timescale as f64).round() as u64
+            })
+    } else {
+        u64::from(track.codec_params.delay.unwrap_or(0))
+    };
     let is_pcm = symphonia::default::get_codecs()
         .get_codec(track.codec_params.codec)
         .is_some_and(|codec| codec.short_name.starts_with("pcm"));
@@ -759,26 +767,104 @@ mod edit_list_tests {
         samples.iter().position(|s| s.abs() > 0.3)
     }
 
-    /// AAC in MP4 and M4A carries encoder priming in the edit list.
-    /// In-process decoding must place audio exactly where FFmpeg (which
-    /// applies the edit list) does, both from the head and after a seek.
+    /// Encoders prime their output: AAC in MP4 and M4A records it in the
+    /// edit list, MP3 in its LAME header. In-process decoding must place
+    /// audio exactly where FFmpeg (which applies both) does, from the head
+    /// and after a seek.
     #[test]
-    fn aac_priming_matches_ffmpeg_timing() {
-        for name in ["camera.mp4", "voice.m4a"] {
-            aac_priming_case(name);
+    fn encoder_priming_matches_ffmpeg_timing() {
+        let click = "aevalsrc='if(between(t,1.5,1.502),0.9,0)':s=48000:d=4";
+        let dir = tempfile::tempdir().unwrap();
+        let clips = [
+            super::test_media::aac_clip(dir.path(), "camera.mp4", click),
+            super::test_media::aac_clip(dir.path(), "voice.m4a", click),
+            super::test_media::encoded_clip(
+                dir.path(),
+                "voice.mp3",
+                click,
+                &["-c:a", "libmp3lame", "-b:a", "192k"],
+            ),
+        ];
+        for clip in clips.iter().flatten() {
+            priming_case(clip);
         }
     }
 
-    fn aac_priming_case(name: &str) {
+    fn native_length(path: &Path) -> usize {
+        let mut frames = 0;
+        decode_native(path, 0, 0.0, None, &mut |block| {
+            frames += block.frames[0].len();
+            Ok(())
+        })
+        .unwrap();
+        frames
+    }
+
+    fn ffmpeg_length(path: &Path) -> usize {
+        let mut frames = 0;
+        let mut pipe = crate::ff::AudioPipe::spawn(path, 0, None, 2).unwrap();
+        pipe.pump(&mut |samples| {
+            frames += samples.len() / 2;
+            Ok(())
+        })
+        .unwrap();
+        frames
+    }
+
+    /// Without a Xing header the frame count of a VBR MP3 is only an
+    /// estimate from its first frames. Trimming the end by that estimate
+    /// dropped the audio after a quiet stretch; the whole file must decode,
+    /// and a frame count that contradicts the LAME header must not break it.
+    #[test]
+    fn mp3_frame_counts_never_cut_audio() {
         let dir = tempfile::tempdir().unwrap();
-        let Some(clip) = super::test_media::aac_clip(
+        // Loud, then silent, then loud: the estimate from the loud opening
+        // is far too short.
+        let source = "anoisesrc=d=4.5:r=44100:a=0.5,volume='if(between(t,0.5,3.8),0,1)':eval=frame";
+        let Some(headerless) = super::test_media::encoded_clip(
             dir.path(),
-            name,
-            "aevalsrc='if(between(t,1.5,1.502),0.9,0)':s=48000:d=4",
+            "headerless.mp3",
+            source,
+            &["-c:a", "libmp3lame", "-q:a", "2", "-write_xing", "0"],
         ) else {
             return;
         };
-        assert!(can_decode(&clip, 0), "AAC must decode in-process");
+        let expected = ffmpeg_length(&headerless);
+        let decoded = native_length(&headerless);
+        assert!(
+            decoded.abs_diff(expected) <= 1152,
+            "{decoded} of {expected} frames"
+        );
+
+        let Some(tagged) = super::test_media::encoded_clip(
+            dir.path(),
+            "tagged.mp3",
+            source,
+            &["-c:a", "libmp3lame", "-q:a", "2"],
+        ) else {
+            return;
+        };
+        let full = native_length(&tagged);
+        // The Xing/Info tag: identifier, flags, then the frame count.
+        let mut data = std::fs::read(&tagged).unwrap();
+        let tag = data
+            .windows(4)
+            .position(|w| w == b"Xing" || w == b"Info")
+            .expect("Xing/Info tag");
+        assert_eq!(data[tag + 7] & 1, 1, "the tag records a frame count");
+        data[tag + 8..tag + 12].copy_from_slice(&1u32.to_be_bytes());
+        std::fs::write(&tagged, data).unwrap();
+        assert!(inspect(&tagged).is_ok());
+        assert_eq!(native_length(&tagged), full);
+    }
+
+    fn priming_case(clip: &Path) {
+        let clip = clip.to_path_buf();
+        assert!(
+            can_decode(&clip, 0),
+            "{} must decode in-process",
+            clip.display()
+        );
         let reference = {
             let mut out = Vec::new();
             let mut pipe = crate::ff::AudioPipe::spawn(&clip, 0, None, 2).unwrap();
@@ -820,19 +906,39 @@ pub(crate) mod test_media {
     /// Stereo AAC in MP4 from an FFmpeg `lavfi` source, or `None` without an
     /// AAC encoder.
     pub(crate) fn aac_clip(dir: &Path, name: &str, source: &str) -> Option<PathBuf> {
+        // Without noise substitution, whose generator state would let one
+        // skipped packet change every later packet.
+        let codec = [
+            "-movflags",
+            "+faststart",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-aac_pns",
+            "0",
+        ];
+        encoded_clip(dir, name, source, &codec)
+    }
+
+    /// Stereo audio from an FFmpeg `lavfi` source with the given codec
+    /// arguments, or `None` without that encoder.
+    pub(crate) fn encoded_clip(
+        dir: &Path,
+        name: &str,
+        source: &str,
+        codec: &[&str],
+    ) -> Option<PathBuf> {
         let ffmpeg = crate::ff::ffmpeg_bin()?;
         let clip = dir.join(name);
         let ok = std::process::Command::new(ffmpeg)
-            .args(["-v", "error", "-y", "-f", "lavfi", "-i", source])
-            .args(["-movflags", "+faststart"])
-            // Without noise substitution, whose generator state would let
-            // one skipped packet change every later packet.
-            .args(["-ac", "2", "-c:a", "aac", "-b:a", "192k", "-aac_pns", "0"])
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", source, "-ac", "2"])
+            .args(codec)
             .arg(&clip)
             .status()
             .is_ok_and(|s| s.success());
         if !ok {
-            eprintln!("SKIP: no AAC encoder");
+            eprintln!("SKIP: no encoder for {name}");
         }
         ok.then_some(clip)
     }
