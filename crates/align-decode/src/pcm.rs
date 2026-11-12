@@ -193,6 +193,7 @@ impl PcmTrack {
                 channels: self.channels,
                 bit_depth: Some(self.bits),
                 is_float: Some(self.float),
+                decoder_delay: 0.0,
             }],
             has_video: false,
             video: None,

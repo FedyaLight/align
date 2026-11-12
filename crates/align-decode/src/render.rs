@@ -77,10 +77,12 @@ pub(crate) fn check_cancel(cancel: &AtomicBool) -> Result<(), RenderError> {
     }
 }
 
-/// A camera's last audio sample may precede its last video frame. After a
-/// successful decode, fill only that sub-frame gap at the container's end.
-/// Never conceal truncated audio-only files or missing audio inside an edit.
-fn finish_video_tail(
+/// A camera's last audio sample may precede its last video frame, and audio
+/// whose decoder delay is trimmed from its start (AC-3 in MPEG-TS) ends that
+/// many samples before its container. After a successful decode, fill only
+/// those gaps at the container's end. Never conceal truncated audio or
+/// missing audio inside an edit.
+fn finish_tail(
     writer: &mut WavWriter,
     probe: &crate::backend::ProbeReport,
     end_seconds: f64,
@@ -91,14 +93,22 @@ fn finish_video_tail(
     if remaining == 0 {
         return Ok(());
     }
-    let frame_duration = probe
-        .video
-        .as_ref()
-        .and_then(|v| v.frame_duration)
-        .map_or(0.001, |t| t.as_seconds());
-    if !probe.has_video
-        || (end_seconds - probe.duration_seconds).abs() > 1.0 / sample_rate
-        || remaining as f64 > (frame_duration * sample_rate).ceil()
+    let delay = probe
+        .audio_streams
+        .first()
+        .map_or(0.0, |s| (s.decoder_delay * sample_rate).round());
+    let frame = if probe.has_video {
+        let frame_duration = probe
+            .video
+            .as_ref()
+            .and_then(|v| v.frame_duration)
+            .map_or(0.001, |t| t.as_seconds());
+        (frame_duration * sample_rate).ceil()
+    } else {
+        0.0
+    };
+    if (end_seconds - probe.duration_seconds).abs() > 1.0 / sample_rate
+        || remaining as f64 > delay + frame
     {
         return Err(RenderError::CannotRead);
     }
@@ -668,7 +678,7 @@ pub fn render_pad_cancellable(
             })
             .map_err(RenderError::from)?;
         if let (Some(n), Some((_, end))) = (remaining, selection) {
-            finish_video_tail(
+            finish_tail(
                 &mut writer,
                 &probe,
                 end as f64 / sample_rate,
@@ -796,7 +806,7 @@ pub fn render_channel_cancellable(
                 )
                 .map_err(RenderError::from)?;
         }
-        finish_video_tail(
+        finish_tail(
             &mut writer,
             &probe,
             source_start.max(0.0) + duration,
@@ -1144,22 +1154,57 @@ mod tests {
         let dst = dir.join("tail.wav");
         let mut writer = WavWriter::create(&dst, 48000, 2, false).unwrap();
         assert_eq!(
-            finish_video_tail(&mut writer, &probe, 1.0, 6, 48000.0, 2),
+            finish_tail(&mut writer, &probe, 1.0, 6, 48000.0, 2),
             Err(RenderError::CannotRead)
         );
         probe.has_video = true;
         assert_eq!(
-            finish_video_tail(&mut writer, &probe, 0.9, 6, 48000.0, 2),
+            finish_tail(&mut writer, &probe, 0.9, 6, 48000.0, 2),
             Err(RenderError::CannotRead)
         );
         assert_eq!(
-            finish_video_tail(&mut writer, &probe, 1.0, 4800, 48000.0, 2),
+            finish_tail(&mut writer, &probe, 1.0, 4800, 48000.0, 2),
             Err(RenderError::CannotRead)
         );
-        finish_video_tail(&mut writer, &probe, 1.0, 6, 48000.0, 2).unwrap();
+        finish_tail(&mut writer, &probe, 1.0, 6, 48000.0, 2).unwrap();
         writer.finalize().unwrap();
         assert_eq!(read_pad_samples(&dst), vec![0.0; 12]);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// AC-3 in MPEG-TS decodes 256 samples late. Trimming them leaves the
+    /// container's last 256 samples without audio, yet a stem of the whole
+    /// file keeps the container's length and its audio stays on time.
+    #[test]
+    fn stems_of_audio_with_a_trimmed_decoder_delay_keep_their_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("recorder.mts");
+        if !crate::ff::write_ac3_transport_stream(&source, 0.5, 1.0) {
+            return;
+        }
+        let backend = crate::portable::PortableBackend;
+        let probe = backend.inspect(&source).unwrap();
+        assert!(!probe.has_video);
+        let stem = dir.path().join("stem.wav");
+        render_channel_cancellable(
+            &backend,
+            &source,
+            &stem,
+            0,
+            None,
+            false,
+            0.0,
+            probe.duration_seconds,
+            0,
+            &NEVER_CANCELLED,
+        )
+        .unwrap();
+        let samples = read_pad_samples(&stem);
+        assert_eq!(
+            samples.len(),
+            (probe.duration_seconds * 48_000.0).round() as usize
+        );
+        assert!(crate::ff::click_at(&samples).abs_diff(24_000) <= 2);
     }
 
     #[test]

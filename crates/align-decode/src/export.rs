@@ -1031,6 +1031,13 @@ fn export_media_file(
     }
     let ffmpeg = crate::ff::ffmpeg_bin()
         .ok_or_else(|| ExportError::Media("ffmpeg not found in PATH.".into()))?;
+    // FFmpeg decodes the recorder here, so trim the decoder delay its output
+    // keeps (AC-3 in MPEG-TS), as the backends do.
+    let decoder_delay = crate::ff::inspect(&plan.recorder_url)
+        .map_err(|error| ExportError::Media(format!("{}: {error}", plan.recorder_url.display())))?
+        .audio_streams
+        .first()
+        .map_or(0.0, |stream| stream.decoder_delay);
     let delay_samples = (plan.leading_silence.max(0.0) * 48_000.0).round() as u64;
     let filter = format!(
         "[1:a:0]atrim=duration={:.9},asetpts=PTS-STARTPTS,aresample=48000,adelay={delay_samples}S:all=1,apad=whole_dur={:.9},atrim=duration={:.9}[clean]",
@@ -1039,7 +1046,11 @@ fn export_media_file(
     let mut child = crate::ff::command(ffmpeg)
         .args(["-y", "-v", "error", "-i"])
         .arg(&plan.video_url)
-        .args(["-ss", &format!("{:.9}", plan.recorder_source_in), "-i"])
+        .args([
+            "-ss",
+            &format!("{:.9}", plan.recorder_source_in + decoder_delay),
+            "-i",
+        ])
         .arg(&plan.recorder_url)
         .args(["-filter_complex", &filter])
         .args(["-map", "0:v:0", "-map", "[clean]"])
@@ -1676,5 +1687,57 @@ mod tests {
             .unwrap();
         assert!((24_000..24_100).contains(&first_signal));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FFmpeg remuxes cameras outside QuickTime and MP4 and then decodes the
+    /// recorder itself. It must trim the recorder's AC-3 decoder delay as the
+    /// backends do, or the clean audio lands 256 samples late.
+    #[test]
+    fn ffmpeg_remux_trims_the_recorder_decoder_delay() {
+        let Some(ffmpeg) = crate::ff::ffmpeg_bin() else {
+            eprintln!("SKIP: ffmpeg is unavailable");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("camera.mts");
+        let recorder = dir.path().join("recorder.mts");
+        let video_ok = crate::ff::command(&ffmpeg)
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+            .arg("color=c=black:s=160x90:r=25:d=2")
+            .args(["-c:v", "mpeg2video", "-f", "mpegts"])
+            .arg(&video)
+            .status()
+            .is_ok_and(|status| status.success());
+        if !video_ok || !crate::ff::write_ac3_transport_stream(&recorder, 0.25, 1.0) {
+            eprintln!("SKIP: fixture generation is unsupported by this ffmpeg");
+            return;
+        }
+        let plan = MediaFilePlan {
+            video_url: video,
+            recorder_url: recorder,
+            recorder_source_in: 0.1,
+            leading_silence: 0.5,
+            recorder_duration: 0.9,
+            video_duration: 2.0,
+            url: dir.path().join("out.mov"),
+        };
+
+        export_media_file(
+            &crate::portable::PortableBackend,
+            &plan,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+
+        let mut left = Vec::new();
+        crate::portable::PortableBackend
+            .decode_native(&plan.url, 0, None, &mut |block| {
+                left.extend_from_slice(&block.frames[0]);
+                Ok(())
+            })
+            .unwrap();
+        // 0.5 s of leading silence, then the click 0.15 s into the recorder.
+        let at = crate::ff::click_at(&left);
+        assert!(at.abs_diff(31_200) <= 2, "click at {at}");
     }
 }

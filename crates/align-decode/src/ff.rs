@@ -122,6 +122,13 @@ fn num(value: &serde_json::Value) -> Option<f64> {
 pub fn parse_ffprobe_json(json: &[u8]) -> Option<ProbeReport> {
     let v: serde_json::Value = serde_json::from_slice(json).ok()?;
     let streams = v.get("streams")?.as_array()?;
+    // MPEG-TS records no edit list, so FFmpeg's output keeps AC-3's codec
+    // delay; in MP4 and MOV FFmpeg trims it through the edit list.
+    let transport_stream = v
+        .get("format")
+        .and_then(|f| f.get("format_name"))
+        .and_then(|n| n.as_str())
+        .is_some_and(|n| n.split(',').any(|n| n == "mpegts"));
     let mut audio_streams = Vec::new();
     let mut has_video = false;
     for s in streams {
@@ -135,14 +142,21 @@ pub fn parse_ffprobe_json(json: &[u8]) -> Option<ProbeReport> {
                 } else {
                     None
                 };
+                let sample_rate = num(s.get("sample_rate")?)?;
+                let decoder_delay = if transport_stream && matches!(codec, "ac3" | "eac3") {
+                    256.0 / sample_rate
+                } else {
+                    0.0
+                };
                 audio_streams.push(AudioStreamProbe {
-                    sample_rate: num(s.get("sample_rate")?)?,
+                    sample_rate,
                     channels: s.get("channels")?.as_u64()? as usize,
                     bit_depth: s
                         .get("bits_per_sample")
                         .and_then(|b| b.as_u64())
                         .map(|b| b as u32),
                     is_float,
+                    decoder_delay,
                 })
             }
             "video" => {
@@ -627,6 +641,9 @@ impl Drop for AudioPipeI32 {
     }
 }
 
+/// A window duration that reaches the end of any file.
+pub(crate) const WHOLE_FILE: f64 = 1e9;
+
 /// Full-file fallback decode to 8 kHz mono (fingerprint path).
 pub fn decode_mono_8k(
     path: &Path,
@@ -638,15 +655,15 @@ pub fn decode_mono_8k(
 ) -> Result<(), DecodeError> {
     // Native rate unknown here — inspect first (header-only, cheap).
     let probe = inspect(path)?;
-    let sample_rate = probe
+    let (sample_rate, delay) = probe
         .audio_streams
         .get(stream_index)
-        .map(|s| s.sample_rate)
-        .unwrap_or(0.0);
+        .map_or((0.0, 0.0), |s| (s.sample_rate, s.decoder_delay));
     if sample_rate <= 0.0 {
         return Err(DecodeError::InvalidPcm);
     }
-    let mut pipe = AudioPipe::spawn(path, stream_index, None, channels)?;
+    let window = (delay > 0.0).then_some((delay, WHOLE_FILE));
+    let mut pipe = AudioPipe::spawn(path, stream_index, window, channels)?;
     let mut mono = crate::mono::MonoPipe::new(
         sample_rate,
         8000.0,
@@ -675,17 +692,21 @@ pub fn decode_window(
     mix_channels: bool,
 ) -> Result<(f64, Vec<f32>), DecodeError> {
     let probe = inspect(path)?;
-    let sample_rate = probe
+    let (sample_rate, delay) = probe
         .audio_streams
         .get(stream_index)
-        .map(|s| s.sample_rate)
-        .unwrap_or(0.0);
+        .map_or((0.0, 0.0), |s| (s.sample_rate, s.decoder_delay));
     if sample_rate <= 0.0 {
         return Err(DecodeError::InvalidPcm);
     }
     let actual_start = start.max(0.0);
     let mut samples = Vec::new();
-    let mut pipe = AudioPipe::spawn(path, stream_index, Some((actual_start, duration)), channels)?;
+    let mut pipe = AudioPipe::spawn(
+        path,
+        stream_index,
+        Some((actual_start + delay, duration)),
+        channels,
+    )?;
     let mut mono = crate::mono::MonoPipe::new(
         sample_rate,
         16_000.0,
@@ -707,8 +728,67 @@ pub fn decode_window(
     Ok((actual_start, samples))
 }
 
+/// Write stereo 48 kHz AC-3 in MPEG-TS, silent except for a 2 ms click at
+/// `click` seconds. False (the test skips) without an AC-3 encoder.
+#[cfg(test)]
+pub(crate) fn write_ac3_transport_stream(path: &Path, click: f64, seconds: f64) -> bool {
+    let Some(ffmpeg) = ffmpeg_bin() else {
+        return false;
+    };
+    let source = format!(
+        "aevalsrc='if(between(t,{click},{}),0.9,0)':s=48000:d={seconds}",
+        click + 0.002
+    );
+    let ok = command(&ffmpeg)
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", &source])
+        .args(["-ac", "2", "-c:a", "ac3", "-b:a", "448k", "-f", "mpegts"])
+        .arg(path)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        eprintln!("SKIP: no AC-3 encoder");
+    }
+    ok
+}
+
+/// Index of the first sample of a `write_ac3_transport_stream` click.
+#[cfg(test)]
+pub(crate) fn click_at(samples: &[f32]) -> usize {
+    samples.iter().position(|s| s.abs() > 0.3).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
+    /// AC-3 decodes 256 samples late, and MPEG-TS records it nowhere (MP4
+    /// and MOV use an edit list, which FFmpeg applies). AVCHD audio must sit
+    /// where AVFoundation places it: on its timeline, not 5.3 ms early.
+    #[test]
+    fn ac3_in_transport_streams_starts_on_time() {
+        use crate::backend::MediaBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("00001.MTS");
+        if !write_ac3_transport_stream(&clip, 1.5, 4.0) {
+            return;
+        }
+        let backend = crate::portable::PortableBackend;
+        for start in [0.0, 0.7] {
+            let mut left = Vec::new();
+            let actual = backend
+                .decode_native(&clip, 0, Some((start, None)), &mut |block| {
+                    left.extend_from_slice(&block.frames[0]);
+                    Ok(())
+                })
+                .unwrap();
+            let at = click_at(&left) + (actual * 48_000.0).round() as usize;
+            assert!(at.abs_diff(72_000) <= 2, "from {start} s: click at {at}");
+        }
+        let (window_start, window) = backend
+            .decode_window_16k(&clip, 1.0, 1.0, align_core::AudioAnalysisSource::default())
+            .unwrap();
+        let at = window_start * 1000.0 + click_at(&window) as f64 / 16.0;
+        assert!((at - 1500.0).abs() < 0.3, "window click at {at} ms");
+    }
+
     #[test]
     fn pipe_fragments_preserve_complete_multichannel_frames() {
         for channels in [1, 2, 3, 6, 8] {

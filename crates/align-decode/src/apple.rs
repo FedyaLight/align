@@ -503,6 +503,7 @@ impl MediaBackend for AppleNativeBackend {
                 channels,
                 bit_depth,
                 is_float,
+                decoder_delay: 0.0,
             });
         }
         let video = video_probe(&asset)?;

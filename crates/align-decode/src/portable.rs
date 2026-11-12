@@ -71,7 +71,10 @@ impl MediaBackend for PortableBackend {
         let mut pipe = crate::ff::AudioPipe::spawn(
             path,
             stream_index,
-            Some((actual, duration.unwrap_or(1e9))),
+            Some((
+                actual + stream.decoder_delay,
+                duration.unwrap_or(crate::ff::WHOLE_FILE),
+            )),
             channels,
         )?;
         let ok = pipe.pump(&mut |frames| {
@@ -122,7 +125,10 @@ impl MediaBackend for PortableBackend {
         let mut pipe = crate::ff::AudioPipeI32::spawn(
             path,
             stream_index,
-            Some((actual, duration.unwrap_or(1e9))),
+            Some((
+                actual + stream.decoder_delay,
+                duration.unwrap_or(crate::ff::WHOLE_FILE),
+            )),
             channels,
         )?;
         let ok = pipe.pump(&mut |frames| {
