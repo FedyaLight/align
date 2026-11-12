@@ -177,11 +177,15 @@ fn write_bundle(
     if is_bundle(source) {
         copy_tree(source, staging.path(), Some(BUNDLE_DOCUMENT), cancel)?;
     }
-    let mut file =
-        std::fs::File::create(staging.path().join(BUNDLE_DOCUMENT)).map_err(write_error)?;
-    file.write_all(document)
-        .and_then(|()| file.sync_all())
-        .map_err(write_error)?;
+    // Closed before the rename: Windows refuses to move a folder holding an
+    // open file.
+    {
+        let mut file =
+            std::fs::File::create(staging.path().join(BUNDLE_DOCUMENT)).map_err(write_error)?;
+        file.write_all(document)
+            .and_then(|()| file.sync_all())
+            .map_err(write_error)?;
+    }
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(TimelineError::Cancelled);
     }
