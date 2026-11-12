@@ -6,8 +6,8 @@
 //! (via [`BackendWindowProvider`]) → graph solve → [`align_core::SyncResult`].
 //!
 //! Important implementation choices:
-//! - fingerprinting and refinement use four bounded workers with indexed
-//!   deterministic results;
+//! - inspection, fingerprinting and refinement use four bounded workers with
+//!   indexed deterministic results;
 //! - ClipIDs hash `path\0duration-micros`, using the same units across backends;
 //! - spanned-file, BWF/iXML/container/LTC timecode, FCP 7 XML and FCPXML
 //!   evidence join the same waveform-first graph without overriding a
@@ -26,6 +26,12 @@ use sha2::{Digest, Sha256};
 
 use crate::backend::{BackendKind, MediaBackend, default_backend};
 use crate::provider::BackendWindowProvider;
+
+/// Files inspected at once. Inspection waits on ffprobe processes and header
+/// reads, and the first time it sees an MXF or MTS file it reads the whole
+/// file to classify frame timing. The bound matches the fingerprint stage's
+/// four concurrent readers of external media.
+const INSPECT_WORKERS: usize = 4;
 
 // ------------------------------------------------------------ types
 
@@ -337,8 +343,9 @@ impl Pipeline {
         }
         let mut clips = Vec::new();
         let mut warnings = Vec::new();
-        for url in &urls {
-            match self.inspect_one(url) {
+        let inspected = self.inspect_all(&urls, None, &std::sync::atomic::AtomicBool::new(false));
+        for (url, outcome) in urls.iter().zip(inspected) {
+            match outcome {
                 Ok(clip) => clips.push(clip),
                 Err(e) => warnings.push(SyncWarning {
                     url: url.clone(),
@@ -369,8 +376,8 @@ impl Pipeline {
     /// Full pipeline: media files/dirs (+ optional one timeline) →
     /// [`align_core::SyncResult`].
     ///
-    /// Fingerprint decode and fine refine run on up to 4 workers with
-    /// deterministic indexed results; `progress`
+    /// Inspection, fingerprint decode and fine refine run on up to 4 workers
+    /// with deterministic indexed results; `progress`
     /// is shared across those threads, `cancel` is polled per clip,
     /// candidate and job.
     pub fn synchronize(
@@ -419,30 +426,15 @@ impl Pipeline {
         // ---- inspect
         let mut clips = Vec::new();
         let mut warnings = Vec::new();
-        for (i, url) in urls.iter().enumerate() {
-            if cancelled(cancel) {
-                return Err(PipelineError::Cancelled);
-            }
-            if let Some(p) = &progress {
-                p(PipelineProgress::basic(
-                    Phase::Inspect,
-                    i,
-                    urls.len(),
-                    Some(url.clone()),
-                ));
-            }
-            match self.inspect_one(url) {
+        let inspected = self.inspect_all(&urls, progress, cancel);
+        // Files already being inspected finish (or fail) after a
+        // cancellation; it must not turn into a missing-media error.
+        if cancelled(cancel) {
+            return Err(PipelineError::Cancelled);
+        }
+        for (url, outcome) in urls.iter().zip(inspected) {
+            match outcome {
                 Ok(clip) => {
-                    if let Some(p) = &progress {
-                        let mut event = PipelineProgress::basic(
-                            Phase::Inspect,
-                            clips.len(),
-                            urls.len(),
-                            Some(url.clone()),
-                        );
-                        event.discovered = Some(clip.clone());
-                        p(event);
-                    }
                     // Variable video timing does not affect audio sync,
                     // but constant-rate interchange needs a CFR transcode.
                     if let Some(video) = &clip.video {
@@ -461,6 +453,7 @@ impl Pipeline {
                     }
                     clips.push(clip);
                 }
+                Err(PipelineError::Cancelled) => return Err(PipelineError::Cancelled),
                 Err(e) => warnings.push(SyncWarning {
                     url: url.clone(),
                     message: e.to_string(),
@@ -766,6 +759,38 @@ impl Pipeline {
             unmatched: chosen.unmatched,
             matches: chosen.matches,
             temporal_policy: options.temporal.clone(),
+        })
+    }
+
+    /// Inspects files on bounded workers. Outcomes keep input order, so clips
+    /// and warnings never depend on which file finishes first; progress
+    /// reports each file as it starts and as it finishes.
+    fn inspect_all(
+        &self,
+        urls: &[PathBuf],
+        progress: Option<&(dyn Fn(PipelineProgress) + Send + Sync)>,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Vec<Result<Clip, PipelineError>> {
+        // Counting and publishing under one lock keeps the completed count
+        // monotonic for listeners such as the progress bar.
+        let done = std::sync::Mutex::new(0_usize);
+        let publish = |finished: bool, url: &PathBuf, discovered: Option<Clip>| {
+            let Some(p) = progress else { return };
+            let mut done = done.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *done += usize::from(finished);
+            let mut event =
+                PipelineProgress::basic(Phase::Inspect, *done, urls.len(), Some(url.clone()));
+            event.discovered = discovered;
+            p(event);
+        };
+        align_core::par_map(urls, INSPECT_WORKERS, |url| {
+            if cancelled(cancel) {
+                return Err(PipelineError::Cancelled);
+            }
+            publish(false, url, None);
+            let outcome = self.inspect_one(url);
+            publish(true, url, outcome.as_ref().ok().cloned());
+            outcome
         })
     }
 
@@ -1669,6 +1694,128 @@ mod tests {
                 None
             }
         }
+    }
+
+    /// Inspection that fails every file after `delay`; nothing else runs.
+    struct FailingInspect {
+        delay: std::time::Duration,
+    }
+
+    impl MediaBackend for FailingInspect {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Portable
+        }
+
+        fn inspect(&self, _: &Path) -> Result<crate::backend::ProbeReport, crate::DecodeError> {
+            std::thread::sleep(self.delay);
+            Err(crate::DecodeError::Incomplete("unreadable".into()))
+        }
+
+        fn decode_mono_8k(
+            &self,
+            _: &Path,
+            _: AudioAnalysisSource,
+            _: &mut dyn FnMut(&[f32]) -> Result<(), crate::DecodeError>,
+        ) -> Result<(), crate::DecodeError> {
+            unreachable!()
+        }
+
+        fn decode_window_16k(
+            &self,
+            _: &Path,
+            _: f64,
+            _: f64,
+            _: AudioAnalysisSource,
+        ) -> Result<(f64, Vec<f32>), crate::DecodeError> {
+            unreachable!()
+        }
+
+        fn decode_native(
+            &self,
+            _: &Path,
+            _: usize,
+            _: Option<(f64, Option<f64>)>,
+            _: &mut dyn FnMut(crate::backend::NativeBlock) -> Result<(), crate::DecodeError>,
+        ) -> Result<f64, crate::DecodeError> {
+            unreachable!()
+        }
+
+        fn decode_native_i32(
+            &self,
+            _: &Path,
+            _: usize,
+            _: Option<(f64, Option<f64>)>,
+            _: &mut dyn FnMut(crate::backend::NativeBlockI32) -> Result<(), crate::DecodeError>,
+        ) -> Result<f64, crate::DecodeError> {
+            unreachable!()
+        }
+    }
+
+    fn failing_inspection(tag: &str, files: usize, delay_ms: u64) -> (PathBuf, Pipeline) {
+        let dir = fixture_dir(tag);
+        for index in 0..files {
+            std::fs::write(dir.join(format!("{index:03}.wav")), b"").unwrap();
+        }
+        let pipe = Pipeline {
+            backend: Box::new(FailingInspect {
+                delay: std::time::Duration::from_millis(delay_ms),
+            }),
+            cache: FingerprintCache::with_backend(Some(dir.join(".cache")), "failing-inspect"),
+        };
+        (dir, pipe)
+    }
+
+    /// Cancelling while every worker is busy used to end as "no media" once
+    /// those files failed.
+    #[test]
+    fn cancelling_during_inspection_is_reported_as_cancelled() {
+        let (dir, pipe) = failing_inspection("cancel-inspection", INSPECT_WORKERS, 400);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            pipe.synchronize(
+                &[PipelineInput::Media(dir.clone())],
+                &[],
+                &PipelineOptions::default(),
+                None,
+                &cancel,
+            )
+        });
+        assert!(
+            matches!(result, Err(PipelineError::Cancelled)),
+            "{result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Workers finish in any order; the completed count the progress bar
+    /// shows must still only grow.
+    #[test]
+    fn inspection_progress_never_goes_backwards() {
+        let (dir, pipe) = failing_inspection("inspection-progress", 400, 0);
+        let counts = std::sync::Mutex::new(Vec::new());
+        let progress = |event: PipelineProgress| {
+            if event.phase == Phase::Inspect {
+                counts.lock().unwrap().push(event.completed);
+            }
+        };
+        let _ = pipe.synchronize(
+            &[PipelineInput::Media(dir.clone())],
+            &[],
+            &PipelineOptions::default(),
+            Some(&progress),
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        let counts = counts.into_inner().unwrap();
+        assert!(counts.len() > 400);
+        assert!(
+            counts.windows(2).all(|pair| pair[0] <= pair[1]),
+            "{counts:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
