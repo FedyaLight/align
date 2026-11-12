@@ -3,19 +3,36 @@ matching, timecode, and recording metadata.
 
 ## What's new in @VERSION@
 
-- **Media loads again on Windows.** Adding media on Windows could fail with
-  repeated "libwinpthread-1.dll was not found" errors, and reinstalling did not
-  help. The bundled FFmpeg tools needed a library the installer did not
-  include. They are now self-contained, and every Windows build is checked in a
-  clean folder before release.
-- **Report a Problem.** Help → Report a Problem… (in the Menu button on Windows
-  and Linux), About, and error dialogs open a GitHub bug form with the Align
-  version, operating system, and architecture already filled in. You review
-  and submit the issue yourself; recordings, file paths, and logs are not sent.
-  A small reminder appears once after each installation or update.
-- **Stricter CLI arguments.** `align-cli` no longer ignores extra paths after a
-  command: `export-json result.json out extra.wav` and `clear-cache extra.wav`
-  now stop with a usage error before doing anything.
+- **Damaged audio no longer stops synchronization.** On Windows and Linux, one
+  file with a damaged audio packet could stop the whole run with "Decode error:
+  symphonia: unexpected end of bitstream." The damaged part now becomes silence
+  of the same length, and the rest of the file synchronizes at its correct
+  offset. When Align's built-in decoder cannot read a file, FFmpeg reads it
+  again. A file neither can read is left out with a warning that names it, and
+  the other files still synchronize.
+- **MXF on macOS.** macOS could not read MXF: Canon XF-AVC, Sony XAVC and
+  other MXF clips were left out with "Decode error: invalid PCM." The macOS app
+  now includes a minimal FFmpeg (about 7 MB) and uses it only for MXF.
+- **Camera metadata XML is skipped.** Selecting camera clips together with the
+  XML files cameras write beside them stopped the run with "Add one timeline
+  at a time." Only FCP 7 XML and FCPXML documents are now imported as
+  timelines.
+- **Faster loading.** Each file is inspected with one ffprobe call instead of
+  up to three, four files at a time. With eight Canon C70 MXF clips and five
+  other files, reading metadata took 1.2 seconds instead of 24, and the
+  timecode of the MXF clips, which was missing before, is now read.
+- **FCPXML bundles.** `.fcpxmld` bundles from Final Cut Pro 10.6 and later
+  import as timelines, and Path Fixer saves a repaired bundle as a bundle.
+  Media paths relative to an FCPXML document now resolve from its folder.
+- **More accurate offsets on Windows and Linux.** MP3 files were placed 23 to
+  25 ms early, and AVCHD clips with AC-3 audio 5.3 ms early; both are now on
+  time. MXF is no longer mistaken for MP3 audio. MP4 files with HE-AAC audio,
+  which did not match at all, now match, though their offset can still be
+  about 60 ms off.
+
+On Windows and Linux, the first synchronization after the update analyses
+every file again, because fingerprints from the previous decoder are not
+reused.
 
 ## Downloads
 
