@@ -224,9 +224,8 @@ fn copy_tree(
             continue;
         }
         let target = to.join(entry.file_name());
-        let kind = entry.file_type().map_err(write_error)?;
         #[cfg(unix)]
-        if kind.is_symlink() {
+        if entry.file_type().map_err(write_error)?.is_symlink() {
             let link = std::fs::read_link(entry.path()).map_err(write_error)?;
             std::os::unix::fs::symlink(link, &target).map_err(write_error)?;
             continue;
