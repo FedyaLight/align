@@ -1421,7 +1421,7 @@ fn expand(inputs: &[PipelineInput]) -> Result<ExpandedInputs, PipelineError> {
     for input in inputs {
         match input {
             PipelineInput::Timeline(path) | PipelineInput::TimelineSequence(path, _) => {
-                if !path.is_file() {
+                if !(path.is_file() || crate::timeline::is_bundle(path) && path.is_dir()) {
                     return Err(PipelineError::Inaccessible(path.clone()));
                 }
                 if timeline.is_some() {
@@ -1439,7 +1439,8 @@ fn expand(inputs: &[PipelineInput]) -> Result<ExpandedInputs, PipelineError> {
             PipelineInput::Media(path) => {
                 let meta = std::fs::metadata(path)
                     .map_err(|_| PipelineError::Inaccessible(path.clone()))?;
-                if meta.is_dir() {
+                // An FCPXML bundle is a directory but one timeline.
+                if meta.is_dir() && !crate::timeline::is_bundle(path) {
                     visit_dir(path, &mut media)?;
                     continue;
                 }
@@ -1477,7 +1478,9 @@ fn visit_dir(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), PipelineError> {
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
-        if meta.is_dir() {
+        // A folder scan collects media; timelines inside it, including
+        // FCPXML bundles, are not opened or scanned.
+        if meta.is_dir() && !crate::timeline::is_bundle(&path) {
             visit_dir(&path, out)?;
         } else if meta.is_file() && crate::is_supported(&path) {
             out.push(normalize(&path));
@@ -3467,6 +3470,62 @@ mod tests {
             error.to_string(),
             "Timeline import: Cannot read timeline edit.xml."
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `.fcpxmld` bundle is a directory, but one timeline, not a folder of
+    /// media to scan.
+    #[test]
+    fn fcpxml_bundles_beside_media_are_imported_as_timelines() {
+        let dir = fixture_dir("fcpxml-bundle");
+        let media = write_mono_wav(&dir, "c.wav", &noise(48_000, 5));
+        let bundle = dir.join("Cut.fcpxmld");
+        std::fs::create_dir(&bundle).unwrap();
+        std::fs::write(
+            bundle.join("Info.fcpxml"),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<fcpxml version="1.10">
+<resources>
+<format id="r1" frameDuration="1/25s"/>
+<asset id="a1" hasAudio="1"><media-rep src="file://{}"/></asset>
+</resources>
+<library><event><project name="Proj">
+<sequence format="r1" name="Cut">
+<spine><asset-clip ref="a1" name="C" offset="0s" duration="25/25s" start="0s"/></spine>
+</sequence>
+</project></event></library>
+</fcpxml>"#,
+                media.display()
+            ),
+        )
+        .unwrap();
+        let pipe = Pipeline::new_in(BackendKind::Portable, Some(dir.join(".cache")));
+        let project = pipe
+            .open(&[
+                PipelineInput::Media(bundle.clone()),
+                PipelineInput::Media(media),
+            ])
+            .expect("bundle imports");
+        let timeline = project.imported_timeline.expect("imported timeline");
+        assert_eq!(timeline.name, "Proj", "read from the bundle's Info.fcpxml");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder scan collects media only; a bundle inside the folder is a
+    /// timeline, and its media are not loose clips.
+    #[test]
+    fn folder_scans_do_not_enter_fcpxml_bundles() {
+        let dir = fixture_dir("bundle-in-folder");
+        let loose = write_mono_wav(&dir, "a.wav", &noise(48_000, 6));
+        let bundle = dir.join("Cut.fcpxmld");
+        std::fs::create_dir_all(bundle.join("Media")).unwrap();
+        std::fs::write(bundle.join("Info.fcpxml"), "<fcpxml version=\"1.10\"/>").unwrap();
+        write_mono_wav(&bundle.join("Media"), "inside.wav", &noise(48_000, 7));
+        let pipe = Pipeline::new_in(BackendKind::Portable, Some(dir.join(".cache")));
+        let project = pipe.open(&[PipelineInput::Media(dir.clone())]).unwrap();
+        let urls: Vec<_> = project.clips.iter().map(|clip| clip.url.clone()).collect();
+        assert_eq!(urls, vec![loose]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

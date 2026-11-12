@@ -768,6 +768,19 @@ pub enum ImportError {
 }
 
 impl ImportError {
+    /// The same error naming `name` instead of the document read, e.g. an
+    /// FCPXML bundle instead of the `Info.fcpxml` inside it.
+    pub fn naming(self, name: &str) -> Self {
+        let name = name.to_string();
+        match self {
+            Self::NoSequence(_) => Self::NoSequence(name),
+            Self::MultipleSequences(_, count) => Self::MultipleSequences(name, count),
+            Self::InvalidSequence(_, index) => Self::InvalidSequence(name, index),
+            Self::NoMedia(_) => Self::NoMedia(name),
+            Self::Unreadable(_) => Self::Unreadable(name),
+        }
+    }
+
     fn filename(url: &Path) -> String {
         url.file_name()
             .and_then(|n| n.to_str())
@@ -887,11 +900,34 @@ pub fn timeline_sequence_summaries(
 /// Rewrite only media locations in FCP 7 XML or FCPXML. Unchanged events are
 /// copied verbatim by quick-xml; elements containing a changed location are
 /// re-escaped without rebuilding the timeline document.
+/// Where a rewritten document is written. Relative FCPXML media URLs resolve
+/// against `from`, the source document's folder. Those that would resolve
+/// differently from `to` and do not point into `copied` (a tree copied
+/// along with the document) become absolute file URLs.
+pub struct Relocation<'a> {
+    pub from: &'a Path,
+    pub to: &'a Path,
+    pub copied: Option<&'a Path>,
+}
+
+impl<'a> Relocation<'a> {
+    /// The document stays in its folder.
+    pub fn none(folder: &'a Path) -> Self {
+        Self {
+            from: folder,
+            to: folder,
+            copied: None,
+        }
+    }
+}
+
 pub fn rewrite_media_paths(
     source: &[u8],
     replacements: &[(PathBuf, PathBuf)],
+    relocation: &Relocation<'_>,
 ) -> Result<Vec<u8>, ImportError> {
-    if replacements.is_empty() {
+    let moves = relocation.from != relocation.to;
+    if replacements.is_empty() && !moves {
         return Ok(source.to_vec());
     }
     let replacement_for = |value: &str, file_url_only: bool| {
@@ -899,11 +935,17 @@ pub fn rewrite_media_paths(
         let path = if file_url_only {
             local_file_path(value)?
         } else {
-            fcpxml_url(value)
+            fcpxml_url(value, relocation.from)
         };
-        replacements
+        if let Some(new) = replacements
             .iter()
             .find_map(|(old, new)| (old == &path).then(|| crate::model::file_url(new)))
+        {
+            return Some(new);
+        }
+        let relative = !file_url_only && !value.contains("://");
+        let still_resolves = !moves || relocation.copied.is_some_and(|tree| path.starts_with(tree));
+        (relative && !still_resolves).then(|| crate::model::file_url(&path))
     };
     let mut reader = Reader::from_reader(source);
     reader.config_mut().trim_text(false);
@@ -2555,16 +2597,40 @@ fn inside_media(doc: &XmlDoc, mut idx: usize) -> bool {
     false
 }
 
-fn fcpxml_url(src: &str) -> PathBuf {
+/// An FCPXML media location: a file URL, or a URL relative to the folder of
+/// the document (`base`), which FCPXML allows. Other URL schemes are kept.
+fn fcpxml_url(src: &str, base: &Path) -> PathBuf {
     if let Some(rest) = src.strip_prefix("file://") {
         let rest = rest
             .strip_prefix("localhost/")
             .or_else(|| rest.strip_prefix("localhost"))
             .unwrap_or(rest);
         decoded_file_url_path(rest)
-    } else {
+    } else if src.contains("://") {
         PathBuf::from(src)
+    } else {
+        relative_to(base, &percent_decode(src))
     }
+}
+
+/// `relative` resolved lexically against `base` (`.` and `..` folded).
+fn relative_to(base: &Path, relative: &str) -> PathBuf {
+    use std::path::Component;
+    let relative = Path::new(relative);
+    if relative.is_absolute() {
+        return relative.to_path_buf();
+    }
+    let mut resolved = base.to_path_buf();
+    for component in relative.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            other => resolved.push(other),
+        }
+    }
+    resolved
 }
 
 fn read_fcpxml(
@@ -2637,6 +2703,8 @@ fn read_fcpxml(
         depth: usize,
     }
 
+    // FCPXML media URLs may be relative to the document's folder.
+    let base = path.parent().unwrap_or_else(|| Path::new(""));
     let mut assets: HashMap<String, AssetInfo> = HashMap::new();
     let mut stack = vec![doc.root];
     while let Some(n) = stack.pop() {
@@ -2670,7 +2738,7 @@ fn read_fcpxml(
                         assets.insert(
                             id.to_string(),
                             AssetInfo {
-                                url: fcpxml_url(src),
+                                url: fcpxml_url(src, base),
                                 has_video: doc.attr(c, "hasVideo") != Some("0"),
                                 has_audio: doc.attr(c, "hasAudio") != Some("0"),
                             },
@@ -3426,6 +3494,26 @@ fn read_fcpxml(
 mod tests {
     use super::*;
 
+    /// FCPXML may locate media relative to the document's folder, with
+    /// percent-encoding; they must not resolve against the working directory.
+    #[test]
+    fn fcpxml_media_may_be_relative_to_the_document() {
+        let dir = std::env::temp_dir().join(format!("align-relative-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cut.fcpxml");
+        std::fs::write(
+            &path,
+            FCPXML.replace("file:///tmp/c.mov", "Media/my%20clip.mov"),
+        )
+        .unwrap();
+        let draft = read_timeline(&path, None).unwrap();
+        assert_eq!(
+            draft.media_urls(),
+            vec![dir.join("Media").join("my clip.mov")]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Editor exports start with a declaration, a DOCTYPE and sometimes
     /// comments; all of them must stay timelines, or projects would be
     /// skipped silently.
@@ -3721,7 +3809,10 @@ mod tests {
             ),
             (PathBuf::from("/old/rec.wav"), PathBuf::from("/new/rec.wav")),
         ];
-        let fixed = String::from_utf8(rewrite_media_paths(fcp7, &replacements).unwrap()).unwrap();
+        let fixed = String::from_utf8(
+            rewrite_media_paths(fcp7, &replacements, &Relocation::none(Path::new("/old"))).unwrap(),
+        )
+        .unwrap();
         assert!(fixed.contains("<pathurl>file:///new/A%20Clip.mov</pathurl>"));
         assert!(fixed.contains("<![CDATA[file:///new/rec.wav]]>"));
         assert!(fixed.contains("<name>Keep &amp; Me</name>"));
@@ -3731,7 +3822,11 @@ mod tests {
 <asset id="b"><media-rep kind="original-media" src="file:///old/rec.wav"/></asset>
 <asset id="c" src="file:///unchanged.mov"/>
 </resources></fcpxml>"#;
-        let fixed = String::from_utf8(rewrite_media_paths(fcpxml, &replacements).unwrap()).unwrap();
+        let fixed = String::from_utf8(
+            rewrite_media_paths(fcpxml, &replacements, &Relocation::none(Path::new("/old")))
+                .unwrap(),
+        )
+        .unwrap();
         assert!(fixed.contains("src=\"file:///new/A%20Clip.mov\""));
         assert!(fixed.contains("src=\"file:///new/rec.wav\""));
         assert!(fixed.contains("<asset id=\"c\" src=\"file:///unchanged.mov\"/>"));

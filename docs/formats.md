@@ -32,7 +32,7 @@ like other files that are not media.
 | Format | Import | Export | Notes |
 | --- | --- | --- | --- |
 | FCP 7 XML | Yes | Yes | Separate Premiere and Resolve writers; selected editing metadata can be preserved. |
-| FCPXML | Yes | Yes | Timeline and multicam projects; optional track storylines and audio roles. |
+| FCPXML | Yes | Yes | Timeline and multicam projects; optional track storylines and audio roles. Imports `.fcpxml` files and `.fcpxmld` bundles. |
 | AAF | Yes | Yes | External picture/audio and embedded PCM audio import; linked media export. Requires `align-aaf`. |
 | OpenTimelineIO | No | Yes | Resolve timeline output. |
 | Resolve Python script | No | Yes | Import helper generated alongside Resolve exports; requires the editor's scripting interface. |
