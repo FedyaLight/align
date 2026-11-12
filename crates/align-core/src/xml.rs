@@ -803,6 +803,51 @@ impl std::error::Error for ImportError {}
 
 // ------------------------------------------------------------ importer
 
+/// Whether an XML file holds an editing timeline: its root element is FCP 7
+/// `xmeml` or `fcpxml`. Cameras write clip metadata as XML beside their
+/// media (Canon `CLIPS001/*.XML`); those are not timelines. Reads at most
+/// 16 KiB. A file that cannot be read or parsed counts as a timeline, so
+/// importing it reports why.
+pub fn is_timeline_document(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = Vec::new();
+    let read =
+        std::fs::File::open(path).and_then(|file| file.take(16 * 1024).read_to_end(&mut head));
+    if read.is_err() {
+        return true;
+    }
+    // Timelines import only as UTF-8, but a UTF-16 project must still be
+    // recognized, so that importing it says it cannot be read instead of the
+    // project being skipped. Other encodings with NUL bytes count as
+    // timelines for the same reason.
+    let utf16 = |bytes: &[u8], unit: fn([u8; 2]) -> u16| {
+        let units = bytes.chunks_exact(2).map(|pair| unit([pair[0], pair[1]]));
+        char::decode_utf16(units)
+            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect::<String>()
+            .into_bytes()
+    };
+    let head = match head.as_slice() {
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, u16::from_le_bytes),
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, u16::from_be_bytes),
+        bytes if bytes.contains(&0) => return true,
+        _ => head,
+    };
+    let mut reader = Reader::from_reader(head.as_slice());
+    let mut buffer = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(element) | Event::Empty(element)) => {
+                let root = element.local_name();
+                return root.as_ref().eq_ignore_ascii_case(b"xmeml")
+                    || root.as_ref().eq_ignore_ascii_case(b"fcpxml");
+            }
+            Ok(Event::Eof) | Err(_) => return true,
+            Ok(_) => buffer.clear(),
+        }
+    }
+}
+
 /// Dispatch by root element (`fcpxml` or FCP 7 XML).
 pub fn read_timeline(
     path: &Path,
@@ -3380,6 +3425,86 @@ fn read_fcpxml(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Editor exports start with a declaration, a DOCTYPE and sometimes
+    /// comments; all of them must stay timelines, or projects would be
+    /// skipped silently.
+    #[test]
+    fn timeline_documents_are_recognized_by_root_element() {
+        let dir = std::env::temp_dir().join(format!("align-timeline-root-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cases = [
+            (
+                "premiere.xml",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE xmeml>\n<xmeml version=\"4\"><sequence/></xmeml>",
+                true,
+            ),
+            (
+                "resolve.xml",
+                "<?xml version=\"1.0\"?>\n<!-- exported -->\n<XMEML version=\"5\"/>",
+                true,
+            ),
+            (
+                "fcp.xml",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE fcpxml>\n<fcpxml version=\"1.10\"/>",
+                true,
+            ),
+            (
+                "A001C001_CANON.XML",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Clip><ClipName>A001C001</ClipName></Clip>",
+                false,
+            ),
+            (
+                "C0001M01.XML",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<NonRealTimeMeta xmlns=\"urn:schemas-professionalDisc:nonRealTimeMeta:ver.2.00\"/>",
+                false,
+            ),
+            ("broken.xml", "not xml at all", true),
+        ];
+        for (name, text, timeline) in cases {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(is_timeline_document(&path), timeline, "{name}");
+        }
+        // UTF-16 with a byte order mark is decoded to find the root; without
+        // one, NUL bytes keep the file a timeline.
+        let utf16 = |text: &str, bom: [u8; 2], unit: fn(u16) -> [u8; 2]| {
+            let mut bytes = bom.to_vec();
+            bytes.extend(text.encode_utf16().flat_map(unit));
+            bytes
+        };
+        let project = "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<xmeml version=\"5\"/>";
+        let camera = "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<Clip/>";
+        let encoded = [
+            (
+                "le.xml",
+                utf16(project, [0xFF, 0xFE], u16::to_le_bytes),
+                true,
+            ),
+            (
+                "be.xml",
+                utf16(project, [0xFE, 0xFF], u16::to_be_bytes),
+                true,
+            ),
+            (
+                "camera-le.xml",
+                utf16(camera, [0xFF, 0xFE], u16::to_le_bytes),
+                false,
+            ),
+            (
+                "no-bom.xml",
+                project.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+                true,
+            ),
+        ];
+        for (name, bytes, timeline) in encoded {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(is_timeline_document(&path), timeline, "{name}");
+        }
+        assert!(is_timeline_document(&dir.join("missing.xml")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     const FCP7: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <xmeml version="4">

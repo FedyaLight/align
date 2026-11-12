@@ -19,12 +19,20 @@ pub enum TimelineError {
     Write(String),
 }
 
+/// AAF, FCPXML, and XML whose root is an FCP 7 or FCPXML document. Camera
+/// metadata XML beside clips is not a timeline and is skipped like any other
+/// file that is not media.
 pub fn is_supported(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-        ["xml", "fcpxml", "aaf"]
-            .iter()
-            .any(|extension| e.eq_ignore_ascii_case(extension))
-    })
+    let Some(extension) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    if ["fcpxml", "aaf"]
+        .iter()
+        .any(|timeline| extension.eq_ignore_ascii_case(timeline))
+    {
+        return true;
+    }
+    extension.eq_ignore_ascii_case("xml") && align_core::xml::is_timeline_document(path)
 }
 
 fn is_aaf(path: &Path) -> bool {

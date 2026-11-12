@@ -1820,7 +1820,7 @@ impl AlignApp {
             .data
             .inputs
             .iter()
-            .any(|path| align_decode::timeline::is_supported(path))
+            .any(|path| self.data.timeline_inputs.contains(path))
             && self.data.can_synchronize()
         {
             self.start_sync(cx);
