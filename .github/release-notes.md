@@ -34,6 +34,10 @@ On Windows and Linux, the first synchronization after the update analyses
 every file again, because fingerprints from the previous decoder are not
 reused.
 
+Thanks to @Opragopa for reporting the decode error with Canon footage (#16),
+which also led to the MXF and camera XML fixes, and for proposing parallel
+inspection (#17).
+
 ## Downloads
 
 | Platform | Installer |
