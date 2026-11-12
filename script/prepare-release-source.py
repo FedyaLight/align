@@ -21,7 +21,7 @@ def main():
     parser.add_argument('output', type=Path)
     parser.add_argument('--platform', required=True, choices=('Linux', 'macOS', 'Windows'))
     parser.add_argument('--licenses', type=Path, required=True)
-    # macOS releases decode through AVFoundation and ship no FFmpeg.
+    # The FFmpeg tools' corresponding source; on macOS they read only MXF.
     parser.add_argument('--ffmpeg', type=Path)
     parser.add_argument('--aaf', type=Path, required=True)
     parser.add_argument('--velopack-version', required=True)

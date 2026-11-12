@@ -470,12 +470,23 @@ fn next_buffer(
 
 pub struct AppleNativeBackend;
 
+/// AVFoundation cannot open MXF. The FFmpeg that ships with Align reads it,
+/// as the portable engine does on every other platform; every other format
+/// stays with AVFoundation.
+fn is_mxf(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mxf"))
+}
+
 impl MediaBackend for AppleNativeBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::AppleNative
     }
 
     fn inspect(&self, path: &Path) -> Result<ProbeReport, DecodeError> {
+        if is_mxf(path) {
+            return crate::portable::PortableBackend.inspect(path);
+        }
         let asset = open_asset(path)?;
         // SAFETY: plain-data property getter.
         let duration = unsafe { asset.duration() };
@@ -521,6 +532,9 @@ impl MediaBackend for AppleNativeBackend {
         source: AudioAnalysisSource,
         consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
     ) -> Result<(), DecodeError> {
+        if is_mxf(path) {
+            return crate::portable::PortableBackend.decode_mono_8k(path, source, consume);
+        }
         if source == AudioAnalysisSource::AllMixed {
             let stream_count = self.inspect(path)?.audio_streams.len();
             return crate::mix::decode_all_streams_mono_8k(self, path, stream_count, consume);
@@ -549,6 +563,14 @@ impl MediaBackend for AppleNativeBackend {
         duration_seconds: f64,
         source: AudioAnalysisSource,
     ) -> Result<(f64, Vec<f32>), DecodeError> {
+        if is_mxf(path) {
+            return crate::portable::PortableBackend.decode_window_16k(
+                path,
+                start_seconds,
+                duration_seconds,
+                source,
+            );
+        }
         if source == AudioAnalysisSource::AllMixed {
             let stream_count = self.inspect(path)?.audio_streams.len();
             return crate::mix::decode_all_streams_window_16k(
@@ -615,6 +637,14 @@ impl MediaBackend for AppleNativeBackend {
         range: Option<(f64, Option<f64>)>,
         consume: &mut dyn FnMut(crate::backend::NativeBlock) -> Result<(), DecodeError>,
     ) -> Result<f64, DecodeError> {
+        if is_mxf(path) {
+            return crate::portable::PortableBackend.decode_native(
+                path,
+                stream_index,
+                range,
+                consume,
+            );
+        }
         let window = range.map(|(start, duration)| (start, duration.unwrap_or(1e9)));
         let (session, sample_rate) = open_reader(path, stream_index, window, false)?;
         let mut actual = None;
@@ -637,6 +667,14 @@ impl MediaBackend for AppleNativeBackend {
         range: Option<(f64, Option<f64>)>,
         consume: &mut dyn FnMut(crate::backend::NativeBlockI32) -> Result<(), DecodeError>,
     ) -> Result<f64, DecodeError> {
+        if is_mxf(path) {
+            return crate::portable::PortableBackend.decode_native_i32(
+                path,
+                stream_index,
+                range,
+                consume,
+            );
+        }
         let window = range.map(|(start, duration)| (start, duration.unwrap_or(1e9)));
         let (session, sample_rate) = open_reader(path, stream_index, window, true)?;
         let mut actual = None;
@@ -842,6 +880,49 @@ mod tests {
         assert_eq!(atc, ptc, "apple={atc:?} portable={ptc:?}");
         assert!(atc.drop_frame);
         assert_eq!(atc.frame_duration, align_core::MediaTime::new(1001, 30_000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AVFoundation cannot open MXF; the macOS engine reads it through
+    /// FFmpeg, with the same results as the portable engine.
+    #[test]
+    fn mxf_is_read_through_ffmpeg() {
+        let (Some(ffmpeg), Some(_)) = (crate::ff::ffmpeg_bin(), crate::ff::ffprobe_bin()) else {
+            return;
+        };
+        let dir = fixture_dir("mxf");
+        let mxf = dir.join("A001C001.MXF");
+        let ok = std::process::Command::new(ffmpeg)
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc2=size=320x240:rate=25")
+            .args(["-f", "lavfi", "-i", "anoisesrc=r=48000:a=0.3", "-t", "2"])
+            .args(["-map", "0:v", "-map", "1:a", "-map", "1:a", "-ac", "1"])
+            .args(["-c:v", "mpeg2video", "-c:a", "pcm_s24le"])
+            .arg(&mxf)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!("SKIP: FFmpeg without MXF support");
+            return;
+        }
+        let apple = AppleNativeBackend
+            .inspect(&mxf)
+            .expect("MXF inspects on macOS");
+        let portable = crate::portable::PortableBackend.inspect(&mxf).unwrap();
+        assert_eq!(apple, portable);
+        assert_eq!(apple.audio_streams.len(), 2);
+        let mut samples = 0;
+        AppleNativeBackend
+            .decode_mono_8k(&mxf, AudioAnalysisSource::Automatic, &mut |block| {
+                samples += block.len();
+                Ok(())
+            })
+            .unwrap();
+        assert!(samples.abs_diff(16_000) < 100, "{samples} samples");
+        let (_, window) = AppleNativeBackend
+            .decode_window_16k(&mxf, 0.5, 1.0, AudioAnalysisSource::Automatic)
+            .unwrap();
+        assert!(window.len() >= 16_000, "{} window samples", window.len());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
