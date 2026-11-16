@@ -139,13 +139,14 @@ fn video_probe(asset: &AVURLAsset) -> Result<Option<VideoProbe>, DecodeError> {
                         durations.observe(duration.value as f64 / duration.timescale as f64);
                     }
                     let pts = cursor.presentationTimeStamp();
-                    if let Some(prev) = previous {
-                        if is_numeric(pts) && is_numeric(prev) {
-                            // Plain-data arithmetic (outer block is unsafe).
-                            let delta = pts.subtract(prev);
-                            if is_numeric(delta) && delta.value > 0 {
-                                deltas.observe(delta.value as f64 / delta.timescale as f64);
-                            }
+                    if let Some(prev) = previous
+                        && is_numeric(pts)
+                        && is_numeric(prev)
+                    {
+                        // Plain-data arithmetic (outer block is unsafe).
+                        let delta = pts.subtract(prev);
+                        if is_numeric(delta) && delta.value > 0 {
+                            deltas.observe(delta.value as f64 / delta.timescale as f64);
                         }
                     }
                     previous = Some(pts);
@@ -303,11 +304,7 @@ fn stream_format(
 /// kAudioFormatLinearPCM + native rate/channels, f32 interleaved.
 /// Key strings are created by value (AVFoundation compares string content,
 /// so this is identical to referencing the missing `AVFormatIDKey` statics).
-fn pcm_settings(
-    sample_rate: f64,
-    channels: usize,
-    int32: bool,
-) -> Retained<NSDictionary<NSString, AnyObject>> {
+fn pcm_settings(sample_rate: f64, channels: usize) -> Retained<NSDictionary<NSString, AnyObject>> {
     let keys = [
         NSString::from_str("AVFormatIDKey"),
         NSString::from_str("AVSampleRateKey"),
@@ -321,7 +318,7 @@ fn pcm_settings(
     let v_rate = NSNumber::numberWithDouble(sample_rate);
     let v_channels = NSNumber::numberWithUnsignedInteger(channels);
     let v_32 = NSNumber::numberWithInt(32);
-    let v_float = NSNumber::numberWithBool(!int32);
+    let v_float = NSNumber::numberWithBool(true);
     let v_no = NSNumber::numberWithBool(false);
     let values: [&AnyObject; 7] = [
         &v_format,
@@ -346,7 +343,6 @@ fn open_reader(
     path: &Path,
     stream_index: usize,
     window: Option<(f64, f64)>,
-    int32: bool,
 ) -> Result<(Reader, f64), DecodeError> {
     let asset = open_asset(path)?;
     let tracks = audio_tracks(&asset)?;
@@ -354,7 +350,7 @@ fn open_reader(
         .get(stream_index)
         .ok_or_else(|| DecodeError::NoAudio(path.display().to_string()))?;
     let (sample_rate, channels, _, _) = stream_format(track)?;
-    let settings = pcm_settings(sample_rate, channels, int32);
+    let settings = pcm_settings(sample_rate, channels);
     // SAFETY: objects valid; reader creation copies settings.
     let reader = unsafe { AVAssetReader::assetReaderWithAsset_error(&asset) }
         .map_err(|e| apple_error("AVAssetReader", Some(e)))?;
@@ -471,8 +467,7 @@ fn next_buffer(
 pub struct AppleNativeBackend;
 
 /// AVFoundation cannot open MXF. The FFmpeg that ships with Align reads it,
-/// as the portable engine does on every other platform; every other format
-/// stays with AVFoundation.
+/// as the portable engine does on every other platform.
 fn is_mxf(path: &Path) -> bool {
     path.extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("mxf"))
@@ -539,7 +534,7 @@ impl MediaBackend for AppleNativeBackend {
             let stream_count = self.inspect(path)?.audio_streams.len();
             return crate::mix::decode_all_streams_mono_8k(self, path, stream_count, consume);
         }
-        let (session, sample_rate) = open_reader(path, source.stream_index(), None, false)?;
+        let (session, sample_rate) = open_reader(path, source.stream_index(), None)?;
         let mut pipe = crate::mono::MonoPipe::new(
             sample_rate,
             8000.0,
@@ -600,7 +595,6 @@ impl MediaBackend for AppleNativeBackend {
             path,
             source.stream_index(),
             Some((start_seconds, duration_seconds)),
-            false,
         )?;
         let want = (duration_seconds * 16_000.0).ceil() as usize + 64;
         let samples = std::cell::RefCell::new(Vec::with_capacity(want.min(16_000 * 12)));
@@ -646,7 +640,7 @@ impl MediaBackend for AppleNativeBackend {
             );
         }
         let window = range.map(|(start, duration)| (start, duration.unwrap_or(1e9)));
-        let (session, sample_rate) = open_reader(path, stream_index, window, false)?;
+        let (session, sample_rate) = open_reader(path, stream_index, window)?;
         let mut actual = None;
         while let Some(bytes) = next_buffer(&session.output, &mut actual)? {
             let floats = bytes_to_f32(&bytes, session.channels)?;
@@ -667,44 +661,22 @@ impl MediaBackend for AppleNativeBackend {
         range: Option<(f64, Option<f64>)>,
         consume: &mut dyn FnMut(crate::backend::NativeBlockI32) -> Result<(), DecodeError>,
     ) -> Result<f64, DecodeError> {
-        if is_mxf(path) {
-            return crate::portable::PortableBackend.decode_native_i32(
-                path,
-                stream_index,
-                range,
-                consume,
-            );
-        }
-        let window = range.map(|(start, duration)| (start, duration.unwrap_or(1e9)));
-        let (session, sample_rate) = open_reader(path, stream_index, window, true)?;
-        let mut actual = None;
-        while let Some(bytes) = next_buffer(&session.output, &mut actual)? {
-            if bytes.len() % (4 * session.channels) != 0 || bytes.is_empty() {
-                return Err(DecodeError::InvalidPcm);
-            }
-            let ints: Vec<i32> = bytes
-                .chunks_exact(4)
-                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect();
-            consume(crate::backend::NativeBlockI32 {
-                sample_rate,
-                channels: session.channels,
-                frames: crate::mono::deinterleave_i32(&ints, session.channels),
-            })?;
-        }
-        check_completed(&session.reader, path)?;
-        Ok(actual.unwrap_or(range.map_or(0.0, |(s, _)| s.max(0.0))))
+        // AVFoundation's PCM conversion rounds some 32-bit integer values.
+        // Keep integer stems on the bit-exact Symphonia/PCM/FFmpeg path.
+        crate::portable::PortableBackend.decode_native_i32(path, stream_index, range, consume)
     }
 }
 
 /// Little-endian f32 frames from an interleaved PCM block.
 fn bytes_to_f32(bytes: &[u8], channels: usize) -> Result<Vec<f32>, DecodeError> {
-    if bytes.len() % (4 * channels) != 0 || bytes.is_empty() {
+    if !bytes.len().is_multiple_of(4 * channels) || bytes.is_empty() {
         return Err(DecodeError::InvalidPcm);
     }
     Ok(bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect())
 }
 

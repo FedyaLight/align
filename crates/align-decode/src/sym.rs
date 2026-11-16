@@ -188,12 +188,11 @@ pub fn inspect(path: &Path) -> Result<SymphoniaProbe, DecodeError> {
             is_float: bits.map(|(_, f)| f),
             decoder_delay: 0.0,
         });
-        if duration_seconds.is_none() {
-            if let (Some(n), Some(rate)) = (p.n_frames, p.sample_rate) {
-                if rate > 0 {
-                    duration_seconds = Some(n as f64 / rate as f64);
-                }
-            }
+        if duration_seconds.is_none()
+            && let (Some(n), Some(rate)) = (p.n_frames, p.sample_rate)
+            && rate > 0
+        {
+            duration_seconds = Some(n as f64 / rate as f64);
         }
     }
     if streams

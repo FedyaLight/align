@@ -1007,6 +1007,7 @@ impl AlignApp {
             return;
         };
         match prepared {
+            #[cfg(windows)]
             updater::Prepared::Velopack { manager, asset } => {
                 super::icons::cleanup();
                 align_decode::media_assets::cleanup();
@@ -2750,11 +2751,11 @@ impl Render for AlignApp {
         if self.data.show_search_quality {
             root = root.child(search_quality_dismiss_layer(cx));
         }
-        if !self.update_notice_dismissed && !self.data.show_about {
-            if let Some(notice) = update_notice(cx, &theme, &self.update_state, self.data.operation)
-            {
-                root = root.child(notice);
-            }
+        if !self.update_notice_dismissed
+            && !self.data.show_about
+            && let Some(notice) = update_notice(cx, &theme, &self.update_state, self.data.operation)
+        {
+            root = root.child(notice);
         }
         // Same corner as the update card, so it waits until that is gone, and
         // it would cover the export sidebar's settings. Modals only dim it:
@@ -4113,24 +4114,24 @@ fn operation_bar(
     }
     bar = bar.child(div().flex_1());
     if !busy {
-        if let Some(result) = &data.result {
-            if result.stages.len() > 1 {
-                bar = bar.child(button(
-                    cx,
-                    theme,
-                    "btn-stage-settings",
-                    format!(
-                        "Stage {}/{}",
-                        result.selected_stage.unwrap_or(0) + 1,
-                        result.stages.len()
-                    ),
-                    data.can_export(),
-                    |this, _, _, cx| {
-                        this.data.show_stage_settings = true;
-                        cx.notify();
-                    },
-                ));
-            }
+        if let Some(result) = &data.result
+            && result.stages.len() > 1
+        {
+            bar = bar.child(button(
+                cx,
+                theme,
+                "btn-stage-settings",
+                format!(
+                    "Stage {}/{}",
+                    result.selected_stage.unwrap_or(0) + 1,
+                    result.stages.len()
+                ),
+                data.can_export(),
+                |this, _, _, cx| {
+                    this.data.show_stage_settings = true;
+                    cx.notify();
+                },
+            ));
         }
         if data.sequence_results.len() > 1 {
             let name = data
@@ -5210,11 +5211,11 @@ fn stream_menu_section(
             title
         }
     };
-    if let Some(lane_id) = &menu.lane_id {
-        if let Some(lane) = data.lanes.iter().find(|l| &l.id == lane_id) {
-            for (index, channels) in lane.stream_channels.iter().copied().enumerate() {
-                counts.insert(index, channels);
-            }
+    if let Some(lane_id) = &menu.lane_id
+        && let Some(lane) = data.lanes.iter().find(|l| &l.id == lane_id)
+    {
+        for (index, channels) in lane.stream_channels.iter().copied().enumerate() {
+            counts.insert(index, channels);
         }
     }
     if counts.is_empty() {

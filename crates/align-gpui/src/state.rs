@@ -841,10 +841,10 @@ impl AppData {
 
     /// Record a sequence choice and queue the timeline as an input.
     pub fn choose_sequence(&mut self, index: usize) {
-        if let Some(picker) = self.sequence_picker.take() {
-            if picker.options.iter().any(|o| o.index == index) {
-                self.queue_timeline_sequences(picker.path, vec![index]);
-            }
+        if let Some(picker) = self.sequence_picker.take()
+            && picker.options.iter().any(|o| o.index == index)
+        {
+            self.queue_timeline_sequences(picker.path, vec![index]);
         }
     }
 

@@ -2,7 +2,8 @@
 
 ## Prerequisites
 
-- A current stable Rust toolchain with rustfmt and Clippy.
+- Rust 1.100.0 with rustfmt and Clippy. `rust-toolchain.toml` pins the
+  development and release toolchain; rustup installs it when needed.
 - FFmpeg and ffprobe on PATH for test fixture generation and portable decoding
   of containers other than WAV/AIFF/MP3/M4A/MOV/MP4. Use a full FFmpeg build for
   fixtures; the packaged minimal build omits the synthetic sources and video
@@ -17,6 +18,16 @@
 
 The workflow is the reference for platform-specific package installation.
 Run commands from the repository root.
+
+Cargo checks unused dependencies through the workspace's inherited lint settings.
+Run `cargo check --workspace --all-targets` so every production target is included
+before removing a reported dependency; platform-specific dependencies still need
+the corresponding platform check. Test fixture writers belong in dev-dependencies.
+
+The registry resolver waits three days before selecting newly published package
+versions during dependency updates. Versions already in `Cargo.lock` remain usable;
+`--locked` builds keep the recorded dependency set. This setting lives in
+`.cargo/config.toml` and does not change release dependencies automatically.
 
 ## Build
 

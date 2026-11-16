@@ -85,7 +85,7 @@ END
 #[cfg(windows)]
 fn align_path(path: &std::path::Path) -> String {
     let text = path.display().to_string().replace('\\', "/");
-    text.strip_prefix("//?/").map(str::to_owned).unwrap_or(text)
+    text.trim_prefix("//?/").to_owned()
 }
 
 /// Cross-compiled Windows builds skip resources (no resource compiler).

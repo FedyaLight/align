@@ -620,8 +620,10 @@ mod tests {
             .unwrap()
             .stdout;
         let samples: Vec<f32> = decoded
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         assert_eq!(samples.len(), 3 * 48_000 * 2);
         let first = samples.iter().position(|s| s.abs() > 0.3).unwrap() / 2;

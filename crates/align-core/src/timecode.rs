@@ -68,10 +68,10 @@ pub fn analyze_timecodes(
             if matched_pairs.contains(&key) {
                 continue;
             }
-            if let (Some(cd), Some(td)) = (candidate.recorded_at, target.recorded_at) {
-                if (cd - td).abs() >= 57_600 {
-                    continue;
-                }
+            if let (Some(cd), Some(td)) = (candidate.recorded_at, target.recorded_at)
+                && (cd - td).abs() >= 57_600
+            {
+                continue;
             }
             let target_end = target_start + target.duration.as_seconds();
             let overlap =

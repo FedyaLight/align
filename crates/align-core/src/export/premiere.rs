@@ -1198,33 +1198,33 @@ fn file_block(
         );
         xml += &source_rate.xml("                    ");
         xml += "                  </timecode>\n";
-    } else if media_type == "video" {
-        if let Some(video) = &clip.video {
-            let fallback = crate::model::SourceTimecode {
-                text: "00:00:00:00".to_string(),
-                frame_number: 0,
-                frame_duration: video
-                    .frame_duration
-                    .unwrap_or(crate::model::MediaTime::new(1, rate.timebase as i32)),
-                drop_frame: false,
-            };
-            let source_rate = SequenceRate::new(fallback.frame_duration);
-            xml += &format!(
-                "                  <timecode><string>{}</string><displayformat>NDF</displayformat>\n",
-                fallback.text
-            );
-            xml += &source_rate.xml("                    ");
-            xml += "                  </timecode>\n";
-        }
+    } else if media_type == "video"
+        && let Some(video) = &clip.video
+    {
+        let fallback = crate::model::SourceTimecode {
+            text: "00:00:00:00".to_string(),
+            frame_number: 0,
+            frame_duration: video
+                .frame_duration
+                .unwrap_or(crate::model::MediaTime::new(1, rate.timebase as i32)),
+            drop_frame: false,
+        };
+        let source_rate = SequenceRate::new(fallback.frame_duration);
+        xml += &format!(
+            "                  <timecode><string>{}</string><displayformat>NDF</displayformat>\n",
+            fallback.text
+        );
+        xml += &source_rate.xml("                    ");
+        xml += "                  </timecode>\n";
     }
     xml += "                  <media>";
-    if media_type == "video" {
-        if let Some(video) = &clip.video {
-            xml += &format!(
-                "<video><samplecharacteristics><width>{}</width><height>{}</height></samplecharacteristics></video>",
-                video.width, video.height
-            );
-        }
+    if media_type == "video"
+        && let Some(video) = &clip.video
+    {
+        xml += &format!(
+            "<video><samplecharacteristics><width>{}</width><height>{}</height></samplecharacteristics></video>",
+            video.width, video.height
+        );
     }
     if let Some(audio) = clip.audio.first() {
         // Padded sidecars are 32-bit float, like drift sidecars.

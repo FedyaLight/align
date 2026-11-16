@@ -578,10 +578,10 @@ pub fn timeline_manifest_with_frame_rate(
         if length == 0 {
             return Err(fail("Empty AAF picture edit"));
         }
-        if !metadata.contains_key(&item.clip.url) {
-            if let Some(value) = picture_metadata(&item.clip.url) {
-                metadata.insert(item.clip.url.clone(), value);
-            }
+        if !metadata.contains_key(&item.clip.url)
+            && let Some(value) = picture_metadata(&item.clip.url)
+        {
+            metadata.insert(item.clip.url.clone(), value);
         }
         if !metadata.contains_key(&item.clip.url) {
             let probe = crate::ff::ffprobe_bin()

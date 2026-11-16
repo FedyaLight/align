@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 #[cfg(not(unix))]
 use std::io::Read;
+use std::mem::DropGuard;
 use std::path::{Path, PathBuf};
 
 use align_core::drift::needs_correction_points;
@@ -18,7 +19,7 @@ use align_core::export::model::{
 
 use crate::backend::MediaBackend;
 use crate::render::{
-    RenderError, render_channel_cancellable, render_drift_cancellable, render_pad_cancellable,
+    RenderError, render_channels_cancellable, render_drift_cancellable, render_pad_cancellable,
 };
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -391,17 +392,17 @@ fn export_prepared_internal(
             .map(&end_for)
             .fold(0.0, f64::max);
         let frame_end = maximum_end * fps;
-        if (frame_end - frame_end.round()).abs() > 1e-7 {
-            if let Some(last) = combined.islands[0].clips.iter_mut().find(|item| {
+        if (frame_end - frame_end.round()).abs() > 1e-7
+            && let Some(last) = combined.islands[0].clips.iter_mut().find(|item| {
                 item.clip.kind == align_core::MediaKind::Audio
                     && !item.is_retimed("audio")
                     && (end_for(item) - maximum_end).abs() < 1e-9
-            }) {
-                let sr = last.clip.audio.first().map_or(48000.0, |a| a.sample_rate);
-                // One extra sample covers nearest-sample placement rounding.
-                last.precision_tail_samples =
-                    ((frame_end.ceil() / fps - maximum_end) * sr).ceil() as u64 + 1;
-            }
+            })
+        {
+            let sr = last.clip.audio.first().map_or(48000.0, |a| a.sample_rate);
+            // One extra sample covers nearest-sample placement rounding.
+            last.precision_tail_samples =
+                ((frame_end.ceil() / fps - maximum_end) * sr).ceil() as u64 + 1;
         }
     }
     let timeline = &combined;
@@ -569,64 +570,64 @@ fn export_prepared_internal(
                     prepared.with_corrected_audio(corrected_urls[item.clip.id.0.as_str()].clone());
             }
 
-            if wants_pad {
-                if let Some((pad_samples, destination)) = pad_plan(
+            if wants_pad
+                && let Some((pad_samples, destination)) = pad_plan(
                     item,
                     sequence_rate_fps,
                     &drift_ids,
                     &audio_dir,
                     source_tags.get(&item.clip.url).map_or("", String::as_str),
-                ) {
-                    if !pad_rendered.contains(&destination) {
-                        emit(
-                            &mut progress,
-                            completed,
-                            total_jobs,
-                            Some(item.clip.url.clone()),
-                            ExportJobKind::Audio,
-                        );
-                        if !destination.is_file() {
-                            // Pad the drift sidecar when one exists, else the
-                            // original: precision stems keep using the
-                            // unpadded source, so the script workflow is
-                            // unaffected by this file.
-                            let pad_source = prepared
-                                .corrected_audio_url
-                                .clone()
-                                .unwrap_or_else(|| item.clip.url.clone());
-                            let sr = item.clip.audio.first().unwrap().sample_rate;
-                            let (start, end) = if prepared.corrected_audio_url.is_some() {
-                                (item.corrected_source_in(), item.corrected_source_out())
-                            } else {
-                                (
-                                    item.selected_source_in("audio"),
-                                    item.selected_source_out("audio"),
-                                )
-                            };
-                            render_pad_cancellable(
-                                backend,
-                                &pad_source,
-                                &destination,
-                                pad_samples,
-                                Some(((start * sr).round() as u64, (end * sr).round() as u64)),
-                                cancel,
+                )
+            {
+                if !pad_rendered.contains(&destination) {
+                    emit(
+                        &mut progress,
+                        completed,
+                        total_jobs,
+                        Some(item.clip.url.clone()),
+                        ExportJobKind::Audio,
+                    );
+                    if !destination.is_file() {
+                        // Pad the drift sidecar when one exists, else the
+                        // original: precision stems keep using the
+                        // unpadded source, so the script workflow is
+                        // unaffected by this file.
+                        let pad_source = prepared
+                            .corrected_audio_url
+                            .clone()
+                            .unwrap_or_else(|| item.clip.url.clone());
+                        let sr = item.clip.audio.first().unwrap().sample_rate;
+                        let (start, end) = if prepared.corrected_audio_url.is_some() {
+                            (item.corrected_source_in(), item.corrected_source_out())
+                        } else {
+                            (
+                                item.selected_source_in("audio"),
+                                item.selected_source_out("audio"),
                             )
-                            .map_err(ExportError::from)?;
-                        }
-                        pad_rendered.insert(destination.clone());
-                        completed += 1;
-                        emit(
-                            &mut progress,
-                            completed,
-                            total_jobs,
-                            Some(item.clip.url.clone()),
-                            ExportJobKind::Audio,
-                        );
+                        };
+                        render_pad_cancellable(
+                            backend,
+                            &pad_source,
+                            &destination,
+                            pad_samples,
+                            Some(((start * sr).round() as u64, (end * sr).round() as u64)),
+                            cancel,
+                        )
+                        .map_err(ExportError::from)?;
                     }
-                    let sample_rate = item.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);
-                    prepared =
-                        prepared.with_placement_pad(destination, pad_samples as f64 / sample_rate);
+                    pad_rendered.insert(destination.clone());
+                    completed += 1;
+                    emit(
+                        &mut progress,
+                        completed,
+                        total_jobs,
+                        Some(item.clip.url.clone()),
+                        ExportJobKind::Audio,
+                    );
                 }
+                let sample_rate = item.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);
+                prepared =
+                    prepared.with_placement_pad(destination, pad_samples as f64 / sample_rate);
             }
 
             if precision_keys.contains(&item.precision_asset_key()) {
@@ -647,10 +648,25 @@ fn export_prepared_internal(
                         .clone()
                         .unwrap_or_else(|| item.clip.url.clone());
                     let float_source = prepared.corrected_audio_url.is_some();
-                    let urls = (0..channels)
+                    let (bit_depth, is_float) = if float_source {
+                        (Some(32), true)
+                    } else {
+                        let a = item.clip.audio.first();
+                        (
+                            a.and_then(|a| a.bit_depth),
+                            a.and_then(|a| a.is_float).unwrap_or(false),
+                        )
+                    };
+                    // Older integer stems may contain rounded AVFoundation samples.
+                    let revision = if bit_depth == Some(32) && !is_float {
+                        "r13"
+                    } else {
+                        "r12"
+                    };
+                    let urls: Vec<_> = (0..channels)
                         .map(|channel| {
-                            let destination = precision_dir.join(format!(
-                                "{stem} – channel {} – {suffix}-{}-{}-{}-r12.wav",
+                            precision_dir.join(format!(
+                                "{stem} – channel {} – {suffix}-{}-{}-{}-{revision}.wav",
                                 channel + 1,
                                 prepared.precision_digest(),
                                 source_tags[&item.clip.url],
@@ -659,34 +675,27 @@ fn export_prepared_internal(
                                 } else {
                                     "original"
                                 }
-                            ));
-                            if !destination.is_file() {
-                                let (bit_depth, is_float) = if float_source {
-                                    (Some(32), true)
-                                } else {
-                                    let a = item.clip.audio.first();
-                                    (
-                                        a.and_then(|a| a.bit_depth),
-                                        a.and_then(|a| a.is_float).unwrap_or(false),
-                                    )
-                                };
-                                render_channel_cancellable(
-                                    backend,
-                                    &source,
-                                    &destination,
-                                    channel,
-                                    bit_depth,
-                                    is_float,
-                                    prepared.precision_source_start(),
-                                    prepared.precision_source_duration(),
-                                    prepared.precision_tail_samples,
-                                    cancel,
-                                )
-                                .map_err(ExportError::from)?;
-                            }
-                            Ok(destination)
+                            ))
                         })
-                        .collect::<Result<Vec<_>, ExportError>>()?;
+                        .collect();
+                    let missing: Vec<_> = urls
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, path)| !path.is_file())
+                        .map(|(channel, path)| (channel, path.as_path()))
+                        .collect();
+                    render_channels_cancellable(
+                        backend,
+                        &source,
+                        &missing,
+                        bit_depth,
+                        is_float,
+                        prepared.precision_source_start(),
+                        prepared.precision_source_duration(),
+                        prepared.precision_tail_samples,
+                        cancel,
+                    )
+                    .map_err(ExportError::from)?;
                     vacant.insert(urls);
                     completed += 1;
                     emit(
@@ -1171,14 +1180,12 @@ fn write_artifacts(
 
 fn write_atomic(url: &Path, bytes: &[u8]) -> Result<(), ExportError> {
     let tmp = url.with_extension(format!("tmp-{}", std::process::id()));
-    if let Err(error) = std::fs::write(&tmp, bytes) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ExportError::Io(error.to_string()));
-    }
-    if let Err(error) = std::fs::rename(&tmp, url) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ExportError::Io(error.to_string()));
-    }
+    let cleanup = DropGuard::new(&tmp, |path| {
+        let _ = std::fs::remove_file(path);
+    });
+    std::fs::write(&tmp, bytes).map_err(|error| ExportError::Io(error.to_string()))?;
+    std::fs::rename(&tmp, url).map_err(|error| ExportError::Io(error.to_string()))?;
+    DropGuard::dismiss(cleanup);
     Ok(())
 }
 
@@ -1457,7 +1464,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_final_partial_frame_keeps_selected_tail_and_pads_only_silence() {
+    fn resolve_precision_stems_keep_selected_tail_and_reuse_completed_channels() {
         let dir = std::env::temp_dir().join(format!("align-resolve-tail-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1465,7 +1472,7 @@ mod tests {
         let mut w = hound::WavWriter::create(
             &src,
             hound::WavSpec {
-                channels: 1,
+                channels: 2,
                 sample_rate: 48000,
                 bits_per_sample: 16,
                 sample_format: hound::SampleFormat::Int,
@@ -1473,14 +1480,15 @@ mod tests {
         )
         .unwrap();
         for i in 0..4800 {
-            w.write_sample(if i == 3479 || i == 3500 { 16000i16 } else { 0 })
-                .unwrap();
+            let value = if i == 3479 || i == 3500 { 16000i16 } else { 0 };
+            w.write_sample(value).unwrap();
+            w.write_sample(-value).unwrap();
         }
         w.finalize().unwrap();
         let original = std::fs::read(&src).unwrap();
         let mut clip = item("tail", MediaKind::Audio, 0.0, 0.1);
         clip.clip.url = src.clone();
-        clip.clip.audio[0].channels = 1;
+        clip.clip.audio[0].channels = 2;
         clip.clip.audio[0].bit_depth = Some(16);
         clip.source_in = 0.01;
         clip.source_out = 0.0725;
@@ -1495,27 +1503,30 @@ mod tests {
             "tail",
         );
         let out = dir.join("out");
-        export_prepared(
-            ExportRequest {
-                backend: &crate::portable::PortableBackend,
-                timeline: &timeline,
-                directory: &out,
-                formats: &[
-                    TimelineExportFormat::ResolveScript,
-                    TimelineExportFormat::ResolveOTIO,
-                ],
-                correct_drift: false,
-                include_replaced_sequence: false,
-                include_media_files: false,
-                aaf_frame_duration: None,
-                include_fcpxml_timeline: true,
-                include_fcpxml_multicam: true,
-                group_fcpxml_storylines: false,
-                cancel: &std::sync::atomic::AtomicBool::new(false),
-            },
-            None,
-        )
-        .unwrap();
+        let run_export = || {
+            export_prepared(
+                ExportRequest {
+                    backend: &crate::portable::PortableBackend,
+                    timeline: &timeline,
+                    directory: &out,
+                    formats: &[
+                        TimelineExportFormat::ResolveScript,
+                        TimelineExportFormat::ResolveOTIO,
+                    ],
+                    correct_drift: false,
+                    include_replaced_sequence: false,
+                    include_media_files: false,
+                    aaf_frame_duration: None,
+                    include_fcpxml_timeline: true,
+                    include_fcpxml_multicam: true,
+                    group_fcpxml_storylines: false,
+                    cancel: &std::sync::atomic::AtomicBool::new(false),
+                },
+                None,
+            )
+            .unwrap()
+        };
+        run_export();
         let doc: serde_json::Value = serde_json::from_slice(
             &std::fs::read(out.join("Align – DaVinci Resolve.otio")).unwrap(),
         )
@@ -1536,6 +1547,32 @@ mod tests {
         assert_eq!(samples.iter().filter(|v| **v != 0.0).count(), 1);
         let duration = c["source_range"]["duration"]["value"].as_f64().unwrap() / 25.0;
         assert!((0.08..=0.08 + 2.0 / 48000.0).contains(&duration));
+        let mut stems: Vec<_> = std::fs::read_dir(out.join("Resolve Precision Audio"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        stems.sort();
+        assert_eq!(stems.len(), 2);
+        let expected: Vec<_> = stems
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stems[0])
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(946684800))
+            .unwrap();
+        let modified = std::fs::metadata(&stems[0]).unwrap().modified().unwrap();
+        std::fs::remove_file(&stems[1]).unwrap();
+        run_export();
+        assert_eq!(
+            std::fs::metadata(&stems[0]).unwrap().modified().unwrap(),
+            modified
+        );
+        for (path, bytes) in stems.iter().zip(&expected) {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes);
+        }
         assert_eq!(std::fs::read(src).unwrap(), original);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1682,8 +1719,10 @@ mod tests {
         assert!(decoded.status.success());
         let first_signal = decoded
             .stdout
-            .chunks_exact(4)
-            .position(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()).abs() > 0.05)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .position(|bytes| f32::from_le_bytes(*bytes).abs() > 0.05)
             .unwrap();
         assert!((24_000..24_100).contains(&first_signal));
         let _ = std::fs::remove_dir_all(&dir);

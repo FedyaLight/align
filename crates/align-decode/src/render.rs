@@ -6,6 +6,7 @@
 //! resampler scratch. Broadcast Wave metadata is handled by `align_core::wav`.
 
 use std::io::{Seek, SeekFrom, Write};
+use std::mem::DropGuard;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -313,7 +314,7 @@ impl Segment {
     /// would corrupt the interleaved writer.
     fn push(&mut self, planes: Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, RenderError> {
         let n = planes.len();
-        let mut out: Vec<Vec<f32>> = (0..n).map(|_| Vec::new()).collect();
+        let mut out = Vec::from_fn(n, |_| Vec::new());
         for ch in 0..n {
             self.pending[ch].extend_from_slice(&planes[ch]);
             while self.pending[ch].len() >= 4096 {
@@ -348,7 +349,7 @@ impl Segment {
     fn finish(&mut self, cancel: &AtomicBool) -> Result<Vec<Vec<f32>>, RenderError> {
         check_cancel(cancel)?;
         // Remainder through process_partial, then bounded tail flush.
-        let mut out: Vec<Vec<f32>> = (0..self.resampler.len()).map(|_| Vec::new()).collect();
+        let mut out = Vec::from_fn(self.resampler.len(), |_| Vec::new());
         for ((pending, rs), dst) in self
             .pending
             .iter_mut()
@@ -371,7 +372,7 @@ impl Segment {
             if self.emitted >= self.expected {
                 break;
             }
-            let mut round: Vec<Vec<f32>> = (0..self.resampler.len()).map(|_| Vec::new()).collect();
+            let mut round = Vec::from_fn(self.resampler.len(), |_| Vec::new());
             for (ch, rs) in self.resampler.iter_mut().enumerate() {
                 let produced: Vec<Vec<f32>> = rs
                     .process_partial::<&[f32]>(None, None)
@@ -434,81 +435,66 @@ pub fn render_drift_cancellable(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos())
     ));
-    let result = (|| {
-        let mut writer = WavWriter::create(&tmp, sample_rate as u32, channels, false)?;
-        for &(source_start, source_duration, target_duration) in &segments {
-            check_cancel(cancel)?;
-            let ratio = target_duration / source_duration;
-            // Supply real neighboring samples to each independent filter.
-            // Zero-padding at an internal knot otherwise creates an impulse
-            // whenever the signal is nonzero there. Guard audio is filtered
-            // but excluded from the emitted segment length.
-            let start_frame = (source_start * sample_rate).round() as usize;
-            let guard_frames = start_frame.min(4096);
-            let decode_start = (start_frame - guard_frames) as f64 / sample_rate;
-            let decode_end =
-                (source_start + source_duration + 4096.0 / sample_rate).min(probe.duration_seconds);
-            let mut segment = Segment::new(
-                source_start,
-                source_duration,
-                target_duration,
-                sample_rate,
-                channels,
-            )?;
-            segment.skip += (guard_frames as f64 * ratio).round() as usize;
-            backend
-                .decode_native(
-                    source,
-                    0,
-                    Some((decode_start, Some((decode_end - decode_start).max(0.0)))),
-                    &mut |block: NativeBlock| {
-                        check_cancel(cancel).map_err(decode_render_error)?;
-                        let out = segment.push(block.frames).map_err(decode_render_error)?;
-                        writer
-                            .write_pcm(channels, &out, f32::to_le_bytes)
-                            .map_err(decode_render_error)
-                    },
-                )
-                .map_err(RenderError::from)?;
-            let tail = segment.finish(cancel)?;
-            writer.write_pcm(channels, &tail, f32::to_le_bytes)?;
-        }
+    let cleanup = DropGuard::new(&tmp, |path| {
+        let _ = std::fs::remove_file(path);
+    });
+    let mut writer = WavWriter::create(&tmp, sample_rate as u32, channels, false)?;
+    for &(source_start, source_duration, target_duration) in &segments {
         check_cancel(cancel)?;
-        writer.finalize()?;
-        Ok::<(), RenderError>(())
-    })();
-    match result {
-        Ok(()) => {
-            if align_core::wav::preserve_broadcast_extension(
+        let ratio = target_duration / source_duration;
+        // Supply real neighboring samples to each independent filter.
+        // Zero-padding at an internal knot otherwise creates an impulse
+        // whenever the signal is nonzero there. Guard audio is filtered
+        // but excluded from the emitted segment length.
+        let start_frame = (source_start * sample_rate).round() as usize;
+        let guard_frames = start_frame.min(4096);
+        let decode_start = (start_frame - guard_frames) as f64 / sample_rate;
+        let decode_end =
+            (source_start + source_duration + 4096.0 / sample_rate).min(probe.duration_seconds);
+        let mut segment = Segment::new(
+            source_start,
+            source_duration,
+            target_duration,
+            sample_rate,
+            channels,
+        )?;
+        segment.skip += (guard_frames as f64 * ratio).round() as usize;
+        backend
+            .decode_native(
                 source,
-                &tmp,
-                sample_rate,
-                channels,
-                32,
-                "drift correction",
                 0,
+                Some((decode_start, Some((decode_end - decode_start).max(0.0)))),
+                &mut |block: NativeBlock| {
+                    check_cancel(cancel).map_err(decode_render_error)?;
+                    let out = segment.push(block.frames).map_err(decode_render_error)?;
+                    writer
+                        .write_pcm(channels, &out, f32::to_le_bytes)
+                        .map_err(decode_render_error)
+                },
             )
-            .is_err()
-            {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(RenderError::CannotWrite);
-            }
-            #[cfg(windows)]
-            if destination.exists() && std::fs::remove_file(destination).is_err() {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(RenderError::CannotWrite);
-            }
-            if std::fs::rename(&tmp, destination).is_err() {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(RenderError::CannotWrite);
-            }
-            Ok(())
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
+            .map_err(RenderError::from)?;
+        let tail = segment.finish(cancel)?;
+        writer.write_pcm(channels, &tail, f32::to_le_bytes)?;
     }
+    check_cancel(cancel)?;
+    writer.finalize()?;
+    align_core::wav::preserve_broadcast_extension(
+        source,
+        &tmp,
+        sample_rate,
+        channels,
+        32,
+        "drift correction",
+        0,
+    )
+    .map_err(|_| RenderError::CannotWrite)?;
+    #[cfg(windows)]
+    if destination.exists() {
+        std::fs::remove_file(destination).map_err(|_| RenderError::CannotWrite)?;
+    }
+    std::fs::rename(&tmp, destination).map_err(|_| RenderError::CannotWrite)?;
+    DropGuard::dismiss(cleanup);
+    Ok(())
 }
 
 // ------------------------------------------------------------ rate conversion
@@ -646,56 +632,52 @@ pub fn render_pad_cancellable(
     )
     .map_err(|_| RenderError::InvalidMapping)?;
     let tmp = destination.with_extension(format!("tmp-{}.wav", std::process::id()));
-    let result = (|| {
-        let mut writer = WavWriter::create(&tmp, sample_rate as u32, channels, false)?;
-        let mut silence = pad_samples;
-        while silence > 0 {
-            check_cancel(cancel)?;
-            let n = silence.min(4096) as usize;
-            writer.write_silence(channels, n)?;
-            silence -= n as u64;
-        }
-        let range = selection.map(|(start, end)| {
-            (
-                start as f64 / sample_rate,
-                Some((end - start) as f64 / sample_rate),
-            )
-        });
-        let mut remaining = selection.map(|(start, end)| end - start);
-        backend
-            .decode_native(source, 0, range, &mut |block| {
-                check_cancel(cancel).map_err(decode_render_error)?;
-                let available = block.frames.first().map_or(0, Vec::len);
-                let take = remaining.map_or(available, |n| n.min(available as u64) as usize);
-                let selected: Vec<&[f32]> = block.frames.iter().map(|ch| &ch[..take]).collect();
-                writer
-                    .write_pcm(channels, &selected, f32::to_le_bytes)
-                    .map_err(decode_render_error)?;
-                if let Some(ref mut n) = remaining {
-                    *n -= take as u64;
-                }
-                Ok(())
-            })
-            .map_err(RenderError::from)?;
-        if let (Some(n), Some((_, end))) = (remaining, selection) {
-            finish_tail(
-                &mut writer,
-                &probe,
-                end as f64 / sample_rate,
-                n,
-                sample_rate,
-                channels,
-            )?;
-        }
+    let cleanup = DropGuard::new(&tmp, |path| {
+        let _ = std::fs::remove_file(path);
+    });
+    let mut writer = WavWriter::create(&tmp, sample_rate as u32, channels, false)?;
+    let mut silence = pad_samples;
+    while silence > 0 {
         check_cancel(cancel)?;
-        writer.finalize()?;
-        Ok(())
-    })();
-    if let Err(error) = result {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error);
+        let n = silence.min(4096) as usize;
+        writer.write_silence(channels, n)?;
+        silence -= n as u64;
     }
-    if align_core::wav::preserve_broadcast_extension(
+    let range = selection.map(|(start, end)| {
+        (
+            start as f64 / sample_rate,
+            Some((end - start) as f64 / sample_rate),
+        )
+    });
+    let mut remaining = selection.map(|(start, end)| end - start);
+    backend
+        .decode_native(source, 0, range, &mut |block| {
+            check_cancel(cancel).map_err(decode_render_error)?;
+            let available = block.frames.first().map_or(0, Vec::len);
+            let take = remaining.map_or(available, |n| n.min(available as u64) as usize);
+            let selected: Vec<&[f32]> = block.frames.iter().map(|ch| &ch[..take]).collect();
+            writer
+                .write_pcm(channels, &selected, f32::to_le_bytes)
+                .map_err(decode_render_error)?;
+            if let Some(ref mut n) = remaining {
+                *n -= take as u64;
+            }
+            Ok(())
+        })
+        .map_err(RenderError::from)?;
+    if let (Some(n), Some((_, end))) = (remaining, selection) {
+        finish_tail(
+            &mut writer,
+            &probe,
+            end as f64 / sample_rate,
+            n,
+            sample_rate,
+            channels,
+        )?;
+    }
+    check_cancel(cancel)?;
+    writer.finalize()?;
+    align_core::wav::preserve_broadcast_extension(
         source,
         &tmp,
         sample_rate,
@@ -704,35 +686,27 @@ pub fn render_pad_cancellable(
         "placement pad",
         reference_shift,
     )
-    .is_err()
-    {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(RenderError::CannotWrite);
-    }
+    .map_err(|_| RenderError::CannotWrite)?;
     #[cfg(windows)]
-    if destination.exists() && std::fs::remove_file(destination).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(RenderError::CannotWrite);
+    if destination.exists() {
+        std::fs::remove_file(destination).map_err(|_| RenderError::CannotWrite)?;
     }
-    if std::fs::rename(&tmp, destination).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(RenderError::CannotWrite);
-    }
+    std::fs::rename(&tmp, destination).map_err(|_| RenderError::CannotWrite)?;
+    DropGuard::dismiss(cleanup);
     Ok(())
 }
 
 // ------------------------------------------------------------ channel stem
 
-/// Sample-exact mono stem extraction (precision audio for Resolve).
-/// Uses int32 for 32-bit integer sources, otherwise float32. BWF
-/// TimeReference shifts by the
-/// trim offset, CodingHistory gains a channel-extraction line.
+/// Sample-exact mono stems for selected source channels (zero-based).
+/// Each pass decodes once for up to 64 outputs, bounding open files and buffers.
+/// Uses int32 for 32-bit integer sources, otherwise float32. BWF TimeReference
+/// shifts by the trim offset; CodingHistory records each channel extraction.
 #[allow(clippy::too_many_arguments)]
-pub fn render_channel_cancellable(
+pub fn render_channels_cancellable(
     backend: &dyn MediaBackend,
     source: &Path,
-    destination: &Path,
-    channel: usize,
+    destinations: &[(usize, &Path)],
     bit_depth: Option<u32>,
     is_float: bool,
     source_start: f64,
@@ -741,6 +715,9 @@ pub fn render_channel_cancellable(
     cancel: &AtomicBool,
 ) -> Result<(), RenderError> {
     check_cancel(cancel)?;
+    if destinations.is_empty() {
+        return Ok(());
+    }
     let int32 = matches!(bit_depth, Some(32)) && !is_float;
     let probe = backend.inspect(source).map_err(RenderError::from)?;
     let stream = probe
@@ -748,115 +725,129 @@ pub fn render_channel_cancellable(
         .first()
         .ok_or_else(|| RenderError::NoAudio(file_name(source)))?;
     let (sample_rate, channels) = (stream.sample_rate, stream.channels);
-    if sample_rate <= 0.0 || channels == 0 || channel >= channels {
+    if sample_rate <= 0.0
+        || channels == 0
+        || destinations.iter().any(|(channel, _)| *channel >= channels)
+    {
         return Err(RenderError::UnknownFormat(file_name(source)));
     }
+    let mut paths = std::collections::HashSet::new();
+    if destinations.iter().any(|(_, path)| !paths.insert(*path)) {
+        return Err(RenderError::InvalidMapping);
+    }
     let start_frame = ((source_start.max(0.0)) * sample_rate).round() as i64;
-    let take_frames = ((duration * sample_rate).round() as i64).max(0);
+    let take_frames = ((duration * sample_rate).round() as i64).max(0) as u64;
 
-    let tmp = destination.with_extension(format!(
-        "tmp-{}.wav",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos())
-    ));
-    let result = (|| {
-        let mut writer = WavWriter::create(&tmp, sample_rate as u32, 1, int32)?;
+    for destinations in destinations.chunks(64) {
+        check_cancel(cancel)?;
+        let temporary = destinations
+            .iter()
+            .map(|(_, destination)| {
+                let parent = destination
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                tempfile::NamedTempFile::new_in(parent)
+                    .map(tempfile::NamedTempFile::into_temp_path)
+                    .map_err(|_| RenderError::CannotWrite)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut writers = destinations
+            .iter()
+            .zip(&temporary)
+            .map(|((channel, _), path)| {
+                WavWriter::create(path, sample_rate as u32, 1, int32)
+                    .map(|writer| (*channel, writer))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut remaining = take_frames;
+        let range = Some((source_start.max(0.0), Some(duration)));
         if int32 {
             backend
-                .decode_native_i32(
-                    source,
-                    0,
-                    Some((source_start.max(0.0), Some(duration))),
-                    &mut |block: NativeBlockI32| {
-                        check_cancel(cancel).map_err(decode_render_error)?;
-                        if remaining <= 0 {
-                            return Ok(());
-                        }
-                        let got = block.frames[channel].len() as i64;
-                        let take = got.min(remaining) as usize;
-                        writer
-                            .write_pcm(1, &[&block.frames[channel][..take]], i32::to_le_bytes)
-                            .map_err(decode_render_error)?;
-                        remaining -= take as i64;
-                        Ok(())
-                    },
-                )
+                .decode_native_i32(source, 0, range, &mut |block: NativeBlockI32| {
+                    write_channel_block(
+                        &mut writers,
+                        &block.frames,
+                        &mut remaining,
+                        i32::to_le_bytes,
+                        cancel,
+                    )
+                    .map_err(decode_render_error)
+                })
                 .map_err(RenderError::from)?;
         } else {
             backend
-                .decode_native(
-                    source,
-                    0,
-                    Some((source_start.max(0.0), Some(duration))),
-                    &mut |block: NativeBlock| {
-                        check_cancel(cancel).map_err(decode_render_error)?;
-                        if remaining <= 0 {
-                            return Ok(());
-                        }
-                        let got = block.frames[channel].len() as i64;
-                        let take = got.min(remaining) as usize;
-                        writer
-                            .write_pcm(1, &[&block.frames[channel][..take]], f32::to_le_bytes)
-                            .map_err(decode_render_error)?;
-                        remaining -= take as i64;
-                        Ok(())
-                    },
-                )
+                .decode_native(source, 0, range, &mut |block: NativeBlock| {
+                    write_channel_block(
+                        &mut writers,
+                        &block.frames,
+                        &mut remaining,
+                        f32::to_le_bytes,
+                        cancel,
+                    )
+                    .map_err(decode_render_error)
+                })
                 .map_err(RenderError::from)?;
         }
-        finish_tail(
-            &mut writer,
-            &probe,
-            source_start.max(0.0) + duration,
-            remaining as u64,
-            sample_rate,
-            1,
-        )?;
-        let mut tail_remaining = tail_samples;
-        while tail_remaining > 0 {
+        for ((channel, mut writer), path) in writers.into_iter().zip(&temporary) {
             check_cancel(cancel)?;
-            let n = tail_remaining.min(4096) as usize;
-            writer.write_silence(1, n)?;
-            tail_remaining -= n as u64;
-        }
-        check_cancel(cancel)?;
-        writer.finalize()?;
-        Ok::<(), RenderError>(())
-    })();
-    match result {
-        Ok(()) => {
-            if align_core::wav::preserve_broadcast_extension(
+            finish_tail(
+                &mut writer,
+                &probe,
+                source_start.max(0.0) + duration,
+                remaining,
+                sample_rate,
+                1,
+            )?;
+            let mut tail_remaining = tail_samples;
+            while tail_remaining > 0 {
+                check_cancel(cancel)?;
+                let n = tail_remaining.min(4096) as usize;
+                writer.write_silence(1, n)?;
+                tail_remaining -= n as u64;
+            }
+            writer.finalize()?;
+            align_core::wav::preserve_broadcast_extension(
                 source,
-                &tmp,
+                path,
                 sample_rate,
                 1,
                 32,
                 &format!("channel {} extraction", channel + 1),
                 start_frame,
             )
-            .is_err()
-            {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(RenderError::CannotWrite);
-            }
-            #[cfg(windows)]
-            if destination.exists() && std::fs::remove_file(destination).is_err() {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(RenderError::CannotWrite);
-            }
-            if std::fs::rename(&tmp, destination).is_err() {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(RenderError::CannotWrite);
-            }
-            Ok(())
+            .map_err(|_| RenderError::CannotWrite)?;
         }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
+        for (path, (_, destination)) in temporary.into_iter().zip(destinations) {
+            check_cancel(cancel)?;
+            path.persist(destination)
+                .map_err(|_| RenderError::CannotWrite)?;
         }
     }
+    Ok(())
+}
+
+fn write_channel_block<T: Copy>(
+    writers: &mut [(usize, WavWriter)],
+    frames: &[Vec<T>],
+    remaining: &mut u64,
+    encode: fn(T) -> [u8; 4],
+    cancel: &AtomicBool,
+) -> Result<(), RenderError> {
+    check_cancel(cancel)?;
+    if *remaining == 0 {
+        return Ok(());
+    }
+    let take = (*remaining).min(frames.first().map_or(0, Vec::len) as u64) as usize;
+    for (channel, writer) in writers {
+        let samples = frames
+            .get(*channel)
+            .and_then(|plane| plane.get(..take))
+            .ok_or(RenderError::CannotRead)?;
+        writer.write_pcm(1, &[samples], encode)?;
+    }
+    *remaining -= take as u64;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1186,11 +1177,10 @@ mod tests {
         let probe = backend.inspect(&source).unwrap();
         assert!(!probe.has_video);
         let stem = dir.path().join("stem.wav");
-        render_channel_cancellable(
+        render_channels_cancellable(
             &backend,
             &source,
-            &stem,
-            0,
+            &[(0, &stem)],
             None,
             false,
             0.0,
@@ -1282,6 +1272,7 @@ mod tests {
         write_stereo_wav(&src, 48000, 1, 42);
         let dst = dir.join("existing.wav");
         std::fs::write(&dst, b"existing output").unwrap();
+        let second = dir.join("second.wav");
         let cancel = AtomicBool::new(false);
         let backend = CancelOnDecode(&cancel);
         assert_eq!(
@@ -1291,11 +1282,10 @@ mod tests {
         for integer in [false, true] {
             cancel.store(false, Ordering::Relaxed);
             assert_eq!(
-                render_channel_cancellable(
+                render_channels_cancellable(
                     &backend,
                     &src,
-                    &dst,
-                    0,
+                    &[(0, &dst), (1, &second)],
                     Some(if integer { 32 } else { 16 }),
                     false,
                     0.0,
@@ -1339,11 +1329,10 @@ mod tests {
             Err(RenderError::Cancelled)
         );
         assert_eq!(
-            render_channel_cancellable(
+            render_channels_cancellable(
                 &backend,
                 &source,
-                &dst,
-                0,
+                &[(0, &dst)],
                 Some(16),
                 false,
                 0.0,
@@ -1406,29 +1395,112 @@ mod tests {
     }
 
     #[test]
-    fn channel_stem_trims_sample_exact() {
-        let dir = tmp("stem");
-        let src = dir.join("src.wav");
-        write_stereo_wav(&src, 48000, 4, 0xC4);
-        let dst = dir.join("ch1.wav");
-        let backend = crate::portable::PortableBackend;
-        render_channel_cancellable(
-            &backend,
-            &src,
-            &dst,
-            1,
-            Some(16),
-            false,
-            1.0,
-            2.0,
+    fn channel_stems_preserve_selected_samples_format_and_bwf() {
+        let dir = tempfile::tempdir().unwrap();
+        let values = [
+            i32::MIN + 1,
+            0x12345679,
+            -0x12345679,
+            i32::MAX - 1,
             0,
-            &NEVER_CANCELLED,
-        )
-        .expect("stem");
-        let reader = hound::WavReader::open(&dst).expect("open stem");
-        assert_eq!(reader.spec().channels, 1);
-        assert_eq!(reader.duration(), 2 * 48000);
-        let _ = std::fs::remove_dir_all(&dir);
+            1,
+            -1,
+        ];
+        let frames: Vec<_> = (0..1200)
+            .map(|i| [values[i % values.len()], values[(i + 3) % values.len()]])
+            .collect();
+        for (bits, format) in [
+            (16, hound::SampleFormat::Int),
+            (24, hound::SampleFormat::Int),
+            (32, hound::SampleFormat::Int),
+            (32, hound::SampleFormat::Float),
+        ] {
+            let source = dir.path().join(format!("{bits}-{format:?}.wav"));
+            let mut input = hound::WavWriter::create(
+                &source,
+                hound::WavSpec {
+                    channels: 2,
+                    sample_rate: 48000,
+                    bits_per_sample: bits,
+                    sample_format: format,
+                },
+            )
+            .unwrap();
+            for frame in &frames {
+                for &value in frame {
+                    if format == hound::SampleFormat::Float {
+                        input.write_sample(value as f32 / 2147483648.0).unwrap();
+                    } else {
+                        input.write_sample(value >> (32 - bits)).unwrap();
+                    }
+                }
+            }
+            input.finalize().unwrap();
+            add_test_bext(&source, 48000);
+            for kind in [
+                crate::backend::BackendKind::Portable,
+                #[cfg(target_os = "macos")]
+                crate::backend::BackendKind::AppleNative,
+            ] {
+                let backend = crate::backend::create(kind);
+                let left = dir.path().join(format!("{kind:?}-{bits}-{format:?}-L.wav"));
+                let right = dir.path().join(format!("{kind:?}-{bits}-{format:?}-R.wav"));
+                std::fs::write(&left, b"previous stem").unwrap();
+                render_channels_cancellable(
+                    backend.as_ref(),
+                    &source,
+                    &[(1, &right), (0, &left)],
+                    Some(u32::from(bits)),
+                    format == hound::SampleFormat::Float,
+                    137.0 / 48000.0,
+                    701.0 / 48000.0,
+                    17,
+                    &NEVER_CANCELLED,
+                )
+                .unwrap();
+                for (channel, path) in [left, right].iter().enumerate() {
+                    let reader = hound::WavReader::open(path).unwrap();
+                    assert_eq!(reader.spec().channels, 1);
+                    assert_eq!(reader.spec().sample_rate, 48000);
+                    assert_eq!(reader.spec().bits_per_sample, 32);
+                    assert_eq!(reader.duration(), 718);
+                    if bits == 32 && format == hound::SampleFormat::Int {
+                        assert_eq!(reader.spec().sample_format, hound::SampleFormat::Int);
+                        let samples: Vec<i32> = reader.into_samples().map(Result::unwrap).collect();
+                        let expected: Vec<_> = frames[137..838]
+                            .iter()
+                            .map(|frame| frame[channel])
+                            .chain(std::iter::repeat_n(0, 17))
+                            .collect();
+                        assert_eq!(samples, expected, "{kind:?}, channel {channel}");
+                    } else {
+                        assert_eq!(reader.spec().sample_format, hound::SampleFormat::Float);
+                        let samples: Vec<f32> = reader.into_samples().map(Result::unwrap).collect();
+                        let expected: Vec<_> = frames[137..838]
+                            .iter()
+                            .map(|frame| {
+                                (frame[channel] >> (32 - bits)) as f32 / (1u64 << (bits - 1)) as f32
+                            })
+                            .chain(std::iter::repeat_n(0.0, 17))
+                            .collect();
+                        assert_eq!(
+                            samples, expected,
+                            "{kind:?}, {bits}, {format:?}, channel {channel}"
+                        );
+                    }
+                    assert_eq!(
+                        align_core::meta::read_bwf(path).unwrap().time_reference,
+                        Some(48137)
+                    );
+                    let wav = std::fs::read(path).unwrap();
+                    let history = format!("T=Align channel {} extraction", channel + 1);
+                    assert!(
+                        wav.windows(history.len())
+                            .any(|bytes| bytes == history.as_bytes())
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1438,11 +1510,10 @@ mod tests {
         let src = dir.join("src.wav");
         write_stereo_wav(&src, 48000, 3, 0xC4);
         let dst = dir.join("trim.wav");
-        render_channel_cancellable(
+        render_channels_cancellable(
             &crate::apple::AppleNativeBackend,
             &src,
-            &dst,
-            0,
+            &[(0, &dst)],
             Some(16),
             false,
             0.4004,

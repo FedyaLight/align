@@ -274,6 +274,7 @@ fn app_menus(appearance: theme::AppearancePreference) -> Vec<Menu> {
 }
 
 fn main() {
+    #[cfg(windows)]
     velopack::VelopackApp::build().run();
 
     struct SessionCleanup;

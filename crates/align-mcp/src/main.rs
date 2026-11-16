@@ -28,13 +28,12 @@ fn main() {
                 break;
             }
         };
-        if let Some(response) = response {
-            if serde_json::to_writer(&mut stdout, &response).is_err()
+        if let Some(response) = response
+            && (serde_json::to_writer(&mut stdout, &response).is_err()
                 || stdout.write_all(b"\n").is_err()
-                || stdout.flush().is_err()
-            {
-                break;
-            }
+                || stdout.flush().is_err())
+        {
+            break;
         }
     }
 }

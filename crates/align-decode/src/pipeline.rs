@@ -2643,7 +2643,11 @@ mod tests {
                         "{tag}: invalid samples"
                     );
                     assert!(
-                        samples.chunks_exact(2).all(|v| (v[0] - v[1]).abs() < 1e-6),
+                        samples
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .all(|v| (v[0] - v[1]).abs() < 1e-6),
                         "{tag}: stereo divergence"
                     );
                 }

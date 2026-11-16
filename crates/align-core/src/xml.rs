@@ -96,17 +96,17 @@ impl XmlDoc {
                     }
                 }
                 Ok(Event::Text(e)) => {
-                    if let Ok(t) = e.unescape() {
-                        if let Some(&top) = stack.last() {
-                            doc.nodes[top].text.push_str(&t);
-                        }
+                    if let Ok(t) = e.unescape()
+                        && let Some(&top) = stack.last()
+                    {
+                        doc.nodes[top].text.push_str(&t);
                     }
                 }
                 Ok(Event::CData(e)) => {
-                    if let Ok(t) = std::str::from_utf8(e.as_ref()) {
-                        if let Some(&top) = stack.last() {
-                            doc.nodes[top].text.push_str(t);
-                        }
+                    if let Ok(t) = std::str::from_utf8(e.as_ref())
+                        && let Some(&top) = stack.last()
+                    {
+                        doc.nodes[top].text.push_str(t);
                     }
                 }
                 Ok(Event::Eof) => break,
@@ -384,18 +384,18 @@ impl TimelineDraft {
                 }
                 continue;
             }
-            if let Some(rewritten) = crate::redirect::rewrite(&missing, redirects) {
-                if rewritten.is_file() {
-                    replacements.insert(missing.clone(), rewritten.clone());
-                    relink_warnings.push(SyncWarning {
-                        url: self.source_url.clone(),
-                        message: format!(
-                            "Relinked {display} to {} via saved redirection.",
-                            rewritten.display()
-                        ),
-                    });
-                    continue;
-                }
+            if let Some(rewritten) = crate::redirect::rewrite(&missing, redirects)
+                && rewritten.is_file()
+            {
+                replacements.insert(missing.clone(), rewritten.clone());
+                relink_warnings.push(SyncWarning {
+                    url: self.source_url.clone(),
+                    message: format!(
+                        "Relinked {display} to {} via saved redirection.",
+                        rewritten.display()
+                    ),
+                });
+                continue;
             }
             let filename = missing
                 .file_name()
@@ -834,7 +834,11 @@ pub fn is_timeline_document(path: &Path) -> bool {
     // project being skipped. Other encodings with NUL bytes count as
     // timelines for the same reason.
     let utf16 = |bytes: &[u8], unit: fn([u8; 2]) -> u16| {
-        let units = bytes.chunks_exact(2).map(|pair| unit([pair[0], pair[1]]));
+        let units = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| unit([pair[0], pair[1]]));
         char::decode_utf16(units)
             .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
             .collect::<String>()
@@ -1160,10 +1164,11 @@ fn fcp7_files_by_id(doc: &XmlDoc) -> HashMap<String, usize> {
     let mut map = HashMap::new();
     let mut stack = vec![doc.root];
     while let Some(idx) = stack.pop() {
-        if doc.nodes[idx].name == "file" && doc.child_text(idx, "pathurl").is_some() {
-            if let Some(id) = doc.attr(idx, "id") {
-                map.entry(id.to_string()).or_insert(idx);
-            }
+        if doc.nodes[idx].name == "file"
+            && doc.child_text(idx, "pathurl").is_some()
+            && let Some(id) = doc.attr(idx, "id")
+        {
+            map.entry(id.to_string()).or_insert(idx);
         }
         for &c in doc.nodes[idx].children.iter().rev() {
             stack.push(c);
@@ -1204,12 +1209,13 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() + 1 {
-            if let (Some(h), Some(l)) = (hex_val(bytes.get(i + 1)), hex_val(bytes.get(i + 2))) {
-                out.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len() + 1
+            && let (Some(h), Some(l)) = (hex_val(bytes.get(i + 1)), hex_val(bytes.get(i + 2)))
+        {
+            out.push(h << 4 | l);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -1646,19 +1652,18 @@ fn read_fcp7(
                         ),
                     );
                 }
-                if let Some(r) = &retime {
-                    if ((timeline_seconds * r.playback_rate) - (r.source_out - r.source_in)).abs()
+                if let Some(r) = &retime
+                    && ((timeline_seconds * r.playback_rate) - (r.source_out - r.source_in)).abs()
                         > timing_tolerance
-                    {
-                        warn(
-                            &mut *warnings,
-                            format!(
-                                "Retimed clip {} declares speed {} but its duration does not match the source span; NLEs may clamp this edit differently.",
-                                clip_name(),
-                                r.playback_rate
-                            ),
-                        );
-                    }
+                {
+                    warn(
+                        &mut *warnings,
+                        format!(
+                            "Retimed clip {} declares speed {} but its duration does not match the source span; NLEs may clamp this edit differently.",
+                            clip_name(),
+                            r.playback_rate
+                        ),
+                    );
                 }
                 if retime.is_none() && (source_seconds - timeline_seconds).abs() > timing_tolerance
                 {
@@ -2500,12 +2505,11 @@ fn fcpxml_time(text: Option<&str>) -> f64 {
     if s.ends_with('s') {
         s.pop();
     }
-    if let Some((num, den)) = s.split_once('/') {
-        if let (Ok(n), Ok(d)) = (num.parse::<f64>(), den.parse::<f64>()) {
-            if d != 0.0 {
-                return n / d;
-            }
-        }
+    if let Some((num, den)) = s.split_once('/')
+        && let (Ok(n), Ok(d)) = (num.parse::<f64>(), den.parse::<f64>())
+        && d != 0.0
+    {
+        return n / d;
     }
     s.parse().unwrap_or(0.0)
 }
@@ -2518,18 +2522,17 @@ fn fcpxml_frame_duration(text: Option<&str>) -> MediaTime {
     if s.ends_with('s') {
         s.pop();
     }
-    if let Some((num, den)) = s.split_once('/') {
-        if let (Ok(n), Ok(d)) = (num.parse::<i64>(), den.parse::<i32>()) {
-            if d != 0 {
-                return MediaTime::new(n, d);
-            }
-        }
+    if let Some((num, den)) = s.split_once('/')
+        && let (Ok(n), Ok(d)) = (num.parse::<i64>(), den.parse::<i32>())
+        && d != 0
+    {
+        return MediaTime::new(n, d);
     }
-    if let Ok(seconds) = s.parse::<f64>() {
-        if seconds > 0.0 {
-            let fps = (1.0 / seconds).round().max(1.0) as i32;
-            return MediaTime::new(1, fps);
-        }
+    if let Ok(seconds) = s.parse::<f64>()
+        && seconds > 0.0
+    {
+        let fps = (1.0 / seconds).round().max(1.0) as i32;
+        return MediaTime::new(1, fps);
     }
     MediaTime::new(1, 25)
 }
@@ -2774,14 +2777,14 @@ fn read_fcpxml(
     {
         let mut stack = vec![doc.root];
         while let Some(n) = stack.pop() {
-            if doc.nodes[n].name == "media" {
-                if let Some(id) = doc.attr(n, "id").map(str::to_string) {
-                    if !doc.children_named(n, "sequence").is_empty() {
-                        compounds.entry(id.clone()).or_insert(n);
-                    }
-                    if !doc.children_named(n, "multicam").is_empty() {
-                        multicams.entry(id).or_insert(n);
-                    }
+            if doc.nodes[n].name == "media"
+                && let Some(id) = doc.attr(n, "id").map(str::to_string)
+            {
+                if !doc.children_named(n, "sequence").is_empty() {
+                    compounds.entry(id.clone()).or_insert(n);
+                }
+                if !doc.children_named(n, "multicam").is_empty() {
+                    multicams.entry(id).or_insert(n);
                 }
             }
             for &c in doc.nodes[n].children.iter().rev() {

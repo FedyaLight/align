@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.100"
 license = "GPL-3.0-only"
 version = "0.3.3"
 
@@ -40,6 +40,10 @@ ltc = "0.2"
 dirs = "6"
 gpui = "0.2.2"
 mimalloc = { version = "0.1", default-features = false }
+
+[workspace.lints.cargo]
+unused_dependencies = "warn"
+unused_workspace_dependencies = "warn"
 
 # DSP dependencies (FFT, resampling, decoding, hashing) dominate test run
 # time when unoptimized. Optimizing just these keeps debug builds quick to
