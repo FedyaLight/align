@@ -187,6 +187,11 @@ pub fn inspect(path: &Path) -> Result<SymphoniaProbe, DecodeError> {
             bit_depth: bits.map(|(b, _)| b),
             is_float: bits.map(|(_, f)| f),
             decoder_delay: 0.0,
+            end_seconds: p
+                .n_frames
+                .zip(p.sample_rate)
+                .filter(|(_, rate)| *rate > 0)
+                .map(|(frames, rate)| frames as f64 / rate as f64),
         });
         if duration_seconds.is_none()
             && let (Some(n), Some(rate)) = (p.n_frames, p.sample_rate)

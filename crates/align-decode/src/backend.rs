@@ -81,6 +81,9 @@ pub struct AudioStreamProbe {
     /// (AVCHD): their 256-sample codec delay is recorded nowhere, and
     /// AVFoundation trims it, so both engines place the audio alike.
     pub decoder_delay: f64,
+    /// Declared end of presented audio on the file's timeline, when known.
+    /// A video container can continue after its audio track has ended.
+    pub end_seconds: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
