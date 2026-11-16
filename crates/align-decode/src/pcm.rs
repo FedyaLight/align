@@ -146,7 +146,10 @@ impl PcmTrack {
                     let channels = field(2) as usize;
                     let sample_rate = u32::from_le_bytes(fmt[4..8].try_into().ok()?);
                     let block_align = field(12) as u64;
-                    if channels == 0 || sample_rate == 0 || block_align % channels as u64 != 0 {
+                    if channels == 0
+                        || sample_rate == 0
+                        || !block_align.is_multiple_of(channels as u64)
+                    {
                         return None;
                     }
                     let bits = (block_align / channels as u64 * 8) as u32;
@@ -500,7 +503,7 @@ mod tests {
             )
             .unwrap();
             pipe.pump(&mut |frames| {
-                reference.extend(frames.chunks_exact(2).map(|f| (f[0], f[1])));
+                reference.extend(frames.as_chunks::<2>().0.iter().map(|f| (f[0], f[1])));
                 Ok(())
             })
             .unwrap();

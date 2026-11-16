@@ -6,6 +6,8 @@ on:
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
       - "about.toml"
       - "script/**"
       - "Support/**"
@@ -19,6 +21,8 @@ on:
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
       - "about.toml"
       - "script/**"
       - "Support/**"
@@ -45,7 +49,7 @@ jobs:
         os: [macos-latest, windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -164,7 +168,7 @@ jobs:
             echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $workspace_version" >&2
             exit 1
           fi
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
       - name: Remove packaging outputs restored from cache
         # rust-cache saves all of target/, including folders the packaging steps

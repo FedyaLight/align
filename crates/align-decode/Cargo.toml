@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Cross-platform media inspect/decode: Symphonia for audio containers, bundled FFmpeg sidecar for MOV/MP4/MTS/MXF/R3D, rubato resample."
 
+[lints]
+workspace = true
+
 [dependencies]
 align-core.workspace = true
 serde.workspace = true
@@ -13,7 +16,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 symphonia.workspace = true
 rubato.workspace = true
-hound.workspace = true
 ltc.workspace = true
 sha2.workspace = true
 blake3.workspace = true
@@ -25,7 +27,6 @@ objc2 = { version = "0.6", default-features = false, features = ["std", "alloc"]
 block2 = "0.6"
 objc2-core-media = "0.3"
 objc2-core-audio-types = "0.3"
-objc2-core-graphics = "0.3"
 objc2-core-foundation = "0.3"
 objc2-av-foundation = { version = "0.3", default-features = false, features = [
     "AVAsset",
@@ -50,3 +51,6 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSURL",
     "NSValue",
 ] }
+
+[dev-dependencies]
+hound.workspace = true

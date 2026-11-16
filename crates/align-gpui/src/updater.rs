@@ -14,6 +14,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
+#[cfg(windows)]
 use velopack::{UpdateCheck, UpdateInfo, UpdateManager, VelopackAsset, sources::GithubSource};
 
 pub const REPOSITORY_URL: &str = "https://github.com/FedyaLight/align";
@@ -40,6 +41,7 @@ pub enum UpdateState {
 
 /// A newer release and how this copy of Align can reach it.
 pub enum Update {
+    #[cfg(windows)]
     Velopack {
         manager: UpdateManager,
         update: Box<UpdateInfo>,
@@ -55,6 +57,7 @@ pub enum Update {
 
 /// A downloaded update, ready to install.
 pub enum Prepared {
+    #[cfg(windows)]
     Velopack {
         manager: UpdateManager,
         asset: VelopackAsset,
@@ -87,6 +90,7 @@ impl UpdateState {
         match self {
             Self::Available(update) => Some(update.version()),
             Self::Downloading { version } | Self::Installing { version } => Some(version),
+            #[cfg(windows)]
             Self::Ready(Prepared::Velopack { asset, .. }) => Some(&asset.Version),
             Self::Ready(Prepared::Package { version, .. }) => Some(version),
             _ => None,
@@ -104,6 +108,7 @@ impl UpdateState {
 impl Update {
     pub fn version(&self) -> &str {
         match self {
+            #[cfg(windows)]
             Self::Velopack { update, .. } => &update.TargetFullRelease.Version,
             Self::Package { version, .. } | Self::Manual { version, .. } => version,
         }
@@ -111,6 +116,7 @@ impl Update {
 }
 
 pub fn check() -> UpdateState {
+    #[cfg(windows)]
     if let Ok(manager) =
         UpdateManager::new(GithubSource::new(REPOSITORY_URL, None, false), None, None)
     {
@@ -136,6 +142,7 @@ pub fn check() -> UpdateState {
 
 pub fn download(update: Update) -> UpdateState {
     match update {
+        #[cfg(windows)]
         Update::Velopack { manager, update } => {
             let asset = update.TargetFullRelease.clone();
             match manager.download_updates(&update, None) {

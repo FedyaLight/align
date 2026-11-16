@@ -40,12 +40,12 @@ pub fn resolve_bin(env_var: &str, name: &str) -> Option<PathBuf> {
             return Some(p);
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for candidate in [dir.join(name), dir.join(format!("{name}.exe"))] {
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        for candidate in [dir.join(name), dir.join(format!("{name}.exe"))] {
+            if candidate.is_file() {
+                return Some(candidate);
             }
         }
     }
@@ -518,8 +518,10 @@ impl AudioPipe {
             frames.clear();
             frames.extend(
                 self.leftover[..usable]
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b)),
             );
             self.leftover.drain(..usable);
             if !frames.is_empty() {
@@ -617,8 +619,10 @@ impl AudioPipeI32 {
             frames.clear();
             frames.extend(
                 self.leftover[..usable]
-                    .chunks_exact(4)
-                    .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| i32::from_le_bytes(*b)),
             );
             self.leftover.drain(..usable);
             if !frames.is_empty() {

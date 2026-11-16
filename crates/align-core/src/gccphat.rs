@@ -12,6 +12,7 @@ use rustfft::{Fft, FftPlanner};
 // immutable, so all refine workers can share this bounded cache.
 type FftPair = (Arc<dyn Fft<f32>>, Arc<dyn Fft<f32>>);
 static PLANS: [OnceLock<FftPair>; 4] = [const { OnceLock::new() }; 4];
+static HANN_WINDOWS: [OnceLock<Vec<f32>>; 4] = [const { OnceLock::new() }; 4];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GccPhatResult {
@@ -111,12 +112,16 @@ pub fn align(left: &[f32], right: &[f32], maximum_lag: usize) -> Option<GccPhatR
 
 fn preprocess(input: &[f32]) -> Vec<f32> {
     let n = input.len();
+    let window = HANN_WINDOWS[n.trailing_zeros() as usize - 14].get_or_init(|| {
+        (0..n)
+            .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (n - 1) as f32).cos())
+            .collect()
+    });
     let mut out = vec![0.0f32; n];
     for (i, &v) in input.iter().enumerate() {
         // Hann (NORM scale-insensitive here) * first-order pre-emphasis.
-        let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (n - 1) as f32).cos();
         let p = if i > 0 { v - 0.97 * input[i - 1] } else { 0.0 };
-        out[i] = p * w;
+        out[i] = p * window[i];
     }
     out
 }

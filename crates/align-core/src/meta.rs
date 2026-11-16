@@ -45,17 +45,12 @@ impl BwfMetadata {
                 .unwrap_or((MediaTime::new(1, 25), false));
             return SourceTimecode::from_samples(tref, rate, duration, drop);
         }
-        if let Some(ix) = self.ixml.as_ref() {
-            if let Some(t) = ix.timestamp.as_ref() {
-                if let Some(tc) = SourceTimecode::from_samples(
-                    t.samples,
-                    t.rate,
-                    ix.frame_duration,
-                    ix.drop_frame,
-                ) {
-                    return Some(tc);
-                }
-            }
+        if let Some(ix) = self.ixml.as_ref()
+            && let Some(t) = ix.timestamp.as_ref()
+            && let Some(tc) =
+                SourceTimecode::from_samples(t.samples, t.rate, ix.frame_duration, ix.drop_frame)
+        {
+            return Some(tc);
         }
         self.timecode.clone()
     }
@@ -227,17 +222,17 @@ fn make_recording_date(
         return None;
     }
     let midnight = days_from_civil(date[0], date[1], date[2])? * 86_400;
-    if let (Some(tref), Some(rate)) = (time_reference, sample_rate) {
-        if rate > 0.0 {
-            let seconds = tref as f64 / rate;
-            // EBU Tech 3285: TimeReference counts samples since midnight, so
-            // only [0, 24 h) belongs to OriginationDate's day. Anything past
-            // midnight is the next (unprovable) day — no calendar date.
-            if (0.0..86_400.0).contains(&seconds) {
-                return Some(midnight + seconds as i64);
-            }
-            return None;
+    if let (Some(tref), Some(rate)) = (time_reference, sample_rate)
+        && rate > 0.0
+    {
+        let seconds = tref as f64 / rate;
+        // EBU Tech 3285: TimeReference counts samples since midnight, so
+        // only [0, 24 h) belongs to OriginationDate's day. Anything past
+        // midnight is the next (unprovable) day — no calendar date.
+        if (0.0..86_400.0).contains(&seconds) {
+            return Some(midnight + seconds as i64);
         }
+        return None;
     }
     let time = numeric_parts(time_text?);
     if time.len() != 3 {
@@ -443,7 +438,7 @@ fn ixml_payload_text(buf: &[u8]) -> Option<&str> {
         return None;
     }
     let text = std::str::from_utf8(payload).ok()?;
-    let head = text.strip_prefix('\u{FEFF}').unwrap_or(text).trim_start();
+    let head = text.trim_prefix('\u{FEFF}').trim_start();
     if head.starts_with("<BWFXML") || head.starts_with("<?xml") {
         Some(text)
     } else {

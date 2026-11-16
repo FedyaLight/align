@@ -92,8 +92,10 @@ pub(crate) fn mix_streams_mono_8k(
         samples.clear();
         samples.extend(
             bytes[..count * 4]
-                .chunks_exact(4)
-                .map(|value| f32::from_le_bytes(value.try_into().unwrap()) * scale),
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|value| f32::from_le_bytes(*value) * scale),
         );
         consume(&samples)?;
         remaining -= count as u64;

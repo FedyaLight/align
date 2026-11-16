@@ -119,22 +119,21 @@ fn write_island(
     // Prepared precision stems contain exactly the selected source range.
     let mut prepared_island = island.clone();
     for item in &mut prepared_island.clips {
-        if item.clip.video.is_none() {
-            if let Some(channel) = item.selected_audio_source_channel() {
-                if let Some(path) = item.precision_audio_url(channel + 1).cloned() {
-                    let duration = item.corrected_selected_duration();
-                    item.clip.url = path;
-                    item.clip.duration = MediaTime::microseconds(duration);
-                    for audio in &mut item.clip.audio {
-                        audio.channels = 1;
-                    }
-                    item.corrected_audio_url = None;
-                    item.source_in = 0.0;
-                    item.source_out = duration;
-                    item.audio_source_channel = Some(0);
-                    item.precision_audio_urls.clear();
-                }
+        if item.clip.video.is_none()
+            && let Some(channel) = item.selected_audio_source_channel()
+            && let Some(path) = item.precision_audio_url(channel + 1).cloned()
+        {
+            let duration = item.corrected_selected_duration();
+            item.clip.url = path;
+            item.clip.duration = MediaTime::microseconds(duration);
+            for audio in &mut item.clip.audio {
+                audio.channels = 1;
             }
+            item.corrected_audio_url = None;
+            item.source_in = 0.0;
+            item.source_out = duration;
+            item.audio_source_channel = Some(0);
+            item.precision_audio_urls.clear();
         }
     }
     let island = &prepared_island;

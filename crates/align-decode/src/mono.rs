@@ -76,10 +76,10 @@ where
         {
             return Err(DecodeError::InvalidPcm);
         }
-        if let Some(ch) = explicit {
-            if ch >= channels {
-                return Err(DecodeError::InvalidPcm);
-            }
+        if let Some(ch) = explicit
+            && ch >= channels
+        {
+            return Err(DecodeError::InvalidPcm);
         }
         let resampler = if (source_rate - target_rate).abs() < 0.001 {
             None
@@ -400,8 +400,9 @@ mod tests {
         })
         .unwrap();
         for packet in frames.chunks(137 * 2) {
-            let left: Vec<f32> = packet.chunks_exact(2).map(|frame| frame[0]).collect();
-            let right: Vec<f32> = packet.chunks_exact(2).map(|frame| frame[1]).collect();
+            let (stereo, _) = packet.as_chunks::<2>();
+            let left: Vec<f32> = stereo.iter().map(|frame| frame[0]).collect();
+            let right: Vec<f32> = stereo.iter().map(|frame| frame[1]).collect();
             pipe.push_planar(&[&left, &right]).unwrap();
         }
         pipe.finish().unwrap();

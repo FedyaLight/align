@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Align batch CLI (sync / export / export-json)."
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "align-cli"
 path = "src/main.rs"

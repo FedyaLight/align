@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Native GPUI desktop app: Metal on macOS, DirectX on Windows, Vulkan on Linux. Single codebase."
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "align"
 path = "src/main.rs"
@@ -19,14 +22,14 @@ mimalloc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 dirs.workspace = true
-velopack = "1.2.0"
-# Same HTTP client and version parser Velopack uses; no extra crates.
+# Native package updates use the same HTTP client and version parser as Velopack.
 ureq = "3"
 semver = "1"
 url = "2"
 sha2.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+velopack = "1.2.0"
 windows-sys = { version = "0.59", features = [
     "Wdk_System_SystemServices",
     "Win32_System_SystemInformation",

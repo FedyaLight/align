@@ -22,7 +22,7 @@ where
     // Each slot is written exactly once, by whichever worker claims its
     // index; the lock guards only the instant of the store, so it cannot
     // contend and cannot poison (no panicking code runs under it).
-    let slots: Vec<Mutex<Option<R>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    let slots = Vec::from_fn(n, |_| Mutex::new(None));
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {

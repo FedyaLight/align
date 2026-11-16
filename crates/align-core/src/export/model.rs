@@ -408,10 +408,10 @@ impl ExportItem {
     }
 
     pub fn is_enabled(&self, media_type: &str) -> bool {
-        if media_type == "audio" {
-            if let Some(linked) = &self.linked_audio_edit {
-                return linked.enabled;
-            }
+        if media_type == "audio"
+            && let Some(linked) = &self.linked_audio_edit
+        {
+            return linked.enabled;
         }
         if media_type == "audio" && self.clip.kind == MediaKind::Video {
             return self.audio_enabled.unwrap_or(self.enabled);
@@ -419,10 +419,10 @@ impl ExportItem {
         self.enabled
     }
     pub fn is_track_enabled(&self, media_type: &str) -> bool {
-        if media_type == "audio" {
-            if let Some(linked) = &self.linked_audio_edit {
-                return linked.track_enabled;
-            }
+        if media_type == "audio"
+            && let Some(linked) = &self.linked_audio_edit
+        {
+            return linked.track_enabled;
         }
         if media_type == "audio" && self.clip.kind == MediaKind::Video {
             return self.audio_track_enabled.unwrap_or(self.track_enabled);
@@ -430,10 +430,10 @@ impl ExportItem {
         self.track_enabled
     }
     pub fn is_track_locked(&self, media_type: &str) -> bool {
-        if media_type == "audio" {
-            if let Some(linked) = &self.linked_audio_edit {
-                return linked.track_locked;
-            }
+        if media_type == "audio"
+            && let Some(linked) = &self.linked_audio_edit
+        {
+            return linked.track_locked;
         }
         if media_type == "audio" && self.clip.kind == MediaKind::Video {
             return self.audio_track_locked.unwrap_or(self.track_locked);
@@ -441,61 +441,61 @@ impl ExportItem {
         self.track_locked
     }
     pub fn timeline_start(&self, media_type: &str) -> f64 {
-        if media_type == "audio" {
-            if let Some(linked) = &self.linked_audio_edit {
-                return linked.start;
-            }
+        if media_type == "audio"
+            && let Some(linked) = &self.linked_audio_edit
+        {
+            return linked.start;
         }
         self.start
     }
     pub fn selected_source_in(&self, media_type: &str) -> f64 {
-        if media_type == "audio" {
-            if let Some(linked) = &self.linked_audio_edit {
-                return linked.source_in;
-            }
+        if media_type == "audio"
+            && let Some(linked) = &self.linked_audio_edit
+        {
+            return linked.source_in;
         }
         self.source_in
     }
     pub fn selected_source_out(&self, media_type: &str) -> f64 {
-        if media_type == "audio" {
-            if let Some(linked) = &self.linked_audio_edit {
-                return linked.source_out;
-            }
+        if media_type == "audio"
+            && let Some(linked) = &self.linked_audio_edit
+        {
+            return linked.source_out;
         }
         self.source_out
     }
     pub fn selected_timeline_duration(&self, media_type: &str) -> f64 {
-        if media_type == "audio" {
-            if let Some(linked) = &self.linked_audio_edit {
-                return linked.timeline_duration;
-            }
+        if media_type == "audio"
+            && let Some(linked) = &self.linked_audio_edit
+        {
+            return linked.timeline_duration;
         }
         self.timeline_duration
     }
     pub fn playback_rate(&self, media_type: &str) -> f64 {
-        if media_type == "audio" {
-            if let Some(linked) = &self.linked_audio_edit {
-                return linked.playback_rate;
-            }
+        if media_type == "audio"
+            && let Some(linked) = &self.linked_audio_edit
+        {
+            return linked.playback_rate;
         }
         self.playback_rate
     }
     pub fn plays_backward(&self, media_type: &str) -> bool {
-        if media_type == "audio" {
-            if let Some(linked) = &self.linked_audio_edit {
-                return linked.plays_backward;
-            }
+        if media_type == "audio"
+            && let Some(linked) = &self.linked_audio_edit
+        {
+            return linked.plays_backward;
         }
         self.plays_backward
     }
     pub fn fcp7_time_remap_xml(&self, media_type: &str) -> Option<&str> {
-        if media_type == "audio" {
-            if let Some(linked) = &self.linked_audio_edit {
-                return linked
-                    .fcp7_time_remap_xml
-                    .as_deref()
-                    .or(self.fcp7_time_remap_xml.as_deref());
-            }
+        if media_type == "audio"
+            && let Some(linked) = &self.linked_audio_edit
+        {
+            return linked
+                .fcp7_time_remap_xml
+                .as_deref()
+                .or(self.fcp7_time_remap_xml.as_deref());
         }
         self.fcp7_time_remap_xml.as_deref()
     }
@@ -552,10 +552,10 @@ impl ExportItem {
             .or(self.fcpxml_audio_role.as_deref())
     }
     pub fn preferred_source_key(&self, media_type: &str) -> Option<&str> {
-        if media_type == "audio" {
-            if let Some(linked) = &self.linked_audio_edit {
-                return Some(linked.preferred_source_key.as_str());
-            }
+        if media_type == "audio"
+            && let Some(linked) = &self.linked_audio_edit
+        {
+            return Some(linked.preferred_source_key.as_str());
         }
         if media_type == "audio" {
             self.preferred_audio_source_key
@@ -911,11 +911,11 @@ fn close_common_gaps(clips: &mut [ExportItem]) {
     spans.sort_by(|a, b| a.0.total_cmp(&b.0));
     let mut covered: Vec<(f64, f64)> = Vec::new();
     for (start, end) in spans {
-        if let Some(last) = covered.last_mut() {
-            if start <= last.1 {
-                last.1 = last.1.max(end);
-                continue;
-            }
+        if let Some(last) = covered.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+            continue;
         }
         covered.push((start, end));
     }
@@ -1750,7 +1750,7 @@ fn median(values: &mut [f64]) -> f64 {
     }
     values.sort_by(|a, b| a.total_cmp(b));
     let middle = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         (values[middle - 1] + values[middle]) / 2.0
     } else {
         values[middle]

@@ -369,11 +369,10 @@ fn media_start(item: &ExportItem, kind: &str) -> f64 {
         && item.clip.kind == crate::model::MediaKind::Audio
         && item.clip.recorded_at_source
             == Some(crate::model::RecordingTimestampSource::EmbeddedMetadata)
+        && let Some(date) = item.clip.recorded_at
     {
-        if let Some(date) = item.clip.recorded_at {
-            // Seconds since UTC midnight.
-            return (date % 86_400) as f64;
-        }
+        // Seconds since UTC midnight.
+        return (date % 86_400) as f64;
     }
     0.0
 }

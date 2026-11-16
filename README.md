@@ -132,8 +132,8 @@ open "/Applications/Align.app"
 
 ### Build from source
 
-Install a current stable Rust toolchain; FFmpeg and ffprobe are needed for
-tests and for MTS/MXF/R3D media on Linux and Windows. See the
+Install Rust 1.100.0 (selected by `rust-toolchain.toml`). FFmpeg and ffprobe
+are needed for tests and for MTS/MXF/R3D media on Linux and Windows. See the
 [development guide](docs/development.md#prerequisites) for platform dependencies.
 
 ```sh
