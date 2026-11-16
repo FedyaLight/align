@@ -157,6 +157,7 @@ pub fn parse_ffprobe_json(json: &[u8]) -> Option<ProbeReport> {
                         .map(|b| b as u32),
                     is_float,
                     decoder_delay,
+                    end_seconds: None,
                 })
             }
             "video" => {

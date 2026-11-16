@@ -504,12 +504,17 @@ impl MediaBackend for AppleNativeBackend {
         let mut audio_streams = Vec::with_capacity(audio.len());
         for track in &audio {
             let (sample_rate, channels, bit_depth, is_float) = stream_format(track)?;
+            // SAFETY: plain-data getters on a loaded audio track.
+            let end = unsafe { track.timeRange().end() };
             audio_streams.push(AudioStreamProbe {
                 sample_rate,
                 channels,
                 bit_depth,
                 is_float,
                 decoder_delay: 0.0,
+                end_seconds: is_numeric(end)
+                    .then(|| end.value as f64 / end.timescale as f64)
+                    .filter(|end| end.is_finite() && *end > 0.0),
             });
         }
         let video = video_probe(&asset)?;

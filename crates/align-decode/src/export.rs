@@ -77,6 +77,11 @@ pub enum ExportJobKind {
 pub enum ExportError {
     Timeline(TimelineExportError),
     Render(RenderError),
+    AudioRender {
+        file: String,
+        operation: &'static str,
+        error: RenderError,
+    },
     Media(String),
     Cancelled,
     Io(String),
@@ -91,11 +96,31 @@ impl From<RenderError> for ExportError {
     }
 }
 
+impl ExportError {
+    fn audio(source: &Path, operation: &'static str, error: RenderError) -> Self {
+        match error {
+            RenderError::Cancelled => Self::Cancelled,
+            error => Self::AudioRender {
+                file: align_core::model::file_name(source),
+                operation,
+                error,
+            },
+        }
+    }
+}
+
 impl std::fmt::Display for ExportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Timeline(e) => write!(f, "{e}"),
             Self::Render(e) => write!(f, "{e}"),
+            Self::AudioRender {
+                file,
+                operation,
+                error,
+            } => {
+                write!(f, "Could not prepare {operation} audio for {file}: {error}")
+            }
             Self::Media(message) => write!(f, "Media export: {message}"),
             Self::Cancelled => write!(f, "Cancelled."),
             Self::Io(msg) => write!(f, "Export IO: {msg}"),
@@ -554,7 +579,7 @@ fn export_prepared_internal(
                             &points,
                             cancel,
                         )
-                        .map_err(ExportError::from)?;
+                        .map_err(|e| ExportError::audio(&item.clip.url, "drift-corrected", e))?;
                     }
                     corrected_urls.insert(item.clip.id.0.as_str(), destination);
                     completed += 1;
@@ -613,7 +638,9 @@ fn export_prepared_internal(
                             Some(((start * sr).round() as u64, (end * sr).round() as u64)),
                             cancel,
                         )
-                        .map_err(ExportError::from)?;
+                        .map_err(|e| {
+                            ExportError::audio(&item.clip.url, "sample-accurate Premiere", e)
+                        })?;
                     }
                     pad_rendered.insert(destination.clone());
                     completed += 1;
@@ -695,7 +722,7 @@ fn export_prepared_internal(
                         prepared.precision_tail_samples,
                         cancel,
                     )
-                    .map_err(ExportError::from)?;
+                    .map_err(|e| ExportError::audio(&item.clip.url, "channel-stem", e))?;
                     vacant.insert(urls);
                     completed += 1;
                     emit(
@@ -1393,6 +1420,160 @@ mod tests {
             .collect();
         assert!((samples[(192 + 4800) * 2] - 8000.0 / 32768.0).abs() < 1e-6);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn premiere_export_keeps_a_camera_with_a_shorter_audio_track() {
+        let Some(ffmpeg) = crate::ff::ffmpeg_bin() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("source.wav");
+        let camera = dir.path().join("camera.mov");
+        let mut input = hound::WavWriter::create(
+            &audio,
+            hound::WavSpec {
+                channels: 2,
+                sample_rate: 48000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for frame in 0..91200 {
+            let value = if frame == 4800 || frame == 91199 {
+                16000i16
+            } else {
+                0
+            };
+            input.write_sample(value).unwrap();
+            input.write_sample(-value).unwrap();
+        }
+        input.finalize().unwrap();
+        assert!(
+            std::process::Command::new(ffmpeg)
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+                .arg("color=c=black:s=160x90:r=25:d=2.04")
+                .arg("-i")
+                .arg(&audio)
+                .args([
+                    "-c:v",
+                    "mpeg4",
+                    "-c:a",
+                    "pcm_s16le",
+                    "-movflags",
+                    "+faststart"
+                ])
+                .arg(&camera)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let original = std::fs::read(&camera).unwrap();
+        for kind in [
+            crate::backend::BackendKind::Portable,
+            #[cfg(target_os = "macos")]
+            crate::backend::BackendKind::AppleNative,
+        ] {
+            let backend = crate::backend::create(kind);
+            for end in [2.04, 2.0] {
+                let mut fractional = item("fractional", MediaKind::Video, 5.084, 2.04);
+                fractional.clip.url = camera.clone();
+                fractional.clip.audio[0].bit_depth = Some(16);
+                fractional.source_in = 0.05;
+                fractional.source_out = end;
+                fractional.timeline_duration = end - 0.05;
+                let mut anchor = item("anchor", MediaKind::Video, 5.0, 2.04);
+                anchor.clip.url = camera.clone();
+                let timeline = ExportTimeline::new(
+                    vec![ExportIsland {
+                        id: 0,
+                        clips: vec![anchor, fractional],
+                        duration: 2.2,
+                    }],
+                    MediaTime::new(1, 25),
+                    "camera tail",
+                );
+                let out = dir.path().join(format!("{kind:?}-{end}"));
+                let run = || {
+                    export_prepared(
+                        ExportRequest {
+                            backend: backend.as_ref(),
+                            timeline: &timeline,
+                            directory: &out,
+                            formats: &[TimelineExportFormat::PremiereXML],
+                            correct_drift: false,
+                            include_replaced_sequence: false,
+                            include_media_files: false,
+                            aaf_frame_duration: None,
+                            include_fcpxml_timeline: true,
+                            include_fcpxml_multicam: true,
+                            group_fcpxml_storylines: false,
+                            cancel: &std::sync::atomic::AtomicBool::new(false),
+                        },
+                        None,
+                    )
+                };
+                let artifacts = run().expect("a valid camera audio extent must export");
+                let pads: Vec<_> = std::fs::read_dir(out.join("Corrected Audio"))
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect();
+                assert_eq!(pads.len(), 1);
+                let reader = hound::WavReader::open(&pads[0]).unwrap();
+                assert_eq!(
+                    reader.duration(),
+                    192 + ((end - 0.05) * 48000.0).round() as u32
+                );
+                let samples: Vec<f32> = reader.into_samples().map(Result::unwrap).collect();
+                let first = 192 + 4800 - 2400;
+                let last = 192 + 91199 - 2400;
+                assert_eq!(
+                    &samples[first * 2..first * 2 + 2],
+                    &[16000.0 / 32768.0, -16000.0 / 32768.0]
+                );
+                assert_eq!(
+                    &samples[last * 2..last * 2 + 2],
+                    &[16000.0 / 32768.0, -16000.0 / 32768.0]
+                );
+                assert!(samples[..192 * 2].iter().all(|sample| *sample == 0.0));
+                assert!(
+                    samples[(last + 1) * 2..]
+                        .iter()
+                        .all(|sample| *sample == 0.0)
+                );
+                assert_eq!(std::fs::read(&camera).unwrap(), original);
+                let xml = &artifacts[0].url;
+                let previous_xml = std::fs::read(xml).unwrap();
+                let previous_pad = std::fs::read(&pads[0]).unwrap();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&camera)
+                    .unwrap()
+                    .set_len((original.len() - 91200) as u64)
+                    .unwrap();
+                assert!(
+                    backend.inspect(&camera).is_ok(),
+                    "metadata remains readable"
+                );
+                let error =
+                    run().expect_err("missing media inside the declared audio track must fail");
+                assert!(error.to_string().contains("camera.mov"), "{error}");
+                assert!(
+                    error.to_string().contains("sample-accurate Premiere"),
+                    "{error}"
+                );
+                assert_eq!(std::fs::read(xml).unwrap(), previous_xml);
+                assert_eq!(std::fs::read(&pads[0]).unwrap(), previous_pad);
+                assert_eq!(
+                    std::fs::read_dir(out.join("Corrected Audio"))
+                        .unwrap()
+                        .count(),
+                    1
+                );
+                std::fs::write(&camera, &original).unwrap();
+            }
+        }
     }
 
     #[test]

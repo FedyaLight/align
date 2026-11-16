@@ -197,6 +197,7 @@ impl PcmTrack {
                 bit_depth: Some(self.bits),
                 is_float: Some(self.float),
                 decoder_delay: 0.0,
+                end_seconds: Some(self.total.saturating_sub(self.lead) as f64 / self.sample_rate),
             }],
             has_video: false,
             video: None,

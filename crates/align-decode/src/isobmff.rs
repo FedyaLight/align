@@ -173,6 +173,8 @@ pub struct Track {
     pub media_duration: u64,
     /// Presented duration from the edit list, in the movie timescale.
     pub edited_duration: Option<u64>,
+    /// Full presentation extent, including empty edits, in the movie timescale.
+    pub presentation_duration: Option<u64>,
     /// Media time where presentation starts (first non-empty edit), in the
     /// track timescale. AAC encoder priming is skipped this way.
     pub media_start: u64,
@@ -321,13 +323,20 @@ impl Movie {
     pub fn probe(&self) -> Option<ProbeReport> {
         let audio_streams: Vec<AudioStreamProbe> = self
             .audio()
-            .filter_map(|t| t.audio.as_ref())
-            .map(|a| AudioStreamProbe {
-                sample_rate: a.sample_rate,
-                channels: a.channels,
-                bit_depth: a.bit_depth,
-                is_float: a.is_float,
-                decoder_delay: 0.0,
+            .filter_map(|track| {
+                let a = track.audio.as_ref()?;
+                let end = match track.presentation_duration {
+                    Some(duration) if self.timescale > 0 => duration as f64 / self.timescale as f64,
+                    _ => track.media_duration as f64 / track.timescale.max(1) as f64,
+                };
+                Some(AudioStreamProbe {
+                    sample_rate: a.sample_rate,
+                    channels: a.channels,
+                    bit_depth: a.bit_depth,
+                    is_float: a.is_float,
+                    decoder_delay: 0.0,
+                    end_seconds: (end.is_finite() && end > 0.0).then_some(end),
+                })
             })
             .collect();
         let video = self.video().map(|track| VideoProbe {
@@ -851,6 +860,7 @@ fn parse_trak(trak: &[u8]) -> Option<Track> {
         let (version, mut b) = full_box(elst.body)?;
         let entries = b.u32()?;
         let mut total = 0u64;
+        let mut presentation = 0u64;
         let mut start = None;
         for _ in 0..entries {
             let (duration, media_time) = if version == 1 {
@@ -859,20 +869,23 @@ fn parse_trak(trak: &[u8]) -> Option<Track> {
                 (b.u32()? as u64, b.u32()? as i32 as i64)
             };
             b.skip(4)?; // media rate
+            presentation = presentation.checked_add(duration)?;
             if media_time >= 0 {
-                total += duration;
+                total = total.checked_add(duration)?;
                 start.get_or_insert(media_time as u64);
             }
         }
-        Some((total, start.unwrap_or(0)))
+        Some((total, start.unwrap_or(0), presentation))
     });
-    let edited_duration = edits.map(|(total, _)| total);
-    let media_start = edits.map_or(0, |(_, start)| start);
+    let edited_duration = edits.map(|(total, _, _)| total);
+    let media_start = edits.map_or(0, |(_, start, _)| start);
+    let presentation_duration = edits.map(|(_, _, presentation)| presentation);
 
     Some(Track {
         id,
         kind,
         edited_duration,
+        presentation_duration,
         media_start,
         codec: entry.kind,
         sample_entry: entry.raw.to_vec(),

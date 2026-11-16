@@ -27,6 +27,7 @@ pub enum RenderError {
     NoAudio(String),
     UnknownFormat(String),
     CannotRead,
+    Decode(String),
     CannotWrite,
     InvalidMapping,
     PlacementPad(String),
@@ -38,7 +39,11 @@ impl std::fmt::Display for RenderError {
             Self::Cancelled => write!(f, "Audio rendering cancelled."),
             Self::NoAudio(name) => write!(f, "No audio track was found in {name}."),
             Self::UnknownFormat(name) => write!(f, "Cannot read the audio format of {name}."),
-            Self::CannotRead => write!(f, "Cannot decode audio for drift correction."),
+            Self::CannotRead => write!(
+                f,
+                "Audio decoding ended before the requested range was complete."
+            ),
+            Self::Decode(message) => write!(f, "Cannot decode audio: {message}"),
             Self::CannotWrite => write!(f, "Cannot write drift-corrected audio."),
             Self::InvalidMapping => write!(f, "The drift-correction time map is invalid."),
             Self::PlacementPad(message) => {
@@ -58,7 +63,7 @@ impl From<DecodeError> for RenderError {
             DecodeError::InvalidPcm | DecodeError::UnsupportedOutput => {
                 Self::UnknownFormat(String::new())
             }
-            _ => Self::CannotRead,
+            other => Self::Decode(other.to_string()),
         }
     }
 }
@@ -78,7 +83,7 @@ pub(crate) fn check_cancel(cancel: &AtomicBool) -> Result<(), RenderError> {
     }
 }
 
-/// A camera's last audio sample may precede its last video frame, and audio
+/// A camera's audio track may end before its video track, and audio
 /// whose decoder delay is trimmed from its start (AC-3 in MPEG-TS) ends that
 /// many samples before its container. After a successful decode, fill only
 /// those gaps at the container's end. Never conceal truncated audio or
@@ -90,14 +95,13 @@ fn finish_tail(
     remaining: u64,
     sample_rate: f64,
     channels: usize,
+    cancel: &AtomicBool,
 ) -> Result<(), RenderError> {
     if remaining == 0 {
         return Ok(());
     }
-    let delay = probe
-        .audio_streams
-        .first()
-        .map_or(0.0, |s| (s.decoder_delay * sample_rate).round());
+    let stream = probe.audio_streams.first();
+    let delay = stream.map_or(0.0, |s| (s.decoder_delay * sample_rate).round());
     let frame = if probe.has_video {
         let frame_duration = probe
             .video
@@ -108,12 +112,24 @@ fn finish_tail(
     } else {
         0.0
     };
-    if (end_seconds - probe.duration_seconds).abs() > 1.0 / sample_rate
-        || remaining as f64 > delay + frame
-    {
+    let end_sample = (end_seconds * sample_rate).round();
+    let allowance = stream
+        .and_then(|s| s.end_seconds)
+        .filter(|end| {
+            end.is_finite() && *end > 0.0 && *end <= probe.duration_seconds + 1.0 / sample_rate
+        })
+        .map(|audio_end| (end_sample - (audio_end * sample_rate).round()).max(0.0) + delay)
+        .unwrap_or_else(|| {
+            if (end_seconds - probe.duration_seconds).abs() <= 1.0 / sample_rate {
+                delay + frame
+            } else {
+                0.0
+            }
+        });
+    if end_seconds > probe.duration_seconds + 1.0 / sample_rate || remaining as f64 > allowance {
         return Err(RenderError::CannotRead);
     }
-    writer.write_silence(channels, remaining as usize)
+    writer.write_silence(channels, remaining, cancel)
 }
 
 // ------------------------------------------------------------ wav writer
@@ -185,10 +201,21 @@ impl WavWriter {
         self.flush_frames(n)
     }
 
-    fn write_silence(&mut self, channels: usize, frames: usize) -> Result<(), RenderError> {
-        self.bytes.clear();
-        self.bytes.resize(frames * channels * 4, 0);
-        self.flush_frames(frames)
+    fn write_silence(
+        &mut self,
+        channels: usize,
+        mut frames: u64,
+        cancel: &AtomicBool,
+    ) -> Result<(), RenderError> {
+        while frames > 0 {
+            check_cancel(cancel)?;
+            let take = frames.min(4096) as usize;
+            self.bytes.clear();
+            self.bytes.resize(take * channels * 4, 0);
+            self.flush_frames(take)?;
+            frames -= take as u64;
+        }
+        Ok(())
     }
 
     fn flush_frames(&mut self, frames: usize) -> Result<(), RenderError> {
@@ -636,13 +663,7 @@ pub fn render_pad_cancellable(
         let _ = std::fs::remove_file(path);
     });
     let mut writer = WavWriter::create(&tmp, sample_rate as u32, channels, false)?;
-    let mut silence = pad_samples;
-    while silence > 0 {
-        check_cancel(cancel)?;
-        let n = silence.min(4096) as usize;
-        writer.write_silence(channels, n)?;
-        silence -= n as u64;
-    }
+    writer.write_silence(channels, pad_samples, cancel)?;
     let range = selection.map(|(start, end)| {
         (
             start as f64 / sample_rate,
@@ -673,6 +694,7 @@ pub fn render_pad_cancellable(
             n,
             sample_rate,
             channels,
+            cancel,
         )?;
     }
     check_cancel(cancel)?;
@@ -798,14 +820,9 @@ pub fn render_channels_cancellable(
                 remaining,
                 sample_rate,
                 1,
+                cancel,
             )?;
-            let mut tail_remaining = tail_samples;
-            while tail_remaining > 0 {
-                check_cancel(cancel)?;
-                let n = tail_remaining.min(4096) as usize;
-                writer.write_silence(1, n)?;
-                tail_remaining -= n as u64;
-            }
+            writer.write_silence(1, tail_samples, cancel)?;
             writer.finalize()?;
             align_core::wav::preserve_broadcast_extension(
                 source,
@@ -934,14 +951,15 @@ mod tests {
                     .flat_map(f32::to_le_bytes)
                     .collect::<Vec<_>>()
             };
-            let capacity = writer.bytes.capacity();
-            writer.write_silence(2, 2).unwrap();
-            assert_eq!(writer.bytes.capacity(), capacity);
-            assert_eq!(writer.frames_written, 5);
+            writer.write_silence(2, 8193, &NEVER_CANCELLED).unwrap();
+            assert_eq!(
+                writer.write_silence(2, 1, &AtomicBool::new(true)),
+                Err(RenderError::Cancelled)
+            );
             writer.finalize().unwrap();
             let bytes = std::fs::read(path).unwrap();
             assert_eq!(&bytes[80..104], expected);
-            assert_eq!(&bytes[104..], &[0; 16]);
+            assert_eq!(&bytes[104..], &[0; 8193 * 8]);
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1138,6 +1156,7 @@ mod tests {
 
     #[test]
     fn camera_tail_gap_is_silent_but_truncated_audio_is_rejected() {
+        let cancel = &NEVER_CANCELLED;
         let dir = tmp("camera-tail");
         let src = dir.join("source.wav");
         write_stereo_wav(&src, 48000, 1, 42);
@@ -1145,21 +1164,37 @@ mod tests {
         let dst = dir.join("tail.wav");
         let mut writer = WavWriter::create(&dst, 48000, 2, false).unwrap();
         assert_eq!(
-            finish_tail(&mut writer, &probe, 1.0, 6, 48000.0, 2),
+            finish_tail(&mut writer, &probe, 1.0, 6, 48000.0, 2, cancel),
             Err(RenderError::CannotRead)
         );
         probe.has_video = true;
         assert_eq!(
-            finish_tail(&mut writer, &probe, 0.9, 6, 48000.0, 2),
+            finish_tail(&mut writer, &probe, 0.9, 6, 48000.0, 2, cancel),
             Err(RenderError::CannotRead)
         );
         assert_eq!(
-            finish_tail(&mut writer, &probe, 1.0, 4800, 48000.0, 2),
+            finish_tail(&mut writer, &probe, 1.0, 4800, 48000.0, 2, cancel),
             Err(RenderError::CannotRead)
         );
-        finish_tail(&mut writer, &probe, 1.0, 6, 48000.0, 2).unwrap();
+        // Even a short shortage is not valid inside a known audio extent.
+        assert_eq!(
+            finish_tail(&mut writer, &probe, 1.0, 6, 48000.0, 2, cancel),
+            Err(RenderError::CannotRead)
+        );
+        probe.duration_seconds = 1.14;
+        assert_eq!(
+            finish_tail(&mut writer, &probe, 1.14, 6721, 48000.0, 2, cancel),
+            Err(RenderError::CannotRead)
+        );
+        assert_eq!(
+            finish_tail(&mut writer, &probe, 1.15, 7200, 48000.0, 2, cancel),
+            Err(RenderError::CannotRead)
+        );
+        finish_tail(&mut writer, &probe, 1.14, 6720, 48000.0, 2, cancel).unwrap();
+        probe.audio_streams[0].end_seconds = None;
+        finish_tail(&mut writer, &probe, 1.14, 6, 48000.0, 2, cancel).unwrap();
         writer.finalize().unwrap();
-        assert_eq!(read_pad_samples(&dst), vec![0.0; 12]);
+        assert_eq!(read_pad_samples(&dst), vec![0.0; (6720 + 6) * 2]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
