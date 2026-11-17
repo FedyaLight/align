@@ -100,7 +100,7 @@ fn slide_in_from_right<E: IntoElement + Styled + 'static>(
         .child(child)
         .with_animation(
             id,
-            entrance(if closing { 180 } else { 280 }),
+            entrance(if closing { SIDEBAR_CLOSE_MS } else { 280 }),
             move |el, progress| {
                 let visible = if closing { 1. - progress } else { progress };
                 let visible = if reduced {
@@ -132,7 +132,7 @@ fn quality_dropdown_motion<E: IntoElement + Styled + 'static>(
             } else {
                 "search-quality-dropdown-in"
             },
-            entrance(200),
+            entrance(DROPDOWN_MS),
             move |el, progress| {
                 let visible = if reduced {
                     if closing { 1. - progress } else { progress }
@@ -166,7 +166,7 @@ fn export_select_motion<E: IntoElement + Styled + 'static>(
         .rounded_lg()
         .shadow_md()
         .child(child)
-        .with_animation(animation_id, entrance(200), move |el, progress| {
+        .with_animation(animation_id, entrance(DROPDOWN_MS), move |el, progress| {
             let visible = if closing { 1. - progress } else { progress };
             let height = if reduced { 1. } else { visible };
             el.h(px(menu_height * height)).opacity(visible)
@@ -192,7 +192,7 @@ fn settings_select_motion<E: IntoElement + Styled + 'static>(
                 select.id(),
                 if closing { "out" } else { "in" }
             )),
-            entrance(180),
+            entrance(SETTINGS_MOTION_MS),
             move |el, progress| {
                 let visible = if closing { 1. - progress } else { progress };
                 let height = if reduced { 1. } else { visible };
@@ -216,7 +216,7 @@ fn settings_reset_motion<E: IntoElement + Styled + 'static>(
             } else {
                 "settings-reset-in"
             },
-            entrance(180),
+            entrance(SETTINGS_MOTION_MS),
             move |el, progress| {
                 let visible = if closing { 1. - progress } else { progress };
                 let width = if reduced { 1. } else { visible };
@@ -309,7 +309,7 @@ fn export_reveal<E: IntoElement + 'static>(
         .child(child)
         .with_animation(
             (id, usize::from(closing)),
-            entrance(180),
+            entrance(SETTINGS_MOTION_MS),
             move |el, progress| {
                 let visible = if closing { 1. - progress } else { progress };
                 let height = if reduced { 1. } else { visible };
@@ -331,7 +331,11 @@ fn selection_control_motion<E: IntoElement + Styled + 'static>(
         .child(child)
         .with_animation(
             id,
-            entrance(if closing { 130 } else { 160 }),
+            entrance(if closing {
+                SELECTION_CONTROL_CLOSE_MS
+            } else {
+                160
+            }),
             move |el, progress| {
                 let visible = if reduced {
                     if closing { 0. } else { 1. }
@@ -800,6 +804,48 @@ impl ExportInputs {
     }
 }
 
+/// Exit and motion lengths, shared by an element's animation and the timer
+/// that removes it once the animation has played.
+const SIDEBAR_CLOSE_MS: u64 = 180;
+const DROPDOWN_MS: u64 = 200;
+const SETTINGS_MOTION_MS: u64 = 180;
+const SELECTION_CONTROL_CLOSE_MS: u64 = 130;
+
+/// The exit phase of a transient element, which stays rendered while it
+/// animates out. Restarting or cancelling the exit invalidates earlier timers.
+#[derive(Default)]
+struct Exit {
+    active: bool,
+    generation: u64,
+}
+
+impl Exit {
+    fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Starts the exit; its timer must present the returned token.
+    fn start(&mut self) -> u64 {
+        self.generation += 1;
+        self.active = true;
+        self.generation
+    }
+
+    fn cancel(&mut self) {
+        self.generation += 1;
+        self.active = false;
+    }
+
+    /// Ends the exit when `token` is the latest; true when it ended.
+    fn finish(&mut self, token: u64) -> bool {
+        let current = self.active && self.generation == token;
+        if current {
+            self.active = false;
+        }
+        current
+    }
+}
+
 pub struct AlignApp {
     pub(crate) data: AppData,
     pub(crate) focus_handle: FocusHandle,
@@ -809,20 +855,18 @@ pub struct AlignApp {
     app_menu_position: Option<Point<Pixels>>,
     export_scroll: ScrollHandle,
     export_scroll_drag: Option<(f32, f32)>,
-    export_sidebar_closing: bool,
-    search_quality_closing: bool,
+    export_sidebar_exit: Exit,
+    search_quality_exit: Exit,
     export_select: Option<ExportSelect>,
-    export_select_closing: bool,
-    export_select_generation: u64,
+    export_select_exit: Exit,
     settings_select: Option<SettingsSelect>,
-    settings_select_closing: bool,
-    settings_select_generation: u64,
+    settings_select_exit: Exit,
     settings_close_closing: bool,
     settings_reset_closing: bool,
     settings_motion_generation: u64,
     settings_initial_common: SyncDefaults,
     settings_initial_sequence: SequenceDefaults,
-    selection_controls_closing: bool,
+    selection_controls_exit: Exit,
     export_reveals_closing: HashMap<&'static str, u64>,
     export_reveal_generation: u64,
     timeline_transitions: HashMap<ClipId, TimelineTransition>,
@@ -855,20 +899,18 @@ impl AlignApp {
             app_menu_position: None,
             export_scroll: ScrollHandle::new(),
             export_scroll_drag: None,
-            export_sidebar_closing: false,
-            search_quality_closing: false,
+            export_sidebar_exit: Exit::default(),
+            search_quality_exit: Exit::default(),
             export_select: None,
-            export_select_closing: false,
-            export_select_generation: 0,
+            export_select_exit: Exit::default(),
             settings_select: None,
-            settings_select_closing: false,
-            settings_select_generation: 0,
+            settings_select_exit: Exit::default(),
             settings_close_closing: false,
             settings_reset_closing: false,
             settings_motion_generation: 0,
             settings_initial_common: SyncDefaults::default(),
             settings_initial_sequence: SequenceDefaults::default(),
-            selection_controls_closing: false,
+            selection_controls_exit: Exit::default(),
             export_reveals_closing: HashMap::new(),
             export_reveal_generation: 0,
             timeline_transitions: HashMap::new(),
@@ -1053,11 +1095,11 @@ impl AlignApp {
     }
 
     pub(crate) fn start_sync(&mut self, cx: &mut Context<Self>) {
-        self.search_quality_closing = false;
+        self.search_quality_exit.cancel();
         self.clear_export_select();
         self.clear_settings_select();
-        self.selection_controls_closing = false;
-        self.export_sidebar_closing = false;
+        self.selection_controls_exit.cancel();
+        self.export_sidebar_exit.cancel();
         if !self.data.begin_sync_run() {
             return;
         }
@@ -1293,11 +1335,11 @@ impl AlignApp {
             return;
         }
         self.data.show_export = true;
-        self.export_sidebar_closing = false;
+        self.export_sidebar_exit.cancel();
         self.export_reveals_closing.clear();
         self.clear_export_select();
         self.data.show_search_quality = false;
-        self.search_quality_closing = false;
+        self.search_quality_exit.cancel();
         self.data.export_started = false;
         self.data.error = None;
         self.export_scroll.set_offset(point(px(0.), px(0.)));
@@ -1305,103 +1347,72 @@ impl AlignApp {
     }
 
     fn close_search_quality(&mut self, cx: &mut Context<Self>) {
-        if !self.data.show_search_quality || self.search_quality_closing {
+        if !self.data.show_search_quality || self.search_quality_exit.is_active() {
             return;
         }
-        self.search_quality_closing = true;
+        let exit = self.search_quality_exit.start();
         cx.notify();
-
-        let timer = cx.background_executor().timer(Duration::from_millis(200));
-        cx.spawn(async move |view, cx| {
-            timer.await;
-            let _ = view.update(cx, |this, cx| {
-                if this.search_quality_closing {
-                    this.data.show_search_quality = false;
-                    this.search_quality_closing = false;
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+        self.after(DROPDOWN_MS, cx, move |this| {
+            if this.search_quality_exit.finish(exit) {
+                this.data.show_search_quality = false;
+            }
+        });
     }
 
     fn toggle_export_select(&mut self, select: ExportSelect, cx: &mut Context<Self>) {
-        if self.export_select == Some(select) && !self.export_select_closing {
+        if self.export_select == Some(select) && !self.export_select_exit.is_active() {
             self.close_export_select(cx);
             return;
         }
-        self.export_select_generation += 1;
+        self.export_select_exit.cancel();
         self.export_select = Some(select);
-        self.export_select_closing = false;
         cx.notify();
     }
 
     fn close_export_select(&mut self, cx: &mut Context<Self>) {
-        if self.export_select.is_none() || self.export_select_closing {
+        if self.export_select.is_none() || self.export_select_exit.is_active() {
             return;
         }
-        self.export_select_generation += 1;
-        let generation = self.export_select_generation;
-        self.export_select_closing = true;
+        let exit = self.export_select_exit.start();
         cx.notify();
-
-        let timer = cx.background_executor().timer(Duration::from_millis(200));
-        cx.spawn(async move |view, cx| {
-            timer.await;
-            let _ = view.update(cx, |this, cx| {
-                if this.export_select_generation == generation && this.export_select_closing {
-                    this.export_select = None;
-                    this.export_select_closing = false;
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+        self.after(DROPDOWN_MS, cx, move |this| {
+            if this.export_select_exit.finish(exit) {
+                this.export_select = None;
+            }
+        });
     }
 
     fn clear_export_select(&mut self) {
-        self.export_select_generation += 1;
+        self.export_select_exit.cancel();
         self.export_select = None;
-        self.export_select_closing = false;
     }
 
     fn toggle_settings_select(&mut self, select: SettingsSelect, cx: &mut Context<Self>) {
-        if self.settings_select == Some(select) && !self.settings_select_closing {
+        if self.settings_select == Some(select) && !self.settings_select_exit.is_active() {
             self.close_settings_select(cx);
             return;
         }
-        self.settings_select_generation += 1;
+        self.settings_select_exit.cancel();
         self.settings_select = Some(select);
-        self.settings_select_closing = false;
         cx.notify();
     }
 
     fn close_settings_select(&mut self, cx: &mut Context<Self>) {
-        if self.settings_select.is_none() || self.settings_select_closing {
+        if self.settings_select.is_none() || self.settings_select_exit.is_active() {
             return;
         }
-        self.settings_select_generation += 1;
-        let generation = self.settings_select_generation;
-        self.settings_select_closing = true;
+        let exit = self.settings_select_exit.start();
         cx.notify();
-        let timer = cx.background_executor().timer(Duration::from_millis(180));
-        cx.spawn(async move |view, cx| {
-            timer.await;
-            let _ = view.update(cx, |this, cx| {
-                if this.settings_select_generation == generation && this.settings_select_closing {
-                    this.settings_select = None;
-                    this.settings_select_closing = false;
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+        self.after(SETTINGS_MOTION_MS, cx, move |this| {
+            if this.settings_select_exit.finish(exit) {
+                this.settings_select = None;
+            }
+        });
     }
 
     fn clear_settings_select(&mut self) {
-        self.settings_select_generation += 1;
+        self.settings_select_exit.cancel();
         self.settings_select = None;
-        self.settings_select_closing = false;
     }
 
     fn animate_settings_change(
@@ -1432,18 +1443,12 @@ impl AlignApp {
         if !self.settings_close_closing && !self.settings_reset_closing {
             return;
         }
-        let timer = cx.background_executor().timer(Duration::from_millis(180));
-        cx.spawn(async move |view, cx| {
-            timer.await;
-            let _ = view.update(cx, |this, cx| {
-                if this.settings_motion_generation == generation {
-                    this.settings_close_closing = false;
-                    this.settings_reset_closing = false;
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+        self.after(SETTINGS_MOTION_MS, cx, move |this| {
+            if this.settings_motion_generation == generation {
+                this.settings_close_closing = false;
+                this.settings_reset_closing = false;
+            }
+        });
     }
 
     fn set_settings_scope(&mut self, scope: SettingsScope, cx: &mut Context<Self>) {
@@ -1457,17 +1462,11 @@ impl AlignApp {
             self.settings_reset_closing = !was_default && is_default;
             cx.notify();
             if self.settings_reset_closing {
-                let timer = cx.background_executor().timer(Duration::from_millis(180));
-                cx.spawn(async move |view, cx| {
-                    timer.await;
-                    let _ = view.update(cx, |this, cx| {
-                        if this.settings_motion_generation == generation {
-                            this.settings_reset_closing = false;
-                            cx.notify();
-                        }
-                    });
-                })
-                .detach();
+                self.after(SETTINGS_MOTION_MS, cx, move |this| {
+                    if this.settings_motion_generation == generation {
+                        this.settings_reset_closing = false;
+                    }
+                });
                 return;
             }
         }
@@ -1585,56 +1584,54 @@ impl AlignApp {
         if closing.is_empty() {
             return;
         }
-        let timer = cx.background_executor().timer(Duration::from_millis(180));
-        cx.spawn(async move |view, cx| {
-            timer.await;
-            let _ = view.update(cx, |this, cx| {
-                for (id, generation) in closing {
-                    if this.export_reveals_closing.get(id) == Some(&generation) {
-                        this.export_reveals_closing.remove(id);
-                    }
+        self.after(SETTINGS_MOTION_MS, cx, move |this| {
+            for (id, generation) in closing {
+                if this.export_reveals_closing.get(id) == Some(&generation) {
+                    this.export_reveals_closing.remove(id);
                 }
-                cx.notify();
-            });
-        })
-        .detach();
+            }
+        });
     }
 
     fn close_export_sidebar(&mut self, cx: &mut Context<Self>) {
-        if !self.data.show_export || self.export_sidebar_closing {
+        if !self.data.show_export || self.export_sidebar_exit.is_active() {
             return;
         }
         self.clear_export_select();
-        self.export_sidebar_closing = true;
+        let exit = self.export_sidebar_exit.start();
         cx.notify();
-
-        let timer = cx.background_executor().timer(Duration::from_millis(180));
-        cx.spawn(async move |view, cx| {
-            timer.await;
-            let _ = view.update(cx, |this, cx| {
-                if this.export_sidebar_closing {
-                    this.data.show_export = false;
-                    this.export_sidebar_closing = false;
-                    this.clear_export_select();
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+        self.after(SIDEBAR_CLOSE_MS, cx, move |this| {
+            if this.export_sidebar_exit.finish(exit) {
+                this.data.show_export = false;
+                this.clear_export_select();
+            }
+        });
     }
 
     fn close_selection_controls(&mut self, cx: &mut Context<Self>) {
-        self.selection_controls_closing = true;
+        let exit = self.selection_controls_exit.start();
         cx.notify();
+        self.after(SELECTION_CONTROL_CLOSE_MS, cx, move |this| {
+            this.selection_controls_exit.finish(exit);
+        });
+    }
 
-        let timer = cx.background_executor().timer(Duration::from_millis(130));
+    /// Runs `finish` and redraws once `duration_ms` has passed, e.g. to
+    /// remove an element after its exit animation.
+    fn after(
+        &self,
+        duration_ms: u64,
+        cx: &mut Context<Self>,
+        finish: impl FnOnce(&mut Self) + 'static,
+    ) {
+        let timer = cx
+            .background_executor()
+            .timer(Duration::from_millis(duration_ms));
         cx.spawn(async move |view, cx| {
             timer.await;
             let _ = view.update(cx, |this, cx| {
-                if this.selection_controls_closing {
-                    this.selection_controls_closing = false;
-                    cx.notify();
-                }
+                finish(this);
+                cx.notify();
             });
         })
         .detach();
@@ -1662,7 +1659,7 @@ impl AlignApp {
             .omit_extensions
             .update(cx, |input, cx| input.set_text(omitted, cx));
         self.data.show_export = false;
-        self.export_sidebar_closing = false;
+        self.export_sidebar_exit.cancel();
         self.clear_export_select();
         self.data.show_path_fixer = true;
         self.data.error = None;
@@ -2415,7 +2412,7 @@ fn sidebar_scrim(theme: &Theme, closing: bool) -> impl IntoElement {
             } else {
                 "export-sidebar-scrim-in"
             },
-            entrance(if closing { 180 } else { 280 }),
+            entrance(if closing { SIDEBAR_CLOSE_MS } else { 280 }),
             move |el, progress| el.opacity(if closing { 1. - progress } else { progress }),
         )
 }
@@ -2644,7 +2641,7 @@ impl Render for AlignApp {
                     &theme,
                     &self.data,
                     content_active,
-                    self.search_quality_closing,
+                    self.search_quality_exit.is_active(),
                 ),
                 "top-toolbar-entrance",
             ));
@@ -2656,7 +2653,7 @@ impl Render for AlignApp {
             &self.timeline_transitions,
             fit_width,
             content_active,
-            self.selection_controls_closing,
+            self.selection_controls_exit.is_active(),
         ));
         if !self.data.warnings.is_empty() {
             content = content.child(warning_banner(cx, &theme, &self.data));
@@ -2674,7 +2671,7 @@ impl Render for AlignApp {
             ));
         }
         if self.data.show_export {
-            content = content.child(sidebar_scrim(&theme, self.export_sidebar_closing));
+            content = content.child(sidebar_scrim(&theme, self.export_sidebar_exit.is_active()));
         }
         root = root.child(content);
         if let Some(position) = self.app_menu_position {
@@ -2715,12 +2712,14 @@ impl Render for AlignApp {
                     cx,
                     &theme,
                     &self.data,
-                    &self.export_inputs,
-                    &self.export_scroll,
-                    &self.export_reveals_closing,
-                    self.export_select,
-                    self.export_select_closing,
-                    self.export_sidebar_closing,
+                    ExportPanel {
+                        inputs: &self.export_inputs,
+                        scroll: &self.export_scroll,
+                        reveals_closing: &self.export_reveals_closing,
+                        select: self.export_select,
+                        select_closing: self.export_select_exit.is_active(),
+                    },
+                    self.export_sidebar_exit.is_active(),
                 ))
                 .child(export_sidebar_action(cx, &theme, &self.data));
         }
@@ -2795,7 +2794,7 @@ impl Render for AlignApp {
                     &theme,
                     &self.data,
                     self.settings_select,
-                    self.settings_select_closing,
+                    self.settings_select_exit.is_active(),
                     self.settings_close_closing,
                     self.settings_reset_closing,
                 ),
@@ -3344,7 +3343,7 @@ fn file_list(
                         .iter()
                         .map(|clip| clip.url.clone())
                         .collect();
-                    this.selection_controls_closing = false;
+                    this.selection_controls_exit.cancel();
                     cx.notify();
                 }
             },
@@ -3420,7 +3419,7 @@ fn file_list(
                     }
                 } else {
                     this.data.selection.insert(url.clone());
-                    this.selection_controls_closing = false;
+                    this.selection_controls_exit.cancel();
                     cx.notify();
                 }
             }));
@@ -4503,18 +4502,53 @@ fn settings_menu_row(
         )
 }
 
-#[allow(clippy::too_many_arguments)]
+/// A labelled dropdown row: the menu it opens and how that menu is shown.
+struct Dropdown<S> {
+    id: SharedString,
+    label: &'static str,
+    value: String,
+    select: S,
+    open: bool,
+    /// The open menu is playing its exit animation.
+    closing: bool,
+}
+
+impl<S: Copy + PartialEq> Dropdown<S> {
+    /// `current` is the open menu, if any; `closing` its exit state.
+    fn new(
+        id: impl Into<SharedString>,
+        label: &'static str,
+        value: String,
+        select: S,
+        current: Option<S>,
+        closing: bool,
+    ) -> Self {
+        let open = current == Some(select);
+        Self {
+            id: id.into(),
+            label,
+            value,
+            select,
+            open,
+            closing: open && closing,
+        }
+    }
+}
+
 fn settings_select_row(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
-    id: &'static str,
-    title: &'static str,
-    value: String,
-    select: SettingsSelect,
-    open: bool,
-    closing: bool,
+    row: Dropdown<SettingsSelect>,
     options: Vec<(String, bool)>,
 ) -> Div {
+    let Dropdown {
+        id,
+        label: title,
+        value,
+        select,
+        open,
+        closing,
+    } = row;
     let menu_height = options.len() as f32 * 28. + 8.;
     let mut menu = div()
         .id(SharedString::from(format!("settings-{}-menu", select.id())))
@@ -4624,7 +4658,7 @@ fn settings_header(
                 )
                 .with_animation(
                     "settings-apply-in",
-                    entrance(180),
+                    entrance(SETTINGS_MOTION_MS),
                     |el, progress| el.opacity(progress),
                 ),
             ),
@@ -4642,9 +4676,11 @@ fn settings_header(
                             true,
                             |_, _, _, _| {},
                         ))
-                        .with_animation("settings-close-out", entrance(180), |el, progress| {
-                            el.opacity(1. - progress)
-                        }),
+                        .with_animation(
+                            "settings-close-out",
+                            entrance(SETTINGS_MOTION_MS),
+                            |el, progress| el.opacity(1. - progress),
+                        ),
                 ),
             );
         }
@@ -4663,9 +4699,11 @@ fn settings_header(
                         true,
                         |this, _, _, cx| this.finish_search_settings(cx),
                     ))
-                    .with_animation("settings-close-in", entrance(180), |el, progress| {
-                        el.opacity(progress)
-                    }),
+                    .with_animation(
+                        "settings-close-in",
+                        entrance(SETTINGS_MOTION_MS),
+                        |el, progress| el.opacity(progress),
+                    ),
             ),
         );
         if close_closing {
@@ -4681,7 +4719,7 @@ fn settings_header(
                     )
                     .with_animation(
                         "settings-apply-out",
-                        entrance(180),
+                        entrance(SETTINGS_MOTION_MS),
                         |el, progress| el.opacity(1. - progress),
                     ),
                 ),
@@ -4779,7 +4817,7 @@ fn search_quality_button(
                 if this.data.show_search_quality {
                     this.close_search_quality(cx);
                 } else {
-                    this.search_quality_closing = false;
+                    this.search_quality_exit.cancel();
                     this.data.show_search_quality = true;
                     cx.notify();
                 }
@@ -4987,24 +5025,24 @@ fn search_settings_panel(
             "Choose defaults for every sequence or replace them for the current sequence. Track menus inherit these values.",
         ))
         .child(scope_row)
-        .child(settings_select_row(cx, theme, "settings-search", "Search accuracy",
-            scoped_label(search, common.search_accuracy, |value| value.label()), SettingsSelect::Search,
-            selected == Some(SettingsSelect::Search), select_closing, settings_options(data, SettingsSelect::Search)))
-        .child(settings_select_row(cx, theme, "settings-audio", "Wave source",
-            scoped_label(audio, common.audio_source, audio_source_label), SettingsSelect::Audio,
-            selected == Some(SettingsSelect::Audio), select_closing, settings_options(data, SettingsSelect::Audio)))
-        .child(settings_select_row(cx, theme, "settings-temporal", "Time source",
-            scoped_label(temporal, common.temporal_mode, |value| value.title()), SettingsSelect::Temporal,
-            selected == Some(SettingsSelect::Temporal), select_closing, settings_options(data, SettingsSelect::Temporal)))
-        .child(settings_select_row(cx, theme, "settings-threshold", "Match threshold",
-            scoped_label(threshold, common.match_threshold, match_threshold_label), SettingsSelect::Threshold,
-            selected == Some(SettingsSelect::Threshold), select_closing, settings_options(data, SettingsSelect::Threshold)))
-        .child(settings_select_row(cx, theme, "settings-order", "Clip order",
-            scoped_label(order, common.clip_order, clip_order_label), SettingsSelect::Order,
-            selected == Some(SettingsSelect::Order), select_closing, settings_options(data, SettingsSelect::Order)))
-        .child(settings_select_row(cx, theme, "settings-content", "Track content",
-            scoped_label(content, common.track_content, track_content_label), SettingsSelect::Content,
-            selected == Some(SettingsSelect::Content), select_closing, settings_options(data, SettingsSelect::Content)))
+        .child(settings_select_row(cx, theme,
+            Dropdown::new("settings-search", "Search accuracy", scoped_label(search, common.search_accuracy, |value| value.label()), SettingsSelect::Search, selected, select_closing),
+            settings_options(data, SettingsSelect::Search)))
+        .child(settings_select_row(cx, theme,
+            Dropdown::new("settings-audio", "Wave source", scoped_label(audio, common.audio_source, audio_source_label), SettingsSelect::Audio, selected, select_closing),
+            settings_options(data, SettingsSelect::Audio)))
+        .child(settings_select_row(cx, theme,
+            Dropdown::new("settings-temporal", "Time source", scoped_label(temporal, common.temporal_mode, |value| value.title()), SettingsSelect::Temporal, selected, select_closing),
+            settings_options(data, SettingsSelect::Temporal)))
+        .child(settings_select_row(cx, theme,
+            Dropdown::new("settings-threshold", "Match threshold", scoped_label(threshold, common.match_threshold, match_threshold_label), SettingsSelect::Threshold, selected, select_closing),
+            settings_options(data, SettingsSelect::Threshold)))
+        .child(settings_select_row(cx, theme,
+            Dropdown::new("settings-order", "Clip order", scoped_label(order, common.clip_order, clip_order_label), SettingsSelect::Order, selected, select_closing),
+            settings_options(data, SettingsSelect::Order)))
+        .child(settings_select_row(cx, theme,
+            Dropdown::new("settings-content", "Track content", scoped_label(content, common.track_content, track_content_label), SettingsSelect::Content, selected, select_closing),
+            settings_options(data, SettingsSelect::Content)))
 }
 
 // ---------------- diagnostics popover
@@ -5797,22 +5835,24 @@ fn export_select_option(
         )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn export_select_row(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
-    id: impl Into<SharedString>,
-    label: &'static str,
-    value: String,
-    select: ExportSelect,
-    open: bool,
-    closing: bool,
+    row: Dropdown<ExportSelect>,
     enabled: bool,
     menu_height: f32,
     menu: Stateful<Div>,
 ) -> Div {
+    let Dropdown {
+        id,
+        label,
+        value,
+        select,
+        open,
+        closing,
+    } = row;
     let mut button = div()
-        .id(id.into())
+        .id(id)
         .relative()
         .w(px(160.))
         .h(px(28.))
@@ -5950,18 +5990,29 @@ fn step_button(
     control
 }
 
-#[allow(clippy::too_many_arguments)]
-fn seconds_stepper(
-    cx: &mut Context<AlignApp>,
-    theme: &Theme,
+/// A labelled number of seconds with − and + buttons; zero reads "Off".
+struct Stepper {
     id: &'static str,
     title: &'static str,
     value: f64,
     decimals: usize,
     enabled: bool,
+}
+
+fn seconds_stepper(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    stepper: Stepper,
     decrement: impl Fn(&mut AlignApp, &ClickEvent, &mut Window, &mut Context<AlignApp>) + 'static,
     increment: impl Fn(&mut AlignApp, &ClickEvent, &mut Window, &mut Context<AlignApp>) + 'static,
 ) -> impl IntoElement {
+    let Stepper {
+        id,
+        title,
+        value,
+        decimals,
+        enabled,
+    } = stepper;
     let can_decrement = enabled && value > 0.0;
     let value_label = if value <= 0.0 {
         "Off".to_string()
@@ -6343,16 +6394,22 @@ fn export_scrollbar(
         )
 }
 
-#[allow(clippy::too_many_arguments)]
+/// View state of the export sheet beyond the app data.
+#[derive(Clone, Copy)]
+struct ExportPanel<'a> {
+    inputs: &'a ExportInputs,
+    scroll: &'a ScrollHandle,
+    /// Option groups playing their hide animation, by reveal id.
+    reveals_closing: &'a HashMap<&'static str, u64>,
+    select: Option<ExportSelect>,
+    select_closing: bool,
+}
+
 fn export_sidebar(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &super::state::AppData,
-    inputs: &ExportInputs,
-    scroll: &ScrollHandle,
-    reveals_closing: &HashMap<&'static str, u64>,
-    export_select: Option<ExportSelect>,
-    export_select_closing: bool,
+    panel: ExportPanel,
     closing: bool,
 ) -> impl IntoElement {
     let can_close = !matches!(data.operation, Operation::Exporting);
@@ -6401,16 +6458,7 @@ fn export_sidebar(
                 })
                 .child(div().flex_1()),
         )
-        .child(export_sheet(
-            cx,
-            theme,
-            data,
-            inputs,
-            scroll,
-            reveals_closing,
-            export_select,
-            export_select_closing,
-        ))
+        .child(export_sheet(cx, theme, data, panel))
         .cursor_default()
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
@@ -6827,17 +6875,19 @@ fn export_success_sheet(
         .child(slide_in(support, "export-success-support-footer", 150))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn export_sheet(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &super::state::AppData,
-    inputs: &ExportInputs,
-    scroll: &ScrollHandle,
-    reveals_closing: &HashMap<&'static str, u64>,
-    export_select: Option<ExportSelect>,
-    export_select_closing: bool,
+    panel: ExportPanel,
 ) -> Stateful<Div> {
+    let ExportPanel {
+        inputs,
+        scroll,
+        reveals_closing,
+        select: export_select,
+        select_closing: export_select_closing,
+    } = panel;
     use super::state::Operation;
     let busy = matches!(data.operation, Operation::Exporting);
     let done = matches!(data.operation, Operation::Exported) && data.export_started;
@@ -7043,16 +7093,17 @@ fn export_sheet(
                         },
                     ));
                 }
-                let select_open = export_select == Some(ExportSelect::AafFrameRate);
                 let options = export_select_row(
                     cx,
                     theme,
-                    "exp-aaf-frame-rate",
-                    "Frame rate",
-                    aaf_frame_rate_label(data.export_aaf_frame_duration).to_string(),
-                    ExportSelect::AafFrameRate,
-                    select_open,
-                    select_open && export_select_closing,
+                    Dropdown::new(
+                        "exp-aaf-frame-rate",
+                        "Frame rate",
+                        aaf_frame_rate_label(data.export_aaf_frame_duration).to_string(),
+                        ExportSelect::AafFrameRate,
+                        export_select,
+                        export_select_closing,
+                    ),
                     !busy,
                     260.,
                     menu,
@@ -7150,11 +7201,13 @@ fn export_sheet(
                 group = group.child(seconds_stepper(
                     cx,
                     theme,
-                    "exp-cut-short",
-                    "Remove clips shorter than",
-                    data.export_cut_shorter_than,
-                    0,
-                    !busy,
+                    Stepper {
+                        id: "exp-cut-short",
+                        title: "Remove clips shorter than",
+                        value: data.export_cut_shorter_than,
+                        decimals: 0,
+                        enabled: !busy,
+                    },
                     |this, _, _, cx| {
                         this.data.export_cut_shorter_than =
                             (this.data.export_cut_shorter_than - 1.0).max(0.0);
@@ -7169,11 +7222,13 @@ fn export_sheet(
                 group = group.child(seconds_stepper(
                     cx,
                     theme,
-                    "exp-trim-start",
-                    "Trim each clip start",
-                    data.export_trim_starts,
-                    1,
-                    !busy,
+                    Stepper {
+                        id: "exp-trim-start",
+                        title: "Trim each clip start",
+                        value: data.export_trim_starts,
+                        decimals: 1,
+                        enabled: !busy,
+                    },
                     |this, _, _, cx| {
                         this.data.export_trim_starts =
                             ((this.data.export_trim_starts - 0.1).max(0.0) * 10.0).round() / 10.0;
@@ -7189,11 +7244,13 @@ fn export_sheet(
                 group = group.child(seconds_stepper(
                     cx,
                     theme,
-                    "exp-trim-end",
-                    "Trim each clip end",
-                    data.export_trim_ends,
-                    1,
-                    !busy,
+                    Stepper {
+                        id: "exp-trim-end",
+                        title: "Trim each clip end",
+                        value: data.export_trim_ends,
+                        decimals: 1,
+                        enabled: !busy,
+                    },
                     |this, _, _, cx| {
                         this.data.export_trim_ends =
                             ((this.data.export_trim_ends - 0.1).max(0.0) * 10.0).round() / 10.0;
@@ -7242,16 +7299,17 @@ fn export_sheet(
                     },
                 ));
             }
-            let select_open = export_select == Some(ExportSelect::UnmatchedPlacement);
             group = group.child(export_select_row(
                 cx,
                 theme,
-                "exp-unmatched-placement",
-                "Placement",
-                unmatched_placement_label(data.export_unmatched).to_string(),
-                ExportSelect::UnmatchedPlacement,
-                select_open,
-                select_open && export_select_closing,
+                Dropdown::new(
+                    "exp-unmatched-placement",
+                    "Placement",
+                    unmatched_placement_label(data.export_unmatched).to_string(),
+                    ExportSelect::UnmatchedPlacement,
+                    export_select,
+                    export_select_closing,
+                ),
                 !busy,
                 92.,
                 menu,
