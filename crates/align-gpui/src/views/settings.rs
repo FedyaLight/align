@@ -656,8 +656,7 @@ pub(super) fn search_quality_menu(
                 |this, _, _, cx| {
                     this.close_search_quality(cx);
                     this.clear_settings_select();
-                    this.settings_close_closing = false;
-                    this.settings_reset_closing = false;
+                    this.settings_buttons.stop();
                     this.settings_initial_common = this.data.common_settings;
                     this.settings_initial_sequence = this.data.current_sequence_settings();
                     this.data.show_search_settings = true;

@@ -384,6 +384,40 @@ const DROPDOWN_MS: u64 = 200;
 const SETTINGS_MOTION_MS: u64 = 180;
 const SELECTION_CONTROL_CLOSE_MS: u64 = 130;
 
+/// Transitions of the settings header buttons: the close button switching
+/// between its close and apply forms, and the reset button leaving. One
+/// timer settles both.
+#[derive(Default)]
+struct SettingsButtons {
+    close_changing: bool,
+    reset_leaving: bool,
+    generation: u64,
+}
+
+impl SettingsButtons {
+    fn is_animating(&self) -> bool {
+        self.close_changing || self.reset_leaving
+    }
+
+    /// Supersedes pending timers; the new timer must present the token.
+    fn restart(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
+    }
+
+    /// Ends both transitions when `token` is the latest.
+    fn settle(&mut self, token: u64) {
+        if self.generation == token {
+            self.stop();
+        }
+    }
+
+    fn stop(&mut self) {
+        self.close_changing = false;
+        self.reset_leaving = false;
+    }
+}
+
 /// The exit phase of a transient element, which stays rendered while it
 /// animates out. Restarting or cancelling the exit invalidates earlier timers.
 #[derive(Default)]
@@ -434,9 +468,7 @@ pub struct AlignApp {
     export_select_exit: Exit,
     settings_select: Option<SettingsSelect>,
     settings_select_exit: Exit,
-    settings_close_closing: bool,
-    settings_reset_closing: bool,
-    settings_motion_generation: u64,
+    settings_buttons: SettingsButtons,
     settings_initial_common: SyncDefaults,
     settings_initial_sequence: SequenceDefaults,
     selection_controls_exit: Exit,
@@ -478,9 +510,7 @@ impl AlignApp {
             export_select_exit: Exit::default(),
             settings_select: None,
             settings_select_exit: Exit::default(),
-            settings_close_closing: false,
-            settings_reset_closing: false,
-            settings_motion_generation: 0,
+            settings_buttons: SettingsButtons::default(),
             settings_initial_common: SyncDefaults::default(),
             settings_initial_sequence: SequenceDefaults::default(),
             selection_controls_exit: Exit::default(),
@@ -1002,26 +1032,20 @@ impl AlignApp {
             || self.data.current_sequence_settings() != self.settings_initial_sequence;
         self.data.settings_changed = is_dirty;
         let is_default = self.data.scoped_settings_are_default();
-        self.settings_motion_generation += 1;
-        let generation = self.settings_motion_generation;
+        let buttons = &mut self.settings_buttons;
+        let token = buttons.restart();
         if was_dirty != is_dirty {
-            self.settings_close_closing = true;
+            buttons.close_changing = true;
         }
-        if was_default && !is_default {
-            self.settings_reset_closing = false;
-        } else if !was_default && is_default {
-            self.settings_reset_closing = true;
+        if was_default != is_default {
+            buttons.reset_leaving = is_default;
         }
         cx.notify();
-        if !self.settings_close_closing && !self.settings_reset_closing {
-            return;
+        if buttons.is_animating() {
+            self.after(SETTINGS_MOTION_MS, cx, move |this| {
+                this.settings_buttons.settle(token);
+            });
         }
-        self.after(SETTINGS_MOTION_MS, cx, move |this| {
-            if this.settings_motion_generation == generation {
-                this.settings_close_closing = false;
-                this.settings_reset_closing = false;
-            }
-        });
     }
 
     fn set_settings_scope(&mut self, scope: SettingsScope, cx: &mut Context<Self>) {
@@ -1030,17 +1054,15 @@ impl AlignApp {
         self.clear_settings_select();
         let is_default = self.data.scoped_settings_are_default();
         if was_default != is_default {
-            self.settings_motion_generation += 1;
-            let generation = self.settings_motion_generation;
-            self.settings_reset_closing = !was_default && is_default;
-            cx.notify();
-            if self.settings_reset_closing {
+            let buttons = &mut self.settings_buttons;
+            let token = buttons.restart();
+            buttons.reset_leaving = is_default;
+            // Settling also ends a close-button change whose timer the
+            // restart superseded.
+            if buttons.is_animating() {
                 self.after(SETTINGS_MOTION_MS, cx, move |this| {
-                    if this.settings_motion_generation == generation {
-                        this.settings_reset_closing = false;
-                    }
+                    this.settings_buttons.settle(token);
                 });
-                return;
             }
         }
         cx.notify();
@@ -1212,8 +1234,7 @@ impl AlignApp {
 
     fn finish_search_settings(&mut self, cx: &mut Context<Self>) {
         self.clear_settings_select();
-        self.settings_close_closing = false;
-        self.settings_reset_closing = false;
+        self.settings_buttons.stop();
         self.data.show_search_settings = false;
         let changed = std::mem::take(&mut self.data.settings_changed);
         if changed {

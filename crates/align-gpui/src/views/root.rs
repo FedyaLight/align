@@ -311,8 +311,8 @@ impl Render for AlignApp {
                     &self.data,
                     self.settings_select,
                     self.settings_select_exit.is_active(),
-                    self.settings_close_closing,
-                    self.settings_reset_closing,
+                    self.settings_buttons.close_changing,
+                    self.settings_buttons.reset_leaving,
                 ),
             ));
         }

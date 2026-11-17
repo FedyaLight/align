@@ -1153,19 +1153,19 @@ pub(super) fn export_sheet(
     data: &crate::state::AppData,
     panel: ExportPanel,
 ) -> Stateful<Div> {
-    let ExportPanel {
-        inputs,
-        scroll,
-        reveals_closing,
-        select: export_select,
-        select_closing: export_select_closing,
-    } = panel;
     use crate::state::Operation;
-    let busy = matches!(data.operation, Operation::Exporting);
-    let done = matches!(data.operation, Operation::Exported) && data.export_started;
-    if done {
+    if matches!(data.operation, Operation::Exported) && data.export_started {
         return export_success_sheet(cx, theme, data);
     }
+    let scroll = panel.scroll;
+    let busy = matches!(data.operation, Operation::Exporting);
+    let sheet_context = SheetContext {
+        theme,
+        data,
+        panel,
+        reveals: ExportReveals::new(data),
+        busy,
+    };
     let mut sheet = div()
         .id("export-sheet")
         .flex()
@@ -1177,50 +1177,7 @@ pub(super) fn export_sheet(
         .min_h(px(0.))
         .flex_shrink_0()
         .overflow_hidden();
-    // Destination.
-    {
-        let mut row = div().flex().flex_row().items_center().gap_3().h(px(32.));
-        row = row.child(export_section_title(theme, "Destination"));
-        let destination = data
-            .export_dir
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Not selected".to_string());
-        let destination_display = middle_ellipsis(&destination, 31);
-        let mut destination_label = div()
-            .id("export-destination-path-text")
-            .w_full()
-            .max_w_full()
-            .flex_1()
-            .min_w(px(0.))
-            .truncate()
-            .text_color(rgb(if data.export_dir.is_some() {
-                theme.text
-            } else {
-                theme.dim
-            }))
-            .child(destination_display);
-        if data.export_dir.is_some() {
-            destination_label = destination_label.tooltip(hover_tip(destination, theme));
-        }
-        row = row.child(
-            div()
-                .id("export-destination-path")
-                .w(px(232.))
-                .flex_shrink_0()
-                .overflow_hidden()
-                .child(destination_label),
-        );
-        row = row.child(button(
-            cx,
-            theme,
-            "btn-exp-dir",
-            "Choose…",
-            !busy,
-            |this, _, _, cx| this.choose_export_dir(cx),
-        ));
-        sheet = sheet.child(row);
-    }
+    sheet = sheet.child(export_destination_row(cx, sheet_context));
     let mut columns = div()
         .id("export-sidebar-scroll")
         .flex()
@@ -1232,532 +1189,20 @@ pub(super) fn export_sheet(
         .track_scroll(scroll)
         .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
         .pb_2();
+    columns = columns.child(export_formats_section(cx, sheet_context));
     let mut settings = div().flex().flex_col().gap_3();
-    let reveals = ExportReveals::new(data);
-    // Formats.
-    {
-        let mut group = div().flex().flex_col().gap_1().flex_shrink_0();
-        group = group.child(export_section_title(theme, "Formats"));
-        for target in ExportTarget::all() {
-            let active = data.export_selected.contains(&target);
-            let title = target.title().to_string();
-            group = group.child(check_row(
-                cx,
-                theme,
-                format!("exp-fmt-{}", target.title()),
-                active,
-                title,
-                !busy,
-                move |this, _, _, cx| {
-                    this.update_export_options(cx, |data| {
-                        if data.export_selected.contains(&target) {
-                            data.export_selected.remove(&target);
-                        } else {
-                            data.export_selected.insert(target);
-                        }
-                    });
-                },
-            ));
-            if target == ExportTarget::FinalCutPro
-                && (reveals.final_cut || reveals_closing.contains_key("export-final-cut-options"))
-            {
-                let mut options = div().flex().flex_col().gap_1();
-                options = options.child(check_row(
-                    cx,
-                    theme,
-                    "exp-fcpxml-timeline",
-                    data.export_fcpxml_timeline,
-                    "Synchronized timeline".to_string(),
-                    !busy,
-                    |this, _, _, cx| {
-                        this.update_export_options(cx, |data| {
-                            data.export_fcpxml_timeline = !data.export_fcpxml_timeline;
-                        });
-                    },
-                ));
-                options = options.child(check_row(
-                    cx,
-                    theme,
-                    "exp-fcpxml-multicam",
-                    data.export_fcpxml_multicam,
-                    "Multicam clip".to_string(),
-                    !busy,
-                    |this, _, _, cx| {
-                        this.data.export_fcpxml_multicam = !this.data.export_fcpxml_multicam;
-                        cx.notify();
-                    },
-                ));
-                if reveals.storylines || reveals_closing.contains_key("export-storylines") {
-                    options = options.child(export_reveal(
-                        check_row(
-                            cx,
-                            theme,
-                            "exp-storylines",
-                            data.export_storylines,
-                            "Group tracks as storylines".to_string(),
-                            !busy,
-                            |this, _, _, cx| {
-                                this.data.export_storylines = !this.data.export_storylines;
-                                cx.notify();
-                            },
-                        ),
-                        "export-storylines",
-                        32.,
-                        !reveals.storylines,
-                    ));
-                }
-                group = group.child(export_reveal(
-                    export_dependent_options(theme, options),
-                    "export-final-cut-options",
-                    104.,
-                    !reveals.final_cut,
-                ));
-            }
-            if target == ExportTarget::Premiere
-                && (reveals.premiere || reveals_closing.contains_key("export-premiere-options"))
-            {
-                group = group.child(export_reveal(
-                    export_dependent_options(
-                        theme,
-                        check_row(
-                            cx,
-                            theme,
-                            "exp-replaced",
-                            data.export_replaced,
-                            "Add a sequence with replaced camera audio".to_string(),
-                            !busy,
-                            |this, _, _, cx| {
-                                this.data.export_replaced = !this.data.export_replaced;
-                                cx.notify();
-                            },
-                        ),
-                    ),
-                    "export-premiere-options",
-                    40.,
-                    !reveals.premiere,
-                ));
-            }
-            if target == ExportTarget::Aaf
-                && (reveals.aaf || reveals_closing.contains_key("export-aaf-options"))
-            {
-                let mut menu = div()
-                    .id("export-aaf-frame-rate-menu")
-                    .w(px(160.))
-                    .flex()
-                    .flex_col()
-                    .p_1()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(theme.border))
-                    .bg(rgb(theme.panel))
-                    .shadow_md()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-                for (id, frame_duration, title) in aaf_frame_rate_options() {
-                    menu = menu.child(export_select_option(
-                        cx,
-                        theme,
-                        format!("exp-aaf-fps-{id}"),
-                        data.export_aaf_frame_duration == frame_duration,
-                        title,
-                        move |this, _, _, cx| {
-                            this.data.export_aaf_frame_duration = frame_duration;
-                            cx.notify();
-                        },
-                    ));
-                }
-                let options = export_select_row(
-                    cx,
-                    theme,
-                    Dropdown::new(
-                        "exp-aaf-frame-rate",
-                        "Frame rate",
-                        aaf_frame_rate_label(data.export_aaf_frame_duration).to_string(),
-                        ExportSelect::AafFrameRate,
-                        export_select,
-                        export_select_closing,
-                    ),
-                    !busy,
-                    260.,
-                    menu,
-                );
-                group = group.child(export_reveal(
-                    export_dependent_options(theme, options),
-                    "export-aaf-options",
-                    36.,
-                    !reveals.aaf,
-                ));
-            }
-        }
-        group = group.child(check_row(
-            cx,
-            theme,
-            "exp-media",
-            data.export_media,
-            "Video files with external audio (.mov)".to_string(),
-            !busy,
-            |this, _, _, cx| {
-                this.data.export_media = !this.data.export_media;
-                cx.notify();
-            },
-        ));
-        columns = columns.child(group);
+    // Rendering is offered only when the result contains measured drift.
+    if data.has_drift() {
+        settings = settings.child(export_audio_section(cx, sheet_context));
     }
-    {
-        // Only offer rendering when the result contains measured drift.
-        if data.has_drift() {
-            let mut group = div().flex().flex_col();
-            group = group.child(export_section_title(theme, "Audio"));
-            let on = data.export_drift && data.has_drift();
-            group = group.child(check_row(
-                cx,
-                theme,
-                "exp-drift",
-                on,
-                "Render drift-corrected audio".to_string(),
-                !busy,
-                |this, _, _, cx| {
-                    this.data.export_drift = !this.data.export_drift;
-                    cx.notify();
-                },
-            ));
-            settings = settings.child(group);
-        }
-        // Timeline assembly.
-        {
-            let mut group = div().flex().flex_col().gap_1();
-            group = group.child(export_section_title(theme, "Timeline"));
-            let on = data.export_prevent_overlaps;
-            group = group.child(check_row(
-                cx,
-                theme,
-                "exp-prevent-overlaps",
-                on,
-                "Prevent overlaps".to_string(),
-                !busy,
-                |this, _, _, cx| {
-                    this.data.export_prevent_overlaps = !this.data.export_prevent_overlaps;
-                    cx.notify();
-                },
-            ));
-            settings = settings.child(group);
-        }
-        // Cut / Remove.
-        {
-            let mut group = div().flex().flex_col().gap_1();
-            group = group.child(export_section_title(theme, "Cleanup"));
-            group = group.child(check_row(
-                cx,
-                theme,
-                "exp-cut-gaps",
-                data.export_cut_common_gaps,
-                "Cut gaps empty on all tracks".to_string(),
-                !busy,
-                |this, _, _, cx| {
-                    this.data.export_cut_common_gaps = !this.data.export_cut_common_gaps;
-                    cx.notify();
-                },
-            ));
-            group = group.child(check_row(
-                cx,
-                theme,
-                "exp-cut-lone",
-                data.export_cut_lone_recorder,
-                "Cut recorder audio with no camera".to_string(),
-                !busy,
-                |this, _, _, cx| {
-                    this.data.export_cut_lone_recorder = !this.data.export_cut_lone_recorder;
-                    cx.notify();
-                },
-            ));
-            {
-                group = group.child(seconds_stepper(
-                    cx,
-                    theme,
-                    Stepper {
-                        id: "exp-cut-short",
-                        title: "Remove clips shorter than",
-                        value: data.export_cut_shorter_than,
-                        decimals: 0,
-                        enabled: !busy,
-                    },
-                    |this, _, _, cx| {
-                        this.data.export_cut_shorter_than =
-                            (this.data.export_cut_shorter_than - 1.0).max(0.0);
-                        cx.notify();
-                    },
-                    |this, _, _, cx| {
-                        this.data.export_cut_shorter_than =
-                            (this.data.export_cut_shorter_than + 1.0).min(3_600.0);
-                        cx.notify();
-                    },
-                ));
-                group = group.child(seconds_stepper(
-                    cx,
-                    theme,
-                    Stepper {
-                        id: "exp-trim-start",
-                        title: "Trim each clip start",
-                        value: data.export_trim_starts,
-                        decimals: 1,
-                        enabled: !busy,
-                    },
-                    |this, _, _, cx| {
-                        this.data.export_trim_starts =
-                            ((this.data.export_trim_starts - 0.1).max(0.0) * 10.0).round() / 10.0;
-                        cx.notify();
-                    },
-                    |this, _, _, cx| {
-                        this.data.export_trim_starts =
-                            ((this.data.export_trim_starts + 0.1).min(3_600.0) * 10.0).round()
-                                / 10.0;
-                        cx.notify();
-                    },
-                ));
-                group = group.child(seconds_stepper(
-                    cx,
-                    theme,
-                    Stepper {
-                        id: "exp-trim-end",
-                        title: "Trim each clip end",
-                        value: data.export_trim_ends,
-                        decimals: 1,
-                        enabled: !busy,
-                    },
-                    |this, _, _, cx| {
-                        this.data.export_trim_ends =
-                            ((this.data.export_trim_ends - 0.1).max(0.0) * 10.0).round() / 10.0;
-                        cx.notify();
-                    },
-                    |this, _, _, cx| {
-                        this.data.export_trim_ends =
-                            ((this.data.export_trim_ends + 0.1).min(3_600.0) * 10.0).round() / 10.0;
-                        cx.notify();
-                    },
-                ));
-            }
-            settings = settings.child(group);
-        }
-        if data.unmatched_count() > 0 {
-            use align_core::export_model::UnmatchedPlacement as P;
-            let mut group = div().flex().flex_col();
-            group = group.child(export_section_title(theme, "Unmatched clips"));
-            let mut menu = div()
-                .id("export-unmatched-placement-menu")
-                .w(px(160.))
-                .flex()
-                .flex_col()
-                .p_1()
-                .rounded_lg()
-                .border_1()
-                .border_color(rgb(theme.border))
-                .bg(rgb(theme.panel))
-                .shadow_md()
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-            for (placement, title, id) in [
-                (P::ByOrderAndTime, "By order & time", "exp-unmatched-time"),
-                (P::ByOrderOnly, "By order only", "exp-unmatched-order"),
-                (P::Remove, "Remove", "exp-unmatched-remove"),
-            ] {
-                menu = menu.child(export_select_option(
-                    cx,
-                    theme,
-                    id,
-                    data.export_unmatched == placement,
-                    title,
-                    move |this, _, _, cx| {
-                        this.update_export_options(cx, |data| {
-                            data.export_unmatched = placement;
-                        });
-                    },
-                ));
-            }
-            group = group.child(export_select_row(
-                cx,
-                theme,
-                Dropdown::new(
-                    "exp-unmatched-placement",
-                    "Placement",
-                    unmatched_placement_label(data.export_unmatched).to_string(),
-                    ExportSelect::UnmatchedPlacement,
-                    export_select,
-                    export_select_closing,
-                ),
-                !busy,
-                92.,
-                menu,
-            ));
-            if reveals.unmatched_kept || reveals_closing.contains_key("export-unmatched-kept") {
-                group = group.child(export_reveal(
-                    export_dependent_options(
-                        theme,
-                        check_row(
-                            cx,
-                            theme,
-                            "exp-disable-unmatched",
-                            data.export_disable_unmatched,
-                            "Disable in timeline".to_string(),
-                            !busy,
-                            |this, _, _, cx| {
-                                this.data.export_disable_unmatched =
-                                    !this.data.export_disable_unmatched;
-                                cx.notify();
-                            },
-                        ),
-                    ),
-                    "export-unmatched-kept",
-                    40.,
-                    !reveals.unmatched_kept,
-                ));
-            }
-            settings = settings.child(group);
-        }
+    settings = settings
+        .child(export_timeline_section(cx, sheet_context))
+        .child(export_cleanup_section(cx, sheet_context));
+    if data.unmatched_count() > 0 {
+        settings = settings.child(export_unmatched_section(cx, sheet_context));
     }
     // Naming stays in the same scrollable form as the processing settings.
-    {
-        let mut group = div().flex().flex_col().gap_1();
-        group = group.child(export_section_title(theme, "Names & labels"));
-        group = group.child(export_text_field(
-            theme,
-            "Sequence name",
-            inputs.sequence_name.clone(),
-        ));
-        group = group.child(check_row(
-            cx,
-            theme,
-            "exp-label-synced",
-            data.export_label_synced,
-            "Label synchronized clips".to_string(),
-            !busy,
-            |this, _, _, cx| {
-                this.update_export_options(cx, |data| {
-                    data.export_label_synced = !data.export_label_synced;
-                });
-            },
-        ));
-        if reveals.synced_labels || reveals_closing.contains_key("export-synced-labels") {
-            let mut details = div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(export_text_field(
-                    theme,
-                    "Name marker",
-                    inputs.synced_symbol.clone(),
-                ))
-                .child(check_row(
-                    cx,
-                    theme,
-                    "exp-synced-symbol-suffix",
-                    data.export_synced_symbol_suffix,
-                    "Place marker after clip name".to_string(),
-                    !busy,
-                    |this, _, _, cx| {
-                        this.data.export_synced_symbol_suffix =
-                            !this.data.export_synced_symbol_suffix;
-                        cx.notify();
-                    },
-                ));
-            if reveals.synced_xml || reveals_closing.contains_key("export-synced-xml") {
-                details = details.child(export_reveal(
-                    export_text_field(theme, "XML label color", inputs.synced_color.clone()),
-                    "export-synced-xml",
-                    36.,
-                    !reveals.synced_xml,
-                ));
-            }
-            if reveals.synced_final_cut || reveals_closing.contains_key("export-synced-final-cut") {
-                details = details.child(export_reveal(
-                    export_text_field(theme, "Final Cut audio role", inputs.synced_role.clone()),
-                    "export-synced-final-cut",
-                    36.,
-                    !reveals.synced_final_cut,
-                ));
-            }
-            group = group.child(export_reveal(
-                export_dependent_options(theme, details),
-                "export-synced-labels",
-                152.,
-                !reveals.synced_labels,
-            ));
-        }
-        if data.unmatched_count() > 0
-            && (reveals.unmatched_label_control
-                || reveals_closing.contains_key("export-unmatched-label-control"))
-        {
-            let mut unmatched = div().flex().flex_col().gap_1().child(check_row(
-                cx,
-                theme,
-                "exp-label-unmatched",
-                data.export_label_unmatched,
-                "Label unmatched clips".to_string(),
-                !busy,
-                |this, _, _, cx| {
-                    this.update_export_options(cx, |data| {
-                        data.export_label_unmatched = !data.export_label_unmatched;
-                    });
-                },
-            ));
-            if reveals.unmatched_labels || reveals_closing.contains_key("export-unmatched-labels") {
-                let mut details = div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(export_text_field(
-                        theme,
-                        "Name marker",
-                        inputs.unmatched_symbol.clone(),
-                    ))
-                    .child(check_row(
-                        cx,
-                        theme,
-                        "exp-symbol-suffix",
-                        data.export_unmatched_symbol_suffix,
-                        "Place marker after clip name".to_string(),
-                        !busy,
-                        |this, _, _, cx| {
-                            this.data.export_unmatched_symbol_suffix =
-                                !this.data.export_unmatched_symbol_suffix;
-                            cx.notify();
-                        },
-                    ));
-                if reveals.unmatched_xml || reveals_closing.contains_key("export-unmatched-xml") {
-                    details = details.child(export_reveal(
-                        export_text_field(theme, "XML label color", inputs.unmatched_color.clone()),
-                        "export-unmatched-xml",
-                        36.,
-                        !reveals.unmatched_xml,
-                    ));
-                }
-                if reveals.unmatched_final_cut
-                    || reveals_closing.contains_key("export-unmatched-final-cut")
-                {
-                    details = details.child(export_reveal(
-                        export_text_field(
-                            theme,
-                            "Final Cut audio role",
-                            inputs.unmatched_role.clone(),
-                        ),
-                        "export-unmatched-final-cut",
-                        36.,
-                        !reveals.unmatched_final_cut,
-                    ));
-                }
-                unmatched = unmatched.child(export_reveal(
-                    export_dependent_options(theme, details),
-                    "export-unmatched-labels",
-                    152.,
-                    !reveals.unmatched_labels,
-                ));
-            }
-            group = group.child(export_reveal(
-                unmatched,
-                "export-unmatched-label-control",
-                192.,
-                !reveals.unmatched_label_control,
-            ));
-        }
-        settings = settings.child(group);
-    }
+    settings = settings.child(export_names_section(cx, sheet_context));
     columns = columns.child(div().id("export-settings").min_w(px(0.)).child(settings));
     sheet = sheet.child(
         div()
@@ -1791,4 +1236,634 @@ pub(super) fn export_sheet(
     // In-flight cancellation stays in the persistent operation bar so it is
     // not duplicated here.
     sheet
+}
+
+/// What every section of the export sheet reads.
+#[derive(Clone, Copy)]
+pub(super) struct SheetContext<'a> {
+    theme: &'a Theme,
+    data: &'a crate::state::AppData,
+    panel: ExportPanel<'a>,
+    reveals: ExportReveals,
+    busy: bool,
+}
+
+/// The chosen export folder and the button that changes it.
+fn export_destination_row(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Div {
+    let SheetContext {
+        theme, data, busy, ..
+    } = sheet;
+    let mut row = div().flex().flex_row().items_center().gap_3().h(px(32.));
+    row = row.child(export_section_title(theme, "Destination"));
+    let destination = data
+        .export_dir
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Not selected".to_string());
+    let destination_display = middle_ellipsis(&destination, 31);
+    let mut destination_label = div()
+        .id("export-destination-path-text")
+        .w_full()
+        .max_w_full()
+        .flex_1()
+        .min_w(px(0.))
+        .truncate()
+        .text_color(rgb(if data.export_dir.is_some() {
+            theme.text
+        } else {
+            theme.dim
+        }))
+        .child(destination_display);
+    if data.export_dir.is_some() {
+        destination_label = destination_label.tooltip(hover_tip(destination, theme));
+    }
+    row = row.child(
+        div()
+            .id("export-destination-path")
+            .w(px(232.))
+            .flex_shrink_0()
+            .overflow_hidden()
+            .child(destination_label),
+    );
+    row = row.child(button(
+        cx,
+        theme,
+        "btn-exp-dir",
+        "Choose…",
+        !busy,
+        |this, _, _, cx| this.choose_export_dir(cx),
+    ));
+    row
+}
+
+/// Names and labels of synchronized and unmatched clips.
+fn export_names_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Div {
+    let SheetContext {
+        theme,
+        data,
+        busy,
+        reveals,
+        panel:
+            ExportPanel {
+                inputs,
+                reveals_closing,
+                ..
+            },
+        ..
+    } = sheet;
+    let mut group = div().flex().flex_col().gap_1();
+    group = group.child(export_section_title(theme, "Names & labels"));
+    group = group.child(export_text_field(
+        theme,
+        "Sequence name",
+        inputs.sequence_name.clone(),
+    ));
+    group = group.child(check_row(
+        cx,
+        theme,
+        "exp-label-synced",
+        data.export_label_synced,
+        "Label synchronized clips".to_string(),
+        !busy,
+        |this, _, _, cx| {
+            this.update_export_options(cx, |data| {
+                data.export_label_synced = !data.export_label_synced;
+            });
+        },
+    ));
+    if reveals.synced_labels || reveals_closing.contains_key("export-synced-labels") {
+        let mut details = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(export_text_field(
+                theme,
+                "Name marker",
+                inputs.synced_symbol.clone(),
+            ))
+            .child(check_row(
+                cx,
+                theme,
+                "exp-synced-symbol-suffix",
+                data.export_synced_symbol_suffix,
+                "Place marker after clip name".to_string(),
+                !busy,
+                |this, _, _, cx| {
+                    this.data.export_synced_symbol_suffix = !this.data.export_synced_symbol_suffix;
+                    cx.notify();
+                },
+            ));
+        if reveals.synced_xml || reveals_closing.contains_key("export-synced-xml") {
+            details = details.child(export_reveal(
+                export_text_field(theme, "XML label color", inputs.synced_color.clone()),
+                "export-synced-xml",
+                36.,
+                !reveals.synced_xml,
+            ));
+        }
+        if reveals.synced_final_cut || reveals_closing.contains_key("export-synced-final-cut") {
+            details = details.child(export_reveal(
+                export_text_field(theme, "Final Cut audio role", inputs.synced_role.clone()),
+                "export-synced-final-cut",
+                36.,
+                !reveals.synced_final_cut,
+            ));
+        }
+        group = group.child(export_reveal(
+            export_dependent_options(theme, details),
+            "export-synced-labels",
+            152.,
+            !reveals.synced_labels,
+        ));
+    }
+    if data.unmatched_count() > 0
+        && (reveals.unmatched_label_control
+            || reveals_closing.contains_key("export-unmatched-label-control"))
+    {
+        let mut unmatched = div().flex().flex_col().gap_1().child(check_row(
+            cx,
+            theme,
+            "exp-label-unmatched",
+            data.export_label_unmatched,
+            "Label unmatched clips".to_string(),
+            !busy,
+            |this, _, _, cx| {
+                this.update_export_options(cx, |data| {
+                    data.export_label_unmatched = !data.export_label_unmatched;
+                });
+            },
+        ));
+        if reveals.unmatched_labels || reveals_closing.contains_key("export-unmatched-labels") {
+            let mut details = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(export_text_field(
+                    theme,
+                    "Name marker",
+                    inputs.unmatched_symbol.clone(),
+                ))
+                .child(check_row(
+                    cx,
+                    theme,
+                    "exp-symbol-suffix",
+                    data.export_unmatched_symbol_suffix,
+                    "Place marker after clip name".to_string(),
+                    !busy,
+                    |this, _, _, cx| {
+                        this.data.export_unmatched_symbol_suffix =
+                            !this.data.export_unmatched_symbol_suffix;
+                        cx.notify();
+                    },
+                ));
+            if reveals.unmatched_xml || reveals_closing.contains_key("export-unmatched-xml") {
+                details = details.child(export_reveal(
+                    export_text_field(theme, "XML label color", inputs.unmatched_color.clone()),
+                    "export-unmatched-xml",
+                    36.,
+                    !reveals.unmatched_xml,
+                ));
+            }
+            if reveals.unmatched_final_cut
+                || reveals_closing.contains_key("export-unmatched-final-cut")
+            {
+                details = details.child(export_reveal(
+                    export_text_field(theme, "Final Cut audio role", inputs.unmatched_role.clone()),
+                    "export-unmatched-final-cut",
+                    36.,
+                    !reveals.unmatched_final_cut,
+                ));
+            }
+            unmatched = unmatched.child(export_reveal(
+                export_dependent_options(theme, details),
+                "export-unmatched-labels",
+                152.,
+                !reveals.unmatched_labels,
+            ));
+        }
+        group = group.child(export_reveal(
+            unmatched,
+            "export-unmatched-label-control",
+            192.,
+            !reveals.unmatched_label_control,
+        ));
+    }
+    group
+}
+
+/// Placement of clips without a synchronization match.
+fn export_unmatched_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Div {
+    let SheetContext {
+        theme,
+        data,
+        busy,
+        reveals,
+        panel:
+            ExportPanel {
+                reveals_closing,
+                select: export_select,
+                select_closing: export_select_closing,
+                ..
+            },
+        ..
+    } = sheet;
+    use align_core::export_model::UnmatchedPlacement as P;
+    let mut group = div().flex().flex_col();
+    group = group.child(export_section_title(theme, "Unmatched clips"));
+    let mut menu = div()
+        .id("export-unmatched-placement-menu")
+        .w(px(160.))
+        .flex()
+        .flex_col()
+        .p_1()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(theme.border))
+        .bg(rgb(theme.panel))
+        .shadow_md()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+    for (placement, title, id) in [
+        (P::ByOrderAndTime, "By order & time", "exp-unmatched-time"),
+        (P::ByOrderOnly, "By order only", "exp-unmatched-order"),
+        (P::Remove, "Remove", "exp-unmatched-remove"),
+    ] {
+        menu = menu.child(export_select_option(
+            cx,
+            theme,
+            id,
+            data.export_unmatched == placement,
+            title,
+            move |this, _, _, cx| {
+                this.update_export_options(cx, |data| {
+                    data.export_unmatched = placement;
+                });
+            },
+        ));
+    }
+    group = group.child(export_select_row(
+        cx,
+        theme,
+        Dropdown::new(
+            "exp-unmatched-placement",
+            "Placement",
+            unmatched_placement_label(data.export_unmatched).to_string(),
+            ExportSelect::UnmatchedPlacement,
+            export_select,
+            export_select_closing,
+        ),
+        !busy,
+        92.,
+        menu,
+    ));
+    if reveals.unmatched_kept || reveals_closing.contains_key("export-unmatched-kept") {
+        group = group.child(export_reveal(
+            export_dependent_options(
+                theme,
+                check_row(
+                    cx,
+                    theme,
+                    "exp-disable-unmatched",
+                    data.export_disable_unmatched,
+                    "Disable in timeline".to_string(),
+                    !busy,
+                    |this, _, _, cx| {
+                        this.data.export_disable_unmatched = !this.data.export_disable_unmatched;
+                        cx.notify();
+                    },
+                ),
+            ),
+            "export-unmatched-kept",
+            40.,
+            !reveals.unmatched_kept,
+        ));
+    }
+    group
+}
+
+/// Clip removal and trimming applied to the exported timeline.
+fn export_cleanup_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Div {
+    let SheetContext {
+        theme, data, busy, ..
+    } = sheet;
+    let mut group = div().flex().flex_col().gap_1();
+    group = group.child(export_section_title(theme, "Cleanup"));
+    group = group.child(check_row(
+        cx,
+        theme,
+        "exp-cut-gaps",
+        data.export_cut_common_gaps,
+        "Cut gaps empty on all tracks".to_string(),
+        !busy,
+        |this, _, _, cx| {
+            this.data.export_cut_common_gaps = !this.data.export_cut_common_gaps;
+            cx.notify();
+        },
+    ));
+    group = group.child(check_row(
+        cx,
+        theme,
+        "exp-cut-lone",
+        data.export_cut_lone_recorder,
+        "Cut recorder audio with no camera".to_string(),
+        !busy,
+        |this, _, _, cx| {
+            this.data.export_cut_lone_recorder = !this.data.export_cut_lone_recorder;
+            cx.notify();
+        },
+    ));
+    {
+        group = group.child(seconds_stepper(
+            cx,
+            theme,
+            Stepper {
+                id: "exp-cut-short",
+                title: "Remove clips shorter than",
+                value: data.export_cut_shorter_than,
+                decimals: 0,
+                enabled: !busy,
+            },
+            |this, _, _, cx| {
+                this.data.export_cut_shorter_than =
+                    (this.data.export_cut_shorter_than - 1.0).max(0.0);
+                cx.notify();
+            },
+            |this, _, _, cx| {
+                this.data.export_cut_shorter_than =
+                    (this.data.export_cut_shorter_than + 1.0).min(3_600.0);
+                cx.notify();
+            },
+        ));
+        group = group.child(seconds_stepper(
+            cx,
+            theme,
+            Stepper {
+                id: "exp-trim-start",
+                title: "Trim each clip start",
+                value: data.export_trim_starts,
+                decimals: 1,
+                enabled: !busy,
+            },
+            |this, _, _, cx| {
+                this.data.export_trim_starts =
+                    ((this.data.export_trim_starts - 0.1).max(0.0) * 10.0).round() / 10.0;
+                cx.notify();
+            },
+            |this, _, _, cx| {
+                this.data.export_trim_starts =
+                    ((this.data.export_trim_starts + 0.1).min(3_600.0) * 10.0).round() / 10.0;
+                cx.notify();
+            },
+        ));
+        group = group.child(seconds_stepper(
+            cx,
+            theme,
+            Stepper {
+                id: "exp-trim-end",
+                title: "Trim each clip end",
+                value: data.export_trim_ends,
+                decimals: 1,
+                enabled: !busy,
+            },
+            |this, _, _, cx| {
+                this.data.export_trim_ends =
+                    ((this.data.export_trim_ends - 0.1).max(0.0) * 10.0).round() / 10.0;
+                cx.notify();
+            },
+            |this, _, _, cx| {
+                this.data.export_trim_ends =
+                    ((this.data.export_trim_ends + 0.1).min(3_600.0) * 10.0).round() / 10.0;
+                cx.notify();
+            },
+        ));
+    }
+    group
+}
+
+/// Timeline assembly options.
+fn export_timeline_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Div {
+    let SheetContext {
+        theme, data, busy, ..
+    } = sheet;
+    let mut group = div().flex().flex_col().gap_1();
+    group = group.child(export_section_title(theme, "Timeline"));
+    let on = data.export_prevent_overlaps;
+    group = group.child(check_row(
+        cx,
+        theme,
+        "exp-prevent-overlaps",
+        on,
+        "Prevent overlaps".to_string(),
+        !busy,
+        |this, _, _, cx| {
+            this.data.export_prevent_overlaps = !this.data.export_prevent_overlaps;
+            cx.notify();
+        },
+    ));
+    group
+}
+
+/// Drift-corrected audio rendering, offered when drift was measured.
+fn export_audio_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Div {
+    let SheetContext {
+        theme, data, busy, ..
+    } = sheet;
+    let mut group = div().flex().flex_col();
+    group = group.child(export_section_title(theme, "Audio"));
+    let on = data.export_drift && data.has_drift();
+    group = group.child(check_row(
+        cx,
+        theme,
+        "exp-drift",
+        on,
+        "Render drift-corrected audio".to_string(),
+        !busy,
+        |this, _, _, cx| {
+            this.data.export_drift = !this.data.export_drift;
+            cx.notify();
+        },
+    ));
+    group
+}
+
+/// Export formats with their per-format options.
+fn export_formats_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Div {
+    let SheetContext {
+        theme,
+        data,
+        busy,
+        reveals,
+        panel:
+            ExportPanel {
+                reveals_closing,
+                select: export_select,
+                select_closing: export_select_closing,
+                ..
+            },
+        ..
+    } = sheet;
+    let mut group = div().flex().flex_col().gap_1().flex_shrink_0();
+    group = group.child(export_section_title(theme, "Formats"));
+    for target in ExportTarget::all() {
+        let active = data.export_selected.contains(&target);
+        let title = target.title().to_string();
+        group = group.child(check_row(
+            cx,
+            theme,
+            format!("exp-fmt-{}", target.title()),
+            active,
+            title,
+            !busy,
+            move |this, _, _, cx| {
+                this.update_export_options(cx, |data| {
+                    if data.export_selected.contains(&target) {
+                        data.export_selected.remove(&target);
+                    } else {
+                        data.export_selected.insert(target);
+                    }
+                });
+            },
+        ));
+        if target == ExportTarget::FinalCutPro
+            && (reveals.final_cut || reveals_closing.contains_key("export-final-cut-options"))
+        {
+            let mut options = div().flex().flex_col().gap_1();
+            options = options.child(check_row(
+                cx,
+                theme,
+                "exp-fcpxml-timeline",
+                data.export_fcpxml_timeline,
+                "Synchronized timeline".to_string(),
+                !busy,
+                |this, _, _, cx| {
+                    this.update_export_options(cx, |data| {
+                        data.export_fcpxml_timeline = !data.export_fcpxml_timeline;
+                    });
+                },
+            ));
+            options = options.child(check_row(
+                cx,
+                theme,
+                "exp-fcpxml-multicam",
+                data.export_fcpxml_multicam,
+                "Multicam clip".to_string(),
+                !busy,
+                |this, _, _, cx| {
+                    this.data.export_fcpxml_multicam = !this.data.export_fcpxml_multicam;
+                    cx.notify();
+                },
+            ));
+            if reveals.storylines || reveals_closing.contains_key("export-storylines") {
+                options = options.child(export_reveal(
+                    check_row(
+                        cx,
+                        theme,
+                        "exp-storylines",
+                        data.export_storylines,
+                        "Group tracks as storylines".to_string(),
+                        !busy,
+                        |this, _, _, cx| {
+                            this.data.export_storylines = !this.data.export_storylines;
+                            cx.notify();
+                        },
+                    ),
+                    "export-storylines",
+                    32.,
+                    !reveals.storylines,
+                ));
+            }
+            group = group.child(export_reveal(
+                export_dependent_options(theme, options),
+                "export-final-cut-options",
+                104.,
+                !reveals.final_cut,
+            ));
+        }
+        if target == ExportTarget::Premiere
+            && (reveals.premiere || reveals_closing.contains_key("export-premiere-options"))
+        {
+            group = group.child(export_reveal(
+                export_dependent_options(
+                    theme,
+                    check_row(
+                        cx,
+                        theme,
+                        "exp-replaced",
+                        data.export_replaced,
+                        "Add a sequence with replaced camera audio".to_string(),
+                        !busy,
+                        |this, _, _, cx| {
+                            this.data.export_replaced = !this.data.export_replaced;
+                            cx.notify();
+                        },
+                    ),
+                ),
+                "export-premiere-options",
+                40.,
+                !reveals.premiere,
+            ));
+        }
+        if target == ExportTarget::Aaf
+            && (reveals.aaf || reveals_closing.contains_key("export-aaf-options"))
+        {
+            let mut menu = div()
+                .id("export-aaf-frame-rate-menu")
+                .w(px(160.))
+                .flex()
+                .flex_col()
+                .p_1()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(theme.border))
+                .bg(rgb(theme.panel))
+                .shadow_md()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+            for (id, frame_duration, title) in aaf_frame_rate_options() {
+                menu = menu.child(export_select_option(
+                    cx,
+                    theme,
+                    format!("exp-aaf-fps-{id}"),
+                    data.export_aaf_frame_duration == frame_duration,
+                    title,
+                    move |this, _, _, cx| {
+                        this.data.export_aaf_frame_duration = frame_duration;
+                        cx.notify();
+                    },
+                ));
+            }
+            let options = export_select_row(
+                cx,
+                theme,
+                Dropdown::new(
+                    "exp-aaf-frame-rate",
+                    "Frame rate",
+                    aaf_frame_rate_label(data.export_aaf_frame_duration).to_string(),
+                    ExportSelect::AafFrameRate,
+                    export_select,
+                    export_select_closing,
+                ),
+                !busy,
+                260.,
+                menu,
+            );
+            group = group.child(export_reveal(
+                export_dependent_options(theme, options),
+                "export-aaf-options",
+                36.,
+                !reveals.aaf,
+            ));
+        }
+    }
+    group = group.child(check_row(
+        cx,
+        theme,
+        "exp-media",
+        data.export_media,
+        "Video files with external audio (.mov)".to_string(),
+        !busy,
+        |this, _, _, cx| {
+            this.data.export_media = !this.data.export_media;
+            cx.notify();
+        },
+    ));
+    group
 }
