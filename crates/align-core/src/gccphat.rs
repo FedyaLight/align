@@ -8,11 +8,33 @@ use std::sync::{Arc, OnceLock};
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 
-// Only four power-of-two sizes (16K–128K) pass the gate below. Plans are
-// immutable, so all refine workers can share this bounded cache.
-type FftPair = (Arc<dyn Fft<f32>>, Arc<dyn Fft<f32>>);
-static PLANS: [OnceLock<FftPair>; 4] = [const { OnceLock::new() }; 4];
-static HANN_WINDOWS: [OnceLock<Vec<f32>>; 4] = [const { OnceLock::new() }; 4];
+/// FFT plans and analysis window for one window size. Immutable, so every
+/// refine worker shares them.
+struct SizeTables {
+    forward: Arc<dyn Fft<f32>>,
+    inverse: Arc<dyn Fft<f32>>,
+    hann: Vec<f32>,
+}
+
+/// Only four power-of-two sizes (16K–128K) pass the gate in [`align`].
+static TABLES: [OnceLock<SizeTables>; 4] = [const { OnceLock::new() }; 4];
+
+/// The shared tables for `count`, a power of two from 16K to 128K.
+fn tables(count: usize) -> &'static SizeTables {
+    debug_assert!(count.is_power_of_two() && (16_384..=131_072).contains(&count));
+    TABLES[count.trailing_zeros() as usize - 14].get_or_init(|| {
+        let mut planner = FftPlanner::<f32>::new();
+        SizeTables {
+            forward: planner.plan_fft_forward(count),
+            inverse: planner.plan_fft_inverse(count),
+            hann: (0..count)
+                .map(|i| {
+                    0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (count - 1) as f32).cos()
+                })
+                .collect(),
+        }
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GccPhatResult {
@@ -27,21 +49,16 @@ pub fn align(left: &[f32], right: &[f32], maximum_lag: usize) -> Option<GccPhatR
         return None;
     }
 
-    let l = preprocess(&left[..count]);
-    let r = preprocess(&right[..count]);
+    let tables = tables(count);
+    let l = preprocess(&left[..count], &tables.hann);
+    let r = preprocess(&right[..count], &tables.hann);
     let l_rms = rms(&l);
     let r_rms = rms(&r);
     if l_rms <= 1e-5 || r_rms <= 1e-5 {
         return None;
     }
 
-    let (forward, inverse) = PLANS[count.trailing_zeros() as usize - 14].get_or_init(|| {
-        let mut planner = FftPlanner::<f32>::new();
-        (
-            planner.plan_fft_forward(count),
-            planner.plan_fft_inverse(count),
-        )
-    });
+    let (forward, inverse) = (&tables.forward, &tables.inverse);
 
     let mut lb: Vec<Complex32> = l.iter().map(|&v| Complex32::new(v, 0.0)).collect();
     let mut rb: Vec<Complex32> = r.iter().map(|&v| Complex32::new(v, 0.0)).collect();
@@ -110,14 +127,8 @@ pub fn align(left: &[f32], right: &[f32], maximum_lag: usize) -> Option<GccPhatR
     })
 }
 
-fn preprocess(input: &[f32]) -> Vec<f32> {
-    let n = input.len();
-    let window = HANN_WINDOWS[n.trailing_zeros() as usize - 14].get_or_init(|| {
-        (0..n)
-            .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (n - 1) as f32).cos())
-            .collect()
-    });
-    let mut out = vec![0.0f32; n];
+fn preprocess(input: &[f32], window: &[f32]) -> Vec<f32> {
+    let mut out = vec![0.0f32; input.len()];
     for (i, &v) in input.iter().enumerate() {
         // Hann (NORM scale-insensitive here) * first-order pre-emphasis.
         let p = if i > 0 { v - 0.97 * input[i - 1] } else { 0.0 };
