@@ -830,7 +830,18 @@ impl Document {
         let plays_backward = item.plays_backward(media_type);
         let graph_slope = playback_rate * source_rate.fps / rate.fps;
         let retimed = item.is_retimed(media_type);
-        let item_rate = if retimed { rate } else { source_rate };
+        // Premiere counts `<in>` and `<out>` in the sequence timebase whatever
+        // the clipitem's `<rate>` says, so a 24 fps camera on a 25 fps
+        // sequence lost 4% of its range. Its clipitems use the sequence rate.
+        // Resolve honors the clip's own rate and keeps it.
+        let conformed = !retimed
+            && format == TimelineExportFormat::PremiereXML
+            && (source_rate.timebase, source_rate.ntsc) != (rate.timebase, rate.ntsc);
+        let item_rate = if retimed || conformed {
+            rate
+        } else {
+            source_rate
+        };
         let geometry = item.fcp7_retime_geometry(media_type);
         let (computed_in, computed_out) = if retimed {
             let media_in = in_seconds * source_rate.fps;
@@ -849,8 +860,8 @@ impl Document {
             (g_in, g_out)
         } else {
             (
-                source_rate.frames(in_seconds, Rounding::Nearest),
-                source_rate.frames(out_seconds, Rounding::Nearest),
+                item_rate.frames(in_seconds, Rounding::Nearest),
+                item_rate.frames(out_seconds, Rounding::Nearest),
             )
         };
         let source_in = if padded {
@@ -867,6 +878,8 @@ impl Document {
             || {
                 if retimed {
                     source_out.max((file_duration as f64 / graph_slope).round() as i64)
+                } else if conformed {
+                    rate.frames(file_duration as f64 / source_rate.fps, Rounding::Nearest)
                 } else {
                     file_duration
                 }
@@ -1545,6 +1558,40 @@ mod tests {
         assert!(xml.contains("<name>rec.wav</name>"));
         assert!(xml.contains("<start>13</start>"));
         assert!(xml.contains("<pathurl>file:///v/rec.wav</pathurl>"));
+    }
+
+    #[test]
+    fn premiere_counts_other_rate_sources_in_sequence_frames() {
+        // A 24 fps camera on the fixture's 25 fps sequence: Premiere reads
+        // `<in>`/`<out>` as sequence frames, Resolve as the clip's own.
+        let mut timeline = fixture_timeline();
+        let cam = timeline.islands[0]
+            .clips
+            .iter_mut()
+            .find(|i| i.clip.id.0 == "cam")
+            .expect("camera item");
+        cam.clip.video.as_mut().unwrap().frame_duration = Some(crate::model::MediaTime::new(1, 24));
+        let clipitem = |xml: &str| {
+            let start = xml.find("<clipitem").unwrap();
+            let end = start + xml[start..].find("</clipitem>").unwrap();
+            xml[start..end].to_string()
+        };
+        let premiere = clipitem(&write(
+            &timeline,
+            TimelineExportFormat::PremiereXML,
+            PremiereOptions::default(),
+        ));
+        assert!(premiere.contains("<duration>250</duration>"));
+        assert!(premiere.contains("<timebase>25</timebase>"));
+        assert!(premiere.contains("<in>0</in>\n                <out>250</out>"));
+        // The file keeps its own rate.
+        assert!(premiere.contains("<rate><timebase>24</timebase>"));
+        let resolve = clipitem(&write(
+            &timeline,
+            TimelineExportFormat::ResolveXML,
+            PremiereOptions::default(),
+        ));
+        assert!(resolve.contains("<in>0</in>\n                <out>240</out>"));
     }
 
     #[test]
