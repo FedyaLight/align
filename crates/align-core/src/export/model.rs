@@ -610,7 +610,8 @@ pub struct ExportAssemblyOptions {
     pub unmatched_symbol_suffix: bool,
     /// FCP 7 color label assigned to unmatched clips (Premiere/Resolve
     /// XML); explicit assignment wins over preserved source labels.
-    /// FCPXML and OTIO have no color-label representation.
+    /// FCPXML has no color-label representation; the OTIO carries the
+    /// nearest Resolve clip color for the Resolve import script.
     pub unmatched_color: Option<String>,
     /// Final Cut audio role assigned to unmatched audio (FCPXML only).
     pub unmatched_role: Option<String>,
@@ -2580,6 +2581,19 @@ mod tests {
             super::super::fcpxml::write(&timeline, super::super::fcpxml::FcpxmlOptions::TIMELINE);
         assert!(fcpxml.contains("name=\"recorder.wav ✓\""));
         assert!(fcpxml.contains("audioRole=\"dialogue.interview\""));
+        // Resolve imports neither, so the OTIO carries the name and the
+        // nearest Resolve color for the import script to apply.
+        let otio: serde_json::Value =
+            serde_json::from_slice(&super::super::otio::data(&timeline, false).unwrap()).unwrap();
+        let clip = otio["tracks"]["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|track| track["children"].as_array().unwrap())
+            .find(|child| child["OTIO_SCHEMA"] == "Clip.2")
+            .expect("clip");
+        assert_eq!(clip["name"], "recorder.wav ✓");
+        assert_eq!(clip["metadata"]["Align"]["Resolve Clip Color"], "Blue");
     }
 
     #[test]

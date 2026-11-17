@@ -287,6 +287,9 @@ fn clip_json(
             }),
         );
     }
+    if let Some(color) = item.fcp7_labels_xml(kind).and_then(resolve_clip_color) {
+        metadata.entry("Align").or_insert_with(|| json!({}))["Resolve Clip Color"] = json!(color);
+    }
     let effects: Vec<Value> = if item.is_retimed(kind) {
         vec![json!({
             "OTIO_SCHEMA": "LinearTimeWarp.1",
@@ -323,6 +326,38 @@ fn clip_json(
             },
         },
         "active_media_reference_key": "DEFAULT_MEDIA",
+    })
+}
+
+/// The Resolve clip color closest to an FCP 7 / Premiere color label.
+/// Resolve imports neither the label nor a clip color from XML or OTIO, so
+/// the import script applies this one; `None` leaves the clip uncolored.
+fn resolve_clip_color(labels_xml: &str) -> Option<&'static str> {
+    let label = labels_xml
+        .split_once("<label2>")?
+        .1
+        .split_once("</label2>")?
+        .0
+        .trim()
+        .to_ascii_lowercase();
+    Some(match label.as_str() {
+        "orange" | "mango" | "red" => "Orange",
+        "apricot" => "Apricot",
+        "yellow" => "Yellow",
+        "lime" => "Lime",
+        "olive" => "Olive",
+        "green" | "forest" => "Green",
+        "teal" | "caribbean" => "Teal",
+        "navy" => "Navy",
+        "blue" | "iris" | "cerulean" => "Blue",
+        "purple" => "Purple",
+        "violet" => "Violet",
+        "pink" | "rose" | "magenta" | "lavender" => "Pink",
+        "tan" => "Tan",
+        "beige" => "Beige",
+        "brown" => "Brown",
+        "chocolate" => "Chocolate",
+        _ => return None,
     })
 }
 

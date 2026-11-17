@@ -195,8 +195,11 @@ align-cli export-json --unmatched order-only --disable-unmatched \
   are retained; this option does not retime the footage.
 
 Labels, roles, sequence names, gap removal, and trimming are listed in
-`align-cli export --help`. Check the exported timeline before using it as the
-basis for further editing.
+`align-cli export --help`. DaVinci Resolve ignores clip names and color labels
+when it imports XML or OTIO; its import script applies them, using the nearest
+Resolve clip color, and substitutes lookalike characters for punctuation such as
+`?` that Resolve does not allow in names. Check the exported timeline before
+using it as the basis for further editing.
 
 ## Cache and saved media
 

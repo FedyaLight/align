@@ -1,7 +1,8 @@
 //! Resolve precision importer script with sample-grid placement and
 //! render-compatible audio-only timelines. When the OTIO lists media bins,
 //! the script imports into a new media pool folder and files each source
-//! into a subfolder per camera and recorder.
+//! into a subfolder per camera and recorder. Resolve imports neither clip
+//! names nor colors, so the script applies them and the enabled state.
 
 pub fn write() -> &'static str {
     r#"#!/usr/bin/env python3
@@ -32,6 +33,7 @@ if not project:
     raise RuntimeError('Open a DaVinci Resolve project first')
 pool = project.GetMediaPool()
 document = json.load(open(otio_path, encoding='utf-8'))
+warnings = []
 
 
 def collect_media(folder):
@@ -129,6 +131,37 @@ video_clips = [
 ]
 
 
+# Resolve refuses clip names with file-name punctuation; these lookalikes
+# keep a label such as "clip.wav ?" readable.
+NAME_LOOKALIKES = str.maketrans({
+    '?': '\uff1f', '/': '\u2044', ':': '\u2236', '*': '\u2217', '"': '\uff02',
+    '<': '\u2039', '>': '\u203a', '|': '\u01c0', '\\': '\u29f5',
+})
+
+
+def apply_clip(item, clip):
+    """Give a timeline item its OTIO name, color, and enabled state. Resolve
+    imports neither clip names nor colors, and a re-placed clip starts out
+    with its media's name, enabled."""
+    name = clip.get('name')
+    if (
+        name
+        and item.GetName() != name
+        and not item.SetName(name)
+        and not item.SetName(name.translate(NAME_LOOKALIKES))
+    ):
+        warnings.append(f'Could not name {name}')
+    color = ((clip.get('metadata') or {}).get('Align') or {}).get('Resolve Clip Color')
+    if color and not item.SetClipColor(color):
+        warnings.append(f'Could not color {name} {color}')
+    if not clip.get('enabled', True) and not item.SetClipEnabled(False):
+        warnings.append(f'Could not disable {name}')
+
+
+def otio_clips(track):
+    return [child for child in track['children'] if child['OTIO_SCHEMA'] == 'Clip.2']
+
+
 def append_audio(entry):
     source_rate = float(entry['media'].GetClipProperty('FPS') or rate)
     start = entry['source_in'] * source_rate
@@ -154,6 +187,7 @@ def append_audio(entry):
     actual = float(result[0].GetStart(True))
     if abs(actual - entry['record']) > rate / sample_rate:
         raise RuntimeError(f"Resolve quantized {entry['name']} to {actual}")
+    apply_clip(result[0], entry['clip'])
 
 
 if not video_clips:
@@ -218,12 +252,15 @@ if not video_clips:
                     'duration': duration,
                     'full_source': abs(source_in) < 0.000001 and abs(duration - available_duration) < 0.00001,
                     'name': child['name'],
+                    'clip': child,
                 })
                 placed += 1
             cursor += duration
     organize_media()
     project.SetCurrentTimeline(timeline)
     print(f'Created {timeline.GetName()} with {placed} sample-accurate audio clips')
+    for warning in warnings:
+        print('Warning:', warning, file=sys.stderr)
     sys.exit(0)
 
 timeline = pool.ImportTimelineFromFile(
@@ -235,12 +272,20 @@ if not timeline:
 
 timeline_start = float(timeline.GetStartFrame())
 replacements = []
-warnings = []
+
+video_tracks = [track for track in document['tracks']['children'] if track['kind'] == 'Video']
+for track_index, track in enumerate(video_tracks, 1):
+    clips = otio_clips(track)
+    resolve_items = timeline.GetItemListInTrack('video', track_index) or []
+    if len(clips) != len(resolve_items):
+        warnings.append(f'Video track {track_index} did not conform one-to-one; kept its clip names')
+        continue
+    for clip, item in zip(clips, resolve_items):
+        apply_clip(item, clip)
 
 for track_index, track in enumerate(audio_tracks, 1):
-    otio_clips = [child for child in track['children'] if child['OTIO_SCHEMA'] == 'Clip.2']
     resolve_items = timeline.GetItemListInTrack('audio', track_index) or []
-    if len(otio_clips) != len(resolve_items):
+    if len(otio_clips(track)) != len(resolve_items):
         raise RuntimeError(f'Audio track {track_index} did not conform one-to-one')
     cursor = 0.0
     clip_index = 0
@@ -250,10 +295,13 @@ for track_index, track in enumerate(audio_tracks, 1):
             item = resolve_items[clip_index]
             clip_index += 1
             metadata = child.get('metadata', {}).get('Resolve_OTIO', {})
-            if metadata.get('Link Group ID') is None:
+            if metadata.get('Link Group ID') is not None:
+                apply_clip(item, child)
+            else:
                 media = item.GetMediaPoolItem()
                 if str(media.GetClipProperty('Audio Ch')) != '1':
                     warnings.append(f"Kept frame-quantized multichannel clip: {child['name']}")
+                    apply_clip(item, child)
                 else:
                     reference = child['media_references'][child['active_media_reference_key']]
                     source_in = seconds(child['source_range']['start_time']) - seconds(
@@ -269,6 +317,7 @@ for track_index, track in enumerate(audio_tracks, 1):
                         'duration': duration,
                         'full_source': abs(source_in) < 0.000001 and abs(duration - available_duration) < 0.00001,
                         'name': child['name'],
+                        'clip': child,
                     })
         cursor += duration
 

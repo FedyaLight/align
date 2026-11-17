@@ -272,7 +272,8 @@ struct AssignArgs {
     /// Attach the synchronized symbol as a suffix instead of a prefix.
     #[arg(long)]
     synced_symbol_suffix: bool,
-    /// FCP 7 color label for synchronized clips (Premiere/Resolve XML).
+    /// FCP 7 color label for synchronized clips (Premiere XML; the Resolve import
+    /// script applies the nearest Resolve clip color).
     #[arg(long, value_name = "COLOR")]
     synced_color: Option<String>,
     /// Final Cut audio role for synchronized audio (FCPXML only).
@@ -284,7 +285,8 @@ struct AssignArgs {
     /// Attach the unmatched symbol as a suffix instead of a prefix.
     #[arg(long)]
     unmatched_symbol_suffix: bool,
-    /// FCP 7 color label for unmatched clips (Premiere/Resolve XML).
+    /// FCP 7 color label for unmatched clips (Premiere XML; the Resolve import
+    /// script applies the nearest Resolve clip color).
     #[arg(long, value_name = "COLOR")]
     unmatched_color: Option<String>,
     /// Final Cut audio role for unmatched audio (FCPXML only).
