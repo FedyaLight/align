@@ -20,6 +20,7 @@ pub mod parallel;
 pub mod piecewise;
 pub mod redirect;
 pub mod spanned;
+pub mod staged;
 pub mod timecode;
 pub mod timing;
 pub mod wav;

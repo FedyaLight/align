@@ -249,14 +249,8 @@ impl FingerprintCache {
         if std::fs::create_dir_all(&self.dir).is_err() {
             return;
         }
-        // Distinct writers never share a temporary file, even within one process.
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = path.with_extension(format!("timing-tmp-{}-{serial}", std::process::id()));
-        if std::fs::write(&tmp, bytes).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
-        }
-        let _ = std::fs::remove_file(tmp);
+        // Best effort: a cache entry that cannot be written is recomputed.
+        let _ = crate::staged::write(&path, &bytes);
     }
 
     fn video_timing_path(&self, media: &Path, decoder: &str) -> std::io::Result<PathBuf> {
@@ -302,7 +296,6 @@ impl FingerprintCache {
         if std::fs::create_dir_all(&self.dir).is_err() {
             return;
         }
-        // Write to a temporary file and rename after completing the payload.
         let payload = Payload {
             version: CACHE_VERSION,
             backend_tag: self.backend_tag.clone(),
@@ -312,14 +305,7 @@ impl FingerprintCache {
         let Ok(bytes) = bincode::serialize(&payload) else {
             return;
         };
-        let tmp = url.with_extension(format!("tmp-{}", std::process::id()));
-        if std::fs::write(&tmp, &bytes).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-            return;
-        }
-        if std::fs::rename(&tmp, &url).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
+        let _ = crate::staged::write(&url, &bytes);
     }
 
     /// Load the compact amplitude envelope stored beside a fingerprint entry.
@@ -359,14 +345,7 @@ impl FingerprintCache {
         let Ok(bytes) = bincode::serialize(waveform) else {
             return;
         };
-        let tmp = url.with_extension(format!("waveform-tmp-{}", std::process::id()));
-        if std::fs::write(&tmp, bytes).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-            return;
-        }
-        if std::fs::rename(&tmp, &url).is_err() {
-            let _ = std::fs::remove_file(tmp);
-        }
+        let _ = crate::staged::write(&url, &bytes);
     }
 
     fn cache_path(&self, media: &Path, variant: &str) -> std::io::Result<PathBuf> {

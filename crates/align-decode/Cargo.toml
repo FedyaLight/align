@@ -20,7 +20,7 @@ ltc.workspace = true
 sha2.workspace = true
 blake3.workspace = true
 dirs.workspace = true
-tempfile = "3"
+tempfile.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", default-features = false, features = ["std", "alloc"] }

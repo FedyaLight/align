@@ -7,28 +7,28 @@
 //! deliberately NOT copied (they describe stretched-away samples).
 //! Files without `bext` pass through untouched.
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+
+use crate::model::file_name;
+use crate::staged::StagedFile;
 
 const MAX_BEXT: u64 = 16 * 1024 * 1024;
 const COPY_BUF: usize = 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, thiserror::Error)]
 pub enum WavError {
-    CannotRead,
-    CannotWrite,
+    #[error("Cannot read Broadcast Wave metadata from {file}: {source}")]
+    Read {
+        file: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("Cannot write Broadcast Wave metadata: {0}")]
+    Write(#[source] io::Error),
+    #[error("Invalid Broadcast Wave metadata: {0}.")]
+    Invalid(&'static str),
 }
-
-impl std::fmt::Display for WavError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::CannotRead => write!(f, "Cannot decode audio for drift correction."),
-            Self::CannotWrite => write!(f, "Cannot write drift-corrected audio."),
-        }
-    }
-}
-
-impl std::error::Error for WavError {}
 
 /// Copy `bext` from `source` into already-rendered `target`.
 pub fn preserve_broadcast_extension(
@@ -55,22 +55,23 @@ pub fn preserve_broadcast_extension(
 }
 
 fn read_bext(path: &Path) -> Result<Option<Vec<u8>>, WavError> {
-    let mut file = std::fs::File::open(path).map_err(|_| WavError::CannotRead)?;
-    let size = file.metadata().map_err(|_| WavError::CannotRead)?.len();
+    let read = |source| WavError::Read {
+        file: file_name(path),
+        source,
+    };
+    let mut file = std::fs::File::open(path).map_err(read)?;
+    let size = file.metadata().map_err(read)?.len();
     let mut header = [0u8; 12];
-    file.read_exact(&mut header)
-        .map_err(|_| WavError::CannotRead)?;
+    file.read_exact(&mut header).map_err(read)?;
     if !matches!(&header[0..4], b"RIFF" | b"RF64" | b"BW64") || &header[8..12] != b"WAVE" {
         return Ok(None);
     }
     let mut offset = 12u64;
     let mut data_size_64 = None;
     while offset <= size && size - offset >= 8 {
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|_| WavError::CannotRead)?;
+        file.seek(SeekFrom::Start(offset)).map_err(read)?;
         let mut chunk_header = [0u8; 8];
-        file.read_exact(&mut chunk_header)
-            .map_err(|_| WavError::CannotRead)?;
+        file.read_exact(&mut chunk_header).map_err(read)?;
         let id = &chunk_header[0..4];
         let size32 = u32::from_le_bytes(chunk_header[4..8].try_into().unwrap());
         let chunk_size = if id == b"data" && size32 == u32::MAX {
@@ -83,21 +84,17 @@ fn read_bext(path: &Path) -> Result<Option<Vec<u8>>, WavError> {
             return Ok(None);
         }
         if id == b"ds64" && chunk_size >= 16 {
-            file.seek(SeekFrom::Start(payload))
-                .map_err(|_| WavError::CannotRead)?;
+            file.seek(SeekFrom::Start(payload)).map_err(read)?;
             let mut buf = [0u8; 16];
-            file.read_exact(&mut buf)
-                .map_err(|_| WavError::CannotRead)?;
+            file.read_exact(&mut buf).map_err(read)?;
             data_size_64 = Some(u64::from_le_bytes(buf[8..16].try_into().unwrap()));
         } else if id == b"bext" {
             if chunk_size > MAX_BEXT {
-                return Err(WavError::CannotWrite);
+                return Err(WavError::Invalid("bext chunk is larger than 16 MiB"));
             }
-            file.seek(SeekFrom::Start(payload))
-                .map_err(|_| WavError::CannotRead)?;
+            file.seek(SeekFrom::Start(payload)).map_err(read)?;
             let mut buf = vec![0u8; chunk_size as usize];
-            file.read_exact(&mut buf)
-                .map_err(|_| WavError::CannotRead)?;
+            file.read_exact(&mut buf).map_err(read)?;
             return Ok(Some(buf));
         }
         offset = payload + chunk_size + (chunk_size & 1);
@@ -123,7 +120,7 @@ fn updated_bext(
         // Never wrap a timestamp into a plausible but unrelated value.
         let updated = original
             .checked_add_signed(time_reference_offset)
-            .ok_or(WavError::CannotWrite)?;
+            .ok_or(WavError::Invalid("TimeReference is out of range"))?;
         result[338..342].copy_from_slice(&(updated as u32).to_le_bytes());
         result[342..346].copy_from_slice(&((updated >> 32) as u32).to_le_bytes());
     }
@@ -147,119 +144,83 @@ fn updated_bext(
     Ok(result)
 }
 
+/// Rewrites `target` with `payload` as its first chunk after any `ds64`.
+/// The audio is streamed into a staged copy that replaces `target` only when
+/// complete.
 fn insert_bext(payload: &[u8], target: &Path) -> Result<(), WavError> {
     if payload.len() > u32::MAX as usize {
-        return Err(WavError::CannotWrite);
+        return Err(WavError::Invalid("bext chunk is larger than 4 GiB"));
     }
-    let original_size = std::fs::metadata(target)
-        .map_err(|_| WavError::CannotWrite)?
-        .len();
-    let mut input = std::fs::File::open(target).map_err(|_| WavError::CannotWrite)?;
+    let mut input = std::fs::File::open(target).map_err(WavError::Write)?;
+    let original_size = input.metadata().map_err(WavError::Write)?.len();
     let mut header = [0u8; 12];
-    input
-        .read_exact(&mut header)
-        .map_err(|_| WavError::CannotWrite)?;
+    input.read_exact(&mut header).map_err(WavError::Write)?;
     if !matches!(&header[0..4], b"RIFF" | b"RF64" | b"BW64") || &header[8..12] != b"WAVE" {
-        return Err(WavError::CannotWrite);
+        return Err(WavError::Invalid("rendered audio is not a WAVE file"));
     }
     let container = header[0..4].to_vec();
 
-    let rewritten = target.with_extension(format!(
-        "tmp-{}.wav",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos())
-    ));
-    let mut output = std::fs::File::create(&rewritten).map_err(|_| WavError::CannotWrite)?;
-    let result: Result<(), WavError> = (|| {
-        output
-            .write_all(&header)
-            .map_err(|_| WavError::CannotWrite)?;
+    let rewritten = StagedFile::new(target).map_err(WavError::Write)?;
+    {
+        let mut output = std::fs::File::create(rewritten.path()).map_err(WavError::Write)?;
+        output.write_all(&header).map_err(WavError::Write)?;
         let mut input_offset = 12u64;
         let mut ds64_data_offset = None;
         if container != b"RIFF" {
             input
                 .seek(SeekFrom::Start(input_offset))
-                .map_err(|_| WavError::CannotWrite)?;
+                .map_err(WavError::Write)?;
             let mut ds64_header = [0u8; 8];
             input
                 .read_exact(&mut ds64_header)
-                .map_err(|_| WavError::CannotWrite)?;
+                .map_err(WavError::Write)?;
             if &ds64_header[0..4] != b"ds64" {
-                return Err(WavError::CannotWrite);
+                return Err(WavError::Invalid("RF64 audio has no ds64 chunk"));
             }
             let ds64_size = u64::from(u32::from_le_bytes(ds64_header[4..8].try_into().unwrap()));
             let chunk_size = 8 + ds64_size + (ds64_size & 1);
             if chunk_size > original_size - input_offset {
-                return Err(WavError::CannotWrite);
+                return Err(WavError::Invalid("ds64 chunk is truncated"));
             }
             ds64_data_offset = Some(20u64);
             input
                 .seek(SeekFrom::Start(input_offset))
-                .map_err(|_| WavError::CannotWrite)?;
+                .map_err(WavError::Write)?;
             copy_bytes(chunk_size, &mut input, &mut output)?;
             input_offset += chunk_size;
         }
-        output
-            .write_all(b"bext")
-            .map_err(|_| WavError::CannotWrite)?;
+        output.write_all(b"bext").map_err(WavError::Write)?;
         output
             .write_all(&(payload.len() as u32).to_le_bytes())
-            .map_err(|_| WavError::CannotWrite)?;
-        output
-            .write_all(payload)
-            .map_err(|_| WavError::CannotWrite)?;
+            .map_err(WavError::Write)?;
+        output.write_all(payload).map_err(WavError::Write)?;
         if payload.len() % 2 == 1 {
-            output.write_all(&[0]).map_err(|_| WavError::CannotWrite)?;
+            output.write_all(&[0]).map_err(WavError::Write)?;
         }
         input
             .seek(SeekFrom::Start(input_offset))
-            .map_err(|_| WavError::CannotWrite)?;
+            .map_err(WavError::Write)?;
         copy_bytes(original_size - input_offset, &mut input, &mut output)?;
-        let rewritten_size = output
-            .stream_position()
-            .map_err(|_| WavError::CannotWrite)?;
+        let rewritten_size = output.stream_position().map_err(WavError::Write)?;
         if container == b"RIFF" {
             if rewritten_size < 8 || rewritten_size - 8 > u64::from(u32::MAX) {
-                return Err(WavError::CannotWrite);
+                return Err(WavError::Invalid("RIFF audio would exceed 4 GiB"));
             }
-            output
-                .seek(SeekFrom::Start(4))
-                .map_err(|_| WavError::CannotWrite)?;
+            output.seek(SeekFrom::Start(4)).map_err(WavError::Write)?;
             output
                 .write_all(&((rewritten_size - 8) as u32).to_le_bytes())
-                .map_err(|_| WavError::CannotWrite)?;
+                .map_err(WavError::Write)?;
         } else if let Some(off) = ds64_data_offset {
-            output
-                .seek(SeekFrom::Start(off))
-                .map_err(|_| WavError::CannotWrite)?;
+            output.seek(SeekFrom::Start(off)).map_err(WavError::Write)?;
             output
                 .write_all(&(rewritten_size - 8).to_le_bytes())
-                .map_err(|_| WavError::CannotWrite)?;
+                .map_err(WavError::Write)?;
         }
-        output.flush().map_err(|_| WavError::CannotWrite)?;
-        Ok(())
-    })();
-    drop(output);
-    drop(input);
-    match result {
-        Ok(()) => {
-            #[cfg(windows)]
-            if std::fs::remove_file(target).is_err() {
-                let _ = std::fs::remove_file(&rewritten);
-                return Err(WavError::CannotWrite);
-            }
-            if std::fs::rename(&rewritten, target).is_err() {
-                let _ = std::fs::remove_file(&rewritten);
-                return Err(WavError::CannotWrite);
-            }
-            Ok(())
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&rewritten);
-            Err(e)
-        }
+        output.flush().map_err(WavError::Write)?;
     }
+    // Both handles are closed here: Windows cannot replace an open file.
+    drop(input);
+    rewritten.commit().map_err(WavError::Write)
 }
 
 fn copy_bytes(
@@ -270,12 +231,8 @@ fn copy_bytes(
     let mut buf = vec![0u8; COPY_BUF];
     while count > 0 {
         let n = (count.min(COPY_BUF as u64)) as usize;
-        input
-            .read_exact(&mut buf[..n])
-            .map_err(|_| WavError::CannotRead)?;
-        output
-            .write_all(&buf[..n])
-            .map_err(|_| WavError::CannotWrite)?;
+        input.read_exact(&mut buf[..n]).map_err(WavError::Write)?;
+        output.write_all(&buf[..n]).map_err(WavError::Write)?;
         count -= n as u64;
     }
     Ok(())
@@ -369,15 +326,15 @@ mod tests {
         bext[338..346].copy_from_slice(&100u64.to_le_bytes());
         let shifted = updated_bext(&bext, 48000.0, 1, 32, "pad", -100).unwrap();
         assert_eq!(&shifted[338..346], &0u64.to_le_bytes());
-        assert_eq!(
+        assert!(matches!(
             updated_bext(&bext, 48000.0, 1, 32, "pad", -101),
-            Err(WavError::CannotWrite)
-        );
+            Err(WavError::Invalid(_))
+        ));
         bext[338..346].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert_eq!(
+        assert!(matches!(
             updated_bext(&bext, 48000.0, 1, 32, "trim", 1),
-            Err(WavError::CannotWrite)
-        );
+            Err(WavError::Invalid(_))
+        ));
     }
 
     #[test]
