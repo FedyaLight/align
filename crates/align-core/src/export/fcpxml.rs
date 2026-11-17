@@ -246,7 +246,7 @@ fn write_island(
     if options.multicam {
         xml += &format!("      <project name=\"{name} – multicam\">\n{sequence}");
         xml += &format!(
-            "          <spine>\n            <mc-clip name=\"{name} – Multicam\" ref=\"{MULTICAM_ID}\" offset=\"0s\" duration=\"{total_duration}\" tcStart=\"{sequence_start}\" format=\"{FORMAT_ID}\"/>\n          </spine>\n        </sequence>\n      </project>\n"
+            "          <spine>\n            <mc-clip name=\"{name} – Multicam\" ref=\"{MULTICAM_ID}\" offset=\"0s\" duration=\"{total_duration}\"/>\n          </spine>\n        </sequence>\n      </project>\n"
         );
     }
     xml += "    </event>\n  </library>\n</fcpxml>\n";
@@ -647,6 +647,17 @@ mod tests {
         assert!(!multicam_only.contains("– synced"));
         assert!(multicam_only.contains("r_multicam"));
         assert!(multicam_only.contains("– multicam"));
+    }
+
+    #[test]
+    fn multicam_clip_uses_only_attributes_the_dtd_declares() {
+        let xml = write(&fixture_timeline(), FcpxmlOptions::default());
+        let clip = &xml[xml.find("<mc-clip ").expect("mc-clip")..];
+        let clip = &clip[..clip.find("/>").expect("end")];
+        assert!(
+            !clip.contains("tcStart=") && !clip.contains("format="),
+            "{clip}"
+        );
     }
 
     #[test]
