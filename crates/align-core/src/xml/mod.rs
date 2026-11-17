@@ -26,8 +26,9 @@ use fcp7::*;
 use fcpxml::*;
 
 use crate::model::{
-    Clip, ImportedTimeline, MediaKind, MediaTime, SyncWarning, TimelineEdit,
-    TimelineLinkedAudioEdit, TimelineSequenceSummary, TimelineTransition, TimelineTransitionKind,
+    Clip, ImportedTimeline, MediaKind, MediaTime, RATE_TOLERANCE, SyncWarning, TIME_TOLERANCE,
+    TimelineEdit, TimelineLinkedAudioEdit, TimelineSequenceSummary, TimelineTransition,
+    TimelineTransitionKind,
 };
 
 // ------------------------------------------------------------ DOM
@@ -118,7 +119,8 @@ impl XmlDoc {
                     }
                 }
                 Ok(Event::Eof) => break,
-                Err(_) => return Err(ImportError::Unreadable(String::new())),
+                // Named by the caller, which knows the file.
+                Err(error) => return Err(ImportError::unreadable("", error)),
                 _ => {}
             }
             buf.clear();
@@ -749,8 +751,8 @@ fn closest_embedded_audio<'a>(
     same_media
         .into_iter()
         .filter(|c| {
-            (c.source_in - video.source_in).abs() < 0.000_001
-                && (c.source_out - video.source_out).abs() < 0.000_001
+            (c.source_in - video.source_in).abs() < TIME_TOLERANCE
+                && (c.source_out - video.source_out).abs() < TIME_TOLERANCE
                 && (c.timeline_start - video.timeline_start).abs() <= tolerance
                 && (c.timeline_end - video.timeline_end).abs() <= tolerance
         })
@@ -766,13 +768,18 @@ fn closest_embedded_audio<'a>(
 
 // ------------------------------------------------------------ errors
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum ImportError {
+    #[error("No FCP 7 XML sequence was found in {0}.")]
     NoSequence(String),
+    #[error("{0} contains {1} sequences. Choose one explicitly.")]
     MultipleSequences(String, usize),
+    #[error("Sequence {} does not exist in {}.", .1 + 1, .0)]
     InvalidSequence(String, usize),
+    #[error("No readable media clip items were found in {0}.")]
     NoMedia(String),
-    Unreadable(String),
+    #[error("Cannot read timeline {file}: {reason}.")]
+    Unreadable { file: String, reason: String },
 }
 
 impl ImportError {
@@ -785,7 +792,14 @@ impl ImportError {
             Self::MultipleSequences(_, count) => Self::MultipleSequences(name, count),
             Self::InvalidSequence(_, index) => Self::InvalidSequence(name, index),
             Self::NoMedia(_) => Self::NoMedia(name),
-            Self::Unreadable(_) => Self::Unreadable(name),
+            Self::Unreadable { reason, .. } => Self::Unreadable { file: name, reason },
+        }
+    }
+
+    fn unreadable(file: &str, reason: impl std::fmt::Display) -> Self {
+        Self::Unreadable {
+            file: file.to_string(),
+            reason: reason.to_string().trim_end_matches('.').to_string(),
         }
     }
 
@@ -796,31 +810,6 @@ impl ImportError {
             .to_string()
     }
 }
-
-impl std::fmt::Display for ImportError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoSequence(url) => {
-                write!(f, "No FCP 7 XML sequence was found in {url}.")
-            }
-            Self::MultipleSequences(url, count) => {
-                write!(
-                    f,
-                    "{url} contains {count} sequences. Choose one explicitly."
-                )
-            }
-            Self::InvalidSequence(url, index) => {
-                write!(f, "Sequence {} does not exist in {url}.", index + 1)
-            }
-            Self::NoMedia(url) => {
-                write!(f, "No readable media clip items were found in {url}.")
-            }
-            Self::Unreadable(url) => write!(f, "Cannot read timeline {url}."),
-        }
-    }
-}
-
-impl std::error::Error for ImportError {}
 
 // ------------------------------------------------------------ importer
 
@@ -886,9 +875,10 @@ pub fn read_timeline_with_proxies(
     sequence_index: Option<usize>,
     prefer_proxies: bool,
 ) -> Result<TimelineDraft, ImportError> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|_| ImportError::Unreadable(ImportError::filename(path)))?;
-    let doc = XmlDoc::parse(&text)?;
+    let name = ImportError::filename(path);
+    let text =
+        std::fs::read_to_string(path).map_err(|error| ImportError::unreadable(&name, error))?;
+    let doc = XmlDoc::parse(&text).map_err(|error| error.naming(&name))?;
     if doc.root_name().eq_ignore_ascii_case("fcpxml") {
         read_fcpxml(&doc, path, sequence_index, prefer_proxies)
     } else {
@@ -899,11 +889,12 @@ pub fn read_timeline_with_proxies(
 pub fn timeline_sequence_summaries(
     path: &Path,
 ) -> Result<Vec<TimelineSequenceSummary>, ImportError> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|_| ImportError::Unreadable(ImportError::filename(path)))?;
-    let doc = XmlDoc::parse(&text)?;
+    let name = ImportError::filename(path);
+    let text =
+        std::fs::read_to_string(path).map_err(|error| ImportError::unreadable(&name, error))?;
+    let doc = XmlDoc::parse(&text).map_err(|error| error.naming(&name))?;
     if doc.root_name().eq_ignore_ascii_case("fcpxml") {
-        summaries_fcpxml(&doc)
+        summaries_fcpxml(&doc).map_err(|error| error.naming(&name))
     } else {
         summaries_fcp7(&doc, path)
     }
@@ -965,9 +956,7 @@ pub fn rewrite_media_paths(
     let mut in_pathurl = false;
     let mut buf = Vec::new();
     loop {
-        let event = reader
-            .read_event_into(&mut buf)
-            .map_err(|_| ImportError::Unreadable(String::new()))?;
+        let event = reader.read_event_into(&mut buf).map_err(malformed)?;
         match event {
             Event::Start(start) => {
                 let local = String::from_utf8_lossy(start.local_name().as_ref()).into_owned();
@@ -981,9 +970,7 @@ pub fn rewrite_media_paths(
                         &replacement_for,
                     )?;
                 } else {
-                    writer
-                        .write_event(Event::Start(start))
-                        .map_err(|_| ImportError::Unreadable(String::new()))?;
+                    writer.write_event(Event::Start(start)).map_err(malformed)?;
                 }
             }
             Event::Empty(empty) => {
@@ -997,23 +984,17 @@ pub fn rewrite_media_paths(
                         &replacement_for,
                     )?;
                 } else {
-                    writer
-                        .write_event(Event::Empty(empty))
-                        .map_err(|_| ImportError::Unreadable(String::new()))?;
+                    writer.write_event(Event::Empty(empty)).map_err(malformed)?;
                 }
             }
             Event::Text(text) if in_pathurl => {
-                let value = text
-                    .unescape()
-                    .map_err(|_| ImportError::Unreadable(String::new()))?;
+                let value = text.unescape().map_err(malformed)?;
                 if let Some(new) = replacement_for(&value, true) {
                     writer
                         .write_event(Event::Text(BytesText::new(&new)))
-                        .map_err(|_| ImportError::Unreadable(String::new()))?;
+                        .map_err(malformed)?;
                 } else {
-                    writer
-                        .write_event(Event::Text(text))
-                        .map_err(|_| ImportError::Unreadable(String::new()))?;
+                    writer.write_event(Event::Text(text)).map_err(malformed)?;
                 }
             }
             Event::CData(text) if in_pathurl => {
@@ -1021,25 +1002,19 @@ pub fn rewrite_media_paths(
                 if let Some(new) = replacement_for(&value, true) {
                     writer
                         .write_event(Event::CData(BytesCData::new(&new)))
-                        .map_err(|_| ImportError::Unreadable(String::new()))?;
+                        .map_err(malformed)?;
                 } else {
-                    writer
-                        .write_event(Event::CData(text))
-                        .map_err(|_| ImportError::Unreadable(String::new()))?;
+                    writer.write_event(Event::CData(text)).map_err(malformed)?;
                 }
             }
             Event::End(end) => {
                 if end.local_name().as_ref() == b"pathurl" {
                     in_pathurl = false;
                 }
-                writer
-                    .write_event(Event::End(end))
-                    .map_err(|_| ImportError::Unreadable(String::new()))?;
+                writer.write_event(Event::End(end)).map_err(malformed)?;
             }
             Event::Eof => break,
-            other => writer
-                .write_event(other)
-                .map_err(|_| ImportError::Unreadable(String::new()))?,
+            other => writer.write_event(other).map_err(malformed)?,
         }
         buf.clear();
     }
@@ -1059,11 +1034,11 @@ where
     let mut attributes = Vec::new();
     let mut changed = false;
     for attribute in tag.attributes() {
-        let attribute = attribute.map_err(|_| ImportError::Unreadable(String::new()))?;
+        let attribute = attribute.map_err(malformed)?;
         let key = String::from_utf8_lossy(attribute.key.as_ref()).into_owned();
         let mut value = attribute
             .decode_and_unescape_value(reader.decoder())
-            .map_err(|_| ImportError::Unreadable(String::new()))?
+            .map_err(malformed)?
             .into_owned();
         if key == "src"
             && let Some(new) = replacement_for(&value, false)
@@ -1085,7 +1060,7 @@ where
             } else {
                 Event::Start(rewritten)
             })
-            .map_err(|_| ImportError::Unreadable(String::new()))
+            .map_err(malformed)
     } else {
         writer
             .write_event(if empty {
@@ -1093,8 +1068,14 @@ where
             } else {
                 Event::Start(tag)
             })
-            .map_err(|_| ImportError::Unreadable(String::new()))
+            .map_err(malformed)
     }
+}
+
+/// A document quick-xml cannot parse or re-serialize. The caller names the
+/// file with [`ImportError::naming`].
+fn malformed(error: impl std::fmt::Display) -> ImportError {
+    ImportError::unreadable("", error)
 }
 
 /// Records warnings about the timeline document at `path`.

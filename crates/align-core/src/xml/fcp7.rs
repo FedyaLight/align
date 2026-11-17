@@ -655,7 +655,7 @@ pub(super) fn read_fcp7(
     if edits.iter().any(|e| e.plays_backward)
         && edits
             .iter()
-            .any(|e| e.plays_backward && (e.playback_rate - 1.0).abs() > 0.000_001)
+            .any(|e| e.plays_backward && (e.playback_rate - 1.0).abs() > RATE_TOLERANCE)
     {
         warn(
             &mut warnings,
@@ -1112,7 +1112,7 @@ pub(super) fn read_nested_sequence(
         return;
     }
     let speed = parent_dur / window_dur;
-    let drop_verbatim = (speed - 1.0).abs() > 0.000_001;
+    let drop_verbatim = (speed - 1.0).abs() > RATE_TOLERANCE;
     if drop_verbatim {
         warn(
             &mut *warnings,
@@ -1305,7 +1305,7 @@ pub(super) fn read_multiclip(
             continue;
         }
         let speed = parent_dur / window_dur;
-        let drop_verbatim = (speed - 1.0).abs() > 0.000_001;
+        let drop_verbatim = (speed - 1.0).abs() > RATE_TOLERANCE;
         if drop_verbatim {
             warn(
                 &mut *warnings,

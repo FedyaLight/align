@@ -127,7 +127,8 @@ pub fn write_relinked_copy(
         },
         copied: (is_bundle(source) && is_bundle(destination)).then_some(source),
     };
-    let fixed = align_core::rewrite_media_paths(&bytes, replacements, &relocation)?;
+    let fixed = align_core::rewrite_media_paths(&bytes, replacements, &relocation)
+        .map_err(|error| error.naming(&align_core::model::file_name(source)))?;
     if is_bundle(destination) {
         return write_bundle(source, destination, &fixed, cancel);
     }

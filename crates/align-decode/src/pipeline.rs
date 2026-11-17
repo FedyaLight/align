@@ -175,25 +175,32 @@ pub enum PipelineInput {
     TimelineSequence(PathBuf, usize),
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
+    #[error("No readable audio or video media was found.")]
     NoMedia,
-    Inaccessible(PathBuf),
+    #[error("Cannot access {}{}.", .path.display(), .source.as_ref().map_or(String::new(), |e| format!(": {e}")))]
+    Inaccessible {
+        path: PathBuf,
+        #[source]
+        source: Option<std::io::Error>,
+    },
+    #[error("Add one timeline at a time.")]
     MultipleTimelines,
+    #[error("Timeline import: {}.", .0.trim_end_matches('.'))]
     Timeline(String),
+    #[error("Cancelled.")]
     Cancelled,
-    Decode(crate::DecodeError),
+    #[error("Decode error: {0}.")]
+    Decode(#[source] crate::DecodeError),
 }
 
-impl std::fmt::Display for PipelineError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoMedia => write!(f, "No readable audio or video media was found."),
-            Self::Inaccessible(p) => write!(f, "Cannot access {}.", p.display()),
-            Self::MultipleTimelines => write!(f, "Add one timeline at a time."),
-            Self::Timeline(msg) => write!(f, "Timeline import: {}.", msg.trim_end_matches('.')),
-            Self::Cancelled => write!(f, "Cancelled."),
-            Self::Decode(e) => write!(f, "Decode error: {e}."),
+impl PipelineError {
+    fn inaccessible(path: &Path) -> impl FnOnce(std::io::Error) -> Self {
+        let path = path.to_path_buf();
+        move |error| Self::Inaccessible {
+            path,
+            source: Some(error),
         }
     }
 }
@@ -211,8 +218,6 @@ impl From<crate::timeline::TimelineError> for PipelineError {
 fn cancelled(flag: &std::sync::atomic::AtomicBool) -> bool {
     flag.load(std::sync::atomic::Ordering::Relaxed)
 }
-
-impl std::error::Error for PipelineError {}
 
 pub struct Pipeline {
     backend: Box<dyn MediaBackend>,
@@ -298,35 +303,8 @@ impl Pipeline {
         inputs: &[PipelineInput],
         options: &PipelineOptions,
     ) -> Result<SyncProject, PipelineError> {
-        let expanded = expand(inputs)?;
-        let draft = expanded
-            .timeline
-            .map(|t| {
-                crate::timeline::read_with_proxies(
-                    &t.path,
-                    t.sequence,
-                    &std::sync::atomic::AtomicBool::new(false),
-                    options.prefer_proxies,
-                )
-                .map(|d| {
-                    d.relinking_missing_media(
-                        &expanded.media,
-                        &options.redirects,
-                        &options.manual_relinks,
-                    )
-                })
-                .map_err(PipelineError::from)
-            })
-            .transpose()?;
-        let mut urls = expanded.media;
-        if let Some(d) = &draft {
-            for url in d.media_urls() {
-                if !urls.contains(&url) {
-                    urls.push(url);
-                }
-            }
-            urls.sort();
-        }
+        let (draft, urls) =
+            load_inputs(inputs, options, &std::sync::atomic::AtomicBool::new(false))?;
         let mut clips = Vec::new();
         let mut warnings = Vec::new();
         let inspected = self.inspect_all(&urls, None, &std::sync::atomic::AtomicBool::new(false));
@@ -374,37 +352,7 @@ impl Pipeline {
         progress: Option<&(dyn Fn(PipelineProgress) + Send + Sync)>,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<align_core::SyncResult, PipelineError> {
-        let expanded = expand(inputs)?;
-        // Timeline relink runs BEFORE inspection so relinked files are
-        // inspected like directly added media.
-        let draft = expanded
-            .timeline
-            .map(|t| {
-                crate::timeline::read_with_proxies(
-                    &t.path,
-                    t.sequence,
-                    cancel,
-                    options.prefer_proxies,
-                )
-                .map(|d| {
-                    d.relinking_missing_media(
-                        &expanded.media,
-                        &options.redirects,
-                        &options.manual_relinks,
-                    )
-                })
-                .map_err(PipelineError::from)
-            })
-            .transpose()?;
-        let mut urls = expanded.media;
-        if let Some(d) = &draft {
-            for url in d.media_urls() {
-                if !urls.contains(&url) {
-                    urls.push(url);
-                }
-            }
-            urls.sort();
-        }
+        let (draft, urls) = load_inputs(inputs, options, cancel)?;
         if urls.is_empty() {
             return Err(PipelineError::NoMedia);
         }
@@ -421,22 +369,7 @@ impl Pipeline {
         for (url, outcome) in urls.iter().zip(inspected) {
             match outcome {
                 Ok(clip) => {
-                    // Variable video timing does not affect audio sync,
-                    // but constant-rate interchange needs a CFR transcode.
-                    if let Some(video) = &clip.video {
-                        use align_core::VideoFrameRateMode;
-                        match video.frame_rate_mode {
-                            Some(VideoFrameRateMode::Variable) => warnings.push(SyncWarning {
-                                url: url.clone(),
-                                message: "Variable frame rate detected. Audio synchronization remains sample-accurate, but FCP 7 XML can describe only a constant edit rate; transcode this source to CFR before frame-exact interchange.".into(),
-                            }),
-                            Some(VideoFrameRateMode::Unknown) => warnings.push(SyncWarning {
-                                url: url.clone(),
-                                message: "This media container does not expose frame sample timing, so constant versus variable frame rate could not be verified. Audio synchronization is unaffected; transcode to CFR before frame-exact interchange.".into(),
-                            }),
-                            _ => {}
-                        }
-                    }
+                    warnings.extend(frame_rate_warning(url, &clip));
                     clips.push(clip);
                 }
                 Err(PipelineError::Cancelled) => return Err(PipelineError::Cancelled),
@@ -467,48 +400,7 @@ impl Pipeline {
         let order_context =
             align_core::ClipOrderContext::from_clips(&clips, imported_timeline.as_ref());
 
-        let mut search_overrides = options.search_overrides.clone();
-        for clip in &clips {
-            let kind = match clip.kind {
-                MediaKind::Video => "video",
-                MediaKind::Audio => "audio",
-            };
-            let source = align_core::source_key_for_clip(
-                &clip.url,
-                clip.source_identifier.as_deref(),
-                clip.media_span
-                    .as_ref()
-                    .map(|span| span.identifier.as_str()),
-            );
-            let mut keys = vec![format!("{kind}:{source}")];
-            if let Some(timeline) = &imported_timeline {
-                keys = timeline
-                    .edits
-                    .iter()
-                    .filter(|edit| edit.clip_id == clip.id)
-                    .map(|edit| {
-                        format!(
-                            "{kind}:imported-{}-{:06}",
-                            edit.media_type.as_str(),
-                            edit.track_index
-                        )
-                    })
-                    .collect();
-            }
-            // A media file used on several tracks is analysed once. Resolve
-            // competing track budgets to the deepest requested search.
-            let requested = keys
-                .iter()
-                .filter_map(|key| options.source_search_overrides.get(key))
-                .max_by_key(|level| {
-                    align_core::SearchAccuracy::ALL
-                        .iter()
-                        .position(|item| item == *level)
-                });
-            if let Some(level) = requested {
-                search_overrides.entry(clip.id.clone()).or_insert(*level);
-            }
-        }
+        let search_overrides = search_overrides(&clips, imported_timeline.as_ref(), options);
 
         // ---- fingerprints (multi-stream variants + shared-hash selection)
         let usable: Vec<&Clip> = clips.iter().filter(|c| !c.audio.is_empty()).collect();
@@ -554,14 +446,7 @@ impl Pipeline {
             for (i, m) in candidates.iter().enumerate() {
                 let mut event =
                     PipelineProgress::basic(Phase::Match, i + 1, candidates.len(), None);
-                event.preview = Some(align_core::MatchPreview {
-                    left: m.left.clone(),
-                    right: m.right.clone(),
-                    rate: m.rate,
-                    offset: m.offset,
-                    confidence: m.confidence,
-                    stage: align_core::MatchPreviewStage::Candidate,
-                });
+                event.preview = Some(preview(m, align_core::MatchPreviewStage::Candidate));
                 p(event);
             }
             p(PipelineProgress::basic(Phase::Match, 1, 1, None));
@@ -597,29 +482,30 @@ impl Pipeline {
             progress.as_ref().map(|p| {
                 let candidates = &candidates;
                 Box::new(move |event: align_core::RefineEvent| {
-                    let lookup = candidates
-                        .iter()
-                        .find(|m| m.left == event.left && m.right == event.right);
-                    let (rate, offset, confidence) = lookup
-                        .map(|m| (m.rate, m.offset, m.confidence))
-                        .unwrap_or((1.0, 0.0, 0.0));
+                    let stage = match event.stage {
+                        align_core::RefineStage::Refined => align_core::MatchPreviewStage::Refined,
+                        align_core::RefineStage::Rejected => {
+                            align_core::MatchPreviewStage::Rejected
+                        }
+                    };
                     let mut out =
                         PipelineProgress::basic(Phase::Refine, event.completed, event.total, None);
-                    out.preview = Some(align_core::MatchPreview {
-                        left: event.left.clone(),
-                        right: event.right.clone(),
-                        rate,
-                        offset,
-                        confidence,
-                        stage: match event.stage {
-                            align_core::RefineStage::Refined => {
-                                align_core::MatchPreviewStage::Refined
-                            }
-                            align_core::RefineStage::Rejected => {
-                                align_core::MatchPreviewStage::Rejected
-                            }
+                    out.preview = Some(
+                        match candidates
+                            .iter()
+                            .find(|m| m.left == event.left && m.right == event.right)
+                        {
+                            Some(candidate) => preview(candidate, stage),
+                            None => align_core::MatchPreview {
+                                left: event.left.clone(),
+                                right: event.right.clone(),
+                                rate: 1.0,
+                                offset: 0.0,
+                                confidence: 0.0,
+                                stage,
+                            },
                         },
-                    });
+                    );
                     p(out);
                 }) as Box<dyn Fn(align_core::RefineEvent) + Send + Sync>
             });
@@ -671,54 +557,21 @@ impl Pipeline {
                 .filter(|m| !matches!(m.evidence, align_core::MatchEvidence::Waveform))
             {
                 let mut event = PipelineProgress::basic(Phase::Solve, 0, 1, None);
-                event.preview = Some(align_core::MatchPreview {
-                    left: m.left.clone(),
-                    right: m.right.clone(),
-                    rate: m.rate,
-                    offset: m.offset,
-                    confidence: m.confidence,
-                    stage: align_core::MatchPreviewStage::Refined,
-                });
+                event.preview = Some(preview(m, align_core::MatchPreviewStage::Refined));
                 p(event);
             }
         }
-        let mut stages: Vec<align_core::SyncStage> = Vec::new();
-        for (kind, matches) in [
-            (align_core::SyncStageKind::Waveform, &waveform_matches),
-            (align_core::SyncStageKind::FileSpans, &span_matches),
-            (align_core::SyncStageKind::Timecode, &refined),
-        ] {
-            if cancelled(cancel) {
-                if stages.is_empty() {
-                    return Err(PipelineError::Cancelled);
-                }
-                break;
-            }
-            let stage = solve_stage(kind, &clips, matches, &options.match_policy);
-            if stages
-                .last()
-                .is_none_or(|previous| previous.matches != stage.matches)
-            {
-                stages.push(stage);
-                if let Some(p) = &progress {
-                    let mut event = PipelineProgress::basic(Phase::Solve, stages.len(), 3, None);
-                    event.completed_stage = Some(kind);
-                    p(event);
-                }
-            }
-        }
-        let stopped = cancelled(cancel);
-        // Prefer the most placed clips; equal counts retain the later stage.
-        let selected = if stopped {
-            stages.len() - 1
-        } else {
-            stages
-                .iter()
-                .enumerate()
-                .max_by_key(|(index, stage)| (stage.synchronized_count(), *index))
-                .map(|(index, _)| index)
-                .expect("waveform stage is always present")
-        };
+        let (mut stages, selected, stopped) = solve_stages(
+            &clips,
+            [
+                (align_core::SyncStageKind::Waveform, &waveform_matches),
+                (align_core::SyncStageKind::FileSpans, &span_matches),
+                (align_core::SyncStageKind::Timecode, &refined),
+            ],
+            &options.match_policy,
+            progress,
+            cancel,
+        )?;
         let chosen = stages[selected].clone();
         // One-stage results retain legacy JSON, with no redundant history.
         let selected_stage = (stages.len() > 1).then_some(selected);
@@ -1266,6 +1119,53 @@ impl Pipeline {
     }
 }
 
+/// Solves each evidence stage that changes the matches (waveform, then file
+/// spans, then timecode) and selects the one placing the most clips; equal
+/// counts retain the later stage. Cancellation keeps the stages solved so
+/// far and selects the last. Returns the stages, the selected index, and
+/// whether solving stopped early.
+fn solve_stages(
+    clips: &[Clip],
+    evidence: [(align_core::SyncStageKind, &Vec<align_core::PairwiseMatch>); 3],
+    match_policy: &align_core::MatchPolicy,
+    progress: Option<&(dyn Fn(PipelineProgress) + Send + Sync)>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(Vec<align_core::SyncStage>, usize, bool), PipelineError> {
+    let mut stages: Vec<align_core::SyncStage> = Vec::new();
+    for (kind, matches) in evidence {
+        if cancelled(cancel) {
+            if stages.is_empty() {
+                return Err(PipelineError::Cancelled);
+            }
+            break;
+        }
+        let stage = solve_stage(kind, clips, matches, match_policy);
+        if stages
+            .last()
+            .is_none_or(|previous| previous.matches != stage.matches)
+        {
+            stages.push(stage);
+            if let Some(p) = &progress {
+                let mut event = PipelineProgress::basic(Phase::Solve, stages.len(), 3, None);
+                event.completed_stage = Some(kind);
+                p(event);
+            }
+        }
+    }
+    let stopped = cancelled(cancel);
+    let selected = if stopped {
+        stages.len() - 1
+    } else {
+        stages
+            .iter()
+            .enumerate()
+            .max_by_key(|(index, stage)| (stage.synchronized_count(), *index))
+            .map(|(index, _)| index)
+            .expect("waveform stage is always present")
+    };
+    Ok((stages, selected, stopped))
+}
+
 fn solve_stage(
     kind: align_core::SyncStageKind,
     clips: &[Clip],
@@ -1369,7 +1269,10 @@ fn mapping_points(
     sources.sort_by(|a, b| a.total_cmp(b));
     let mut knots: Vec<(f64, f64)> = Vec::new();
     for source in sources {
-        if knots.last().is_some_and(|(s, _)| (s - source).abs() < 1e-6) {
+        if knots
+            .last()
+            .is_some_and(|(s, _)| (s - source).abs() < align_core::TIME_TOLERANCE)
+        {
             continue;
         }
         knots.push((source, map.value_at(source)));
@@ -1415,6 +1318,124 @@ struct ExpandedInputs {
     timeline: Option<TimelineRequest>,
 }
 
+/// Reads the optional timeline and relinks its missing media, then lists
+/// every file to inspect: the added media plus the timeline's media. The
+/// relink runs before inspection so relinked files are inspected like
+/// directly added media.
+fn load_inputs(
+    inputs: &[PipelineInput],
+    options: &PipelineOptions,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(Option<align_core::TimelineDraft>, Vec<PathBuf>), PipelineError> {
+    let expanded = expand(inputs)?;
+    let draft = expanded
+        .timeline
+        .map(|t| {
+            crate::timeline::read_with_proxies(&t.path, t.sequence, cancel, options.prefer_proxies)
+                .map(|d| {
+                    d.relinking_missing_media(
+                        &expanded.media,
+                        &options.redirects,
+                        &options.manual_relinks,
+                    )
+                })
+                .map_err(PipelineError::from)
+        })
+        .transpose()?;
+    let mut urls = expanded.media;
+    if let Some(d) = &draft {
+        for url in d.media_urls() {
+            if !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+        urls.sort();
+    }
+    Ok((draft, urls))
+}
+
+/// Variable video timing does not affect audio sync, but constant-rate
+/// interchange needs a CFR transcode.
+fn frame_rate_warning(url: &Path, clip: &Clip) -> Option<SyncWarning> {
+    use align_core::VideoFrameRateMode;
+    let message = match clip.video.as_ref()?.frame_rate_mode? {
+        VideoFrameRateMode::Variable => {
+            "Variable frame rate detected. Audio synchronization remains sample-accurate, but FCP 7 XML can describe only a constant edit rate; transcode this source to CFR before frame-exact interchange."
+        }
+        VideoFrameRateMode::Unknown => {
+            "This media container does not expose frame sample timing, so constant versus variable frame rate could not be verified. Audio synchronization is unaffected; transcode to CFR before frame-exact interchange."
+        }
+        _ => return None,
+    };
+    Some(SyncWarning {
+        url: url.to_path_buf(),
+        message: message.into(),
+    })
+}
+
+/// Per-clip search accuracy: explicit clip overrides win, then the deepest
+/// accuracy requested for any source or imported track the clip plays on.
+fn search_overrides(
+    clips: &[Clip],
+    imported_timeline: Option<&align_core::ImportedTimeline>,
+    options: &PipelineOptions,
+) -> HashMap<ClipId, align_core::SearchAccuracy> {
+    let mut search_overrides = options.search_overrides.clone();
+    for clip in clips {
+        let kind = clip.kind.as_str();
+        let source = align_core::source_key_for_clip(
+            &clip.url,
+            clip.source_identifier.as_deref(),
+            clip.media_span
+                .as_ref()
+                .map(|span| span.identifier.as_str()),
+        );
+        let mut keys = vec![format!("{kind}:{source}")];
+        if let Some(timeline) = imported_timeline {
+            keys = timeline
+                .edits
+                .iter()
+                .filter(|edit| edit.clip_id == clip.id)
+                .map(|edit| {
+                    format!(
+                        "{kind}:imported-{}-{:06}",
+                        edit.media_type.as_str(),
+                        edit.track_index
+                    )
+                })
+                .collect();
+        }
+        // A media file used on several tracks is analysed once. Resolve
+        // competing track budgets to the deepest requested search.
+        let requested = keys
+            .iter()
+            .filter_map(|key| options.source_search_overrides.get(key))
+            .max_by_key(|level| {
+                align_core::SearchAccuracy::ALL
+                    .iter()
+                    .position(|item| item == *level)
+            });
+        if let Some(level) = requested {
+            search_overrides.entry(clip.id.clone()).or_insert(*level);
+        }
+    }
+    search_overrides
+}
+
+fn preview(
+    m: &align_core::PairwiseMatch,
+    stage: align_core::MatchPreviewStage,
+) -> align_core::MatchPreview {
+    align_core::MatchPreview {
+        left: m.left.clone(),
+        right: m.right.clone(),
+        rate: m.rate,
+        offset: m.offset,
+        confidence: m.confidence,
+        stage,
+    }
+}
+
 fn expand(inputs: &[PipelineInput]) -> Result<ExpandedInputs, PipelineError> {
     let mut media = Vec::new();
     let mut timeline: Option<TimelineRequest> = None;
@@ -1422,7 +1443,10 @@ fn expand(inputs: &[PipelineInput]) -> Result<ExpandedInputs, PipelineError> {
         match input {
             PipelineInput::Timeline(path) | PipelineInput::TimelineSequence(path, _) => {
                 if !(path.is_file() || crate::timeline::is_bundle(path) && path.is_dir()) {
-                    return Err(PipelineError::Inaccessible(path.clone()));
+                    return Err(PipelineError::Inaccessible {
+                        path: path.clone(),
+                        source: None,
+                    });
                 }
                 if timeline.is_some() {
                     return Err(PipelineError::MultipleTimelines);
@@ -1437,8 +1461,7 @@ fn expand(inputs: &[PipelineInput]) -> Result<ExpandedInputs, PipelineError> {
                 });
             }
             PipelineInput::Media(path) => {
-                let meta = std::fs::metadata(path)
-                    .map_err(|_| PipelineError::Inaccessible(path.clone()))?;
+                let meta = std::fs::metadata(path).map_err(PipelineError::inaccessible(path))?;
                 // An FCPXML bundle is a directory but one timeline.
                 if meta.is_dir() && !crate::timeline::is_bundle(path) {
                     visit_dir(path, &mut media)?;
@@ -1464,8 +1487,7 @@ fn expand(inputs: &[PipelineInput]) -> Result<ExpandedInputs, PipelineError> {
 }
 
 fn visit_dir(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), PipelineError> {
-    let entries =
-        std::fs::read_dir(dir).map_err(|_| PipelineError::Inaccessible(dir.to_path_buf()))?;
+    let entries = std::fs::read_dir(dir).map_err(PipelineError::inaccessible(dir))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if path
@@ -2235,7 +2257,7 @@ mod tests {
         ) else {
             return;
         };
-        let timing = crate::ff::video_timing(&clip).unwrap();
+        let timing = crate::ff::inspect_full(&clip).unwrap().video.unwrap();
         assert_eq!(timing.mode, align_core::VideoFrameRateMode::Constant);
         let pipe = Pipeline::new_in(BackendKind::Portable, Some(dir.join(".cache")));
         let result = pipe
@@ -2316,8 +2338,8 @@ mod tests {
             eprintln!("SKIP: ffmpeg concat failed");
             return;
         }
-        // 1. The packet walk itself classifies variable durations.
-        let timing = crate::ff::video_timing(&vfr).expect("walk");
+        // 1. The probe's packet walk classifies variable durations.
+        let timing = crate::ff::inspect_full(&vfr).unwrap().video.expect("walk");
         assert_eq!(timing.mode, align_core::VideoFrameRateMode::Variable);
         // 2. A full sync surfaces the CFR caveat on the clip.
         let pipe = Pipeline::new_in(BackendKind::Portable, Some(dir.join(".cache")));
@@ -2377,7 +2399,7 @@ mod tests {
         ) else {
             return;
         };
-        let timing = crate::ff::video_timing(&one).expect("walk");
+        let timing = crate::ff::inspect_full(&one).unwrap().video.expect("walk");
         assert_eq!(timing.mode, align_core::VideoFrameRateMode::Unknown);
         let pipe = Pipeline::new_in(BackendKind::Portable, Some(dir.join(".cache")));
         let result = pipe
@@ -2475,11 +2497,18 @@ mod tests {
         }
         for keep_unmatched in [true, false] {
             let timeline = ExportTimeline::from_result(&result, keep_unmatched).unwrap();
-            let artifacts = crate::export::export(
-                &timeline,
-                &dir.join(format!("export-{keep_unmatched}")),
-                &[TimelineExportFormat::ResolveOTIO],
-                false,
+            let artifacts = crate::export::export_prepared(
+                crate::export::ExportRequest {
+                    backend: &crate::portable::PortableBackend,
+                    timeline: &timeline,
+                    directory: &dir.join(format!("export-{keep_unmatched}")),
+                    options: &crate::export::ExportOptions {
+                        formats: vec![TimelineExportFormat::ResolveOTIO],
+                        ..Default::default()
+                    },
+                    cancel: &std::sync::atomic::AtomicBool::new(false),
+                },
+                None,
             )
             .unwrap();
             let json: serde_json::Value =
@@ -3468,7 +3497,7 @@ mod tests {
             .expect_err("the project is not skipped");
         assert_eq!(
             error.to_string(),
-            "Timeline import: Cannot read timeline edit.xml."
+            "Timeline import: Cannot read timeline edit.xml: stream did not contain valid UTF-8."
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -23,6 +23,30 @@ fn fcpxml_media_may_be_relative_to_the_document() {
 /// Editor exports start with a declaration, a DOCTYPE and sometimes
 /// comments; all of them must stay timelines, or projects would be
 /// skipped silently.
+/// Parse failures surface while importing a file the user chose, so the
+/// message must name it.
+#[test]
+fn unreadable_documents_are_named_in_import_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let broken = dir.path().join("broken.xml");
+    std::fs::write(&broken, "<xmeml version=\"5\"><sequence></xmeml>").unwrap();
+    let empty = dir.path().join("empty.fcpxml");
+    std::fs::write(&empty, "<fcpxml version=\"1.10\"><library/></fcpxml>").unwrap();
+    let missing = dir.path().join("missing.xml");
+    for (path, name) in [
+        (&broken, "broken.xml"),
+        (&empty, "empty.fcpxml"),
+        (&missing, "missing.xml"),
+    ] {
+        for error in [
+            read_timeline(path, None).unwrap_err(),
+            timeline_sequence_summaries(path).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains(name), "{error}");
+        }
+    }
+}
+
 #[test]
 fn timeline_documents_are_recognized_by_root_element() {
     let dir = std::env::temp_dir().join(format!("align-timeline-root-{}", std::process::id()));

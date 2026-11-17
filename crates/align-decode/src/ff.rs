@@ -329,30 +329,6 @@ impl PacketTiming {
     }
 }
 
-/// Video timing without decoding frames: packet PTS/duration walk feeding
-/// the shared [`align_core::classify`]. Early-exits once variability is
-/// proven; constant-rate classification requires the full walk.
-pub fn video_timing(path: &Path) -> Result<align_core::VideoTimingInspection, DecodeError> {
-    cached_video_timing(path, media_revision(path), |bin| {
-        let header = command(bin)
-            .args([
-                "-v",
-                "error",
-                "-print_format",
-                "json",
-                "-show_streams",
-                "-select_streams",
-                "v:0",
-            ])
-            .arg(path)
-            .output()
-            .map_err(DecodeError::Io)?;
-        Ok(parse_video_stream(&header.stdout)
-            .as_ref()
-            .and_then(header_frame_duration))
-    })
-}
-
 /// Nominal rate from the header, snapped through the broadcast table.
 fn header_frame_duration(header: &FfVideoStream) -> Option<align_core::MediaTime> {
     align_core::canonical_frame_duration(header.avg_fps?, None)

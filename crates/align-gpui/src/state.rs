@@ -1990,11 +1990,6 @@ impl AppData {
             .collect()
     }
 
-    #[cfg(test)]
-    pub fn pipeline_options(&self) -> PipelineOptions {
-        self.pipeline_options_for_sequence(self.current_sequence_key())
-    }
-
     pub fn pipeline_options_for_sequence(&self, sequence_key: usize) -> PipelineOptions {
         let defaults = self.effective_settings_for(sequence_key);
         let overrides = self
@@ -2954,7 +2949,7 @@ mod tests {
             ]),
             2
         );
-        let options = data.pipeline_options();
+        let options = data.pipeline_options_for_sequence(data.current_sequence_key());
         assert_eq!(options.redirects, data.redirects);
         assert_eq!(
             options.manual_relinks,
@@ -2964,7 +2959,8 @@ mod tests {
         data.set_omit_extensions(".JPG, png; jpg  WAV");
         assert_eq!(data.omit_extensions, vec!["jpg", "png", "wav"]);
         assert_eq!(
-            data.pipeline_options().omit_extensions,
+            data.pipeline_options_for_sequence(data.current_sequence_key())
+                .omit_extensions,
             vec!["jpg", "png", "wav"]
         );
         data.inputs.insert(0, PathBuf::from("/v/edit.fcpxml"));

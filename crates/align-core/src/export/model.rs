@@ -10,13 +10,11 @@ use sha2::{Digest, Sha256};
 
 use crate::allocator::source_key_for_clip;
 use crate::model::{
-    Clip, ClipId, MappingPoint, MediaKind, MediaTime, SyncResult, TemporalPolicy,
-    TimelinePreviewItem, TimelineTransitionKind, file_name,
+    Clip, ClipId, ImportedTimeline, MappingPoint, MediaKind, MediaTime, RATE_TOLERANCE, SyncIsland,
+    SyncResult, TemporalPolicy, TimelineEdit, TimelineLinkedAudioEdit, TimelinePreviewItem,
+    TimelineTransitionKind, file_name,
 };
 use crate::piecewise::{MapPoint, PiecewiseTimeMapping};
-
-/// Playback rates closer to 1 than this play at normal speed.
-pub const RATE_TOLERANCE: f64 = 1e-6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExportTransitionKind {
@@ -939,36 +937,302 @@ impl TimelineExportFormat {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum TimelineExportError {
+    #[error("There are no synchronized islands to export.")]
     NoSynchronizedIslands,
+    #[error("The imported timeline contains no media edits that can be exported.")]
     NoImportedEdits,
+    #[error("Audio channel {} is unavailable in {}.", .channel.saturating_add(1), .path.display())]
     InvalidAudioChannel { path: PathBuf, channel: usize },
 }
 
-impl std::fmt::Display for TimelineExportError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidAudioChannel { path, channel } => write!(
-                f,
-                "Audio channel {} is unavailable in {}.",
-                channel.saturating_add(1),
-                path.display()
-            ),
-            Self::NoSynchronizedIslands => {
-                write!(f, "There are no synchronized islands to export.")
-            }
-            Self::NoImportedEdits => {
-                write!(
-                    f,
-                    "The imported timeline contains no media edits that can be exported."
-                )
-            }
-        }
+/// One solved island's placements as items, in timeline order.
+fn solved_island(island: &SyncIsland, clips_by_id: &HashMap<&ClipId, &Clip>) -> ExportIsland {
+    let mut items: Vec<ExportItem> = island
+        .placements
+        .iter()
+        .filter_map(|placement| {
+            let clip = clips_by_id.get(&placement.clip_id).copied()?;
+            let first = placement.mapping.points.first()?;
+            let last = placement.mapping.points.last()?;
+            let source_span = last.source.as_seconds() - first.source.as_seconds();
+            let island_span = last.island.as_seconds() - first.island.as_seconds();
+            Some(ExportItem::new(
+                clip.clone(),
+                first.island.as_seconds(),
+                if source_span > 0.0 {
+                    island_span / source_span
+                } else {
+                    1.0
+                },
+                placement.mapping.points.clone(),
+                placement.confidence,
+            ))
+        })
+        .collect();
+    items.sort_by(|a, b| {
+        a.start
+            .total_cmp(&b.start)
+            .then_with(|| file_name(&a.clip.url).cmp(&file_name(&b.clip.url)))
+    });
+    let duration = items
+        .iter()
+        .map(|i| i.start + i.source_duration().max(i.mapped_duration()))
+        .fold(0.0f64, f64::max);
+    ExportIsland {
+        id: island.id,
+        clips: items,
+        duration,
     }
 }
 
-impl std::error::Error for TimelineExportError {}
+/// A clip without a synchronization match, played whole at its own rate.
+fn unmatched_item(clip: &Clip, options: &ExportAssemblyOptions) -> ExportItem {
+    let zero = MediaTime::new(0, 1);
+    let identity = vec![
+        MappingPoint {
+            source: zero,
+            island: zero,
+        },
+        MappingPoint {
+            source: clip.duration,
+            island: clip.duration,
+        },
+    ];
+    let mut item = ExportItem {
+        display_name: options.unmatched_label(&file_name(&clip.url)),
+        enabled: !options.disable_unmatched,
+        ..ExportItem::new(clip.clone(), 0.0, 1.0, identity, 0.0)
+    };
+    options.apply_unmatched_assignment(&mut item);
+    item
+}
+
+/// Each track moves by the median difference between where the solve
+/// places its edits' media and where the edit placed them. Preserved
+/// tracks stay put and the others move relative to them.
+fn imported_track_shifts(
+    imported: &ImportedTimeline,
+    base_by_id: &HashMap<&ClipId, &ExportItem>,
+    result: &SyncResult,
+) -> HashMap<String, f64> {
+    let mut track_diffs: HashMap<String, Vec<f64>> = HashMap::new();
+    for edit in &imported.edits {
+        let Some(base) = base_by_id.get(&edit.clip_id) else {
+            continue;
+        };
+        let mapping = PiecewiseTimeMapping::new(
+            base.mapping_points
+                .iter()
+                .map(|p| MapPoint::new(p.source.as_seconds(), p.island.as_seconds()))
+                .collect(),
+        );
+        track_diffs
+            .entry(imported_track_key(edit.media_type, edit.track_index))
+            .or_default()
+            .push(mapping.value_at(edit.source_in.as_seconds()) - edit.timeline_start.as_seconds());
+        if let Some(audio) = &edit.linked_audio_edit {
+            track_diffs
+                .entry(imported_track_key(MediaKind::Audio, audio.track_index))
+                .or_default()
+                .push(
+                    mapping.value_at(audio.source_in.as_seconds())
+                        - audio.timeline_start.as_seconds(),
+                );
+        }
+    }
+    let track_medians: HashMap<String, f64> = track_diffs
+        .into_iter()
+        .map(|(key, mut diffs)| (key, median(&mut diffs)))
+        .collect();
+    let mut anchor_diffs: Vec<f64> = track_medians
+        .iter()
+        .filter(|(key, _)| result.preserve_editing_tracks.contains(*key))
+        .map(|(_, value)| *value)
+        .collect();
+    let anchor_shift = (!anchor_diffs.is_empty()).then(|| median(&mut anchor_diffs));
+    track_medians
+        .into_iter()
+        .map(|(key, synchronized_shift)| {
+            let shift = if result.preserve_editing_tracks.contains(&key) {
+                0.0
+            } else {
+                synchronized_shift - anchor_shift.unwrap_or(0.0)
+            };
+            (key, shift)
+        })
+        .collect()
+}
+
+/// Places imported editing-timeline edits by their synchronized media.
+struct ImportedAssembly<'a> {
+    result: &'a SyncResult,
+    options: &'a ExportAssemblyOptions,
+    /// Each clip's item in the combined synchronized sequence.
+    base_by_id: HashMap<&'a ClipId, &'a ExportItem>,
+    /// Timeline shift of each imported track.
+    track_shifts: HashMap<String, f64>,
+    /// The video edit owning each linked audio edit.
+    parent_by_linked: HashMap<&'a str, &'a str>,
+    unmatched_ids: HashSet<&'a ClipId>,
+}
+
+impl ImportedAssembly<'_> {
+    fn preserves(&self, track_key: &str) -> bool {
+        self.result.preserve_editing_tracks.contains(track_key)
+    }
+
+    /// The edit on the synchronized timeline, or `None` when its media or
+    /// track was not placed.
+    fn item(&self, edit: &TimelineEdit) -> Option<ExportItem> {
+        let base = self.base_by_id.get(&edit.clip_id)?;
+        let track_key = imported_track_key(edit.media_type, edit.track_index);
+        let shift = self.track_shifts.get(&track_key).copied()?;
+        let preserve_track = self.preserves(&track_key);
+        let media_str = edit.media_type.as_str();
+        let mk_transition = |t: &crate::model::TimelineTransition| ExportTransition {
+            kind: ExportTransitionKind::from_model(t.kind),
+            right_instance_id: format!("imported-{media_str}-{}", t.right_edit_id),
+            start: t.start.as_seconds() + shift,
+            end: t.end.as_seconds() + shift,
+            alignment: t.alignment.clone(),
+            fcp7_effect_xml: t.fcp7_effect_xml.clone(),
+            fcp7_transition_xml: t.fcp7_transition_xml.clone(),
+            is_otio_portable: t.is_otio_portable,
+        };
+        let linked = edit
+            .linked_audio_edit
+            .as_ref()
+            .map(|audio| self.linked_audio(audio, base, shift));
+        let is_unmatched = self.unmatched_ids.contains(&edit.clip_id);
+        let fallback_name = || {
+            edit.name
+                .clone()
+                .unwrap_or_else(|| file_name(&base.clip.url))
+        };
+        let mut item = ExportItem {
+            instance_id: format!("imported-{media_str}-{}", edit.id),
+            display_name: if is_unmatched {
+                self.options.unmatched_label(&fallback_name())
+            } else {
+                self.options
+                    .synced_label(&fallback_name())
+                    .or_else(|| edit.name.clone())
+            },
+            clip: {
+                let mut clip = base.clip.clone();
+                if edit.media_type == MediaKind::Audio {
+                    clip.video = None;
+                    clip.kind = MediaKind::Audio;
+                }
+                clip
+            },
+            start: edit.timeline_start.as_seconds() + shift,
+            source_in: edit.source_in.as_seconds().max(0.0),
+            source_out: edit.source_out.as_seconds().min(base.source_duration()),
+            timeline_duration: (edit.timeline_end.as_seconds() - edit.timeline_start.as_seconds())
+                .max(0.0),
+            playback_rate: edit.playback_rate,
+            plays_backward: edit.plays_backward,
+            fcp7_time_remap_xml: edit.fcp7_time_remap_xml.clone(),
+            fcp7_filter_xmls: edit.fcp7_filter_xmls.clone(),
+            fcp7_retime_in: edit.fcp7_retime_in,
+            fcp7_retime_out: edit.fcp7_retime_out,
+            fcp7_retime_duration: edit.fcp7_retime_duration,
+            fcp7_labels_xml: edit.fcp7_labels_xml.clone(),
+            audio_source_channel: edit.audio_source_channel,
+            fcpxml_audio_role: edit.fcpxml_audio_role.clone(),
+            preferred_source_key: Some(track_key),
+            preferred_audio_source_key: edit
+                .audio_track_index
+                .map(|t| format!("imported-audio-{t:06}")),
+            enabled: edit.enabled && base.enabled,
+            track_enabled: edit.track_enabled,
+            track_locked: edit.track_locked || preserve_track,
+            audio_enabled: edit.audio_enabled,
+            audio_track_enabled: edit.audio_track_enabled,
+            audio_track_locked: edit.audio_track_index.map(|index| {
+                edit.audio_track_locked.unwrap_or(false)
+                    || self.preserves(&imported_track_key(MediaKind::Audio, index))
+            }),
+            transition_after: edit.transition_after.as_ref().map(mk_transition),
+            audio_transition_after: edit.audio_transition_after.as_ref().map(|t| {
+                let mut e = mk_transition(t);
+                e.is_otio_portable = false;
+                e
+            }),
+            mapping_rate: base.mapping_rate,
+            mapping_points: base.mapping_points.clone(),
+            confidence: base.confidence,
+            corrected_audio_url: None,
+            precision_audio_urls: Vec::new(),
+            precision_tail_samples: 0,
+            placement_pad_url: None,
+            placement_pad_seconds: 0.0,
+            linked_audio_edit: linked,
+        };
+        if is_unmatched {
+            self.options.apply_unmatched_assignment(&mut item);
+        } else {
+            self.options.apply_synced_assignment(&mut item);
+        }
+        Some(item)
+    }
+
+    /// A video edit's separately edited audio, moved with its own track.
+    fn linked_audio(
+        &self,
+        audio: &TimelineLinkedAudioEdit,
+        base: &ExportItem,
+        video_shift: f64,
+    ) -> ExportLinkedAudio {
+        let audio_key = imported_track_key(MediaKind::Audio, audio.track_index);
+        let audio_shift = self
+            .track_shifts
+            .get(&audio_key)
+            .copied()
+            .unwrap_or(video_shift);
+        let preserve_audio = self.preserves(&audio_key);
+        let transition_after = audio.transition_after.as_ref().and_then(|t| {
+            self.parent_by_linked
+                .get(t.right_edit_id.as_str())
+                .map(|parent| ExportTransition {
+                    kind: ExportTransitionKind::from_model(t.kind),
+                    right_instance_id: format!("imported-video-{parent}"),
+                    start: t.start.as_seconds() + audio_shift,
+                    end: t.end.as_seconds() + audio_shift,
+                    alignment: t.alignment.clone(),
+                    fcp7_effect_xml: t.fcp7_effect_xml.clone(),
+                    fcp7_transition_xml: t.fcp7_transition_xml.clone(),
+                    is_otio_portable: false,
+                })
+        });
+        ExportLinkedAudio {
+            start: audio.timeline_start.as_seconds() + audio_shift,
+            source_in: audio.source_in.as_seconds().max(0.0),
+            source_out: audio.source_out.as_seconds().min(base.source_duration()),
+            timeline_duration: (audio.timeline_end.as_seconds()
+                - audio.timeline_start.as_seconds())
+            .max(0.0),
+            playback_rate: audio.playback_rate,
+            plays_backward: audio.plays_backward,
+            fcp7_time_remap_xml: audio.fcp7_time_remap_xml.clone(),
+            fcp7_filter_xmls: audio.fcp7_filter_xmls.clone(),
+            fcp7_retime_in: audio.fcp7_retime_in,
+            fcp7_retime_out: audio.fcp7_retime_out,
+            fcp7_retime_duration: audio.fcp7_retime_duration,
+            fcp7_labels_xml: audio.fcp7_labels_xml.clone(),
+            audio_source_channel: audio.audio_source_channel,
+            fcpxml_audio_role: audio.fcpxml_audio_role.clone(),
+            preferred_source_key: audio_key,
+            enabled: audio.enabled && base.enabled,
+            track_enabled: audio.track_enabled,
+            track_locked: audio.track_locked || preserve_audio,
+            transition_after,
+        }
+    }
+}
 
 fn validate_audio_channel(clip: &Clip, selected: Option<usize>) -> Result<(), TimelineExportError> {
     if let Some(channel) = selected
@@ -1037,50 +1301,11 @@ impl ExportTimeline {
                 }
             }
         }
-        let unmatched_ids: HashSet<&ClipId> = result.unmatched.iter().collect();
         let mut groups: Vec<ExportIsland> = result
             .islands
             .iter()
-            .map(|island| {
-                let mut items: Vec<ExportItem> = island
-                    .placements
-                    .iter()
-                    .filter_map(|placement| {
-                        let clip = clips_by_id.get(&placement.clip_id).copied()?;
-                        let first = placement.mapping.points.first()?;
-                        let last = placement.mapping.points.last()?;
-                        let source_span = last.source.as_seconds() - first.source.as_seconds();
-                        let island_span = last.island.as_seconds() - first.island.as_seconds();
-                        Some(ExportItem::new(
-                            (*clip).clone(),
-                            first.island.as_seconds(),
-                            if source_span > 0.0 {
-                                island_span / source_span
-                            } else {
-                                1.0
-                            },
-                            placement.mapping.points.clone(),
-                            placement.confidence,
-                        ))
-                    })
-                    .collect();
-                items.sort_by(|a, b| {
-                    a.start
-                        .total_cmp(&b.start)
-                        .then_with(|| file_name(&a.clip.url).cmp(&file_name(&b.clip.url)))
-                });
-                let duration = items
-                    .iter()
-                    .map(|i| i.start + i.source_duration().max(i.mapped_duration()))
-                    .fold(0.0f64, f64::max);
-                ExportIsland {
-                    id: island.id,
-                    clips: items,
-                    duration,
-                }
-            })
+            .map(|island| solved_island(island, &clips_by_id))
             .collect();
-
         for item in groups.iter_mut().flat_map(|island| &mut island.clips) {
             let fallback = item
                 .display_name
@@ -1099,62 +1324,13 @@ impl ExportTimeline {
                 let Some(clip) = clips_by_id.get(clip_id) else {
                     continue;
                 };
-                let zero = MediaTime::new(0, 1);
-                let mut item = ExportItem {
-                    instance_id: clip.id.0.clone(),
-                    display_name: options.unmatched_label(&file_name(&clip.url)),
-                    clip: (*clip).clone(),
-                    start: 0.0,
-                    source_in: 0.0,
-                    source_out: clip.duration.as_seconds(),
-                    timeline_duration: clip.duration.as_seconds(),
-                    playback_rate: 1.0,
-                    plays_backward: false,
-                    fcp7_time_remap_xml: None,
-                    fcp7_filter_xmls: Vec::new(),
-                    fcp7_retime_in: None,
-                    fcp7_retime_out: None,
-                    fcp7_retime_duration: None,
-                    fcp7_labels_xml: None,
-                    audio_source_channel: None,
-                    fcpxml_audio_role: None,
-                    preferred_source_key: None,
-                    preferred_audio_source_key: None,
-                    mapping_rate: 1.0,
-                    mapping_points: vec![
-                        MappingPoint {
-                            source: zero,
-                            island: zero,
-                        },
-                        MappingPoint {
-                            source: clip.duration,
-                            island: clip.duration,
-                        },
-                    ],
-                    confidence: 0.0,
-                    corrected_audio_url: None,
-                    precision_audio_urls: Vec::new(),
-                    precision_tail_samples: 0,
-                    placement_pad_url: None,
-                    placement_pad_seconds: 0.0,
-                    enabled: !options.disable_unmatched,
-                    track_enabled: true,
-                    track_locked: false,
-                    audio_enabled: None,
-                    audio_track_enabled: None,
-                    audio_track_locked: None,
-                    transition_after: None,
-                    audio_transition_after: None,
-                    linked_audio_edit: None,
-                };
-                options.apply_unmatched_assignment(&mut item);
                 let id = (next_id + index as i64) as usize;
                 if options.unmatched == UnmatchedPlacement::ByOrderOnly {
                     order_only_islands.insert(id);
                 }
                 groups.push(ExportIsland {
                     id,
-                    clips: vec![item],
+                    clips: vec![unmatched_item(clip, &options)],
                     duration: clip.duration.as_seconds(),
                 });
             }
@@ -1186,6 +1362,9 @@ impl ExportTimeline {
                 order_only_islands,
             });
         };
+
+        // Imported edits replace the solved islands: each edit keeps its own
+        // placement, moved with its track to where the solve put its media.
         let frame_duration = imported.frame_duration;
         let name = options
             .sequence_name
@@ -1196,210 +1375,28 @@ impl ExportTimeline {
         combined_base.prevent_group_overlaps = options.prevent_group_overlaps;
         combined_base.order_only_islands = order_only_islands;
         let combined = combined_base.combined_island(1.0);
-        let base_by_id: HashMap<&ClipId, &ExportItem> =
-            combined.clips.iter().map(|i| (&i.clip.id, i)).collect();
-        let mut track_diffs: HashMap<String, Vec<f64>> = HashMap::new();
-        for edit in &imported.edits {
-            let Some(base) = base_by_id.get(&edit.clip_id) else {
-                continue;
-            };
-            let mapping = PiecewiseTimeMapping::new(
-                base.mapping_points
-                    .iter()
-                    .map(|p| MapPoint::new(p.source.as_seconds(), p.island.as_seconds()))
-                    .collect(),
-            );
-            track_diffs
-                .entry(imported_track_key(edit.media_type, edit.track_index))
-                .or_default()
-                .push(
-                    mapping.value_at(edit.source_in.as_seconds())
-                        - edit.timeline_start.as_seconds(),
-                );
-            if let Some(audio) = &edit.linked_audio_edit {
-                track_diffs
-                    .entry(imported_track_key(MediaKind::Audio, audio.track_index))
-                    .or_default()
-                    .push(
-                        mapping.value_at(audio.source_in.as_seconds())
-                            - audio.timeline_start.as_seconds(),
-                    );
-            }
-        }
-        let track_medians: HashMap<String, f64> = track_diffs
-            .into_iter()
-            .map(|(key, mut diffs)| (key, median(&mut diffs)))
-            .collect();
-        let mut anchor_diffs: Vec<f64> = track_medians
-            .iter()
-            .filter(|(key, _)| result.preserve_editing_tracks.contains(*key))
-            .map(|(_, value)| *value)
-            .collect();
-        let anchor_shift = (!anchor_diffs.is_empty()).then(|| median(&mut anchor_diffs));
-        let track_shifts: HashMap<String, f64> = track_medians
-            .into_iter()
-            .map(|(key, synchronized_shift)| {
-                let shift = if result.preserve_editing_tracks.contains(&key) {
-                    0.0
-                } else {
-                    synchronized_shift - anchor_shift.unwrap_or(0.0)
-                };
-                (key, shift)
-            })
-            .collect();
-        let parent_by_linked: HashMap<&str, &str> = imported
+        let base_by_id = combined.clips.iter().map(|i| (&i.clip.id, i)).collect();
+        let assembly = ImportedAssembly {
+            result,
+            options: &options,
+            track_shifts: imported_track_shifts(imported, &base_by_id, result),
+            base_by_id,
+            parent_by_linked: imported
+                .edits
+                .iter()
+                .filter_map(|e| {
+                    e.linked_audio_edit
+                        .as_ref()
+                        .map(|l| (l.id.as_str(), e.id.as_str()))
+                })
+                .collect(),
+            unmatched_ids: result.unmatched.iter().collect(),
+        };
+        let mut imported_items: Vec<ExportItem> = imported
             .edits
             .iter()
-            .filter_map(|e| {
-                e.linked_audio_edit
-                    .as_ref()
-                    .map(|l| (l.id.as_str(), e.id.as_str()))
-            })
+            .filter_map(|edit| assembly.item(edit))
             .collect();
-        let mut imported_items = Vec::new();
-        for edit in &imported.edits {
-            let Some(base) = base_by_id.get(&edit.clip_id) else {
-                continue;
-            };
-            let track_key = imported_track_key(edit.media_type, edit.track_index);
-            let Some(shift) = track_shifts.get(&track_key).copied() else {
-                continue;
-            };
-            let preserve_track = result.preserve_editing_tracks.contains(&track_key);
-            let media_str = edit.media_type.as_str();
-            let mk_transition = |t: &crate::model::TimelineTransition| ExportTransition {
-                kind: ExportTransitionKind::from_model(t.kind),
-                right_instance_id: format!("imported-{media_str}-{}", t.right_edit_id),
-                start: t.start.as_seconds() + shift,
-                end: t.end.as_seconds() + shift,
-                alignment: t.alignment.clone(),
-                fcp7_effect_xml: t.fcp7_effect_xml.clone(),
-                fcp7_transition_xml: t.fcp7_transition_xml.clone(),
-                is_otio_portable: t.is_otio_portable,
-            };
-            let linked = edit.linked_audio_edit.as_ref().map(|audio| {
-                let audio_key = imported_track_key(MediaKind::Audio, audio.track_index);
-                let audio_shift = track_shifts.get(&audio_key).copied().unwrap_or(shift);
-                let preserve_audio = result.preserve_editing_tracks.contains(&audio_key);
-                let transition_after = audio.transition_after.as_ref().and_then(|t| {
-                    parent_by_linked
-                        .get(t.right_edit_id.as_str())
-                        .map(|parent| ExportTransition {
-                            kind: ExportTransitionKind::from_model(t.kind),
-                            right_instance_id: format!("imported-video-{parent}"),
-                            start: t.start.as_seconds() + audio_shift,
-                            end: t.end.as_seconds() + audio_shift,
-                            alignment: t.alignment.clone(),
-                            fcp7_effect_xml: t.fcp7_effect_xml.clone(),
-                            fcp7_transition_xml: t.fcp7_transition_xml.clone(),
-                            is_otio_portable: false,
-                        })
-                });
-                ExportLinkedAudio {
-                    start: audio.timeline_start.as_seconds() + audio_shift,
-                    source_in: audio.source_in.as_seconds().max(0.0),
-                    source_out: audio.source_out.as_seconds().min(base.source_duration()),
-                    timeline_duration: (audio.timeline_end.as_seconds()
-                        - audio.timeline_start.as_seconds())
-                    .max(0.0),
-                    playback_rate: audio.playback_rate,
-                    plays_backward: audio.plays_backward,
-                    fcp7_time_remap_xml: audio.fcp7_time_remap_xml.clone(),
-                    fcp7_filter_xmls: audio.fcp7_filter_xmls.clone(),
-                    fcp7_retime_in: audio.fcp7_retime_in,
-                    fcp7_retime_out: audio.fcp7_retime_out,
-                    fcp7_retime_duration: audio.fcp7_retime_duration,
-                    fcp7_labels_xml: audio.fcp7_labels_xml.clone(),
-                    audio_source_channel: audio.audio_source_channel,
-                    fcpxml_audio_role: audio.fcpxml_audio_role.clone(),
-                    preferred_source_key: audio_key,
-                    enabled: audio.enabled && base.enabled,
-                    track_enabled: audio.track_enabled,
-                    track_locked: audio.track_locked || preserve_audio,
-                    transition_after,
-                }
-            });
-            let is_unmatched = unmatched_ids.contains(&edit.clip_id);
-            let mut imported_item = ExportItem {
-                instance_id: format!("imported-{media_str}-{}", edit.id),
-                display_name: if is_unmatched {
-                    options.unmatched_label(
-                        &edit
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| file_name(&base.clip.url)),
-                    )
-                } else {
-                    let fallback = edit
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| file_name(&base.clip.url));
-                    options
-                        .synced_label(&fallback)
-                        .or_else(|| edit.name.clone())
-                },
-                clip: {
-                    let mut clip = base.clip.clone();
-                    if edit.media_type == MediaKind::Audio {
-                        clip.video = None;
-                        clip.kind = MediaKind::Audio;
-                    }
-                    clip
-                },
-                start: edit.timeline_start.as_seconds() + shift,
-                source_in: edit.source_in.as_seconds().max(0.0),
-                source_out: edit.source_out.as_seconds().min(base.source_duration()),
-                timeline_duration: (edit.timeline_end.as_seconds()
-                    - edit.timeline_start.as_seconds())
-                .max(0.0),
-                playback_rate: edit.playback_rate,
-                plays_backward: edit.plays_backward,
-                fcp7_time_remap_xml: edit.fcp7_time_remap_xml.clone(),
-                fcp7_filter_xmls: edit.fcp7_filter_xmls.clone(),
-                fcp7_retime_in: edit.fcp7_retime_in,
-                fcp7_retime_out: edit.fcp7_retime_out,
-                fcp7_retime_duration: edit.fcp7_retime_duration,
-                fcp7_labels_xml: edit.fcp7_labels_xml.clone(),
-                audio_source_channel: edit.audio_source_channel,
-                fcpxml_audio_role: edit.fcpxml_audio_role.clone(),
-                preferred_source_key: Some(track_key),
-                preferred_audio_source_key: edit
-                    .audio_track_index
-                    .map(|t| format!("imported-audio-{t:06}")),
-                mapping_rate: base.mapping_rate,
-                mapping_points: base.mapping_points.clone(),
-                confidence: base.confidence,
-                corrected_audio_url: None,
-                precision_audio_urls: Vec::new(),
-                precision_tail_samples: 0,
-                placement_pad_url: None,
-                placement_pad_seconds: 0.0,
-                enabled: edit.enabled && base.enabled,
-                track_enabled: edit.track_enabled,
-                track_locked: edit.track_locked || preserve_track,
-                audio_enabled: edit.audio_enabled,
-                audio_track_enabled: edit.audio_track_enabled,
-                audio_track_locked: edit.audio_track_index.map(|index| {
-                    edit.audio_track_locked.unwrap_or(false)
-                        || result
-                            .preserve_editing_tracks
-                            .contains(&imported_track_key(MediaKind::Audio, index))
-                }),
-                transition_after: edit.transition_after.as_ref().map(mk_transition),
-                audio_transition_after: edit.audio_transition_after.as_ref().map(|t| {
-                    let mut e = mk_transition(t);
-                    e.is_otio_portable = false;
-                    e
-                }),
-                linked_audio_edit: linked,
-            };
-            if is_unmatched {
-                options.apply_unmatched_assignment(&mut imported_item);
-            } else {
-                options.apply_synced_assignment(&mut imported_item);
-            }
-            imported_items.push(imported_item);
-        }
         if imported_items.is_empty() {
             return Err(TimelineExportError::NoImportedEdits);
         }
@@ -1963,32 +1960,41 @@ mod tests {
         assert_eq!(auto.ruler_timecode_start(), None);
     }
 
-    #[test]
-    fn combined_island_compacts_clock_gaps_and_serializes_one_source() {
-        let islands = vec![
-            ExportIsland {
-                id: 0,
-                clips: vec![island_clip("first", 1_000, 100.0)],
+    /// Combined-sequence starts of one-clip islands, each given as
+    /// (source folder, clip, recording time, timecode seconds).
+    fn combined_starts(
+        clips: &[(&str, &str, i64, f64)],
+        prevent_group_overlaps: bool,
+    ) -> HashMap<String, f64> {
+        let islands = clips
+            .iter()
+            .enumerate()
+            .map(|(id, &(source, name, recorded, timecode))| ExportIsland {
+                id,
+                clips: vec![island_clip_from(source, name, recorded, timecode)],
                 duration: 10.0,
-            },
-            ExportIsland {
-                id: 1,
-                clips: vec![island_clip("in-gap", 1_015, 115.0)],
-                duration: 10.0,
-            },
-            ExportIsland {
-                id: 2,
-                clips: vec![island_clip("overlap", 1_005, 105.0)],
-                duration: 10.0,
-            },
-        ];
-        let timeline = ExportTimeline::new(islands, MediaTime::new(1, 25), "t");
-        let combined = timeline.combined_island(1.0);
-        let starts: HashMap<_, _> = combined
+            })
+            .collect();
+        let mut timeline = ExportTimeline::new(islands, MediaTime::new(1, 25), "t");
+        timeline.prevent_group_overlaps = prevent_group_overlaps;
+        timeline
+            .combined_island(1.0)
             .clips
             .iter()
-            .map(|item| (item.clip.id.0.as_str(), item.start))
-            .collect();
+            .map(|item| (item.clip.id.0.clone(), item.start))
+            .collect()
+    }
+
+    #[test]
+    fn combined_island_compacts_clock_gaps_and_serializes_one_source() {
+        let starts = combined_starts(
+            &[
+                ("v", "first", 1_000, 100.0),
+                ("v", "in-gap", 1_015, 115.0),
+                ("v", "overlap", 1_005, 105.0),
+            ],
+            false,
+        );
         assert_eq!(starts["first"], 0.0);
         assert_eq!(starts["overlap"], 11.0);
         assert_eq!(starts["in-gap"], 22.0);
@@ -1996,85 +2002,34 @@ mod tests {
 
     #[test]
     fn combined_island_packs_incompatible_recording_dates() {
-        let islands = vec![
-            ExportIsland {
-                id: 0,
-                clips: vec![island_clip("recorder", 1_704_075_706, 100.0)],
-                duration: 10.0,
-            },
-            ExportIsland {
-                id: 1,
-                clips: vec![island_clip("camera", 1_771_769_850, 200.0)],
-                duration: 10.0,
-            },
-        ];
-        let timeline = ExportTimeline::new(islands, MediaTime::new(1, 25), "t");
-        let combined = timeline.combined_island(1.0);
-        assert_eq!(combined.clips[0].start, 0.0);
-        assert_eq!(combined.clips[1].start, 11.0);
+        let starts = combined_starts(
+            &[
+                ("v", "recorder", 1_704_075_706, 100.0),
+                ("v", "camera", 1_771_769_850, 200.0),
+            ],
+            false,
+        );
+        assert_eq!(starts["recorder"], 0.0);
+        assert_eq!(starts["camera"], 11.0);
     }
 
+    /// Distinct sources may overlap on the clock; preventing group
+    /// overlaps serializes the same input instead.
     #[test]
-    fn distinct_sources_keep_clock_overlap_but_compact_empty_time() {
-        let islands = vec![
-            ExportIsland {
-                id: 0,
-                clips: vec![island_clip_from("one", "first", 1_000, 100.0)],
-                duration: 10.0,
-            },
-            ExportIsland {
-                id: 1,
-                clips: vec![island_clip_from("two", "overlap", 1_005, 105.0)],
-                duration: 10.0,
-            },
-            ExportIsland {
-                id: 2,
-                clips: vec![island_clip_from("three", "later", 1_030, 130.0)],
-                duration: 10.0,
-            },
+    fn distinct_sources_keep_clock_overlap_unless_group_overlaps_are_prevented() {
+        let clips = [
+            ("one", "first", 1_000, 100.0),
+            ("two", "overlap", 1_005, 105.0),
+            ("three", "later", 1_030, 130.0),
         ];
-        let timeline = ExportTimeline::new(islands, MediaTime::new(1, 25), "t");
-        let combined = timeline.combined_island(1.0);
-        let starts: HashMap<_, _> = combined
-            .clips
-            .iter()
-            .map(|item| (item.clip.id.0.as_str(), item.start))
-            .collect();
-        assert_eq!(starts["first"], 0.0);
-        assert_eq!(starts["overlap"], 5.0);
-        assert_eq!(starts["later"], 16.0);
-    }
-
-    #[test]
-    fn prevent_group_overlaps_serializes_distinct_sources() {
-        let islands = vec![
-            ExportIsland {
-                id: 0,
-                clips: vec![island_clip_from("one", "first", 1_000, 100.0)],
-                duration: 10.0,
-            },
-            ExportIsland {
-                id: 1,
-                clips: vec![island_clip_from("two", "overlap", 1_005, 105.0)],
-                duration: 10.0,
-            },
-            ExportIsland {
-                id: 2,
-                clips: vec![island_clip_from("three", "later", 1_030, 130.0)],
-                duration: 10.0,
-            },
-        ];
-        let mut timeline = ExportTimeline::new(islands, MediaTime::new(1, 25), "t");
-        timeline.prevent_group_overlaps = true;
-        let combined = timeline.combined_island(1.0);
-        let starts: HashMap<_, _> = combined
-            .clips
-            .iter()
-            .map(|item| (item.clip.id.0.as_str(), item.start))
-            .collect();
-        assert_eq!(starts["first"], 0.0);
-        assert_eq!(starts["overlap"], 11.0);
-        assert_eq!(starts["later"], 22.0);
+        let overlapping = combined_starts(&clips, false);
+        assert_eq!(overlapping["first"], 0.0);
+        assert_eq!(overlapping["overlap"], 5.0);
+        assert_eq!(overlapping["later"], 16.0);
+        let serialized = combined_starts(&clips, true);
+        assert_eq!(serialized["first"], 0.0);
+        assert_eq!(serialized["overlap"], 11.0);
+        assert_eq!(serialized["later"], 22.0);
     }
 
     #[test]

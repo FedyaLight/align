@@ -229,32 +229,6 @@ pub struct ExportBatchRequest<'a> {
     pub cancel: &'a AtomicBool,
 }
 
-/// Write timelines without rendering drift corrections or audio stems.
-pub fn export(
-    timeline: &ExportTimeline,
-    directory: &Path,
-    formats: &[TimelineExportFormat],
-    include_replaced_sequence: bool,
-) -> Result<Vec<ExportArtifact>, ExportError> {
-    if formats.contains(&TimelineExportFormat::Aaf) {
-        return Err(ExportError::Unsupported(
-            "AAF requires prepared audio export.",
-        ));
-    }
-    timeline.validate_audio_source_channels()?;
-    std::fs::create_dir_all(directory).map_err(ExportError::Write)?;
-    let mut timeline = timeline.clone();
-    crate::media_assets::preserve_export(&mut timeline, directory, &AtomicBool::new(false))
-        .map_err(ExportError::write_or_cancelled)?;
-    write_artifacts(
-        &timeline,
-        directory,
-        formats,
-        include_replaced_sequence,
-        FcpxmlOptions::default(),
-    )
-}
-
 pub fn export_prepared_many(
     request: ExportBatchRequest<'_>,
     mut progress: Option<&mut dyn FnMut(ExportJobProgress)>,
@@ -1393,6 +1367,15 @@ mod tests {
         let Some(ffmpeg) = crate::ff::test_ffmpeg() else {
             return;
         };
+        // 1.9 s of audio in a 2.04 s camera file, with clicks at 0.1 s and
+        // on the last audio sample.
+        const AUDIO_FRAMES: usize = 91_200;
+        const FIRST_CLICK: usize = 4_800;
+        const LAST_CLICK: usize = AUDIO_FRAMES - 1;
+        // The clip starts 0.05 s into the file, at 5.084 s on a 25 fps
+        // timeline: frame 127 (5.08 s) plus a 4 ms (192-sample) prepend.
+        const SOURCE_IN: usize = 2_400;
+        const PAD: usize = 192;
         let dir = tempfile::tempdir().unwrap();
         let audio = dir.path().join("source.wav");
         let camera = dir.path().join("camera.mov");
@@ -1406,8 +1389,8 @@ mod tests {
             },
         )
         .unwrap();
-        for frame in 0..91200 {
-            let value = if frame == 4800 || frame == 91199 {
+        for frame in 0..AUDIO_FRAMES {
+            let value = if frame == FIRST_CLICK || frame == LAST_CLICK {
                 16000i16
             } else {
                 0
@@ -1486,11 +1469,11 @@ mod tests {
                 let reader = hound::WavReader::open(&pads[0]).unwrap();
                 assert_eq!(
                     reader.duration(),
-                    192 + ((end - 0.05) * 48000.0).round() as u32
+                    (PAD + ((end - 0.05) * 48000.0).round() as usize) as u32
                 );
                 let samples: Vec<f32> = reader.into_samples().map(Result::unwrap).collect();
-                let first = 192 + 4800 - 2400;
-                let last = 192 + 91199 - 2400;
+                let first = PAD + FIRST_CLICK - SOURCE_IN;
+                let last = PAD + LAST_CLICK - SOURCE_IN;
                 assert_eq!(
                     &samples[first * 2..first * 2 + 2],
                     &[16000.0 / 32768.0, -16000.0 / 32768.0]
@@ -1499,7 +1482,7 @@ mod tests {
                     &samples[last * 2..last * 2 + 2],
                     &[16000.0 / 32768.0, -16000.0 / 32768.0]
                 );
-                assert!(samples[..192 * 2].iter().all(|sample| *sample == 0.0));
+                assert!(samples[..PAD * 2].iter().all(|sample| *sample == 0.0));
                 assert!(
                     samples[(last + 1) * 2..]
                         .iter()
@@ -1509,11 +1492,13 @@ mod tests {
                 let xml = &artifacts[0].url;
                 let previous_xml = std::fs::read(xml).unwrap();
                 let previous_pad = std::fs::read(&pads[0]).unwrap();
+                // The header precedes the media data (faststart): dropping the
+                // file's last 91,200 bytes removes audio the track declares.
                 std::fs::OpenOptions::new()
                     .write(true)
                     .open(&camera)
                     .unwrap()
-                    .set_len((original.len() - 91200) as u64)
+                    .set_len((original.len() - 91_200) as u64)
                     .unwrap();
                 assert!(
                     backend.inspect(&camera).is_ok(),
