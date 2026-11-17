@@ -16,10 +16,17 @@ pub(super) fn read_results(path: &Path) -> Result<Vec<SyncResult>, CliError> {
         .map_err(|error| CliError::Failure(format!("read {}: {error}", path.display())))?;
     let decoded: Results = serde_json::from_slice(&bytes)
         .map_err(|error| CliError::Failure(format!("parse {}: {error}", path.display())))?;
-    let results = match decoded {
+    let mut results = match decoded {
         Results::Batch(results) => results,
         Results::Single(result) => vec![*result],
     };
+    // Results saved from relative paths name media relative to the working
+    // directory, where export also reads them.
+    for clip in results.iter_mut().flat_map(|r| &mut r.project.clips) {
+        if clip.url.is_relative() {
+            clip.url = super::absolute(std::mem::take(&mut clip.url));
+        }
+    }
     if results.is_empty() {
         return Err(CliError::Failure(
             "Saved result contains no sequences".into(),

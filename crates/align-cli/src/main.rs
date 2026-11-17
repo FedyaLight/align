@@ -671,7 +671,43 @@ fn print_json(value: &impl serde::Serialize) -> Result<(), CliError> {
     Ok(())
 }
 
+/// A path relative to the working directory, made absolute. Results and
+/// exported timelines name media for other applications, which cannot
+/// resolve paths relative to where the CLI ran.
+fn absolute(path: PathBuf) -> PathBuf {
+    std::path::absolute(&path).unwrap_or(path)
+}
+
+impl Cli {
+    fn with_absolute_paths(mut self) -> Self {
+        let all = |paths: Vec<PathBuf>| paths.into_iter().map(absolute).collect();
+        self.paths = all(self.paths);
+        match &mut self.command {
+            Some(Command::Sync { paths, relink, .. }) => {
+                *paths = all(std::mem::take(paths));
+                relink.write_fixed_project = relink.write_fixed_project.take().map(absolute);
+            }
+            Some(Command::Export {
+                output,
+                paths,
+                relink,
+                ..
+            }) => {
+                *output = absolute(std::mem::take(output));
+                *paths = all(std::mem::take(paths));
+                relink.write_fixed_project = relink.write_fixed_project.take().map(absolute);
+            }
+            Some(Command::ExportJson { output, .. }) => {
+                *output = absolute(std::mem::take(output));
+            }
+            Some(Command::ClearCache { .. }) | None => {}
+        }
+        self
+    }
+}
+
 fn run_inner(cli: Cli) -> Result<(), CliError> {
+    let cli = cli.with_absolute_paths();
     match cli.command {
         None if cli.paths.is_empty() => Err(CliError::Usage),
         None => {
@@ -840,6 +876,26 @@ mod tests {
                 .paths,
             vec![PathBuf::from("camera.wav"), PathBuf::from("recorder.wav")],
         );
+    }
+
+    #[test]
+    fn relative_paths_become_absolute_before_running() {
+        let cwd = std::env::current_dir().unwrap();
+        let recorder = cwd.join("Audio").join("rec.wav");
+        let cli = Cli::try_parse_from([
+            "align-cli".as_ref(),
+            "export".as_ref(),
+            "out".as_ref(),
+            "CamA".as_ref(),
+            recorder.as_os_str(),
+        ])
+        .expect("export arguments")
+        .with_absolute_paths();
+        let Some(Command::Export { output, paths, .. }) = cli.command else {
+            panic!("export command")
+        };
+        assert_eq!(output, cwd.join("out"));
+        assert_eq!(paths, [cwd.join("CamA"), recorder]);
     }
 
     #[test]
