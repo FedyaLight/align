@@ -5,15 +5,17 @@
 //! groups, per-channel mono audio tracks, gaps, portable Cross Dissolves
 //! as `SMPTE_Dissolve`, and `LinearTimeWarp` for constant retimes
 //! (negative scalar for reverse). Serialized pretty-printed with sorted
-//! keys and unescaped slashes.
+//! keys and unescaped slashes. Optional `Align` metadata lists the media
+//! bins the import script creates.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
-use super::model::{ExportItem, ExportTimeline, ExportTransition};
+use super::model::{ExportIsland, ExportItem, ExportTimeline, ExportTransition};
 use crate::allocator::{TimelineTrackRequest, allocate, source_key_for_url};
+use crate::bins::{GENERATED_AUDIO, MediaBins};
 use crate::model::{MediaKind, TIME_TOLERANCE};
 
 struct Entry<'a> {
@@ -21,7 +23,10 @@ struct Entry<'a> {
     source_channel: usize,
 }
 
-pub fn data(timeline: &ExportTimeline) -> Result<Vec<u8>, String> {
+/// The OTIO document. With `media_bins`, its metadata lists each camera and
+/// recorder bin's source files for the import script, which files them into
+/// media pool folders.
+pub fn data(timeline: &ExportTimeline, media_bins: bool) -> Result<Vec<u8>, String> {
     let rate = 1.0 / timeline.frame_duration.as_seconds();
     let island = timeline.islands.first().ok_or("no islands")?;
     let video_tracks = tracks(
@@ -90,7 +95,7 @@ pub fn data(timeline: &ExportTimeline) -> Result<Vec<u8>, String> {
             "rate": rate,
             "value": rate.round() * 3_600.0,
         },
-        "metadata": { "Resolve_OTIO": { "Resolve OTIO Meta Version": "1.0" } },
+        "metadata": metadata(island, media_bins),
         "tracks": {
             "OTIO_SCHEMA": "Stack.1",
             "metadata": {},
@@ -103,6 +108,44 @@ pub fn data(timeline: &ExportTimeline) -> Result<Vec<u8>, String> {
         },
     });
     serde_json::to_vec_pretty(&root).map_err(|e| e.to_string())
+}
+
+/// Resolve metadata, plus with `media_bins` the source files of each bin
+/// and the audio files Align generated for the timeline.
+fn metadata(island: &ExportIsland, media_bins: bool) -> Value {
+    let mut metadata = json!({ "Resolve_OTIO": { "Resolve OTIO Meta Version": "1.0" } });
+    if media_bins {
+        let bins = MediaBins::new(island.clips.iter().map(|item| &item.clip));
+        let mut generated: Vec<String> = Vec::new();
+        for item in &island.clips {
+            for url in item
+                .corrected_audio_url
+                .iter()
+                .chain(&item.precision_audio_urls)
+            {
+                let path = url.to_string_lossy().into_owned();
+                if !generated.contains(&path) {
+                    generated.push(path);
+                }
+            }
+        }
+        metadata["Align"] = json!({
+            "mediaBins": bins
+                .bins()
+                .iter()
+                .map(|bin| json!({
+                    "name": bin.name,
+                    "media": bin
+                        .clips
+                        .iter()
+                        .map(|clip| clip.url.to_string_lossy())
+                        .collect::<Vec<_>>(),
+                }))
+                .collect::<Vec<_>>(),
+            "generatedAudio": { "name": GENERATED_AUDIO, "media": generated },
+        });
+    }
+    metadata
 }
 
 fn track_json(
@@ -582,7 +625,7 @@ pub(crate) mod tests {
         let mut result = fixture_result();
         result.project.clips[0].audio[0].channels = 2;
         let timeline = ExportTimeline::from_result(&result, true).unwrap();
-        let v: Value = serde_json::from_slice(&data(&timeline).unwrap()).unwrap();
+        let v: Value = serde_json::from_slice(&data(&timeline, false).unwrap()).unwrap();
         let channels: Vec<i64> = v["tracks"]["children"]
             .as_array()
             .unwrap()
@@ -609,7 +652,7 @@ pub(crate) mod tests {
         ] {
             let mut timeline = fixture_timeline();
             timeline.frame_duration = duration;
-            let v: Value = serde_json::from_slice(&data(&timeline).unwrap()).unwrap();
+            let v: Value = serde_json::from_slice(&data(&timeline, false).unwrap()).unwrap();
             assert_eq!(v["global_start_time"]["value"], expected);
             let exported_rate = v["global_start_time"]["rate"].as_f64().unwrap();
             assert!((exported_rate - 1.0 / duration.as_seconds()).abs() < 1e-12);
@@ -617,9 +660,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn media_bins_are_listed_for_the_import_script() {
+        let timeline = fixture_timeline();
+        let v: Value = serde_json::from_slice(&data(&timeline, true).unwrap()).unwrap();
+        assert_eq!(
+            v["metadata"]["Align"],
+            json!({
+                "mediaBins": [
+                    { "name": "v – Video", "media": ["/v/cam.mov"] },
+                    { "name": "v – Audio", "media": ["/v/rec.wav"] },
+                ],
+                "generatedAudio": { "name": "Align generated audio", "media": [] },
+            })
+        );
+        assert_eq!(
+            v["metadata"]["Resolve_OTIO"]["Resolve OTIO Meta Version"],
+            "1.0"
+        );
+        let plain: Value = serde_json::from_slice(&data(&timeline, false).unwrap()).unwrap();
+        assert!(plain["metadata"].get("Align").is_none());
+    }
+
+    #[test]
     fn otio_structure() {
         let timeline = fixture_timeline();
-        let bytes = data(&timeline).expect("otio");
+        let bytes = data(&timeline, false).expect("otio");
         let v: Value = serde_json::from_slice(&bytes).expect("json");
         assert_eq!(v["OTIO_SCHEMA"], "Timeline.1");
         assert_eq!(v["global_start_time"]["value"], 3_600.0 * 25.0);

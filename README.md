@@ -79,6 +79,8 @@ an existing edit.
   changing the source files.
 - **Separate recordings:** keep unrelated material in separate synchronization
   groups and show clips that could not be matched.
+- **Organized source clips:** optionally open the export with the source clips
+  grouped by source folder in Premiere Pro, Final Cut Pro, and DaVinci Resolve.
 - **Repeat work:** reuse cached fingerprints and save analysis results for later
   export.
 

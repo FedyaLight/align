@@ -289,6 +289,8 @@ pub struct AppData {
     pub export_selected: HashSet<ExportTarget>,
     pub export_drift: bool,
     pub export_replaced: bool,
+    /// Group imported source clips by source folder.
+    pub export_media_bins: bool,
     pub export_storylines: bool,
     pub export_fcpxml_timeline: bool,
     pub export_fcpxml_multicam: bool,
@@ -374,6 +376,7 @@ impl Default for AppData {
             export_selected: [ExportTarget::ResolveOtio].into_iter().collect(),
             export_drift: true,
             export_replaced: false,
+            export_media_bins: false,
             export_storylines: false,
             export_fcpxml_timeline: true,
             export_fcpxml_multicam: true,

@@ -1238,6 +1238,33 @@ pub(super) fn export_sheet(
     sheet
 }
 
+/// The option to organize imported source clips. Resolve XML and AAF carry
+/// no browser organization, so it applies only with another editor format.
+fn export_source_bins(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Stateful<Div> {
+    let SheetContext {
+        theme, data, busy, ..
+    } = sheet;
+    let applies = [
+        ExportTarget::Premiere,
+        ExportTarget::FinalCutPro,
+        ExportTarget::ResolveOtio,
+    ]
+    .iter()
+    .any(|target| data.export_selected.contains(target));
+    check_row(
+        cx,
+        theme,
+        "exp-media-bins",
+        data.export_media_bins,
+        "Organize imported source clips".to_string(),
+        !busy && applies,
+        |this, _, _, cx| {
+            this.data.export_media_bins = !this.data.export_media_bins;
+            cx.notify();
+        },
+    )
+}
+
 /// What every section of the export sheet reads.
 #[derive(Clone, Copy)]
 pub(super) struct SheetContext<'a> {
@@ -1547,6 +1574,7 @@ fn export_cleanup_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
     } = sheet;
     let mut group = div().flex().flex_col().gap_1();
     group = group.child(export_section_title(theme, "Cleanup"));
+    group = group.child(export_source_bins(cx, sheet));
     group = group.child(check_row(
         cx,
         theme,

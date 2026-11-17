@@ -43,6 +43,40 @@ import script, and FCPXML. A batch combines sequences into one Premiere XML,
 one FCPXML, or one AAF where applicable; Resolve artifacts are written per
 sequence. AAF is selected explicitly with `--aaf`.
 
+## Organized source clips
+
+**Organize imported source clips** in the export sheet, or `--media-bins`,
+groups the source clips an export includes, so the editor's browser shows one
+group per source. It is off by default and changes only the browser: the
+synchronized timelines are the same with or without it.
+
+| Editor | What the import creates |
+| --- | --- |
+| Premiere Pro | A bin per source group holding its master clips, an `Align generated audio` bin, then the sequences. |
+| Final Cut Pro | A browser clip for every file in the event, tagged with its source group or `Align generated audio`, and a keyword collection per tag. |
+| DaVinci Resolve | The import script creates a media pool folder named after the timeline, with a folder per source group and one for generated audio. |
+
+A group is named after the folder the files were copied into. The folder
+structure that cameras and recorders write on their cards is skipped, so files
+in `Wedding/CamA/PRIVATE/M4ROOT/CLIP` belong to `CamA`. Folders with the same
+name are told apart by their parent folder, such as `Day 1 · CamA`. A folder
+that holds both video and audio-only files is split into its video and its
+audio, and Sony cameras sharing a folder are told apart by their metadata.
+Other cameras and audio recorders are grouped by folder only: cards of one
+camera copied into two folders form two groups, and several recorders copied
+into one folder form one.
+
+Source clips keep their original audio; use the exported timeline for
+synchronized playback. `Align generated audio` holds the files Align rendered
+for the timelines: drift corrections, and copies with leading silence that
+place audio on the exact sample. The timelines play these files, so keep them
+with the export.
+
+Organizing never renames or moves files on disk. Each run of the Resolve import
+script creates its own folder, because Resolve imports a timeline's media again
+on every import. Importing the Resolve XML or OTIO without the script, and AAF
+exports, do not create groups.
+
 ## Editing support
 
 Selected imported tracks can anchor an existing edit: source ranges, repeated

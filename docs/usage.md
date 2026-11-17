@@ -172,12 +172,15 @@ align-cli export-json --aaf --aaf-fps 25 result.json /path/to/aaf-output
 align-cli export-json --no-drift result.json /path/to/output
 align-cli export-json --replaced-audio result.json /path/to/output
 align-cli export-json --no-fcpxml-multicam result.json /path/to/output
+align-cli export-json --media-bins result.json /path/to/output
 align-cli export-json --unmatched order-only --disable-unmatched \
   --prevent-group-overlaps result.json /path/to/output
 ```
 
 - `--no-drift` disables clock-drift correction during export.
 - `--replaced-audio` adds a sequence with external audio replacing camera audio.
+- `--media-bins` organizes the source clips an editor imports into one group per
+  source folder; see [organized source clips](formats.md#organized-source-clips).
 - `--export-media` also creates complete camera files with replacement audio;
   this is separate from timeline-only export.
 - `--no-fcpxml-multicam` or `--no-fcpxml-timeline` omits the corresponding

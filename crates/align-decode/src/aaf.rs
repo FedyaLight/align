@@ -757,7 +757,14 @@ mod tests {
         for (extension, xml) in [
             (
                 "xml",
-                premiere::write(&timeline, TimelineExportFormat::PremiereXML, false),
+                premiere::write(
+                    &timeline,
+                    TimelineExportFormat::PremiereXML,
+                    premiere::PremiereOptions {
+                        media_bins: true,
+                        ..Default::default()
+                    },
+                ),
             ),
             (
                 "fcpxml",
@@ -777,7 +784,7 @@ mod tests {
             assert_eq!(channels, vec![Some(0), Some(1)], "{extension}");
         }
         let otio: serde_json::Value =
-            serde_json::from_slice(&otio::data(&timeline).unwrap()).unwrap();
+            serde_json::from_slice(&otio::data(&timeline, true).unwrap()).unwrap();
         let mut channels: Vec<_> = otio["tracks"]["children"]
             .as_array()
             .unwrap()

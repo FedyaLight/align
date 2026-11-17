@@ -174,6 +174,10 @@ fn sync_schema(export: bool) -> Value {
             json!({ "type": "boolean", "default": false, "description": "Also render media files with external audio." }),
         );
         properties.insert(
+            "media_bins".into(),
+            json!({ "type": "boolean", "default": false, "description": "Group the source clips editors import by source folder: Premiere bins, Final Cut Pro keyword collections, Resolve import-script folders." }),
+        );
+        properties.insert(
             "aaf_only".into(),
             json!({ "type": "boolean", "default": false, "description": "Export AAF instead of the default editor timeline formats." }),
         );
@@ -265,6 +269,7 @@ fn sync_args(arguments: &Map<String, Value>, export: bool) -> Result<Vec<String>
             args.push("--no-drift".into());
         }
         push_bool_flag(arguments, "export_media", "--export-media", &mut args)?;
+        push_bool_flag(arguments, "media_bins", "--media-bins", &mut args)?;
         push_bool_flag(arguments, "aaf_only", "--aaf", &mut args)?;
         let output = arguments
             .get("output_directory")
@@ -400,7 +405,8 @@ mod tests {
             "output_directory": "/output",
             "search_accuracy": "thorough",
             "correct_drift": false,
-            "export_media": true
+            "export_media": true,
+            "media_bins": true
         });
         let args = sync_args(arguments.as_object().unwrap(), true).unwrap();
         assert_eq!(
@@ -411,6 +417,7 @@ mod tests {
                 "thorough",
                 "--no-drift",
                 "--export-media",
+                "--media-bins",
                 "/output",
                 "/media/a.wav",
                 "/media/b.wav"

@@ -2571,7 +2571,7 @@ mod tests {
         let premiere = super::super::premiere::write(
             &timeline,
             super::TimelineExportFormat::PremiereXML,
-            false,
+            Default::default(),
         );
         assert!(premiere.contains("<label2>Iris</label2>"));
         assert!(premiere.contains("<name>recorder.wav ✓</name>"));
@@ -2645,8 +2645,11 @@ mod tests {
         // Writers render one combined island, like the export pipeline.
         let mut single = timeline.clone();
         single.islands = vec![timeline.combined_island(1.0)];
-        let xml =
-            super::super::premiere::write(&single, super::TimelineExportFormat::PremiereXML, false);
+        let xml = super::super::premiere::write(
+            &single,
+            super::TimelineExportFormat::PremiereXML,
+            Default::default(),
+        );
         assert_eq!(xml.matches("<label2>Iris</label2>").count(), 2);
     }
 

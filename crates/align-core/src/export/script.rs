@@ -1,5 +1,7 @@
 //! Resolve precision importer script with sample-grid placement and
-//! render-compatible audio-only timelines.
+//! render-compatible audio-only timelines. When the OTIO lists media bins,
+//! the script imports into a new media pool folder and files each source
+//! into a subfolder per camera and recorder.
 
 pub fn write() -> &'static str {
     r#"#!/usr/bin/env python3
@@ -30,16 +32,91 @@ if not project:
     raise RuntimeError('Open a DaVinci Resolve project first')
 pool = project.GetMediaPool()
 document = json.load(open(otio_path, encoding='utf-8'))
-name = (document.get('name') or 'Align') + ' – Sample Accurate'
-existing_names = {
-    project.GetTimelineByIndex(index).GetName()
-    for index in range(1, project.GetTimelineCount() + 1)
-}
-base_name = name
-suffix = 2
-while name in existing_names:
-    name = f'{base_name} {suffix}'
-    suffix += 1
+
+
+def collect_media(folder):
+    result = list(folder.GetClipList() or [])
+    for child in folder.GetSubFolderList() or []:
+        result.extend(collect_media(child))
+    return result
+
+
+def media_paths(items):
+    paths = {}
+    for item in items:
+        path = item.GetClipProperty('File Path')
+        if path:
+            paths[os.path.realpath(str(path))] = item
+    return paths
+
+
+def unique_name(names, base):
+    name = base
+    suffix = 2
+    while name in names:
+        name = f'{base} {suffix}'
+        suffix += 1
+    return name
+
+
+bins = (document.get('metadata') or {}).get('Align') or {}
+media_bins = bins.get('mediaBins') or []
+export_folder = None
+if media_bins:
+    # Resolve imports a timeline's media anew on every import, so each run
+    # gets a complete folder of its own.
+    root = pool.GetRootFolder()
+    export_folder = pool.AddSubFolder(root, unique_name(
+        {folder.GetName() for folder in root.GetSubFolderList() or []},
+        document.get('name') or 'Align',
+    ))
+    if not export_folder or not pool.SetCurrentFolder(export_folder):
+        raise RuntimeError('Resolve could not create the media pool folder')
+
+
+def organize_media():
+    """File this import's clips into one folder per camera and recorder."""
+    if export_folder is None:
+        return
+    imported = media_paths(export_folder.GetClipList() or [])
+    for media_bin in media_bins:
+        folder = pool.AddSubFolder(export_folder, media_bin['name'])
+        if not folder:
+            raise RuntimeError(f"Resolve could not create the {media_bin['name']} folder")
+        clips = []
+        missing = []
+        for path in media_bin['media']:
+            real = os.path.realpath(path)
+            if real in imported:
+                clips.append(imported.pop(real))
+            else:
+                missing.append(path)
+        if clips and not pool.MoveClips(clips, folder):
+            raise RuntimeError(f"Resolve could not move clips into {media_bin['name']}")
+        if missing:
+            pool.SetCurrentFolder(folder)
+            if len(pool.ImportMedia(missing) or []) < len(missing):
+                print(f"Warning: Resolve did not import every file of {media_bin['name']}", file=sys.stderr)
+    generated_audio = bins['generatedAudio']
+    generated = [
+        imported.pop(real)
+        for real in dict.fromkeys(os.path.realpath(path) for path in generated_audio['media'])
+        if real in imported
+    ]
+    if generated:
+        folder = pool.AddSubFolder(export_folder, generated_audio['name'])
+        if not folder or not pool.MoveClips(generated, folder):
+            raise RuntimeError(f"Resolve could not move clips into {generated_audio['name']}")
+    pool.SetCurrentFolder(export_folder)
+
+
+name = unique_name(
+    {
+        project.GetTimelineByIndex(index).GetName()
+        for index in range(1, project.GetTimelineCount() + 1)
+    },
+    (document.get('name') or 'Align') + ' – Sample Accurate',
+)
 rate = float(document['global_start_time']['rate'])
 audio_tracks = [
     track for track in document['tracks']['children']
@@ -111,17 +188,8 @@ if not video_clips:
                 path = reference['target_url']
                 if path not in paths:
                     paths.append(path)
-    def collect_media(folder):
-        result = list(folder.GetClipList() or [])
-        for child in folder.GetSubFolderList() or []:
-            result.extend(collect_media(child))
-        return result
-
-    media_by_path = {
-        os.path.realpath(str(item.GetClipProperty('File Path'))): item
-        for item in collect_media(pool.GetRootFolder())
-        if item.GetClipProperty('File Path')
-    }
+    # With media bins, use this run's own media like the timeline import does.
+    media_by_path = media_paths(collect_media(export_folder or pool.GetRootFolder()))
     missing = [path for path in paths if os.path.realpath(path) not in media_by_path]
     imported = pool.ImportMedia(missing) or []
     media_by_path.update({
@@ -153,6 +221,7 @@ if not video_clips:
                 })
                 placed += 1
             cursor += duration
+    organize_media()
     project.SetCurrentTimeline(timeline)
     print(f'Created {timeline.GetName()} with {placed} sample-accurate audio clips')
     sys.exit(0)
@@ -209,6 +278,7 @@ if replacements and not timeline.DeleteClips([entry['item'] for entry in replace
 for entry in replacements:
     append_audio(entry)
 
+organize_media()
 project.SetCurrentTimeline(timeline)
 print(f'Created {timeline.GetName()} with {len(replacements)} sample-accurate recorder clips')
 for warning in warnings:

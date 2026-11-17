@@ -621,7 +621,7 @@ fn reverse_retime_imports_backward_with_negative_otio_scalar() {
 
     // OTIO writer emits the negative scalar.
     let timeline = draft_to_otio_timeline(&draft);
-    let bytes = crate::export::otio::data(&timeline).expect("otio");
+    let bytes = crate::export::otio::data(&timeline, false).expect("otio");
     let text = String::from_utf8(bytes).expect("utf8");
     assert!(
         text.contains("\"time_scalar\": -1.0"),
@@ -672,11 +672,11 @@ fn non_portable_dissolve_warns_and_flattens_in_otio() {
     let premiere = crate::export::premiere::write(
         &timeline,
         crate::export_model::TimelineExportFormat::PremiereXML,
-        false,
+        Default::default(),
     );
     assert!(premiere.contains("<transitionitem>"));
     // OTIO has clips + overlap but no Transition node.
-    let bytes = crate::export::otio::data(&timeline).expect("otio");
+    let bytes = crate::export::otio::data(&timeline, false).expect("otio");
     let text = String::from_utf8(bytes).expect("utf8");
     assert!(!text.contains("Transition.1"));
     assert!(text.contains("Clip.2"));

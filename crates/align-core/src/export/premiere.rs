@@ -13,15 +13,21 @@
 //! the floored integer placement with no `<subframeoffset>`; the content
 //! lands exactly. Unpadded items (plain `export`, retimed audio, the
 //! `– replaced` sequence) keep the historical `<subframeoffset>` encoding.
+//!
+//! Media bins: a Premiere project can open with one bin of master clips per
+//! camera and recorder, plus a bin of the audio Align prepared. Master clips
+//! define every `<file>` before the sequences, whose clipitems then
+//! reference them by `masterclipid` and file id.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use super::model::{
     ExportIsland, ExportItem, ExportTimeline, ExportTransition, TimelineExportFormat, xml_text,
 };
 use crate::allocator::{TimelineTrackRequest, allocate, source_key_for_url};
-use crate::model::MediaKind;
+use crate::bins::{GENERATED_AUDIO, MediaBins};
+use crate::model::{ClipId, MediaKind};
 use crate::piecewise::PiecewiseTimeMapping;
 
 // ------------------------------------------------------------ rate
@@ -109,10 +115,20 @@ struct LinkReference {
 
 // ------------------------------------------------------------ write
 
+/// What a Premiere document contains besides its synchronized sequence.
+/// Resolve XML is a bare sequence and ignores both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PremiereOptions {
+    /// A second sequence with recorder audio replacing camera audio.
+    pub replaced_sequence: bool,
+    /// Master clips organized into bins by camera and recorder.
+    pub media_bins: bool,
+}
+
 pub fn write(
     timeline: &ExportTimeline,
     format: TimelineExportFormat,
-    include_replaced_sequence: bool,
+    options: PremiereOptions,
 ) -> String {
     assert!(!matches!(
         format,
@@ -127,11 +143,22 @@ pub fn write(
             rate,
             format,
             defined_files: HashSet::new(),
+            master_clips: HashMap::new(),
         };
-        let replaced = if format == TimelineExportFormat::PremiereXML && include_replaced_sequence {
+        let premiere = format == TimelineExportFormat::PremiereXML;
+        let replaced = if premiere && options.replaced_sequence {
             replaced_island(island)
         } else {
             None
+        };
+        // Bins come first: their master clips define the files that the
+        // sequences then reference.
+        let bins = if premiere && options.media_bins {
+            let mut islands = vec![(island, true)];
+            islands.extend(replaced.as_ref().map(|r| (r, false)));
+            document.media_bins(&islands)
+        } else {
+            String::new()
         };
         let main_xml = document.sequence(
             island,
@@ -144,8 +171,9 @@ pub fn write(
             "",
             true,
         );
-        if format == TimelineExportFormat::PremiereXML {
+        if premiere {
             xml += "  <project>\n    <name>Align</name>\n    <children>\n";
+            xml += &bins;
             xml += &main_xml;
             if let Some(rep) = &replaced {
                 xml += &document.sequence(
@@ -166,44 +194,63 @@ pub fn write(
 }
 
 /// Combine self-contained Premiere project documents into one project while
-/// keeping every sequence and resource identifier unique.
-pub fn combine_project_documents(documents: &[String]) -> Result<String, String> {
+/// keeping every sequence and resource identifier unique. Documents with
+/// media bins each move into a bin named after their sequence, so that bins
+/// of the same camera stay apart.
+pub fn combine_project_documents(
+    documents: &[(String, String)],
+    media_bins: bool,
+) -> Result<String, String> {
     if documents.is_empty() {
         return Err("no Premiere documents to combine".into());
     }
     let mut xml =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE xmeml>\n<xmeml version=\"5\">\n  <project>\n    <name>Align</name>\n    <children>\n"
             .to_string();
-    for (index, document) in documents.iter().enumerate() {
+    for (index, (name, document)) in documents.iter().enumerate() {
+        // The project's own children; bins nest deeper-indented ones.
+        let open = "\n    <children>\n";
         let start = document
-            .find("    <children>\n")
-            .map(|offset| offset + "    <children>\n".len())
+            .find(open)
+            .map(|offset| offset + open.len())
             .ok_or("Premiere document has no project children")?;
-        let end = document[start..]
-            .find("    </children>")
-            .map(|offset| start + offset)
+        let end = document
+            .rfind("\n    </children>\n  </project>")
+            .filter(|&end| end >= start)
+            .map(|end| end + 1)
             .ok_or("Premiere document has unterminated project children")?;
-        xml += &prefix_document_ids(&document[start..end], &format!("s{}-", index + 1));
+        let children = prefix_document_ids(&document[start..end], &format!("s{}-", index + 1));
+        if media_bins {
+            xml += &format!(
+                "      <bin>\n        <name>{}</name>\n        <children>\n{children}        </children>\n      </bin>\n",
+                xml_text::escape(name)
+            );
+        } else {
+            xml += &children;
+        }
     }
     xml += "    </children>\n  </project>\n</xmeml>\n";
     Ok(xml)
 }
 
+/// Prefix every `id` attribute and every element that refers to one.
 fn prefix_document_ids(fragment: &str, prefix: &str) -> String {
     let mut out = fragment.replace(" id=\"", &format!(" id=\"{prefix}"));
-    let open = "<linkclipref>";
-    let close = "</linkclipref>";
-    let mut cursor = 0;
-    while let Some(start) = out[cursor..]
-        .find(open)
-        .map(|offset| cursor + offset + open.len())
-    {
-        out.insert_str(start, prefix);
-        cursor = out[start + prefix.len()..]
-            .find(close)
-            .map_or(out.len(), |offset| {
-                start + prefix.len() + offset + close.len()
-            });
+    for element in ["linkclipref", "masterclipid"] {
+        let open = format!("<{element}>");
+        let close = format!("</{element}>");
+        let mut cursor = 0;
+        while let Some(start) = out[cursor..]
+            .find(&open)
+            .map(|offset| cursor + offset + open.len())
+        {
+            out.insert_str(start, prefix);
+            cursor = out[start + prefix.len()..]
+                .find(&close)
+                .map_or(out.len(), |offset| {
+                    start + prefix.len() + offset + close.len()
+                });
+        }
     }
     out
 }
@@ -215,6 +262,8 @@ struct Document {
     /// Resource keys of `<file>` elements already written; later clipitems
     /// reference them by id only.
     defined_files: HashSet<String>,
+    /// Master clip ids by the resource key of the file they define.
+    master_clips: HashMap<String, String>,
 }
 
 /// Clipitem ids and 1-based track/clip positions of one sequence, which
@@ -773,45 +822,10 @@ impl Document {
             start += adjustment;
             start_frac = effective;
         }
-        let source_rate = item
-            .clip
-            .video
-            .as_ref()
-            .and_then(|v| v.frame_duration)
-            .map(SequenceRate::new)
-            .unwrap_or(rate);
-        let corrected = media_type == MediaKind::Audio && item.corrected_audio_url.is_some();
-        // Pads are a PremiereXML-only essence swap: the Resolve bootstrap keeps
-        // referencing drift/original files with the historical subframeoffset
-        // encoding, byte-identical to before.
-        let padded =
-            item.has_placement_pad(media_type) && format == TimelineExportFormat::PremiereXML;
-        let pad_seconds = if padded {
-            item.placement_pad_seconds
-        } else {
-            0.0
-        };
-        let file_seconds = if corrected {
-            item.mapped_duration()
-        } else {
-            item.source_duration()
-        };
-        let in_seconds = if corrected {
-            item.corrected_source_in()
-        } else {
-            item.selected_source_in(media_type)
-        };
-        let out_seconds = if corrected {
-            item.corrected_source_out()
-        } else {
-            item.selected_source_out(media_type)
-        };
-        let source_rate = if padded { rate } else { source_rate };
-        let file_duration = if padded {
-            source_rate.frames(out_seconds - in_seconds + pad_seconds, Rounding::Up)
-        } else {
-            source_rate.frames(file_seconds, Rounding::Nearest)
-        };
+        let media = self.media_use(item, media_type);
+        let (source_rate, file_duration) = (media.rate, media.duration);
+        let (corrected, padded) = (media.corrected, media.padded);
+        let (in_seconds, out_seconds) = (media.in_seconds, media.out_seconds);
         let playback_rate = item.playback_rate(media_type);
         let plays_backward = item.plays_backward(media_type);
         let graph_slope = playback_rate * source_rate.fps / rate.fps;
@@ -870,41 +884,17 @@ impl Document {
             rate.frames(selected_tl, Rounding::Nearest)
         };
         let end = start + timeline_duration;
-        let media_url: PathBuf = if media_type == MediaKind::Audio {
-            let pad_url = if padded {
-                item.placement_pad_url.clone()
-            } else {
-                None
-            };
-            pad_url
-                .or(item.corrected_audio_url.clone())
-                .unwrap_or_else(|| item.clip.url.clone())
-        } else {
-            item.clip.url.clone()
-        };
-        let name = xml_text::escape(&item.display_name.clone().unwrap_or_else(|| {
-            media_url
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string()
-        }));
-        let resource_key = if padded {
-            // Padded sidecars differ per prepend length: items sharing a source
-            // at different fractional offsets must not share a file block.
-            let sample_rate = item.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);
-            let pad_samples = (pad_seconds * sample_rate).round() as u64;
-            format!(
-                "{}-placement-pad-{pad_samples}-{}-{}",
-                base_resource_key(item),
-                in_seconds.to_bits(),
-                out_seconds.to_bits()
-            )
-        } else {
-            base_resource_key(item)
-        };
-        let file_id = format!("file-{}", xml_text::identifier(&resource_key));
+        let name = xml_text::escape(
+            &item
+                .display_name
+                .clone()
+                .unwrap_or_else(|| crate::model::file_name(&media.url)),
+        );
+        let file_id = media.file_id();
         let mut xml = format!("              <clipitem id=\"{id}\">\n");
+        if let Some(master) = self.master_clips.get(&media.resource_key) {
+            xml += &format!("                <masterclipid>{master}</masterclipid>\n");
+        }
         xml += &format!(
             "                <name>{name}</name>\n                <enabled>{}</enabled>\n                <duration>{clip_duration}</duration>\n",
             tf(item.is_enabled(media_type))
@@ -940,19 +930,8 @@ impl Document {
             }
             xml += "</link>\n";
         }
-        if self.defined_files.insert(resource_key) {
-            xml += &file_block(
-                item,
-                media_type,
-                &FileReference {
-                    id: &file_id,
-                    url: &media_url,
-                    duration: file_duration,
-                    rate: source_rate,
-                    padded,
-                },
-                format,
-            );
+        if self.defined_files.insert(media.resource_key.clone()) {
+            xml += &file_block(item, media_type, &media, format);
         } else {
             xml += &format!("                <file id=\"{file_id}\"/>\n");
         }
@@ -1142,30 +1121,253 @@ fn xml_number(value: f64) -> String {
     s
 }
 
-/// The media file a clipitem plays, written once per document.
-struct FileReference<'a> {
-    id: &'a str,
-    url: &'a Path,
-    /// In frames of `rate`, the source's own rate.
-    duration: i64,
+/// The file one side of an item plays: its source, its drift sidecar, or a
+/// Premiere placement pad, with the `<file>` description it is written with
+/// once per document.
+struct MediaUse {
+    /// One per source, drift sidecar, and pad offset.
+    resource_key: String,
+    url: PathBuf,
+    /// The file's own rate, which `duration` counts in.
     rate: SequenceRate,
-    /// A placement-padded sidecar, which is always 32-bit float.
+    duration: i64,
+    /// A drift-corrected sidecar.
+    corrected: bool,
+    /// A placement-padded sidecar.
     padded: bool,
+    /// The selected range in the file's seconds; a padded sidecar holds
+    /// exactly this range after its leading silence.
+    in_seconds: f64,
+    out_seconds: f64,
+}
+
+impl MediaUse {
+    fn file_id(&self) -> String {
+        format!("file-{}", xml_text::identifier(&self.resource_key))
+    }
+
+    /// Sidecars Align renders are 32-bit float.
+    fn is_prepared(&self) -> bool {
+        self.corrected || self.padded
+    }
+}
+
+fn source_rate(item: &ExportItem, sequence: SequenceRate) -> SequenceRate {
+    item.clip
+        .video
+        .as_ref()
+        .and_then(|v| v.frame_duration)
+        .map(SequenceRate::new)
+        .unwrap_or(sequence)
+}
+
+impl Document {
+    fn media_use(&self, item: &ExportItem, media_type: MediaKind) -> MediaUse {
+        let corrected = media_type == MediaKind::Audio && item.corrected_audio_url.is_some();
+        // Pads are a PremiereXML-only essence swap: the Resolve bootstrap keeps
+        // referencing drift/original files with the historical subframeoffset
+        // encoding, byte-identical to before.
+        let padded =
+            item.has_placement_pad(media_type) && self.format == TimelineExportFormat::PremiereXML;
+        let (in_seconds, out_seconds) = if corrected {
+            (item.corrected_source_in(), item.corrected_source_out())
+        } else {
+            (
+                item.selected_source_in(media_type),
+                item.selected_source_out(media_type),
+            )
+        };
+        let (rate, duration) = if padded {
+            let duration = out_seconds - in_seconds + item.placement_pad_seconds;
+            (self.rate, self.rate.frames(duration, Rounding::Up))
+        } else {
+            let rate = source_rate(item, self.rate);
+            let seconds = if corrected {
+                item.mapped_duration()
+            } else {
+                item.source_duration()
+            };
+            (rate, rate.frames(seconds, Rounding::Nearest))
+        };
+        let url = match media_type {
+            MediaKind::Audio => padded
+                .then(|| item.placement_pad_url.clone())
+                .flatten()
+                .or_else(|| item.corrected_audio_url.clone())
+                .unwrap_or_else(|| item.clip.url.clone()),
+            MediaKind::Video => item.clip.url.clone(),
+        };
+        let resource_key = if padded {
+            // Padded sidecars differ per prepend length: items sharing a source
+            // at different fractional offsets must not share a file block.
+            let sample_rate = item.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);
+            let pad_samples = (item.placement_pad_seconds * sample_rate).round() as u64;
+            format!(
+                "{}-placement-pad-{pad_samples}-{}-{}",
+                base_resource_key(item),
+                in_seconds.to_bits(),
+                out_seconds.to_bits()
+            )
+        } else {
+            base_resource_key(item)
+        };
+        MediaUse {
+            resource_key,
+            url,
+            rate,
+            duration,
+            corrected,
+            padded,
+            in_seconds,
+            out_seconds,
+        }
+    }
+
+    /// An item's untouched source file, which it shares with every other
+    /// item of its clip that plays the source.
+    fn source_use(&self, item: &ExportItem) -> MediaUse {
+        let rate = source_rate(item, self.rate);
+        MediaUse {
+            resource_key: item.clip.id.0.clone(),
+            url: item.clip.url.clone(),
+            rate,
+            duration: rate.frames(item.source_duration(), Rounding::Nearest),
+            corrected: false,
+            padded: false,
+            in_seconds: 0.0,
+            out_seconds: item.source_duration(),
+        }
+    }
+
+    /// Bins of master clips: each source in the bin of its camera or
+    /// recorder, then every sidecar the sequences play in one bin of
+    /// generated audio. A sequence's camera audio is written only when
+    /// `include_embedded_audio` is set for its island.
+    fn media_bins(&mut self, islands: &[(&ExportIsland, bool)]) -> String {
+        let bins = MediaBins::new(
+            islands
+                .iter()
+                .flat_map(|(island, _)| island.clips.iter().map(|item| &item.clip)),
+        );
+        let mut sources: HashMap<&ClipId, &ExportItem> = HashMap::new();
+        let mut prepared = Vec::new();
+        let mut prepared_keys = HashSet::new();
+        for &(island, include_embedded_audio) in islands {
+            for item in &island.clips {
+                sources.entry(&item.clip.id).or_insert(item);
+                let video = item.clip.video.is_some();
+                let audio = !item.clip.audio.is_empty()
+                    && (include_embedded_audio || item.clip.kind == MediaKind::Audio);
+                for (side, plays) in [(MediaKind::Video, video), (MediaKind::Audio, audio)] {
+                    let media = self.media_use(item, side);
+                    if plays
+                        && media.is_prepared()
+                        && prepared_keys.insert(media.resource_key.clone())
+                    {
+                        prepared.push((item, side, media));
+                    }
+                }
+            }
+        }
+
+        let mut xml = String::new();
+        for bin in bins.bins() {
+            xml += &bin_open(&bin.name);
+            for clip in &bin.clips {
+                let item = sources[&clip.id];
+                let side = if clip.video.is_some() {
+                    MediaKind::Video
+                } else {
+                    MediaKind::Audio
+                };
+                let media = self.source_use(item);
+                xml += &self.master_clip(item, side, &media);
+            }
+            xml += BIN_CLOSE;
+        }
+        if !prepared.is_empty() {
+            xml += &bin_open(GENERATED_AUDIO);
+            for (item, side, media) in &prepared {
+                xml += &self.master_clip(item, *side, media);
+            }
+            xml += BIN_CLOSE;
+        }
+        xml
+    }
+
+    /// A master clip defining `media`'s file: its picture, then one mono
+    /// track per audio channel, as Premiere lists a clip's sources.
+    fn master_clip(&mut self, item: &ExportItem, side: MediaKind, media: &MediaUse) -> String {
+        let id = format!("masterclip-{}", self.master_clips.len() + 1);
+        self.master_clips
+            .insert(media.resource_key.clone(), id.clone());
+        let name = xml_text::escape(&crate::model::file_name(&media.url));
+        let mut xml = format!(
+            "          <clip id=\"{id}\">\n            <masterclipid>{id}</masterclipid>\n            <ismasterclip>TRUE</ismasterclip>\n            <name>{name}</name>\n            <duration>{}</duration>\n",
+            media.duration
+        );
+        xml += &media.rate.xml("            ");
+        xml += "            <media>\n";
+        let mut tracks = Vec::new();
+        if side == MediaKind::Video {
+            tracks.push((MediaKind::Video, 0));
+        }
+        let channels = item.clip.audio.first().map_or(0, |a| a.channels);
+        tracks.extend((1..=channels).map(|channel| (MediaKind::Audio, channel)));
+        let mut current = None;
+        for (index, (kind, channel)) in tracks.into_iter().enumerate() {
+            if current != Some(kind) {
+                if let Some(previous) = current {
+                    xml += &format!("              </{previous}>\n");
+                }
+                xml += &format!("              <{kind}>\n");
+                current = Some(kind);
+            }
+            let suffix = match kind {
+                MediaKind::Video => "v".to_string(),
+                MediaKind::Audio => format!("a{channel}"),
+            };
+            xml += &format!(
+                "                <track>\n                  <clipitem id=\"{id}-{suffix}\">\n                    <masterclipid>{id}</masterclipid>\n                    <name>{name}</name>\n"
+            );
+            xml += &media.rate.xml("                    ");
+            if index == 0 && self.defined_files.insert(media.resource_key.clone()) {
+                xml += &file_block(item, side, media, self.format);
+            } else {
+                xml += &format!("                <file id=\"{}\"/>\n", media.file_id());
+            }
+            if kind == MediaKind::Audio {
+                xml += &format!(
+                    "                    <sourcetrack><mediatype>audio</mediatype><trackindex>{channel}</trackindex></sourcetrack>\n"
+                );
+            }
+            xml += "                  </clipitem>\n                </track>\n";
+        }
+        if let Some(kind) = current {
+            xml += &format!("              </{kind}>\n");
+        }
+        xml += "            </media>\n          </clip>\n";
+        xml
+    }
+}
+
+const BIN_CLOSE: &str = "        </children>\n      </bin>\n";
+
+fn bin_open(name: &str) -> String {
+    format!(
+        "      <bin>\n        <name>{}</name>\n        <children>\n",
+        xml_text::escape(name)
+    )
 }
 
 fn file_block(
     item: &ExportItem,
     media_type: MediaKind,
-    file: &FileReference,
+    media: &MediaUse,
     format: TimelineExportFormat,
 ) -> String {
-    let &FileReference {
-        id,
-        url: media_url,
-        duration,
-        rate,
-        padded,
-    } = file;
+    let id = media.file_id();
+    let (media_url, duration, rate) = (&media.url, media.duration, media.rate);
     let clip = &item.clip;
     let file_name = media_url.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let absolute = crate::model::file_url(media_url);
@@ -1225,8 +1427,7 @@ fn file_block(
         );
     }
     if let Some(audio) = clip.audio.first() {
-        // Padded sidecars are 32-bit float, like drift sidecars.
-        let depth = if item.corrected_audio_url.is_some() || padded {
+        let depth = if media.is_prepared() {
             32
         } else {
             audio.bit_depth.unwrap_or(24)
@@ -1251,7 +1452,11 @@ mod tests {
         // Historical encoding, preserved for plain `export` (no sidecars):
         // fixture recorder at 0.5 s = 12.5 frames at 25 fps.
         let timeline = fixture_timeline();
-        let xml = write(&timeline, TimelineExportFormat::PremiereXML, false);
+        let xml = write(
+            &timeline,
+            TimelineExportFormat::PremiereXML,
+            PremiereOptions::default(),
+        );
         assert!(xml.contains("<subframeoffset>40</subframeoffset>"));
     }
 
@@ -1265,7 +1470,11 @@ mod tests {
             .find(|i| i.clip.id.0 == "rec")
             .expect("recorder item");
         rec.start = 9.28;
-        let xml = write(&timeline, TimelineExportFormat::PremiereXML, false);
+        let xml = write(
+            &timeline,
+            TimelineExportFormat::PremiereXML,
+            PremiereOptions::default(),
+        );
         assert!(!xml.contains("subframeoffset"));
         assert!(xml.contains("<start>232</start>"));
     }
@@ -1297,7 +1506,11 @@ mod tests {
             .clone()
             .with_placement_pad(PathBuf::from("/pad/rec-pad.wav"), pad as f64 / 48_000.0);
         *rec = padded;
-        let xml = write(&timeline, TimelineExportFormat::PremiereXML, false);
+        let xml = write(
+            &timeline,
+            TimelineExportFormat::PremiereXML,
+            PremiereOptions::default(),
+        );
         assert!(
             !xml.contains("subframeoffset"),
             "padded items carry no subframeoffset"
@@ -1325,7 +1538,11 @@ mod tests {
         *rec = rec
             .clone()
             .with_placement_pad(PathBuf::from("/pad/rec-pad.wav"), 960.0 / 48_000.0);
-        let xml = write(&timeline, TimelineExportFormat::ResolveXML, false);
+        let xml = write(
+            &timeline,
+            TimelineExportFormat::ResolveXML,
+            PremiereOptions::default(),
+        );
         assert!(!xml.contains("rec-pad.wav"));
         assert!(!xml.contains("subframeoffset"));
         assert!(xml.contains("<name>rec.wav</name>"));
@@ -1349,12 +1566,20 @@ mod tests {
             frame_duration: crate::model::MediaTime::new(1, 48_000),
             drop_frame: false,
         });
-        let resolve = write(&timeline, TimelineExportFormat::ResolveXML, false);
+        let resolve = write(
+            &timeline,
+            TimelineExportFormat::ResolveXML,
+            PremiereOptions::default(),
+        );
         assert!(!resolve.contains("01:26:57:00"));
         assert!(!resolve.contains("<timebase>48000</timebase>"));
         // Camera files keep their timecode.
         assert!(resolve.contains("<timecode><string>"));
-        let premiere = write(&timeline, TimelineExportFormat::PremiereXML, false);
+        let premiere = write(
+            &timeline,
+            TimelineExportFormat::PremiereXML,
+            PremiereOptions::default(),
+        );
         assert!(premiere.contains("01:26:57:00"));
     }
 
@@ -1374,7 +1599,11 @@ mod tests {
         second.placement_pad_url = Some(PathBuf::from("/pad/rec-pad-192.wav"));
         second.placement_pad_seconds = 192.0 / 48_000.0;
         timeline.islands[0].clips.push(second);
-        let xml = write(&timeline, TimelineExportFormat::PremiereXML, false);
+        let xml = write(
+            &timeline,
+            TimelineExportFormat::PremiereXML,
+            PremiereOptions::default(),
+        );
         assert!(xml.contains("file-rec\""), "plain file block keeps its id");
         assert!(
             xml.contains("file-rec-placement-pad-192-"),
@@ -1395,7 +1624,7 @@ mod tests {
             TimelineExportFormat::PremiereXML,
             TimelineExportFormat::ResolveXML,
         ] {
-            let xml = write(&timeline, format, false);
+            let xml = write(&timeline, format, PremiereOptions::default());
             assert!(xml.contains(
                 "<sourcetrack><mediatype>audio</mediatype><trackindex>2</trackindex></sourcetrack>"
             ));
@@ -1407,7 +1636,11 @@ mod tests {
         let mut timeline = fixture_timeline();
         timeline.islands[0].clips[0].fcp7_labels_xml =
             Some("<labels><label2>Mango</label2></labels>".to_string());
-        let xml = write(&timeline, TimelineExportFormat::PremiereXML, false);
+        let xml = write(
+            &timeline,
+            TimelineExportFormat::PremiereXML,
+            PremiereOptions::default(),
+        );
         assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE xmeml>"));
         assert!(xml.contains("<project>"));
         assert!(xml.contains("clipitem-1\"")); // <clipitem id="clipitem-1">
@@ -1420,28 +1653,150 @@ mod tests {
 
     #[test]
     fn combined_project_keeps_sequences_and_scopes_identifiers() {
-        let first = write(
-            &fixture_timeline(),
-            TimelineExportFormat::PremiereXML,
-            false,
-        );
+        const BINS: PremiereOptions = PremiereOptions {
+            replaced_sequence: false,
+            media_bins: true,
+        };
+        let first = write(&fixture_timeline(), TimelineExportFormat::PremiereXML, BINS);
         let mut second_timeline = fixture_timeline();
         second_timeline.name = "Second cut".into();
-        let second = write(&second_timeline, TimelineExportFormat::PremiereXML, false);
-        let combined = combine_project_documents(&[first, second]).expect("combined project");
+        let second = write(&second_timeline, TimelineExportFormat::PremiereXML, BINS);
+        let documents = [
+            ("First cut".to_string(), first),
+            (second_timeline.name.clone(), second),
+        ];
+        let combined = combine_project_documents(&documents, true).expect("combined project");
 
         assert_eq!(combined.matches("<sequence id=").count(), 2);
         assert!(combined.contains("<sequence id=\"s1-sequence-1\">"));
         assert!(combined.contains("<sequence id=\"s2-sequence-1\">"));
         assert!(combined.contains("<linkclipref>s1-clipitem-"));
         assert!(combined.contains("<linkclipref>s2-clipitem-"));
-        assert!(combined.contains("<name>Second cut</name>"));
+        assert!(combined.contains("<masterclipid>s2-masterclip-"));
+        // Each sequence keeps its camera bins inside a bin of its own name.
+        assert!(combined.contains("<bin>\n        <name>First cut</name>"));
+        assert!(combined.contains("<bin>\n        <name>Second cut</name>"));
+        assert_references_resolve(&combined);
+    }
+
+    /// Every id is defined once, and every reference names a definition
+    /// that precedes it, as Premiere resolves them while reading.
+    fn assert_references_resolve(xml: &str) {
+        let mut defined = HashSet::new();
+        let mut rest = xml;
+        while let Some(at) = rest.find(" id=\"") {
+            let tag_start = rest[..at].rfind('<').expect("tag");
+            let value_end = rest[at + 5..].find('"').expect("id") + at + 5;
+            let id = &rest[at + 5..value_end];
+            let tag = &rest[tag_start + 1..at];
+            let reference = tag == "file" && rest[value_end..].starts_with("\"/>");
+            if reference {
+                assert!(
+                    defined.contains(id),
+                    "file {id} referenced before its definition"
+                );
+            } else {
+                assert!(defined.insert(id.to_string()), "duplicate id {id}");
+            }
+            rest = &rest[value_end..];
+        }
+        for element in ["masterclipid", "linkclipref"] {
+            for value in xml.split(&format!("<{element}>")).skip(1) {
+                let id = &value[..value.find('<').expect("closing tag")];
+                assert!(defined.contains(id), "{element} {id} is not defined");
+            }
+        }
+    }
+
+    /// A sequence without the bin-related details: master clip references
+    /// and full file definitions, which bins move into master clips.
+    fn sequence_timing(xml: &str) -> String {
+        let sequence = &xml[xml.find("<sequence").expect("sequence")..];
+        let mut out = String::new();
+        let mut lines = sequence.lines();
+        while let Some(line) = lines.next() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("<masterclipid>") {
+                continue;
+            }
+            if trimmed.starts_with("<file id=") && !trimmed.ends_with("/>") {
+                out += &format!("{}/>\n", trimmed.trim_end_matches('>'));
+                for inner in lines.by_ref() {
+                    if inner.trim() == "</file>" {
+                        break;
+                    }
+                }
+                continue;
+            }
+            out += trimmed;
+            out += "\n";
+        }
+        out
+    }
+
+    #[test]
+    fn media_bins_define_every_file_before_the_sequences() {
+        let mut timeline = fixture_timeline();
+        let rec = timeline.islands[0]
+            .clips
+            .iter_mut()
+            .find(|i| i.clip.id.0 == "rec")
+            .expect("recorder item");
+        rec.start = 2.9 / 25.0;
+        *rec = rec
+            .clone()
+            .with_placement_pad(PathBuf::from("/pad/rec-pad.wav"), 1728.0 / 48_000.0);
+        let options = PremiereOptions {
+            replaced_sequence: true,
+            media_bins: true,
+        };
+        let xml = write(&timeline, TimelineExportFormat::PremiereXML, options);
+        let sequences = xml.find("<sequence").expect("sequence");
+        let bins: Vec<&str> = xml[..sequences]
+            .split("<bin>\n        <name>")
+            .skip(1)
+            .map(|bin| &bin[..bin.find('<').expect("name")])
+            .collect();
+        // One folder holding a camera and a recorder: a bin each, then the
+        // pad the synchronized sequence plays.
+        assert_eq!(bins, ["v – Video", "v – Audio", "Align generated audio"]);
+        for path in ["/v/cam.mov", "/v/rec.wav", "/pad/rec-pad.wav"] {
+            let pathurl = format!("<pathurl>file://{path}</pathurl>");
+            assert_eq!(xml.matches(&pathurl).count(), 1, "{path}");
+            assert!(xml.find(&pathurl).expect("defined") < sequences, "{path}");
+        }
+        assert!(xml[sequences..].contains("<masterclipid>masterclip-"));
+        assert_references_resolve(&xml);
+
+        // Bins leave every sequence's placement and references unchanged.
+        let plain = write(
+            &timeline,
+            TimelineExportFormat::PremiereXML,
+            PremiereOptions {
+                media_bins: false,
+                ..options
+            },
+        );
+        assert!(!plain.contains("<bin>") && !plain.contains("masterclipid"));
+        assert_eq!(sequence_timing(&xml), sequence_timing(&plain));
+        assert_references_resolve(&plain);
+
+        // A Resolve XML sequence has no project to hold bins.
+        let resolve = write(&timeline, TimelineExportFormat::ResolveXML, options);
+        assert!(!resolve.contains("<bin>") && !resolve.contains("masterclipid"));
     }
 
     #[test]
     fn replaced_sequence_appears_on_request() {
         let timeline = fixture_timeline();
-        let xml = write(&timeline, TimelineExportFormat::PremiereXML, true);
+        let xml = write(
+            &timeline,
+            TimelineExportFormat::PremiereXML,
+            PremiereOptions {
+                replaced_sequence: true,
+                ..Default::default()
+            },
+        );
         assert!(xml.contains("sequence-2"));
         assert!(xml.contains("– replaced"));
     }
@@ -1577,7 +1932,11 @@ mod tests {
         };
         let timeline = ExportTimeline::from_result_with_options(&result, Default::default())
             .expect("timeline");
-        let xml = write(&timeline, TimelineExportFormat::PremiereXML, false);
+        let xml = write(
+            &timeline,
+            TimelineExportFormat::PremiereXML,
+            PremiereOptions::default(),
+        );
         assert!(xml.contains("<labels><label2>Grape</label2></labels>"));
         assert!(xml.contains("<labels><label2>Forest</label2></labels>"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1586,7 +1945,11 @@ mod tests {
     #[test]
     fn resolve_bootstrap_has_no_project_wrapper() {
         let timeline = fixture_timeline();
-        let xml = write(&timeline, TimelineExportFormat::ResolveXML, false);
+        let xml = write(
+            &timeline,
+            TimelineExportFormat::ResolveXML,
+            PremiereOptions::default(),
+        );
         assert!(!xml.contains("<project>"));
         assert!(xml.contains("<sequence id=\"sequence-1\">"));
     }
@@ -1727,7 +2090,11 @@ mod tests {
         };
         let timeline = ExportTimeline::from_result_with_options(&result, Default::default())
             .expect("timeline");
-        let xml = write(&timeline, TimelineExportFormat::PremiereXML, false);
+        let xml = write(
+            &timeline,
+            TimelineExportFormat::PremiereXML,
+            PremiereOptions::default(),
+        );
         // Each side passes through exactly once: no leaks across the link.
         assert_eq!(xml.matches("VideoSideEffect").count(), 1);
         assert_eq!(xml.matches("AudioSideEffect").count(), 1);

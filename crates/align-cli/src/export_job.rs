@@ -48,6 +48,7 @@ impl ExportOptions {
             aaf,
             aaf_fps,
             replaced_audio,
+            media_bins,
             fcpxml_storylines,
             no_fcpxml_timeline,
             no_fcpxml_multicam,
@@ -106,12 +107,14 @@ impl ExportOptions {
             formats,
             correct_drift: !no_drift,
             include_replaced_sequence: replaced_audio,
+            media_bins,
             include_media_files: export_media,
             aaf_frame_duration: aaf_fps.frame_duration(),
             fcpxml: align_core::export::fcpxml::FcpxmlOptions {
                 timeline: !no_fcpxml_timeline,
                 multicam: !no_fcpxml_multicam,
                 group_storylines: fcpxml_storylines,
+                ..Default::default()
             },
         };
         let artifacts = align_decode::export::export_prepared_many(

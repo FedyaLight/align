@@ -87,6 +87,10 @@ struct ExportOptions {
     /// Add a sequence with external audio replacing camera audio.
     #[arg(long)]
     replaced_audio: bool,
+    /// Group the source clips editors import by source folder: Premiere bins,
+    /// Final Cut Pro keyword collections, Resolve import-script folders.
+    #[arg(long)]
+    media_bins: bool,
     /// Group FCPXML tracks into separate storylines.
     #[arg(long)]
     fcpxml_storylines: bool,
@@ -917,6 +921,7 @@ mod tests {
             "A2",
             "--no-drift",
             "--replaced-audio",
+            "--media-bins",
             "--no-fcpxml-multicam",
             "--export-media",
             "--label-synced",
@@ -939,6 +944,7 @@ mod tests {
                     aaf,
                     aaf_fps,
                     replaced_audio,
+                    media_bins,
                     fcpxml_storylines,
                     no_fcpxml_timeline,
                     no_fcpxml_multicam,
@@ -981,6 +987,7 @@ mod tests {
         assert_eq!(aaf_fps.frame_duration(), None);
         assert!(no_drift);
         assert!(replaced_audio);
+        assert!(media_bins);
         assert!(!fcpxml_storylines);
         assert!(!no_fcpxml_timeline);
         assert!(no_fcpxml_multicam);

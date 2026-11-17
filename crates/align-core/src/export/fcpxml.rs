@@ -1,13 +1,16 @@
 //! Final Cut Pro FCPXML writer: resources (sequence format + per-media assets), a multicam resource
 //! grouping angles by source, a synced multi-track project and a multicam
-//! project. Times are reduced `MediaTime` rationals (`0s`, `100/25s`).
+//! project. With media bins, the event also lists every asset as a browser
+//! clip tagged with its camera or recorder, and a keyword collection per
+//! tag. Times are reduced `MediaTime` rationals (`0s`, `100/25s`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::model::{ExportIsland, ExportItem, ExportTimeline, xml_text};
 use crate::allocator::{TimelineTrackRequest, allocate, source_key_for_url};
-use crate::model::{MediaKind, MediaTime, TIME_TOLERANCE};
+use crate::bins::{GENERATED_AUDIO, MediaBins};
+use crate::model::{Clip, MediaKind, MediaTime, TIME_TOLERANCE};
 
 /// A single selected source channel remains mono even when its asset is stereo.
 fn audio_channel_end(item: &ExportItem) -> String {
@@ -43,6 +46,9 @@ pub struct FcpxmlOptions {
     pub multicam: bool,
     /// Group each camera's connected clips into one storyline.
     pub group_storylines: bool,
+    /// Browser clips of every source with a keyword collection per camera
+    /// and recorder, and one for the audio Align prepared.
+    pub media_bins: bool,
 }
 
 impl FcpxmlOptions {
@@ -51,6 +57,7 @@ impl FcpxmlOptions {
         timeline: true,
         multicam: false,
         group_storylines: false,
+        media_bins: false,
     };
 }
 
@@ -132,6 +139,18 @@ struct Library<'a> {
     timeline: &'a ExportTimeline,
     frame: MediaTime,
     assets: HashMap<AssetKey, String>,
+    /// Each asset as a clip of the event's browser, in resource order.
+    browser_clips: Vec<BrowserClip>,
+}
+
+/// An asset's whole extent, as the event's browser shows it.
+struct BrowserClip {
+    key: AssetKey,
+    /// Escaped file name.
+    name: String,
+    id: String,
+    start: String,
+    duration: String,
 }
 
 /// The file an item plays: its drift sidecar, else its source.
@@ -192,10 +211,10 @@ fn with_precision_stems(island: &ExportIsland) -> ExportIsland {
 
 fn write_island(
     timeline: &ExportTimeline,
-    island: &ExportIsland,
+    sources: &ExportIsland,
     options: FcpxmlOptions,
 ) -> String {
-    let island = &with_precision_stems(island);
+    let island = &with_precision_stems(sources);
     let frame = timeline.frame_duration;
     let dimension = |side: fn(&crate::model::VideoSummary) -> u32, fallback: u32| {
         island
@@ -216,8 +235,17 @@ fn write_island(
         timeline,
         frame,
         assets: HashMap::new(),
+        browser_clips: Vec::new(),
     };
     xml += &library.assets_xml(island);
+    let bins = options
+        .media_bins
+        .then(|| MediaBins::new(sources.clips.iter().map(|item| &item.clip)));
+    if let Some(bins) = &bins {
+        for clip in bins.bins().iter().flat_map(|bin| &bin.clips) {
+            xml += &library.asset_xml(clip, &clip.url);
+        }
+    }
     if options.multicam {
         xml += &library.multicam_xml(island);
     }
@@ -235,6 +263,9 @@ fn write_island(
     let name = xml_text::escape(&timeline.name);
     xml += "  <library>\n";
     xml += &format!("    <event name=\"{name}\">\n");
+    if let Some(bins) = &bins {
+        xml += &library.browser_xml(bins);
+    }
     if options.timeline {
         xml += &format!("      <project name=\"{name} – synced\">\n{sequence}");
         xml += &format!(
@@ -266,48 +297,113 @@ impl Library<'_> {
 
     /// One `<asset>` per distinct media file and side, in item order.
     fn assets_xml(&mut self, island: &ExportIsland) -> String {
+        island
+            .clips
+            .iter()
+            .map(|item| self.asset_xml(&item.clip, &media_url(item)))
+            .collect()
+    }
+
+    /// The `<asset>` of `clip` played from `media_url`, unless one exists.
+    fn asset_xml(&mut self, clip: &Clip, media_url: &Path) -> String {
+        let audio_only = clip.video.is_none();
+        let key = AssetKey {
+            url: media_url.to_string_lossy().into_owned(),
+            audio_only,
+        };
+        if self.assets.contains_key(&key) {
+            return String::new();
+        }
+        let id = format!("r_asset_{}", self.assets.len() + 1);
+        let duration = xml_text::fcpxml_time(MediaTime::microseconds(clip.duration.as_seconds()));
+        let start = frame_start(clip.source_timecode(), self.frame);
+        let name = xml_text::escape(media_url.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+        let src = xml_text::escape(&crate::model::file_url(media_url));
+        let audio = clip.audio.first();
+        let channels = audio.map_or(2, |a| a.channels);
+        let rate = audio.map_or(48000, |a| a.sample_rate.round() as i64);
+        let audio_attributes =
+            format!(" audioSources=\"1\" audioChannels=\"{channels}\" audioRate=\"{rate}\"");
+        let mut xml = format!(
+            "    <asset id=\"{id}\" name=\"{name}\" start=\"{start}\" duration=\"{duration}\""
+        );
+        if audio_only {
+            xml += &format!(" hasAudio=\"1\"{audio_attributes}");
+        } else {
+            let has_audio = audio.is_some();
+            xml += &format!(
+                " format=\"{FORMAT_ID}\" hasVideo=\"1\" hasAudio=\"{}\"",
+                u8::from(has_audio)
+            );
+            if has_audio {
+                xml += &audio_attributes;
+            }
+        }
+        xml +=
+            &format!(">\n      <media-rep kind=\"original-media\" src=\"{src}\"/>\n    </asset>\n");
+        self.browser_clips.push(BrowserClip {
+            key: key.clone(),
+            name,
+            id: id.clone(),
+            start,
+            duration,
+        });
+        self.assets.insert(key, id);
+        xml
+    }
+
+    /// Browser clips of the event: each source tagged with its bin's
+    /// keyword, every other asset with the prepared-audio keyword, and a
+    /// keyword collection per keyword.
+    fn browser_xml(&self, bins: &MediaBins) -> String {
+        let source_keys: HashMap<AssetKey, &str> = bins
+            .bins()
+            .iter()
+            .flat_map(|bin| {
+                bin.clips.iter().map(|clip| {
+                    let key = AssetKey {
+                        url: clip.url.to_string_lossy().into_owned(),
+                        audio_only: clip.video.is_none(),
+                    };
+                    (key, bin.name.as_str())
+                })
+            })
+            .collect();
+        let source_urls: HashSet<&str> = source_keys.keys().map(|k| k.url.as_str()).collect();
+        let mut keywords: Vec<&str> = bins.bins().iter().map(|bin| bin.name.as_str()).collect();
         let mut xml = String::new();
-        for item in &island.clips {
-            let media_url = media_url(item);
-            let audio_only = item.clip.video.is_none();
-            let key = AssetKey {
-                url: media_url.to_string_lossy().into_owned(),
-                audio_only,
+        for clip in &self.browser_clips {
+            let keyword = match source_keys.get(&clip.key) {
+                Some(bin) => *bin,
+                None if !source_urls.contains(clip.key.url.as_str()) => GENERATED_AUDIO,
+                // The other side of a source, which is not its own browser clip.
+                None => continue,
             };
-            if self.assets.contains_key(&key) {
-                continue;
+            if keyword == GENERATED_AUDIO && !keywords.contains(&GENERATED_AUDIO) {
+                keywords.push(GENERATED_AUDIO);
             }
-            let asset_id = format!("r_asset_{}", self.assets.len() + 1);
-            let duration =
-                xml_text::fcpxml_time(MediaTime::microseconds(item.clip.duration.as_seconds()));
-            let start = frame_start(item.clip.source_timecode(), self.frame);
-            let name =
-                xml_text::escape(media_url.file_name().and_then(|n| n.to_str()).unwrap_or(""));
-            let src = xml_text::escape(&crate::model::file_url(&media_url));
-            let audio = item.clip.audio.first();
-            let channels = audio.map_or(2, |a| a.channels);
-            let rate = audio.map_or(48000, |a| a.sample_rate.round() as i64);
-            let audio_attributes =
-                format!(" audioSources=\"1\" audioChannels=\"{channels}\" audioRate=\"{rate}\"");
-            xml += &format!(
-                "    <asset id=\"{asset_id}\" name=\"{name}\" start=\"{start}\" duration=\"{duration}\""
-            );
-            if audio_only {
-                xml += &format!(" hasAudio=\"1\"{audio_attributes}");
+            let BrowserClip {
+                name,
+                id,
+                start,
+                duration,
+                ..
+            } = clip;
+            let format = if clip.key.audio_only {
+                String::new()
             } else {
-                let has_audio = audio.is_some();
-                xml += &format!(
-                    " format=\"{FORMAT_ID}\" hasVideo=\"1\" hasAudio=\"{}\"",
-                    u8::from(has_audio)
-                );
-                if has_audio {
-                    xml += &audio_attributes;
-                }
-            }
+                format!(" format=\"{FORMAT_ID}\"")
+            };
             xml += &format!(
-                ">\n      <media-rep kind=\"original-media\" src=\"{src}\"/>\n    </asset>\n"
+                "      <asset-clip name=\"{name}\" ref=\"{id}\" start=\"{start}\" duration=\"{duration}\"{format}>\n        <keyword start=\"{start}\" duration=\"{duration}\" value=\"{}\"/>\n      </asset-clip>\n",
+                keyword_value(keyword)
             );
-            self.assets.insert(key, asset_id);
+        }
+        for keyword in keywords {
+            xml += &format!(
+                "      <keyword-collection name=\"{}\"/>\n",
+                keyword_value(keyword)
+            );
         }
         xml
     }
@@ -509,6 +605,11 @@ impl Library<'_> {
     }
 }
 
+/// A keyword attribute value. Final Cut Pro splits keyword values at commas.
+fn keyword_value(name: &str) -> String {
+    xml_text::escape(&name.replace(',', ";"))
+}
+
 fn angle_name(source_key: &str, items: &[&ExportItem]) -> String {
     if let Some(first) = items.first() {
         let folder = first
@@ -594,7 +695,13 @@ mod tests {
     #[test]
     fn fcpxml_roundtrips_through_importer() {
         let timeline = fixture_timeline();
-        let xml = write(&timeline, FcpxmlOptions::default());
+        let xml = write(
+            &timeline,
+            FcpxmlOptions {
+                media_bins: true,
+                ..FcpxmlOptions::default()
+            },
+        );
         assert!(xml.contains("<fcpxml version=\"1.10\">"));
         assert!(xml.contains("r_multicam"));
         assert!(xml.contains("– synced"));
@@ -642,11 +749,49 @@ mod tests {
                 timeline: false,
                 multicam: true,
                 group_storylines: false,
+                media_bins: false,
             },
         );
         assert!(!multicam_only.contains("– synced"));
         assert!(multicam_only.contains("r_multicam"));
         assert!(multicam_only.contains("– multicam"));
+    }
+
+    #[test]
+    fn media_bins_tag_each_asset_as_a_browser_clip() {
+        let mut timeline = fixture_timeline();
+        let rec = timeline.islands[0]
+            .clips
+            .iter_mut()
+            .find(|i| i.clip.id.0 == "rec")
+            .expect("recorder item");
+        *rec = rec.with_corrected_audio(PathBuf::from("/fix/rec – drift.wav"));
+        let xml = write(
+            &timeline,
+            FcpxmlOptions {
+                media_bins: true,
+                ..FcpxmlOptions::default()
+            },
+        );
+        let event = &xml[xml.find("<event").expect("event")..];
+        let browser = &event[..event.find("<project").expect("project")];
+        // Every asset, including the original recorder file the project
+        // does not play, appears once with its bin's keyword.
+        let assets = xml.matches("<asset id=").count();
+        assert_eq!(assets, 3);
+        assert_eq!(browser.matches("<asset-clip ").count(), assets);
+        for (file, keyword) in [
+            ("cam.mov", "v – Video"),
+            ("rec.wav", "v – Audio"),
+            ("rec – drift.wav", "Align generated audio"),
+        ] {
+            let clip = &browser[browser.find(&format!("name=\"{file}\"")).expect(file)..];
+            let clip = &clip[..clip.find("</asset-clip>").expect("clip end")];
+            assert!(clip.contains(&format!("value=\"{keyword}\"/>")), "{file}");
+            assert!(browser.contains(&format!("<keyword-collection name=\"{keyword}\"/>")));
+        }
+        let plain = write(&timeline, FcpxmlOptions::default());
+        assert!(!plain.contains("<keyword") && !plain.contains("rec.wav"));
     }
 
     #[test]
@@ -865,5 +1010,6 @@ mod tests {
         assert!(script.starts_with("#!/usr/bin/env python3"));
         assert!(script.contains("AppendToTimeline"));
         assert!(script.contains("sample-accurate recorder clips"));
+        assert!(script.contains("mediaBins") && script.contains("generatedAudio"));
     }
 }

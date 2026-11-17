@@ -1526,6 +1526,7 @@ impl AlignApp {
         let cancel = self.data.cancel.clone();
         let drift = self.data.export_drift;
         let replaced = self.data.export_replaced;
+        let media_bins = self.data.export_media_bins;
         let storylines = self.data.export_storylines;
         let fcpxml_timeline = self.data.export_fcpxml_timeline;
         let fcpxml_multicam = self.data.export_fcpxml_multicam;
@@ -1555,12 +1556,14 @@ impl AlignApp {
                 formats,
                 correct_drift: drift,
                 include_replaced_sequence: replaced,
+                media_bins,
                 include_media_files: media,
                 aaf_frame_duration,
                 fcpxml: align_core::export::fcpxml::FcpxmlOptions {
                     timeline: fcpxml_timeline,
                     multicam: fcpxml_multicam,
                     group_storylines: storylines,
+                    ..Default::default()
                 },
             };
             let out = align_decode::export::export_prepared_many(

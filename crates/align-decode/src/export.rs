@@ -20,6 +20,7 @@ use align_core::export::model::{
     ExportIsland, ExportItem, ExportTimeline, TimelineExportError, TimelineExportFormat,
     placement_pad_samples, sequence_fps,
 };
+use align_core::export::premiere::PremiereOptions;
 use align_core::model::file_name;
 use align_core::{MediaKind, MediaTime};
 
@@ -182,6 +183,10 @@ pub struct ExportOptions {
     pub correct_drift: bool,
     /// Premiere/Resolve XML: also write the sequence with camera audio replaced.
     pub include_replaced_sequence: bool,
+    /// Group the source clips editors import by source folder: Premiere bins,
+    /// Final Cut Pro keyword collections, and media pool folders from the
+    /// Resolve import script. Sets `fcpxml.media_bins`.
+    pub media_bins: bool,
     /// Copy each camera file with the synchronized recorder audio.
     pub include_media_files: bool,
     /// Override the AAF composition timecode rate used by Resolve. Picture
@@ -196,6 +201,7 @@ impl Default for ExportOptions {
             formats: TimelineExportFormat::default_formats(),
             correct_drift: true,
             include_replaced_sequence: false,
+            media_bins: false,
             include_media_files: false,
             aaf_frame_duration: None,
             fcpxml: FcpxmlOptions::default(),
@@ -279,23 +285,29 @@ pub fn export_prepared_many(
         )?;
         aaf_manifests.extend(aaf_manifest);
         for artifact in sequence_artifacts {
-            let documents = match artifact.format {
-                ExportArtifactFormat::PremiereXML => &mut premiere_documents,
-                ExportArtifactFormat::FinalCutProXML => &mut fcpxml_documents,
-                _ => {
-                    artifacts.push(artifact);
-                    continue;
-                }
-            };
-            documents.push(
-                std::fs::read_to_string(&artifact.url).map_err(ExportError::read(&artifact.url))?,
-            );
-            let _ = std::fs::remove_file(artifact.url);
+            if !matches!(
+                artifact.format,
+                ExportArtifactFormat::PremiereXML | ExportArtifactFormat::FinalCutProXML
+            ) {
+                artifacts.push(artifact);
+                continue;
+            }
+            let document =
+                std::fs::read_to_string(&artifact.url).map_err(ExportError::read(&artifact.url))?;
+            let _ = std::fs::remove_file(&artifact.url);
+            if artifact.format == ExportArtifactFormat::PremiereXML {
+                premiere_documents.push((timeline.name.clone(), document));
+            } else {
+                fcpxml_documents.push(document);
+            }
         }
     }
     if !premiere_documents.is_empty() {
-        let xml = align_core::export::premiere::combine_project_documents(&premiere_documents)
-            .map_err(ExportError::Document)?;
+        let xml = align_core::export::premiere::combine_project_documents(
+            &premiere_documents,
+            options.media_bins,
+        )
+        .map_err(ExportError::Document)?;
         let url = directory.join("Align – Adobe Premiere Pro.xml");
         align_core::staged::write(&url, xml.as_bytes()).map_err(ExportError::Write)?;
         artifacts.push(ExportArtifact {
@@ -404,13 +416,7 @@ fn export_prepared_internal(
     check_cancel(cancel)?;
 
     let prepared = &plan.timeline;
-    let mut artifacts = write_artifacts(
-        prepared,
-        directory,
-        &options.formats,
-        options.include_replaced_sequence,
-        options.fcpxml,
-    )?;
+    let mut artifacts = write_artifacts(prepared, directory, options)?;
     let mut deferred_aaf = None;
     if options.wants(TimelineExportFormat::Aaf) {
         let manifest = crate::aaf::timeline_manifest_with_frame_rate(
@@ -1113,13 +1119,20 @@ fn export_media_file(
 fn write_artifacts(
     timeline: &ExportTimeline,
     directory: &Path,
-    formats: &[TimelineExportFormat],
-    include_replaced_sequence: bool,
-    fcpxml: FcpxmlOptions,
+    options: &ExportOptions,
 ) -> Result<Vec<ExportArtifact>, ExportError> {
     let combined = timeline.combined();
-    let mut artifacts = Vec::with_capacity(formats.len());
-    for &format in formats {
+    let media_bins = options.media_bins;
+    let premiere = PremiereOptions {
+        replaced_sequence: options.include_replaced_sequence,
+        media_bins,
+    };
+    let fcpxml = FcpxmlOptions {
+        media_bins,
+        ..options.fcpxml
+    };
+    let mut artifacts = Vec::with_capacity(options.formats.len());
+    for &format in &options.formats {
         let application = match format {
             TimelineExportFormat::Aaf => continue,
             TimelineExportFormat::PremiereXML => "Adobe Premiere Pro",
@@ -1132,14 +1145,14 @@ fn write_artifacts(
         let bytes: Vec<u8> = match format {
             TimelineExportFormat::Aaf => continue,
             TimelineExportFormat::ResolveOTIO => {
-                align_core::export::otio::data(&combined).map_err(ExportError::Document)?
+                align_core::export::otio::data(&combined, media_bins)
+                    .map_err(ExportError::Document)?
             }
             TimelineExportFormat::ResolveScript => {
                 align_core::export::script::write().as_bytes().to_vec()
             }
             TimelineExportFormat::ResolveXML | TimelineExportFormat::PremiereXML => {
-                align_core::export::premiere::write(&combined, format, include_replaced_sequence)
-                    .into_bytes()
+                align_core::export::premiere::write(&combined, format, premiere).into_bytes()
             }
             TimelineExportFormat::FinalCutProXML => {
                 align_core::export::fcpxml::write(&combined, fcpxml).into_bytes()

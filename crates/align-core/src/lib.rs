@@ -5,6 +5,7 @@
 //! assembly, interchange writers, and the analysis cache.
 
 pub mod allocator;
+pub mod bins;
 pub mod cache;
 pub mod drift;
 pub mod export;
