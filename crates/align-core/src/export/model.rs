@@ -15,6 +15,9 @@ use crate::model::{
 };
 use crate::piecewise::{MapPoint, PiecewiseTimeMapping};
 
+/// Playback rates closer to 1 than this play at normal speed.
+pub const RATE_TOLERANCE: f64 = 1e-6;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExportTransitionKind {
     CrossDissolve,
@@ -284,8 +287,8 @@ impl ExportItem {
     pub fn selected_source_duration(&self) -> f64 {
         (self.source_out - self.source_in).max(0.0)
     }
-    pub fn is_retimed(&self, media_type: &str) -> bool {
-        self.plays_backward(media_type) || (self.playback_rate(media_type) - 1.0).abs() > 0.000_001
+    pub fn is_retimed(&self, media: MediaKind) -> bool {
+        self.plays_backward(media) || (self.playback_rate(media) - 1.0).abs() > RATE_TOLERANCE
     }
     pub fn minimum_timeline_start(&self) -> f64 {
         self.start.min(
@@ -390,8 +393,8 @@ impl ExportItem {
     /// True when the writer must reference the padded sidecar instead of the
     /// drift/original file (audio side only; never for retimed items, which
     /// the pad planner skips).
-    pub fn has_placement_pad(&self, media_type: &str) -> bool {
-        media_type == "audio"
+    pub fn has_placement_pad(&self, media: MediaKind) -> bool {
+        media == MediaKind::Audio
             && self.placement_pad_url.is_some()
             && self.placement_pad_seconds > 0.0
     }
@@ -407,143 +410,101 @@ impl ExportItem {
         self.precision_audio_urls.get(channel_1based - 1)
     }
 
-    pub fn is_enabled(&self, media_type: &str) -> bool {
-        if media_type == "audio"
-            && let Some(linked) = &self.linked_audio_edit
-        {
+    /// The separately edited audio of a linked clip, when `media` is its
+    /// audio side. Each side's edit settings come from here when present.
+    fn linked_audio(&self, media: MediaKind) -> Option<&ExportLinkedAudio> {
+        match media {
+            MediaKind::Audio => self.linked_audio_edit.as_ref(),
+            MediaKind::Video => None,
+        }
+    }
+    /// The audio side of a video clip without its own linked edit.
+    fn is_embedded_audio(&self, media: MediaKind) -> bool {
+        media == MediaKind::Audio && self.clip.kind == MediaKind::Video
+    }
+
+    pub fn is_enabled(&self, media: MediaKind) -> bool {
+        if let Some(linked) = self.linked_audio(media) {
             return linked.enabled;
         }
-        if media_type == "audio" && self.clip.kind == MediaKind::Video {
+        if self.is_embedded_audio(media) {
             return self.audio_enabled.unwrap_or(self.enabled);
         }
         self.enabled
     }
-    pub fn is_track_enabled(&self, media_type: &str) -> bool {
-        if media_type == "audio"
-            && let Some(linked) = &self.linked_audio_edit
-        {
+    pub fn is_track_enabled(&self, media: MediaKind) -> bool {
+        if let Some(linked) = self.linked_audio(media) {
             return linked.track_enabled;
         }
-        if media_type == "audio" && self.clip.kind == MediaKind::Video {
+        if self.is_embedded_audio(media) {
             return self.audio_track_enabled.unwrap_or(self.track_enabled);
         }
         self.track_enabled
     }
-    pub fn is_track_locked(&self, media_type: &str) -> bool {
-        if media_type == "audio"
-            && let Some(linked) = &self.linked_audio_edit
-        {
+    pub fn is_track_locked(&self, media: MediaKind) -> bool {
+        if let Some(linked) = self.linked_audio(media) {
             return linked.track_locked;
         }
-        if media_type == "audio" && self.clip.kind == MediaKind::Video {
+        if self.is_embedded_audio(media) {
             return self.audio_track_locked.unwrap_or(self.track_locked);
         }
         self.track_locked
     }
-    pub fn timeline_start(&self, media_type: &str) -> f64 {
-        if media_type == "audio"
-            && let Some(linked) = &self.linked_audio_edit
-        {
-            return linked.start;
-        }
-        self.start
+    pub fn timeline_start(&self, media: MediaKind) -> f64 {
+        self.linked_audio(media).map_or(self.start, |l| l.start)
     }
-    pub fn selected_source_in(&self, media_type: &str) -> f64 {
-        if media_type == "audio"
-            && let Some(linked) = &self.linked_audio_edit
-        {
-            return linked.source_in;
-        }
-        self.source_in
+    pub fn selected_source_in(&self, media: MediaKind) -> f64 {
+        self.linked_audio(media)
+            .map_or(self.source_in, |l| l.source_in)
     }
-    pub fn selected_source_out(&self, media_type: &str) -> f64 {
-        if media_type == "audio"
-            && let Some(linked) = &self.linked_audio_edit
-        {
-            return linked.source_out;
-        }
-        self.source_out
+    pub fn selected_source_out(&self, media: MediaKind) -> f64 {
+        self.linked_audio(media)
+            .map_or(self.source_out, |l| l.source_out)
     }
-    pub fn selected_timeline_duration(&self, media_type: &str) -> f64 {
-        if media_type == "audio"
-            && let Some(linked) = &self.linked_audio_edit
-        {
-            return linked.timeline_duration;
-        }
-        self.timeline_duration
+    pub fn selected_timeline_duration(&self, media: MediaKind) -> f64 {
+        self.linked_audio(media)
+            .map_or(self.timeline_duration, |l| l.timeline_duration)
     }
-    pub fn playback_rate(&self, media_type: &str) -> f64 {
-        if media_type == "audio"
-            && let Some(linked) = &self.linked_audio_edit
-        {
-            return linked.playback_rate;
-        }
-        self.playback_rate
+    pub fn playback_rate(&self, media: MediaKind) -> f64 {
+        self.linked_audio(media)
+            .map_or(self.playback_rate, |l| l.playback_rate)
     }
-    pub fn plays_backward(&self, media_type: &str) -> bool {
-        if media_type == "audio"
-            && let Some(linked) = &self.linked_audio_edit
-        {
-            return linked.plays_backward;
-        }
-        self.plays_backward
+    pub fn plays_backward(&self, media: MediaKind) -> bool {
+        self.linked_audio(media)
+            .map_or(self.plays_backward, |l| l.plays_backward)
     }
-    pub fn fcp7_time_remap_xml(&self, media_type: &str) -> Option<&str> {
-        if media_type == "audio"
-            && let Some(linked) = &self.linked_audio_edit
-        {
-            return linked
-                .fcp7_time_remap_xml
-                .as_deref()
-                .or(self.fcp7_time_remap_xml.as_deref());
-        }
-        self.fcp7_time_remap_xml.as_deref()
+    pub fn fcp7_time_remap_xml(&self, media: MediaKind) -> Option<&str> {
+        self.linked_audio(media)
+            .and_then(|l| l.fcp7_time_remap_xml.as_deref())
+            .or(self.fcp7_time_remap_xml.as_deref())
     }
-    pub fn fcp7_retime_geometry(&self, media_type: &str) -> Option<(i64, i64, i64)> {
-        let input = if media_type == "audio" {
-            self.linked_audio_edit
-                .as_ref()
-                .and_then(|l| l.fcp7_retime_in)
-                .or(self.fcp7_retime_in)
-        } else {
-            self.fcp7_retime_in
-        };
-        let output = if media_type == "audio" {
-            self.linked_audio_edit
-                .as_ref()
-                .and_then(|l| l.fcp7_retime_out)
-                .or(self.fcp7_retime_out)
-        } else {
-            self.fcp7_retime_out
-        };
-        let duration = if media_type == "audio" {
-            self.linked_audio_edit
-                .as_ref()
-                .and_then(|l| l.fcp7_retime_duration)
-                .or(self.fcp7_retime_duration)
-        } else {
-            self.fcp7_retime_duration
-        };
+    pub fn fcp7_retime_geometry(&self, media: MediaKind) -> Option<(i64, i64, i64)> {
+        let linked = self.linked_audio(media);
+        let input = linked
+            .and_then(|l| l.fcp7_retime_in)
+            .or(self.fcp7_retime_in);
+        let output = linked
+            .and_then(|l| l.fcp7_retime_out)
+            .or(self.fcp7_retime_out);
+        let duration = linked
+            .and_then(|l| l.fcp7_retime_duration)
+            .or(self.fcp7_retime_duration);
         Some((input?, output?, duration?))
     }
-    pub fn fcp7_labels_xml(&self, media_type: &str) -> Option<&str> {
-        if media_type == "audio"
-            && let Some(linked) = &self.linked_audio_edit
-        {
-            return linked.fcp7_labels_xml.as_deref();
+    pub fn fcp7_labels_xml(&self, media: MediaKind) -> Option<&str> {
+        match self.linked_audio(media) {
+            Some(linked) => linked.fcp7_labels_xml.as_deref(),
+            None => self.fcp7_labels_xml.as_deref(),
         }
-        self.fcp7_labels_xml.as_deref()
     }
     /// Verbatim non-timeremap filters for one clipitem side. Like labels
     /// (not like the remap fallback): a video-side filter must never leak
     /// onto the linked audio clipitem.
-    pub fn fcp7_filter_xmls(&self, media_type: &str) -> &[String] {
-        if media_type == "audio"
-            && let Some(linked) = &self.linked_audio_edit
-        {
-            return &linked.fcp7_filter_xmls;
+    pub fn fcp7_filter_xmls(&self, media: MediaKind) -> &[String] {
+        match self.linked_audio(media) {
+            Some(linked) => &linked.fcp7_filter_xmls,
+            None => &self.fcp7_filter_xmls,
         }
-        &self.fcp7_filter_xmls
     }
     pub fn fcpxml_audio_role(&self) -> Option<&str> {
         self.linked_audio_edit
@@ -551,28 +512,26 @@ impl ExportItem {
             .and_then(|linked| linked.fcpxml_audio_role.as_deref())
             .or(self.fcpxml_audio_role.as_deref())
     }
-    pub fn preferred_source_key(&self, media_type: &str) -> Option<&str> {
-        if media_type == "audio"
-            && let Some(linked) = &self.linked_audio_edit
-        {
+    pub fn preferred_source_key(&self, media: MediaKind) -> Option<&str> {
+        if let Some(linked) = self.linked_audio(media) {
             return Some(linked.preferred_source_key.as_str());
         }
-        if media_type == "audio" {
-            self.preferred_audio_source_key
+        match media {
+            MediaKind::Audio => self
+                .preferred_audio_source_key
                 .as_deref()
-                .or(self.preferred_source_key.as_deref())
-        } else {
-            self.preferred_source_key.as_deref()
+                .or(self.preferred_source_key.as_deref()),
+            MediaKind::Video => self.preferred_source_key.as_deref(),
         }
     }
-    pub fn transition_for(&self, media_type: &str) -> Option<&ExportTransition> {
-        if media_type == "audio" {
-            if let Some(linked) = &self.linked_audio_edit {
-                return linked.transition_after.as_ref();
-            }
-            return self.audio_transition_after.as_ref();
+    pub fn transition_for(&self, media: MediaKind) -> Option<&ExportTransition> {
+        match media {
+            MediaKind::Audio => match &self.linked_audio_edit {
+                Some(linked) => linked.transition_after.as_ref(),
+                None => self.audio_transition_after.as_ref(),
+            },
+            MediaKind::Video => self.transition_after.as_ref(),
         }
-        self.transition_after.as_ref()
     }
 
     pub fn offset_by(&self, value: f64) -> Self {
@@ -1489,6 +1448,20 @@ impl ExportTimeline {
         self.order_only_islands = other.order_only_islands.clone();
     }
 
+    /// The same timeline (name, rate, chronology and assembly policies)
+    /// around other islands, such as clips with prepared audio attached.
+    pub fn with_islands(&self, islands: Vec<ExportIsland>) -> Self {
+        let mut timeline = Self::new(islands, self.frame_duration, &self.name);
+        timeline.temporal_policy = self.temporal_policy.clone();
+        timeline.copy_assembly_policy_from(self);
+        timeline
+    }
+
+    /// This timeline as the single sequence every writer exports.
+    pub fn combined(&self) -> Self {
+        self.with_islands(vec![self.combined_island(1.0)])
+    }
+
     /// One sequence for all islands and unmatched clips (gap = 1 s).
     pub fn combined_island(&self, gap: f64) -> ExportIsland {
         let mut combined = Vec::new();
@@ -2183,7 +2156,7 @@ mod tests {
                 .combined_island(1.0)
                 .clips
                 .iter()
-                .all(|item| !item.is_enabled(item.clip.kind.as_str()))
+                .all(|item| !item.is_enabled(item.clip.kind))
         );
         assert!(timeline.combined_island(1.0).clips.iter().all(|item| {
             item.display_name
@@ -2648,7 +2621,8 @@ mod tests {
         );
         assert!(premiere.contains("<label2>Iris</label2>"));
         assert!(premiere.contains("<name>recorder.wav ✓</name>"));
-        let fcpxml = super::super::fcpxml::write(&timeline, false);
+        let fcpxml =
+            super::super::fcpxml::write(&timeline, super::super::fcpxml::FcpxmlOptions::TIMELINE);
         assert!(fcpxml.contains("name=\"recorder.wav ✓\""));
         assert!(fcpxml.contains("audioRole=\"dialogue.interview\""));
     }
@@ -2734,7 +2708,8 @@ mod tests {
         .expect("timeline");
         let mut single = timeline.clone();
         single.islands = vec![timeline.combined_island(1.0)];
-        let xml = super::super::fcpxml::write(&single, false);
+        let xml =
+            super::super::fcpxml::write(&single, super::super::fcpxml::FcpxmlOptions::TIMELINE);
         assert_eq!(xml.matches("audioRole=\"effects\"").count(), 2);
     }
 }

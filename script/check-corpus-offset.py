@@ -63,7 +63,7 @@ def main() -> int:
             base = file_names.get(fid, "")
             if not base:
                 continue  # video-side or unresolvable ref: covered by verifier
-            m = re.match(r"^(.*) – pad (\d+) – [0-9a-f]+-direct\.wav$", base)
+            m = re.match(r"^(.*) – pad (\d+) – [0-9a-f]{16}\.wav$", base)
             if m:
                 stem, pad = m.group(1), int(m.group(2))
                 # original name: stem + extension looked up from placements

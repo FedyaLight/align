@@ -95,19 +95,24 @@ impl ExportOptions {
                 *format != align_core::export_model::TimelineExportFormat::FinalCutProXML
             });
         }
+        let options = align_decode::export::ExportOptions {
+            formats,
+            correct_drift: !no_drift,
+            include_replaced_sequence: replaced_audio,
+            include_media_files: export_media,
+            aaf_frame_duration: aaf_fps.frame_duration(),
+            fcpxml: align_core::export::fcpxml::FcpxmlOptions {
+                timeline: !no_fcpxml_timeline,
+                multicam: !no_fcpxml_multicam,
+                group_storylines: fcpxml_storylines,
+            },
+        };
         let artifacts = align_decode::export::export_prepared_many(
             align_decode::export::ExportBatchRequest {
                 backend,
                 timelines: &timelines,
                 directory: output,
-                formats: &formats,
-                correct_drift: !no_drift,
-                include_replaced_sequence: replaced_audio,
-                include_media_files: export_media,
-                aaf_frame_duration: aaf_fps.frame_duration(),
-                include_fcpxml_timeline: !no_fcpxml_timeline,
-                include_fcpxml_multicam: !no_fcpxml_multicam,
-                group_fcpxml_storylines: fcpxml_storylines,
+                options: &options,
                 cancel,
             },
             Some(&mut |progress: align_decode::export::ExportJobProgress| {

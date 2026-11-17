@@ -4,9 +4,10 @@
 //! source ranges to their validated timeline durations; adjacent segments
 //! meet without a crossfade. Buffers are bounded by decode blocks and
 //! resampler scratch. Broadcast Wave metadata is handled by `align_core::wav`.
+//! Every output is staged beside its destination and replaces it only once
+//! complete.
 
-use std::io::{Seek, SeekFrom, Write};
-use std::mem::DropGuard;
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -14,64 +15,66 @@ static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 use align_core::drift::segments;
 use align_core::model::file_name;
+use align_core::staged::StagedFile;
+use align_core::wav::{WavError, preserve_broadcast_extension};
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 
 use crate::DecodeError;
-use crate::backend::{MediaBackend, NativeBlock, NativeBlockI32};
+use crate::backend::{MediaBackend, NativeBlock, NativeBlockI32, ProbeReport};
 
-#[derive(Clone, Debug, PartialEq)]
+/// Frames per resampler input block and per written block of silence.
+const BLOCK_FRAMES: usize = 4096;
+
+#[derive(Debug, thiserror::Error)]
 pub enum RenderError {
+    #[error("Audio rendering cancelled.")]
     Cancelled,
+    #[error("No audio track was found in {0}.")]
     NoAudio(String),
+    #[error("Cannot read the audio format of {0}.")]
     UnknownFormat(String),
-    CannotRead,
-    Decode(String),
-    CannotWrite,
-    InvalidMapping,
-    PlacementPad(String),
+    /// Decoding stopped inside the requested range: the audio is truncated
+    /// or damaged there.
+    #[error("Audio decoding ended before the requested range was complete.")]
+    Truncated,
+    #[error("Cannot decode audio: {0}")]
+    Decode(#[source] DecodeError),
+    #[error("Cannot resample audio: {0}")]
+    Resample(String),
+    #[error("Cannot write rendered audio: {0}")]
+    Write(#[source] io::Error),
+    #[error(transparent)]
+    Metadata(#[from] WavError),
+    /// The caller asked for something no render can produce.
+    #[error("Invalid audio render request: {0}.")]
+    InvalidRequest(&'static str),
 }
-
-impl std::fmt::Display for RenderError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Cancelled => write!(f, "Audio rendering cancelled."),
-            Self::NoAudio(name) => write!(f, "No audio track was found in {name}."),
-            Self::UnknownFormat(name) => write!(f, "Cannot read the audio format of {name}."),
-            Self::CannotRead => write!(
-                f,
-                "Audio decoding ended before the requested range was complete."
-            ),
-            Self::Decode(message) => write!(f, "Cannot decode audio: {message}"),
-            Self::CannotWrite => write!(f, "Cannot write drift-corrected audio."),
-            Self::InvalidMapping => write!(f, "The drift-correction time map is invalid."),
-            Self::PlacementPad(message) => {
-                write!(f, "Cannot render placement-pad audio: {message}.")
-            }
-        }
-    }
-}
-
-impl std::error::Error for RenderError {}
 
 impl From<DecodeError> for RenderError {
     fn from(error: DecodeError) -> Self {
         match error {
             DecodeError::Cancelled => Self::Cancelled,
             DecodeError::NoAudio(name) => Self::NoAudio(name),
-            DecodeError::InvalidPcm | DecodeError::UnsupportedOutput => {
-                Self::UnknownFormat(String::new())
-            }
-            other => Self::Decode(other.to_string()),
+            // A render callback stopped the decoder: report its own error.
+            DecodeError::Consumer(error) => match error.downcast::<RenderError>() {
+                Ok(error) => *error,
+                Err(other) => Self::Decode(DecodeError::Consumer(other)),
+            },
+            other => Self::Decode(other),
         }
     }
 }
 
-fn decode_render_error(error: RenderError) -> DecodeError {
-    match error {
-        RenderError::Cancelled => DecodeError::Cancelled,
-        other => DecodeError::Incomplete(other.to_string()),
+/// Lets render callbacks use `?` inside decoder callbacks; the decoder hands
+/// the error back unchanged through [`DecodeError::Consumer`].
+impl From<RenderError> for DecodeError {
+    fn from(error: RenderError) -> Self {
+        match error {
+            RenderError::Cancelled => Self::Cancelled,
+            other => Self::Consumer(Box::new(other)),
+        }
     }
 }
 
@@ -83,14 +86,41 @@ pub(crate) fn check_cancel(cancel: &AtomicBool) -> Result<(), RenderError> {
     }
 }
 
-/// A camera's audio track may end before its video track, and audio
-/// whose decoder delay is trimmed from its start (AC-3 in MPEG-TS) ends that
-/// many samples before its container. After a successful decode, fill only
-/// those gaps at the container's end. Never conceal truncated audio or
-/// missing audio inside an edit.
+/// Native rate and channel count of the first audio stream.
+fn audio_format(
+    backend: &dyn MediaBackend,
+    source: &Path,
+) -> Result<(ProbeReport, f64, usize), RenderError> {
+    let probe = backend.inspect(source)?;
+    let stream = probe
+        .audio_streams
+        .first()
+        .ok_or_else(|| RenderError::NoAudio(file_name(source)))?;
+    let (sample_rate, channels) = (stream.sample_rate, stream.channels);
+    if sample_rate.is_nan() || sample_rate <= 0.0 || channels == 0 {
+        return Err(RenderError::UnknownFormat(file_name(source)));
+    }
+    Ok((probe, sample_rate, channels))
+}
+
+/// Video frame length assumed when a probe reports video without a rate.
+const UNKNOWN_FRAME_SECONDS: f64 = 0.001;
+
+/// Fills `remaining` frames that the decoder did not deliver before
+/// `end_seconds`, when the file explains them; otherwise the audio is
+/// truncated and the render fails.
+///
+/// Two gaps are legitimate, both at the end of the audio:
+/// - a camera's audio track may end before its video track, so the requested
+///   range continues past the declared audio end;
+/// - audio whose decoder delay is trimmed from its start (AC-3 in MPEG-TS)
+///   ends that many samples before its container.
+///
+/// Without a declared audio end, at most one video frame at the container's
+/// end is accepted. Missing audio inside an edit is never concealed.
 fn finish_tail(
     writer: &mut WavWriter,
-    probe: &crate::backend::ProbeReport,
+    probe: &ProbeReport,
     end_seconds: f64,
     remaining: u64,
     sample_rate: f64,
@@ -100,34 +130,38 @@ fn finish_tail(
     if remaining == 0 {
         return Ok(());
     }
+    let to_samples = |seconds: f64| (seconds * sample_rate).round() as i64;
+    let end = to_samples(end_seconds);
+    let container_end = to_samples(probe.duration_seconds);
+    if end > container_end + 1 {
+        return Err(RenderError::Truncated);
+    }
     let stream = probe.audio_streams.first();
-    let delay = stream.map_or(0.0, |s| (s.decoder_delay * sample_rate).round());
-    let frame = if probe.has_video {
-        let frame_duration = probe
-            .video
-            .as_ref()
-            .and_then(|v| v.frame_duration)
-            .map_or(0.001, |t| t.as_seconds());
-        (frame_duration * sample_rate).ceil()
-    } else {
-        0.0
-    };
-    let end_sample = (end_seconds * sample_rate).round();
-    let allowance = stream
+    let decoder_delay = stream.map_or(0, |s| to_samples(s.decoder_delay));
+    let declared_audio_end = stream
         .and_then(|s| s.end_seconds)
-        .filter(|end| {
-            end.is_finite() && *end > 0.0 && *end <= probe.duration_seconds + 1.0 / sample_rate
-        })
-        .map(|audio_end| (end_sample - (audio_end * sample_rate).round()).max(0.0) + delay)
-        .unwrap_or_else(|| {
-            if (end_seconds - probe.duration_seconds).abs() <= 1.0 / sample_rate {
-                delay + frame
+        .filter(|seconds| seconds.is_finite())
+        .map(to_samples)
+        .filter(|&audio_end| audio_end > 0 && audio_end <= container_end + 1);
+    let allowance = match declared_audio_end {
+        Some(audio_end) => (end - audio_end).max(0) + decoder_delay,
+        None if (end - container_end).abs() <= 1 => {
+            let frame = if probe.has_video {
+                let seconds = probe
+                    .video
+                    .as_ref()
+                    .and_then(|v| v.frame_duration)
+                    .map_or(UNKNOWN_FRAME_SECONDS, |t| t.as_seconds());
+                (seconds * sample_rate).ceil() as i64
             } else {
-                0.0
-            }
-        });
-    if end_seconds > probe.duration_seconds + 1.0 / sample_rate || remaining as f64 > allowance {
-        return Err(RenderError::CannotRead);
+                0
+            };
+            decoder_delay + frame
+        }
+        None => 0,
+    };
+    if i64::try_from(remaining).unwrap_or(i64::MAX) > allowance {
+        return Err(RenderError::Truncated);
     }
     writer.write_silence(channels, remaining, cancel)
 }
@@ -150,7 +184,6 @@ impl WavWriter {
         channels: usize,
         int32: bool,
     ) -> Result<Self, RenderError> {
-        let mut file = std::fs::File::create(path).map_err(|_| RenderError::CannotWrite)?;
         let mut header = Vec::new();
         header.extend_from_slice(b"RIFF");
         header.extend_from_slice(&[0u8; 4]);
@@ -172,8 +205,8 @@ impl WavWriter {
         header.extend_from_slice(&32u16.to_le_bytes());
         header.extend_from_slice(b"data");
         header.extend_from_slice(&[0u8; 4]);
-        file.write_all(&header)
-            .map_err(|_| RenderError::CannotWrite)?;
+        let mut file = std::fs::File::create(path).map_err(RenderError::Write)?;
+        file.write_all(&header).map_err(RenderError::Write)?;
         Ok(Self {
             file,
             frames_written: 0,
@@ -189,7 +222,7 @@ impl WavWriter {
     ) -> Result<(), RenderError> {
         let n = planes.first().map_or(0, |p| p.as_ref().len());
         if planes.len() < channels || planes.iter().take(channels).any(|p| p.as_ref().len() < n) {
-            return Err(RenderError::CannotRead);
+            return Err(RenderError::Decode(DecodeError::InvalidPcm));
         }
         self.bytes.clear();
         self.bytes.reserve(n * channels * 4);
@@ -209,7 +242,7 @@ impl WavWriter {
     ) -> Result<(), RenderError> {
         while frames > 0 {
             check_cancel(cancel)?;
-            let take = frames.min(4096) as usize;
+            let take = frames.min(BLOCK_FRAMES as u64) as usize;
             self.bytes.clear();
             self.bytes.resize(take * channels * 4, 0);
             self.flush_frames(take)?;
@@ -221,55 +254,41 @@ impl WavWriter {
     fn flush_frames(&mut self, frames: usize) -> Result<(), RenderError> {
         self.file
             .write_all(&self.bytes)
-            .map_err(|_| RenderError::CannotWrite)?;
+            .map_err(RenderError::Write)?;
         self.frames_written += frames as u64;
         Ok(())
     }
 
     fn finalize(mut self) -> Result<(), RenderError> {
-        let len = self
-            .file
-            .stream_position()
-            .map_err(|_| RenderError::CannotWrite)?;
+        self.patch_header().map_err(RenderError::Write)
+    }
+
+    fn patch_header(&mut self) -> io::Result<()> {
+        let len = self.file.stream_position()?;
         // 12-byte RIFF header, 36-byte reserved ds64, 24-byte fmt,
         // and 8-byte data header. Audio starts at byte 80.
-        let data_size = len.checked_sub(80).ok_or(RenderError::CannotWrite)?;
+        let data_size = len
+            .checked_sub(80)
+            .ok_or_else(|| io::Error::other("WAV header is incomplete"))?;
         let riff_size = len - 8;
         let rf64 = riff_size >= u64::from(u32::MAX);
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(if rf64 { b"RF64" } else { b"RIFF" })?;
         self.file
-            .seek(SeekFrom::Start(0))
-            .map_err(|_| RenderError::CannotWrite)?;
-        self.file
-            .write_all(if rf64 { b"RF64" } else { b"RIFF" })
-            .map_err(|_| RenderError::CannotWrite)?;
-        self.file
-            .write_all(&(if rf64 { u32::MAX } else { riff_size as u32 }).to_le_bytes())
-            .map_err(|_| RenderError::CannotWrite)?;
+            .write_all(&(if rf64 { u32::MAX } else { riff_size as u32 }).to_le_bytes())?;
         if rf64 {
-            self.file
-                .seek(SeekFrom::Start(12))
-                .map_err(|_| RenderError::CannotWrite)?;
-            self.file
-                .write_all(b"ds64")
-                .map_err(|_| RenderError::CannotWrite)?;
-            self.file
-                .seek(SeekFrom::Start(20))
-                .map_err(|_| RenderError::CannotWrite)?;
+            self.file.seek(SeekFrom::Start(12))?;
+            self.file.write_all(b"ds64")?;
+            self.file.seek(SeekFrom::Start(20))?;
             for value in [riff_size, data_size, self.frames_written] {
-                self.file
-                    .write_all(&value.to_le_bytes())
-                    .map_err(|_| RenderError::CannotWrite)?;
+                self.file.write_all(&value.to_le_bytes())?;
             }
             // The reserved final u32 remains zero: no ds64 table entries.
         }
+        self.file.seek(SeekFrom::Start(76))?;
         self.file
-            .seek(SeekFrom::Start(76))
-            .map_err(|_| RenderError::CannotWrite)?;
-        self.file
-            .write_all(&(if rf64 { u32::MAX } else { data_size as u32 }).to_le_bytes())
-            .map_err(|_| RenderError::CannotWrite)?;
-        self.file.flush().map_err(|_| RenderError::CannotWrite)?;
-        Ok(())
+            .write_all(&(if rf64 { u32::MAX } else { data_size as u32 }).to_le_bytes())?;
+        self.file.flush()
     }
 }
 
@@ -287,7 +306,6 @@ struct Segment {
 
 impl Segment {
     fn new(
-        _source_start: f64,
         source_duration: f64,
         target_duration: f64,
         sample_rate: f64,
@@ -295,7 +313,9 @@ impl Segment {
     ) -> Result<Self, RenderError> {
         let ratio = target_duration / source_duration;
         if !(ratio.is_finite() && ratio > 0.0) {
-            return Err(RenderError::InvalidMapping);
+            return Err(RenderError::InvalidRequest(
+                "a time map segment has no positive duration",
+            ));
         }
         // Arbitrary clock ratios must not determine the FFT size or be
         // rounded to whole ppm: that can accumulate milliseconds on long takes.
@@ -313,10 +333,10 @@ impl Segment {
                         interpolation: SincInterpolationType::Linear,
                         window: WindowFunction::BlackmanHarris2,
                     },
-                    4096,
+                    BLOCK_FRAMES,
                     1,
                 )
-                .map_err(|_| RenderError::CannotWrite)?,
+                .map_err(|error| RenderError::Resample(error.to_string()))?,
             );
         }
         // rubato 0.15 SincFixedIn starts its interpolation index at -kernel/2:
@@ -328,7 +348,7 @@ impl Segment {
             resampler,
             pending: vec![Vec::new(); channels],
             skip,
-            flush_rounds: ((4.0 * skip as f64 / ratio).ceil() as usize).div_ceil(4096) + 4,
+            flush_rounds: ((4.0 * skip as f64 / ratio).ceil() as usize).div_ceil(BLOCK_FRAMES) + 4,
             emitted: 0,
             expected: (target_duration * sample_rate).round() as usize,
         })
@@ -344,11 +364,11 @@ impl Segment {
         let mut out = Vec::from_fn(n, |_| Vec::new());
         for ch in 0..n {
             self.pending[ch].extend_from_slice(&planes[ch]);
-            while self.pending[ch].len() >= 4096 {
-                let chunk: Vec<f32> = self.pending[ch].drain(..4096).collect();
+            while self.pending[ch].len() >= BLOCK_FRAMES {
+                let chunk: Vec<f32> = self.pending[ch].drain(..BLOCK_FRAMES).collect();
                 let produced: Vec<Vec<f32>> = self.resampler[ch]
                     .process(&[chunk], None)
-                    .map_err(|_| RenderError::CannotWrite)?;
+                    .map_err(|error| RenderError::Resample(error.to_string()))?;
                 out[ch].extend_from_slice(&produced[0]);
             }
         }
@@ -389,7 +409,7 @@ impl Segment {
             let rem = std::mem::take(pending);
             let produced: Vec<Vec<f32>> = rs
                 .process_partial(Some(&[rem]), None)
-                .map_err(|_| RenderError::CannotWrite)?;
+                .map_err(|error| RenderError::Resample(error.to_string()))?;
             dst.extend_from_slice(&produced[0]);
         }
         self.uniform_slice(&mut out);
@@ -403,7 +423,7 @@ impl Segment {
             for (ch, rs) in self.resampler.iter_mut().enumerate() {
                 let produced: Vec<Vec<f32>> = rs
                     .process_partial::<&[f32]>(None, None)
-                    .map_err(|_| RenderError::CannotWrite)?;
+                    .map_err(|error| RenderError::Resample(error.to_string()))?;
                 round[ch].extend_from_slice(&produced[0]);
             }
             self.uniform_slice(&mut round);
@@ -412,7 +432,10 @@ impl Segment {
             }
         }
         if self.emitted != self.expected {
-            return Err(RenderError::CannotWrite);
+            return Err(RenderError::Resample(format!(
+                "produced {} of {} samples",
+                self.emitted, self.expected
+            )));
         }
         Ok(out)
     }
@@ -444,84 +467,85 @@ pub fn render_drift_cancellable(
             island: align_core::MediaTime::seconds(*i),
         })
         .collect();
-    let segments = segments(&model_points).ok_or(RenderError::InvalidMapping)?;
+    let segments = segments(&model_points).ok_or(RenderError::InvalidRequest(
+        "the drift time map needs increasing points",
+    ))?;
     // Probe format first (writer needs rate/channels upfront).
-    let probe = backend.inspect(source).map_err(RenderError::from)?;
-    let stream = probe
-        .audio_streams
-        .first()
-        .ok_or_else(|| RenderError::NoAudio(file_name(source)))?;
-    let (sample_rate, channels) = (stream.sample_rate, stream.channels);
-    if sample_rate <= 0.0 || channels == 0 {
-        return Err(RenderError::UnknownFormat(file_name(source)));
-    }
+    let (probe, sample_rate, channels) = audio_format(backend, source)?;
 
-    let tmp = destination.with_extension(format!(
-        "tmp-{}.wav",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos())
-    ));
-    let cleanup = DropGuard::new(&tmp, |path| {
-        let _ = std::fs::remove_file(path);
-    });
-    let mut writer = WavWriter::create(&tmp, sample_rate as u32, channels, false)?;
+    let staged = StagedFile::new(destination).map_err(RenderError::Write)?;
+    let mut writer = WavWriter::create(staged.path(), sample_rate as u32, channels, false)?;
     for &(source_start, source_duration, target_duration) in &segments {
         check_cancel(cancel)?;
-        let ratio = target_duration / source_duration;
-        // Supply real neighboring samples to each independent filter.
-        // Zero-padding at an internal knot otherwise creates an impulse
-        // whenever the signal is nonzero there. Guard audio is filtered
-        // but excluded from the emitted segment length.
-        let start_frame = (source_start * sample_rate).round() as usize;
-        let guard_frames = start_frame.min(4096);
-        let decode_start = (start_frame - guard_frames) as f64 / sample_rate;
-        let decode_end =
-            (source_start + source_duration + 4096.0 / sample_rate).min(probe.duration_seconds);
-        let mut segment = Segment::new(
+        let mut segment = GuardedSegment::new(
             source_start,
             source_duration,
             target_duration,
             sample_rate,
             channels,
+            probe.duration_seconds,
         )?;
-        segment.skip += (guard_frames as f64 * ratio).round() as usize;
-        backend
-            .decode_native(
-                source,
-                0,
-                Some((decode_start, Some((decode_end - decode_start).max(0.0)))),
-                &mut |block: NativeBlock| {
-                    check_cancel(cancel).map_err(decode_render_error)?;
-                    let out = segment.push(block.frames).map_err(decode_render_error)?;
-                    writer
-                        .write_pcm(channels, &out, f32::to_le_bytes)
-                        .map_err(decode_render_error)
-                },
-            )
-            .map_err(RenderError::from)?;
-        let tail = segment.finish(cancel)?;
+        backend.decode_native(
+            source,
+            0,
+            Some(segment.decode_range),
+            &mut |block: NativeBlock| {
+                check_cancel(cancel)?;
+                let out = segment.segment.push(block.frames)?;
+                writer.write_pcm(channels, &out, f32::to_le_bytes)?;
+                Ok(())
+            },
+        )?;
+        let tail = segment.segment.finish(cancel)?;
         writer.write_pcm(channels, &tail, f32::to_le_bytes)?;
     }
     check_cancel(cancel)?;
     writer.finalize()?;
-    align_core::wav::preserve_broadcast_extension(
+    preserve_broadcast_extension(
         source,
-        &tmp,
+        staged.path(),
         sample_rate,
         channels,
         32,
         "drift correction",
         0,
-    )
-    .map_err(|_| RenderError::CannotWrite)?;
-    #[cfg(windows)]
-    if destination.exists() {
-        std::fs::remove_file(destination).map_err(|_| RenderError::CannotWrite)?;
+    )?;
+    staged.commit().map_err(RenderError::Write)
+}
+
+/// A resampled segment decoded with real neighboring audio on both sides.
+///
+/// Each segment's filter is independent; zero-padding at an internal knot
+/// would otherwise create an impulse whenever the signal is nonzero there.
+/// Guard audio is filtered but excluded from the emitted segment length.
+struct GuardedSegment {
+    segment: Segment,
+    /// Decoder range: start and duration in source seconds.
+    decode_range: (f64, Option<f64>),
+}
+
+impl GuardedSegment {
+    fn new(
+        source_start: f64,
+        source_duration: f64,
+        target_duration: f64,
+        sample_rate: f64,
+        channels: usize,
+        source_end: f64,
+    ) -> Result<Self, RenderError> {
+        let ratio = target_duration / source_duration;
+        let start_frame = (source_start * sample_rate).round() as usize;
+        let guard_frames = start_frame.min(BLOCK_FRAMES);
+        let decode_start = (start_frame - guard_frames) as f64 / sample_rate;
+        let decode_end =
+            (source_start + source_duration + BLOCK_FRAMES as f64 / sample_rate).min(source_end);
+        let mut segment = Segment::new(source_duration, target_duration, sample_rate, channels)?;
+        segment.skip += (guard_frames as f64 * ratio).round() as usize;
+        Ok(Self {
+            segment,
+            decode_range: (decode_start, Some((decode_end - decode_start).max(0.0))),
+        })
     }
-    std::fs::rename(&tmp, destination).map_err(|_| RenderError::CannotWrite)?;
-    DropGuard::dismiss(cleanup);
-    Ok(())
 }
 
 // ------------------------------------------------------------ rate conversion
@@ -540,14 +564,11 @@ pub(crate) fn stream_at_rate(
     emit: &mut dyn FnMut(Vec<Vec<f32>>) -> Result<(), RenderError>,
 ) -> Result<usize, RenderError> {
     check_cancel(cancel)?;
-    let probe = backend.inspect(source).map_err(RenderError::from)?;
-    let stream = probe
-        .audio_streams
-        .first()
-        .ok_or_else(|| RenderError::NoAudio(file_name(source)))?;
-    let (sample_rate, channels) = (stream.sample_rate, stream.channels);
-    if sample_rate <= 0.0 || channels == 0 || duration.is_nan() || duration < 0.0 {
-        return Err(RenderError::UnknownFormat(file_name(source)));
+    let (probe, sample_rate, channels) = audio_format(backend, source)?;
+    if duration.is_nan() || duration < 0.0 {
+        return Err(RenderError::InvalidRequest(
+            "the duration must not be negative",
+        ));
     }
     let source_start = source_start.max(0.0);
     let expected = (duration * target_rate).round() as usize;
@@ -567,47 +588,39 @@ pub(crate) fn stream_at_rate(
         emit(planes)
     };
     if available > 0.0 && (sample_rate - target_rate).abs() < 1e-9 {
-        backend
-            .decode_native(
-                source,
-                0,
-                Some((source_start, Some(available))),
-                &mut |block: NativeBlock| {
-                    check_cancel(cancel).map_err(decode_render_error)?;
-                    forward(block.frames, &mut emitted, audible).map_err(decode_render_error)
-                },
-            )
-            .map_err(RenderError::from)?;
+        backend.decode_native(
+            source,
+            0,
+            Some((source_start, Some(available))),
+            &mut |block: NativeBlock| {
+                check_cancel(cancel)?;
+                forward(block.frames, &mut emitted, audible)?;
+                Ok(())
+            },
+        )?;
     } else if available > 0.0 {
         // Same filter and guard handling as drift segments; the ratio is
         // simply the rate change over an unchanged duration.
-        let start_frame = (source_start * sample_rate).round() as usize;
-        let guard_frames = start_frame.min(4096);
-        let decode_start = (start_frame - guard_frames) as f64 / sample_rate;
-        let decode_end =
-            (source_start + available + 4096.0 / sample_rate).min(probe.duration_seconds);
-        let ratio = target_rate / sample_rate;
-        let mut segment = Segment::new(
+        let mut segment = GuardedSegment::new(
             source_start,
             available,
-            available * ratio,
+            available * target_rate / sample_rate,
             sample_rate,
             channels,
+            probe.duration_seconds,
         )?;
-        segment.skip += (guard_frames as f64 * ratio).round() as usize;
-        backend
-            .decode_native(
-                source,
-                0,
-                Some((decode_start, Some((decode_end - decode_start).max(0.0)))),
-                &mut |block: NativeBlock| {
-                    check_cancel(cancel).map_err(decode_render_error)?;
-                    let out = segment.push(block.frames).map_err(decode_render_error)?;
-                    forward(out, &mut emitted, audible).map_err(decode_render_error)
-                },
-            )
-            .map_err(RenderError::from)?;
-        forward(segment.finish(cancel)?, &mut emitted, audible)?;
+        backend.decode_native(
+            source,
+            0,
+            Some(segment.decode_range),
+            &mut |block: NativeBlock| {
+                check_cancel(cancel)?;
+                let out = segment.segment.push(block.frames)?;
+                forward(out, &mut emitted, audible)?;
+                Ok(())
+            },
+        )?;
+        forward(segment.segment.finish(cancel)?, &mut emitted, audible)?;
     }
     // Silence for any requested time past the end of the source.
     while emitted < expected {
@@ -640,29 +653,18 @@ pub fn render_pad_cancellable(
 ) -> Result<(), RenderError> {
     check_cancel(cancel)?;
     if pad_samples == 0 {
-        return Err(RenderError::PlacementPad("empty prepend".into()));
+        return Err(RenderError::InvalidRequest("a placement pad needs samples"));
     }
-    let probe = backend.inspect(source).map_err(RenderError::from)?;
-    let stream = probe
-        .audio_streams
-        .first()
-        .ok_or_else(|| RenderError::NoAudio(file_name(source)))?;
-    let (sample_rate, channels) = (stream.sample_rate, stream.channels);
-    if sample_rate <= 0.0 || channels == 0 {
-        return Err(RenderError::UnknownFormat(file_name(source)));
-    }
+    let (probe, sample_rate, channels) = audio_format(backend, source)?;
     if selection.is_some_and(|(start, end)| end <= start) {
-        return Err(RenderError::InvalidMapping);
+        return Err(RenderError::InvalidRequest("the selected range is empty"));
     }
     let reference_shift = i64::try_from(
         i128::from(selection.map_or(0, |(start, _)| start)) - i128::from(pad_samples),
     )
-    .map_err(|_| RenderError::InvalidMapping)?;
-    let tmp = destination.with_extension(format!("tmp-{}.wav", std::process::id()));
-    let cleanup = DropGuard::new(&tmp, |path| {
-        let _ = std::fs::remove_file(path);
-    });
-    let mut writer = WavWriter::create(&tmp, sample_rate as u32, channels, false)?;
+    .map_err(|_| RenderError::InvalidRequest("the placement pad is out of range"))?;
+    let staged = StagedFile::new(destination).map_err(RenderError::Write)?;
+    let mut writer = WavWriter::create(staged.path(), sample_rate as u32, channels, false)?;
     writer.write_silence(channels, pad_samples, cancel)?;
     let range = selection.map(|(start, end)| {
         (
@@ -671,21 +673,17 @@ pub fn render_pad_cancellable(
         )
     });
     let mut remaining = selection.map(|(start, end)| end - start);
-    backend
-        .decode_native(source, 0, range, &mut |block| {
-            check_cancel(cancel).map_err(decode_render_error)?;
-            let available = block.frames.first().map_or(0, Vec::len);
-            let take = remaining.map_or(available, |n| n.min(available as u64) as usize);
-            let selected: Vec<&[f32]> = block.frames.iter().map(|ch| &ch[..take]).collect();
-            writer
-                .write_pcm(channels, &selected, f32::to_le_bytes)
-                .map_err(decode_render_error)?;
-            if let Some(ref mut n) = remaining {
-                *n -= take as u64;
-            }
-            Ok(())
-        })
-        .map_err(RenderError::from)?;
+    backend.decode_native(source, 0, range, &mut |block| {
+        check_cancel(cancel)?;
+        let available = block.frames.first().map_or(0, Vec::len);
+        let take = remaining.map_or(available, |n| n.min(available as u64) as usize);
+        let selected: Vec<&[f32]> = block.frames.iter().map(|ch| &ch[..take]).collect();
+        writer.write_pcm(channels, &selected, f32::to_le_bytes)?;
+        if let Some(ref mut n) = remaining {
+            *n -= take as u64;
+        }
+        Ok(())
+    })?;
     if let (Some(n), Some((_, end))) = (remaining, selection) {
         finish_tail(
             &mut writer,
@@ -699,146 +697,137 @@ pub fn render_pad_cancellable(
     }
     check_cancel(cancel)?;
     writer.finalize()?;
-    align_core::wav::preserve_broadcast_extension(
+    preserve_broadcast_extension(
         source,
-        &tmp,
+        staged.path(),
         sample_rate,
         channels,
         32,
         "placement pad",
         reference_shift,
-    )
-    .map_err(|_| RenderError::CannotWrite)?;
-    #[cfg(windows)]
-    if destination.exists() {
-        std::fs::remove_file(destination).map_err(|_| RenderError::CannotWrite)?;
-    }
-    std::fs::rename(&tmp, destination).map_err(|_| RenderError::CannotWrite)?;
-    DropGuard::dismiss(cleanup);
-    Ok(())
+    )?;
+    staged.commit().map_err(RenderError::Write)
 }
 
 // ------------------------------------------------------------ channel stem
 
-/// Sample-exact mono stems for selected source channels (zero-based).
-/// Each pass decodes once for up to 64 outputs, bounding open files and buffers.
-/// Uses int32 for 32-bit integer sources, otherwise float32. BWF TimeReference
-/// shifts by the trim offset; CodingHistory records each channel extraction.
-#[allow(clippy::too_many_arguments)]
+/// Sample-exact mono stems of selected source channels over one range.
+pub struct ChannelStems<'a> {
+    /// Zero-based source channel and output file of each stem.
+    pub outputs: &'a [(usize, &'a Path)],
+    /// Source sample format. 32-bit integer sources produce 32-bit integer
+    /// stems; every other format produces 32-bit float.
+    pub bit_depth: Option<u32>,
+    pub is_float: bool,
+    /// Selected source range, in seconds.
+    pub source_start: f64,
+    pub duration: f64,
+    /// Silence appended after the selected range.
+    pub tail_samples: u64,
+}
+
+/// Outputs written per decoding pass, bounding open files and buffers.
+const STEMS_PER_PASS: usize = 64;
+
+/// Renders [`ChannelStems`]. Each pass decodes the source once for up to
+/// 64 outputs. BWF TimeReference shifts by the trim offset;
+/// CodingHistory records each channel extraction.
 pub fn render_channels_cancellable(
     backend: &dyn MediaBackend,
     source: &Path,
-    destinations: &[(usize, &Path)],
-    bit_depth: Option<u32>,
-    is_float: bool,
-    source_start: f64,
-    duration: f64,
-    tail_samples: u64,
+    stems: &ChannelStems<'_>,
     cancel: &AtomicBool,
 ) -> Result<(), RenderError> {
     check_cancel(cancel)?;
-    if destinations.is_empty() {
+    if stems.outputs.is_empty() {
         return Ok(());
     }
-    let int32 = matches!(bit_depth, Some(32)) && !is_float;
-    let probe = backend.inspect(source).map_err(RenderError::from)?;
-    let stream = probe
-        .audio_streams
-        .first()
-        .ok_or_else(|| RenderError::NoAudio(file_name(source)))?;
-    let (sample_rate, channels) = (stream.sample_rate, stream.channels);
-    if sample_rate <= 0.0
-        || channels == 0
-        || destinations.iter().any(|(channel, _)| *channel >= channels)
+    let int32 = matches!(stems.bit_depth, Some(32)) && !stems.is_float;
+    let (probe, sample_rate, channels) = audio_format(backend, source)?;
+    if stems
+        .outputs
+        .iter()
+        .any(|(channel, _)| *channel >= channels)
     {
-        return Err(RenderError::UnknownFormat(file_name(source)));
+        return Err(RenderError::InvalidRequest(
+            "a stem names a channel the source does not have",
+        ));
     }
     let mut paths = std::collections::HashSet::new();
-    if destinations.iter().any(|(_, path)| !paths.insert(*path)) {
-        return Err(RenderError::InvalidMapping);
+    if stems.outputs.iter().any(|(_, path)| !paths.insert(*path)) {
+        return Err(RenderError::InvalidRequest(
+            "two stems share one output file",
+        ));
     }
-    let start_frame = ((source_start.max(0.0)) * sample_rate).round() as i64;
-    let take_frames = ((duration * sample_rate).round() as i64).max(0) as u64;
+    let source_start = stems.source_start.max(0.0);
+    let start_frame = (source_start * sample_rate).round() as i64;
+    let take_frames = ((stems.duration * sample_rate).round() as i64).max(0) as u64;
+    let range = Some((source_start, Some(stems.duration)));
 
-    for destinations in destinations.chunks(64) {
+    for outputs in stems.outputs.chunks(STEMS_PER_PASS) {
         check_cancel(cancel)?;
-        let temporary = destinations
+        let staged = outputs
             .iter()
-            .map(|(_, destination)| {
-                let parent = destination
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."));
-                tempfile::NamedTempFile::new_in(parent)
-                    .map(tempfile::NamedTempFile::into_temp_path)
-                    .map_err(|_| RenderError::CannotWrite)
-            })
+            .map(|(_, destination)| StagedFile::new(destination).map_err(RenderError::Write))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut writers = destinations
+        let mut writers = outputs
             .iter()
-            .zip(&temporary)
-            .map(|((channel, _), path)| {
-                WavWriter::create(path, sample_rate as u32, 1, int32)
+            .zip(&staged)
+            .map(|((channel, _), staged)| {
+                WavWriter::create(staged.path(), sample_rate as u32, 1, int32)
                     .map(|writer| (*channel, writer))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut remaining = take_frames;
-        let range = Some((source_start.max(0.0), Some(duration)));
         if int32 {
-            backend
-                .decode_native_i32(source, 0, range, &mut |block: NativeBlockI32| {
-                    write_channel_block(
-                        &mut writers,
-                        &block.frames,
-                        &mut remaining,
-                        i32::to_le_bytes,
-                        cancel,
-                    )
-                    .map_err(decode_render_error)
-                })
-                .map_err(RenderError::from)?;
+            backend.decode_native_i32(source, 0, range, &mut |block: NativeBlockI32| {
+                check_cancel(cancel)?;
+                write_channel_block(
+                    &mut writers,
+                    &block.frames,
+                    &mut remaining,
+                    i32::to_le_bytes,
+                )?;
+                Ok(())
+            })?;
         } else {
-            backend
-                .decode_native(source, 0, range, &mut |block: NativeBlock| {
-                    write_channel_block(
-                        &mut writers,
-                        &block.frames,
-                        &mut remaining,
-                        f32::to_le_bytes,
-                        cancel,
-                    )
-                    .map_err(decode_render_error)
-                })
-                .map_err(RenderError::from)?;
+            backend.decode_native(source, 0, range, &mut |block: NativeBlock| {
+                check_cancel(cancel)?;
+                write_channel_block(
+                    &mut writers,
+                    &block.frames,
+                    &mut remaining,
+                    f32::to_le_bytes,
+                )?;
+                Ok(())
+            })?;
         }
-        for ((channel, mut writer), path) in writers.into_iter().zip(&temporary) {
+        for ((channel, mut writer), staged) in writers.into_iter().zip(&staged) {
             check_cancel(cancel)?;
             finish_tail(
                 &mut writer,
                 &probe,
-                source_start.max(0.0) + duration,
+                source_start + stems.duration,
                 remaining,
                 sample_rate,
                 1,
                 cancel,
             )?;
-            writer.write_silence(1, tail_samples, cancel)?;
+            writer.write_silence(1, stems.tail_samples, cancel)?;
             writer.finalize()?;
-            align_core::wav::preserve_broadcast_extension(
+            preserve_broadcast_extension(
                 source,
-                path,
+                staged.path(),
                 sample_rate,
                 1,
                 32,
                 &format!("channel {} extraction", channel + 1),
                 start_frame,
-            )
-            .map_err(|_| RenderError::CannotWrite)?;
+            )?;
         }
-        for (path, (_, destination)) in temporary.into_iter().zip(destinations) {
+        for staged in staged {
             check_cancel(cancel)?;
-            path.persist(destination)
-                .map_err(|_| RenderError::CannotWrite)?;
+            staged.commit().map_err(RenderError::Write)?;
         }
     }
     Ok(())
@@ -849,9 +838,7 @@ fn write_channel_block<T: Copy>(
     frames: &[Vec<T>],
     remaining: &mut u64,
     encode: fn(T) -> [u8; 4],
-    cancel: &AtomicBool,
 ) -> Result<(), RenderError> {
-    check_cancel(cancel)?;
     if *remaining == 0 {
         return Ok(());
     }
@@ -860,7 +847,7 @@ fn write_channel_block<T: Copy>(
         let samples = frames
             .get(*channel)
             .and_then(|plane| plane.get(..take))
-            .ok_or(RenderError::CannotRead)?;
+            .ok_or(RenderError::Decode(DecodeError::InvalidPcm))?;
         writer.write_pcm(1, &[samples], encode)?;
     }
     *remaining -= take as u64;
@@ -952,10 +939,10 @@ mod tests {
                     .collect::<Vec<_>>()
             };
             writer.write_silence(2, 8193, &NEVER_CANCELLED).unwrap();
-            assert_eq!(
+            assert!(matches!(
                 writer.write_silence(2, 1, &AtomicBool::new(true)),
                 Err(RenderError::Cancelled)
-            );
+            ));
             writer.finalize().unwrap();
             let bytes = std::fs::read(path).unwrap();
             assert_eq!(&bytes[80..104], expected);
@@ -1163,33 +1150,33 @@ mod tests {
         let mut probe = crate::portable::PortableBackend.inspect(&src).unwrap();
         let dst = dir.join("tail.wav");
         let mut writer = WavWriter::create(&dst, 48000, 2, false).unwrap();
-        assert_eq!(
+        assert!(matches!(
             finish_tail(&mut writer, &probe, 1.0, 6, 48000.0, 2, cancel),
-            Err(RenderError::CannotRead)
-        );
+            Err(RenderError::Truncated)
+        ));
         probe.has_video = true;
-        assert_eq!(
+        assert!(matches!(
             finish_tail(&mut writer, &probe, 0.9, 6, 48000.0, 2, cancel),
-            Err(RenderError::CannotRead)
-        );
-        assert_eq!(
+            Err(RenderError::Truncated)
+        ));
+        assert!(matches!(
             finish_tail(&mut writer, &probe, 1.0, 4800, 48000.0, 2, cancel),
-            Err(RenderError::CannotRead)
-        );
+            Err(RenderError::Truncated)
+        ));
         // Even a short shortage is not valid inside a known audio extent.
-        assert_eq!(
+        assert!(matches!(
             finish_tail(&mut writer, &probe, 1.0, 6, 48000.0, 2, cancel),
-            Err(RenderError::CannotRead)
-        );
+            Err(RenderError::Truncated)
+        ));
         probe.duration_seconds = 1.14;
-        assert_eq!(
+        assert!(matches!(
             finish_tail(&mut writer, &probe, 1.14, 6721, 48000.0, 2, cancel),
-            Err(RenderError::CannotRead)
-        );
-        assert_eq!(
+            Err(RenderError::Truncated)
+        ));
+        assert!(matches!(
             finish_tail(&mut writer, &probe, 1.15, 7200, 48000.0, 2, cancel),
-            Err(RenderError::CannotRead)
-        );
+            Err(RenderError::Truncated)
+        ));
         finish_tail(&mut writer, &probe, 1.14, 6720, 48000.0, 2, cancel).unwrap();
         probe.audio_streams[0].end_seconds = None;
         finish_tail(&mut writer, &probe, 1.14, 6, 48000.0, 2, cancel).unwrap();
@@ -1215,12 +1202,14 @@ mod tests {
         render_channels_cancellable(
             &backend,
             &source,
-            &[(0, &stem)],
-            None,
-            false,
-            0.0,
-            probe.duration_seconds,
-            0,
+            &ChannelStems {
+                outputs: &[(0, &stem)],
+                bit_depth: None,
+                is_float: false,
+                source_start: 0.0,
+                duration: probe.duration_seconds,
+                tail_samples: 0,
+            },
             &NEVER_CANCELLED,
         )
         .unwrap();
@@ -1242,9 +1231,10 @@ mod tests {
         std::fs::write(&dst, b"existing output").unwrap();
         assert!(render_pad(&crate::portable::PortableBackend, &src, &dst, 192, None).is_err());
         assert_eq!(std::fs::read(&dst).unwrap(), b"existing output");
-        assert!(
-            !dst.with_extension(format!("tmp-{}.wav", std::process::id()))
-                .exists()
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            2,
+            "no staged file remains"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1310,32 +1300,34 @@ mod tests {
         let second = dir.join("second.wav");
         let cancel = AtomicBool::new(false);
         let backend = CancelOnDecode(&cancel);
-        assert_eq!(
+        assert!(matches!(
             render_drift_cancellable(&backend, &src, &dst, &[(0.0, 0.0), (1.0, 1.001)], &cancel),
             Err(RenderError::Cancelled)
-        );
+        ));
         for integer in [false, true] {
             cancel.store(false, Ordering::Relaxed);
-            assert_eq!(
+            assert!(matches!(
                 render_channels_cancellable(
                     &backend,
                     &src,
-                    &[(0, &dst), (1, &second)],
-                    Some(if integer { 32 } else { 16 }),
-                    false,
-                    0.0,
-                    1.0,
-                    0,
-                    &cancel
+                    &ChannelStems {
+                        outputs: &[(0, &dst), (1, &second)],
+                        bit_depth: Some(if integer { 32 } else { 16 }),
+                        is_float: false,
+                        source_start: 0.0,
+                        duration: 1.0,
+                        tail_samples: 0,
+                    },
+                    &cancel,
                 ),
                 Err(RenderError::Cancelled)
-            );
+            ));
         }
         cancel.store(false, Ordering::Relaxed);
-        assert_eq!(
+        assert!(matches!(
             render_pad_cancellable(&backend, &src, &dst, 192, None, &cancel),
             Err(RenderError::Cancelled)
-        );
+        ));
         assert_eq!(std::fs::read(&dst).unwrap(), b"existing output");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
         std::fs::remove_dir_all(dir).unwrap();
@@ -1349,11 +1341,11 @@ mod tests {
         let backend = crate::portable::PortableBackend;
         let cancel = AtomicBool::new(true);
         let source = dir.join("missing.wav");
-        assert_eq!(
+        assert!(matches!(
             render_pad_cancellable(&backend, &source, &dst, 192, None, &cancel),
             Err(RenderError::Cancelled)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             render_drift_cancellable(
                 &backend,
                 &source,
@@ -1362,21 +1354,23 @@ mod tests {
                 &cancel
             ),
             Err(RenderError::Cancelled)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             render_channels_cancellable(
                 &backend,
                 &source,
-                &[(0, &dst)],
-                Some(16),
-                false,
-                0.0,
-                1.0,
-                0,
-                &cancel
+                &ChannelStems {
+                    outputs: &[(0, &dst)],
+                    bit_depth: Some(16),
+                    is_float: false,
+                    source_start: 0.0,
+                    duration: 1.0,
+                    tail_samples: 0,
+                },
+                &cancel,
             ),
             Err(RenderError::Cancelled)
-        );
+        ));
         assert_eq!(std::fs::read(&dst).unwrap(), b"existing output");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         std::fs::remove_dir_all(dir).unwrap();
@@ -1411,10 +1405,10 @@ mod tests {
                 cancel.store(true, Ordering::Relaxed);
             });
             let start = std::time::Instant::now();
-            assert_eq!(
-                crate::export::wait_render_process(&mut child, &cancel),
-                Err(RenderError::Cancelled)
-            );
+            assert!(matches!(
+                crate::process::wait_cancellable(&mut child, &cancel),
+                Err(crate::process::WaitError::Cancelled)
+            ));
             assert!(start.elapsed() < std::time::Duration::from_secs(3));
         });
         assert!(child.try_wait().unwrap().is_some());
@@ -1484,12 +1478,14 @@ mod tests {
                 render_channels_cancellable(
                     backend.as_ref(),
                     &source,
-                    &[(1, &right), (0, &left)],
-                    Some(u32::from(bits)),
-                    format == hound::SampleFormat::Float,
-                    137.0 / 48000.0,
-                    701.0 / 48000.0,
-                    17,
+                    &ChannelStems {
+                        outputs: &[(1, &right), (0, &left)],
+                        bit_depth: Some(u32::from(bits)),
+                        is_float: format == hound::SampleFormat::Float,
+                        source_start: 137.0 / 48000.0,
+                        duration: 701.0 / 48000.0,
+                        tail_samples: 17,
+                    },
                     &NEVER_CANCELLED,
                 )
                 .unwrap();
@@ -1548,12 +1544,14 @@ mod tests {
         render_channels_cancellable(
             &crate::apple::AppleNativeBackend,
             &src,
-            &[(0, &dst)],
-            Some(16),
-            false,
-            0.4004,
-            (80080.0 - 0.00001) / 48000.0,
-            0,
+            &ChannelStems {
+                outputs: &[(0, &dst)],
+                bit_depth: Some(16),
+                is_float: false,
+                source_start: 0.4004,
+                duration: (80080.0 - 0.00001) / 48000.0,
+                tail_samples: 0,
+            },
             &NEVER_CANCELLED,
         )
         .unwrap();
@@ -1750,7 +1748,7 @@ mod tests {
     #[test]
     fn clock_ratio_has_bounded_streaming_latency() {
         for ratio in [1.000801, 0.9999977, 1.000002161] {
-            let mut segment = Segment::new(0.0, 60.0, 60.0 * ratio, 48000.0, 2).unwrap();
+            let mut segment = Segment::new(60.0, 60.0 * ratio, 48000.0, 2).unwrap();
             assert!(segment.skip < 4096, "ratio {ratio}: delay {}", segment.skip);
             let out = segment.push(vec![vec![0.25; 4096]; 2]).unwrap();
             assert!(!out[0].is_empty(), "ratio {ratio}: first block buffered");
@@ -1789,7 +1787,7 @@ mod tests {
         let backend = crate::portable::PortableBackend;
         let err = render_drift(&backend, &src, &dir.join("o.wav"), &[(0.0, 0.0)])
             .expect_err("single point");
-        assert_eq!(err, RenderError::InvalidMapping);
+        assert!(matches!(err, RenderError::InvalidRequest(_)), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

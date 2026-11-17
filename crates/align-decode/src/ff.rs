@@ -11,25 +11,11 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdout, Stdio};
 
 use crate::DecodeError;
 use crate::backend::{AudioStreamProbe, ProbeReport, VideoProbe};
-
-/// A child process that never opens a console window. The Windows desktop
-/// app has no console, so each helper (FFmpeg, the AAF module) would
-/// otherwise flash one; elsewhere this is `Command::new`.
-pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
-    #[allow(unused_mut)]
-    let mut command = Command::new(program);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    command
-}
+use crate::process::command;
 
 /// Locate `ffprobe`/`ffmpeg`: explicit env override → executable's dir
 /// (bundled sidecar layout) → PATH.

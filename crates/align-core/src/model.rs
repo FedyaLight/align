@@ -58,7 +58,8 @@ impl MediaTime {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// A clip's kind, and the audio or video side of an item on a timeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MediaKind {
     Audio,
@@ -71,6 +72,12 @@ impl MediaKind {
             Self::Audio => "audio",
             Self::Video => "video",
         }
+    }
+}
+
+impl std::fmt::Display for MediaKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

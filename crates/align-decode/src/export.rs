@@ -1,25 +1,34 @@
 //! Export preparation and format dispatch.
 //!
-//! Renders corrected audio and precision stems, retains temporary source
-//! media, and writes timeline artifacts. Prepared audio is reused when its
-//! cache identity matches the requested operation. Single and batch exports
-//! share the same preparation path.
+//! An export first plans every audio file the timeline writers will reference
+//! (drift corrections, Premiere placement pads, Resolve precision stems) and
+//! attaches their paths to the timeline. The plan is then rendered job by job
+//! with progress, and the timelines are written last. Prepared audio is
+//! reused when its file name, which encodes its full identity, already exists.
+//! Single and batch exports share the same preparation path.
 
 use std::collections::{HashMap, HashSet};
+use std::io;
 #[cfg(not(unix))]
 use std::io::Read;
-use std::mem::DropGuard;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use align_core::drift::needs_correction_points;
+use align_core::export::fcpxml::FcpxmlOptions;
 use align_core::export::model::{
     ExportIsland, ExportItem, ExportTimeline, TimelineExportError, TimelineExportFormat,
     placement_pad_samples, sequence_fps,
 };
+use align_core::model::file_name;
+use align_core::{MediaKind, MediaTime};
 
+use crate::aaf::AafError;
 use crate::backend::MediaBackend;
+use crate::process::WaitError;
 use crate::render::{
-    RenderError, render_channels_cancellable, render_drift_cancellable, render_pad_cancellable,
+    ChannelStems, RenderError, render_channels_cancellable, render_drift_cancellable,
+    render_pad_cancellable,
 };
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -73,109 +82,140 @@ pub enum ExportJobKind {
     Media,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ExportError {
-    Timeline(TimelineExportError),
-    Render(RenderError),
-    AudioRender {
+    #[error(transparent)]
+    Timeline(#[from] TimelineExportError),
+    #[error("Could not prepare {operation} audio for {file}: {source}")]
+    Audio {
         file: String,
         operation: &'static str,
-        error: RenderError,
+        #[source]
+        source: RenderError,
     },
-    Media(String),
+    #[error("Could not export media for {file}: {message}")]
+    Media { file: String, message: String },
+    #[error("Cannot read {file}: {source}")]
+    Read {
+        file: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("Cannot write export files: {0}")]
+    Write(#[source] io::Error),
+    #[error("Cannot build the timeline document: {0}")]
+    Document(String),
+    #[error(transparent)]
+    Aaf(AafError),
+    #[error("{0}")]
+    Unsupported(&'static str),
+    #[error("Cancelled.")]
     Cancelled,
-    Io(String),
-}
-
-impl From<RenderError> for ExportError {
-    fn from(error: RenderError) -> Self {
-        match error {
-            RenderError::Cancelled => Self::Cancelled,
-            other => Self::Render(other),
-        }
-    }
 }
 
 impl ExportError {
-    fn audio(source: &Path, operation: &'static str, error: RenderError) -> Self {
+    /// A render failure, named by the timeline media it was prepared from.
+    fn audio(media: &Path, operation: &'static str, error: RenderError) -> Self {
         match error {
             RenderError::Cancelled => Self::Cancelled,
-            error => Self::AudioRender {
-                file: align_core::model::file_name(source),
+            source => Self::Audio {
+                file: file_name(media),
                 operation,
-                error,
+                source,
             },
         }
     }
-}
 
-impl std::fmt::Display for ExportError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Timeline(e) => write!(f, "{e}"),
-            Self::Render(e) => write!(f, "{e}"),
-            Self::AudioRender {
-                file,
-                operation,
-                error,
-            } => {
-                write!(f, "Could not prepare {operation} audio for {file}: {error}")
-            }
-            Self::Media(message) => write!(f, "Media export: {message}"),
-            Self::Cancelled => write!(f, "Cancelled."),
-            Self::Io(msg) => write!(f, "Export IO: {msg}"),
+    fn read(path: &Path) -> impl FnOnce(io::Error) -> Self {
+        let file = file_name(path);
+        move |source| Self::Read { file, source }
+    }
+
+    fn media(path: &Path, message: impl std::fmt::Display) -> Self {
+        Self::Media {
+            file: file_name(path),
+            message: message.to_string(),
+        }
+    }
+
+    /// Media preservation reports cancellation as an interrupted write.
+    fn write_or_cancelled(error: io::Error) -> Self {
+        if error.kind() == io::ErrorKind::Interrupted {
+            Self::Cancelled
+        } else {
+            Self::Write(error)
         }
     }
 }
 
-impl std::error::Error for ExportError {}
-
-/// Write timelines without rendering drift corrections or audio stems.
-pub fn export(
-    timeline: &ExportTimeline,
-    directory: &Path,
-    formats: &[TimelineExportFormat],
-    include_replaced_sequence: bool,
-) -> Result<Vec<ExportArtifact>, ExportError> {
-    timeline
-        .validate_audio_source_channels()
-        .map_err(ExportError::Timeline)?;
-    std::fs::create_dir_all(directory).map_err(|e| ExportError::Io(e.to_string()))?;
-    let mut timeline = timeline.clone();
-    crate::media_assets::preserve_export(
-        &mut timeline,
-        directory,
-        &std::sync::atomic::AtomicBool::new(false),
-    )
-    .map_err(|error| ExportError::Io(error.to_string()))?;
-    write_artifacts(
-        &timeline,
-        directory,
-        formats,
-        include_replaced_sequence,
-        true,
-        true,
-        false,
-    )
+impl From<AafError> for ExportError {
+    fn from(error: AafError) -> Self {
+        match error {
+            AafError::Cancelled => Self::Cancelled,
+            other => Self::Aaf(other),
+        }
+    }
 }
 
-/// Drift-corrected export with precision stems and sequential job execution.
-/// Export job description (bundles the growing parameter list).
+impl From<WaitError> for ExportError {
+    fn from(error: WaitError) -> Self {
+        match error {
+            WaitError::Cancelled => Self::Cancelled,
+            WaitError::Io(error) => Self::Write(error),
+        }
+    }
+}
+
+fn check_cancel(cancel: &AtomicBool) -> Result<(), ExportError> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(ExportError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+/// What an export produces, independent of the timeline and media engine.
+#[derive(Clone, Debug)]
+pub struct ExportOptions {
+    pub formats: Vec<TimelineExportFormat>,
+    /// Render drift-corrected audio for recorders whose clock drifts.
+    pub correct_drift: bool,
+    /// Premiere/Resolve XML: also write the sequence with camera audio replaced.
+    pub include_replaced_sequence: bool,
+    /// Copy each camera file with the synchronized recorder audio.
+    pub include_media_files: bool,
+    /// Override the AAF composition timecode rate used by Resolve. Picture
+    /// source slots retain their native edit rates.
+    pub aaf_frame_duration: Option<MediaTime>,
+    pub fcpxml: FcpxmlOptions,
+}
+
+impl Default for ExportOptions {
+    fn default() -> Self {
+        Self {
+            formats: TimelineExportFormat::default_formats(),
+            correct_drift: true,
+            include_replaced_sequence: false,
+            include_media_files: false,
+            aaf_frame_duration: None,
+            fcpxml: FcpxmlOptions::default(),
+        }
+    }
+}
+
+impl ExportOptions {
+    fn wants(&self, format: TimelineExportFormat) -> bool {
+        self.formats.contains(&format)
+    }
+}
+
+/// One synchronized timeline to export.
 pub struct ExportRequest<'a> {
     pub backend: &'a dyn MediaBackend,
     pub timeline: &'a ExportTimeline,
     pub directory: &'a Path,
-    pub formats: &'a [TimelineExportFormat],
-    pub correct_drift: bool,
-    pub include_replaced_sequence: bool,
-    pub include_media_files: bool,
-    /// Override the AAF composition timecode rate used by Resolve. Picture
-    /// source slots retain their native edit rates.
-    pub aaf_frame_duration: Option<align_core::MediaTime>,
-    pub include_fcpxml_timeline: bool,
-    pub include_fcpxml_multicam: bool,
-    pub group_fcpxml_storylines: bool,
-    pub cancel: &'a std::sync::atomic::AtomicBool,
+    pub options: &'a ExportOptions,
+    pub cancel: &'a AtomicBool,
 }
 
 /// One export action containing several independently synchronized sequences.
@@ -185,121 +225,105 @@ pub struct ExportBatchRequest<'a> {
     pub backend: &'a dyn MediaBackend,
     pub timelines: &'a [ExportTimeline],
     pub directory: &'a Path,
-    pub formats: &'a [TimelineExportFormat],
-    pub correct_drift: bool,
-    pub include_replaced_sequence: bool,
-    pub include_media_files: bool,
-    pub aaf_frame_duration: Option<align_core::MediaTime>,
-    pub include_fcpxml_timeline: bool,
-    pub include_fcpxml_multicam: bool,
-    pub group_fcpxml_storylines: bool,
-    pub cancel: &'a std::sync::atomic::AtomicBool,
+    pub options: &'a ExportOptions,
+    pub cancel: &'a AtomicBool,
+}
+
+/// Write timelines without rendering drift corrections or audio stems.
+pub fn export(
+    timeline: &ExportTimeline,
+    directory: &Path,
+    formats: &[TimelineExportFormat],
+    include_replaced_sequence: bool,
+) -> Result<Vec<ExportArtifact>, ExportError> {
+    if formats.contains(&TimelineExportFormat::Aaf) {
+        return Err(ExportError::Unsupported(
+            "AAF requires prepared audio export.",
+        ));
+    }
+    timeline.validate_audio_source_channels()?;
+    std::fs::create_dir_all(directory).map_err(ExportError::Write)?;
+    let mut timeline = timeline.clone();
+    crate::media_assets::preserve_export(&mut timeline, directory, &AtomicBool::new(false))
+        .map_err(ExportError::write_or_cancelled)?;
+    write_artifacts(
+        &timeline,
+        directory,
+        formats,
+        include_replaced_sequence,
+        FcpxmlOptions::default(),
+    )
 }
 
 pub fn export_prepared_many(
     request: ExportBatchRequest<'_>,
     mut progress: Option<&mut dyn FnMut(ExportJobProgress)>,
 ) -> Result<Vec<ExportArtifact>, ExportError> {
-    if request.timelines.is_empty() {
-        return Err(ExportError::Timeline(
-            TimelineExportError::NoSynchronizedIslands,
-        ));
-    }
-    if request.timelines.len() == 1 {
+    let ExportBatchRequest {
+        backend,
+        timelines,
+        directory,
+        options,
+        cancel,
+    } = request;
+    if let [timeline] = timelines {
         return export_prepared(
             ExportRequest {
-                backend: request.backend,
-                timeline: &request.timelines[0],
-                directory: request.directory,
-                formats: request.formats,
-                correct_drift: request.correct_drift,
-                include_replaced_sequence: request.include_replaced_sequence,
-                include_media_files: request.include_media_files,
-                aaf_frame_duration: request.aaf_frame_duration,
-                include_fcpxml_timeline: request.include_fcpxml_timeline,
-                include_fcpxml_multicam: request.include_fcpxml_multicam,
-                group_fcpxml_storylines: request.group_fcpxml_storylines,
-                cancel: request.cancel,
+                backend,
+                timeline,
+                directory,
+                options,
+                cancel,
             },
             progress,
         );
     }
+    if timelines.is_empty() {
+        return Err(TimelineExportError::NoSynchronizedIslands.into());
+    }
 
-    std::fs::create_dir_all(request.directory).map_err(|e| ExportError::Io(e.to_string()))?;
+    std::fs::create_dir_all(directory).map_err(ExportError::Write)?;
     let mut artifacts = Vec::new();
     let mut premiere_documents = Vec::new();
     let mut fcpxml_documents = Vec::new();
     let mut aaf_manifests = Vec::new();
-    for (index, timeline) in request.timelines.iter().enumerate() {
-        if request.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(ExportError::Cancelled);
-        }
-        let sequence_dir = request
-            .directory
-            .join(sequence_folder(index, &timeline.name));
-        let (sequence_artifacts, aaf_manifest) = if let Some(callback) = progress.as_deref_mut() {
-            export_prepared_internal(
-                ExportRequest {
-                    backend: request.backend,
-                    timeline,
-                    directory: &sequence_dir,
-                    formats: request.formats,
-                    correct_drift: request.correct_drift,
-                    include_replaced_sequence: request.include_replaced_sequence,
-                    include_media_files: request.include_media_files,
-                    aaf_frame_duration: request.aaf_frame_duration,
-                    include_fcpxml_timeline: request.include_fcpxml_timeline,
-                    include_fcpxml_multicam: request.include_fcpxml_multicam,
-                    group_fcpxml_storylines: request.group_fcpxml_storylines,
-                    cancel: request.cancel,
-                },
-                Some(callback),
-                true,
-            )?
-        } else {
-            export_prepared_internal(
-                ExportRequest {
-                    backend: request.backend,
-                    timeline,
-                    directory: &sequence_dir,
-                    formats: request.formats,
-                    correct_drift: request.correct_drift,
-                    include_replaced_sequence: request.include_replaced_sequence,
-                    include_media_files: request.include_media_files,
-                    aaf_frame_duration: request.aaf_frame_duration,
-                    include_fcpxml_timeline: request.include_fcpxml_timeline,
-                    include_fcpxml_multicam: request.include_fcpxml_multicam,
-                    group_fcpxml_storylines: request.group_fcpxml_storylines,
-                    cancel: request.cancel,
-                },
-                None,
-                true,
-            )?
-        };
+    for (index, timeline) in timelines.iter().enumerate() {
+        check_cancel(cancel)?;
+        let sequence_dir = directory.join(sequence_folder(index, &timeline.name));
+        let (sequence_artifacts, aaf_manifest) = export_prepared_internal(
+            ExportRequest {
+                backend,
+                timeline,
+                directory: &sequence_dir,
+                options,
+                cancel,
+            },
+            progress
+                .as_mut()
+                .map(|report| &mut **report as &mut dyn FnMut(ExportJobProgress)),
+            true,
+        )?;
         aaf_manifests.extend(aaf_manifest);
         for artifact in sequence_artifacts {
-            match artifact.format {
-                ExportArtifactFormat::PremiereXML => premiere_documents.push(
-                    std::fs::read_to_string(&artifact.url)
-                        .map_err(|e| ExportError::Io(e.to_string()))?,
-                ),
-                ExportArtifactFormat::FinalCutProXML => fcpxml_documents.push(
-                    std::fs::read_to_string(&artifact.url)
-                        .map_err(|e| ExportError::Io(e.to_string()))?,
-                ),
+            let documents = match artifact.format {
+                ExportArtifactFormat::PremiereXML => &mut premiere_documents,
+                ExportArtifactFormat::FinalCutProXML => &mut fcpxml_documents,
                 _ => {
                     artifacts.push(artifact);
                     continue;
                 }
-            }
+            };
+            documents.push(
+                std::fs::read_to_string(&artifact.url).map_err(ExportError::read(&artifact.url))?,
+            );
             let _ = std::fs::remove_file(artifact.url);
         }
     }
     if !premiere_documents.is_empty() {
         let xml = align_core::export::premiere::combine_project_documents(&premiere_documents)
-            .map_err(ExportError::Io)?;
-        let url = request.directory.join("Align – Adobe Premiere Pro.xml");
-        write_atomic(&url, xml.as_bytes())?;
+            .map_err(ExportError::Document)?;
+        let url = directory.join("Align – Adobe Premiere Pro.xml");
+        align_core::staged::write(&url, xml.as_bytes()).map_err(ExportError::Write)?;
         artifacts.push(ExportArtifact {
             format: ExportArtifactFormat::PremiereXML,
             url,
@@ -307,9 +331,9 @@ pub fn export_prepared_many(
     }
     if !fcpxml_documents.is_empty() {
         let xml = align_core::export::fcpxml::combine_documents(&fcpxml_documents)
-            .map_err(ExportError::Io)?;
-        let url = request.directory.join("Align – Final Cut Pro.fcpxml");
-        write_atomic(&url, xml.as_bytes())?;
+            .map_err(ExportError::Document)?;
+        let url = directory.join("Align – Final Cut Pro.fcpxml");
+        align_core::staged::write(&url, xml.as_bytes()).map_err(ExportError::Write)?;
         artifacts.push(ExportArtifact {
             format: ExportArtifactFormat::FinalCutProXML,
             url,
@@ -317,8 +341,8 @@ pub fn export_prepared_many(
     }
     if !aaf_manifests.is_empty() {
         let manifest = serde_json::json!({"version": 3, "sequences": aaf_manifests});
-        let url = request.directory.join("Align.aaf");
-        write_aaf_manifest(&manifest, request.directory, &url, request.cancel)?;
+        let url = directory.join("Align.aaf");
+        write_aaf_manifest(&manifest, directory, &url, cancel)?;
         artifacts.push(ExportArtifact {
             format: ExportArtifactFormat::Aaf,
             url,
@@ -351,426 +375,75 @@ pub fn export_prepared(
     export_prepared_internal(request, progress, false).map(|(artifacts, _)| artifacts)
 }
 
+/// Prepares audio and writes every requested artifact. With `defer_aaf`, the
+/// AAF manifest is returned for a batch to combine instead of being written.
 fn export_prepared_internal(
     request: ExportRequest<'_>,
-    mut progress: Option<&mut dyn FnMut(ExportJobProgress)>,
+    progress: Option<&mut dyn FnMut(ExportJobProgress)>,
     defer_aaf: bool,
 ) -> Result<(Vec<ExportArtifact>, Option<serde_json::Value>), ExportError> {
-    request
-        .timeline
-        .validate_audio_source_channels()
-        .map_err(ExportError::Timeline)?;
-    std::fs::create_dir_all(request.directory).map_err(|e| ExportError::Io(e.to_string()))?;
     let ExportRequest {
         backend,
         timeline,
         directory,
-        formats,
-        correct_drift,
-        include_replaced_sequence,
-        include_media_files,
-        aaf_frame_duration,
-        include_fcpxml_timeline,
-        include_fcpxml_multicam,
-        group_fcpxml_storylines,
+        options,
         cancel,
     } = request;
+    timeline.validate_audio_source_channels()?;
+    if options.wants(TimelineExportFormat::Aaf) && options.include_replaced_sequence {
+        return Err(ExportError::Unsupported(
+            "AAF replaced sequence export is not implemented.",
+        ));
+    }
+    std::fs::create_dir_all(directory).map_err(ExportError::Write)?;
     // Combine up front: the writer floors the combined island's starts, and
     // placement pads depend on those absolute starts (chronology shifts are
     // generally fractional). Planning on pre-combine starts would attach the
     // wrong prepend whenever the island minimum is not frame-exact.
     // Re-combining inside write_artifacts is a no-op shift afterwards.
     // Drift mappings are shift-invariant (relative source/island coords).
-    let mut combined = ExportTimeline::new(
-        vec![timeline.combined_island(1.0)],
-        timeline.frame_duration,
-        &timeline.name,
-    );
-    combined.temporal_policy = timeline.temporal_policy.clone();
-    combined.copy_assembly_policy_from(timeline);
-    crate::media_assets::preserve_export(&mut combined, directory, cancel).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::Interrupted {
-            ExportError::Cancelled
-        } else {
-            ExportError::Io(error.to_string())
-        }
-    })?;
-    // Resolve floors the timeline end even when the final audio item extends
-    // into the next partial frame. Extend only a final recorder's derived
-    // precision stem with silence so an Entire Timeline render retains it.
-    if formats.contains(&TimelineExportFormat::ResolveScript) {
-        let fps = sequence_fps(combined.frame_duration);
-        let end_for = |item: &ExportItem| {
-            let duration = if correct_drift
-                && needs_correction_points(&item.mapping_points)
-                && item.clip.kind == align_core::MediaKind::Audio
-            {
-                item.corrected_selected_duration()
-            } else {
-                item.selected_timeline_duration("audio")
-            };
-            item.timeline_start("audio") + duration
-        };
-        let maximum_end = combined.islands[0]
-            .clips
-            .iter()
-            .map(&end_for)
-            .fold(0.0, f64::max);
-        let frame_end = maximum_end * fps;
-        if (frame_end - frame_end.round()).abs() > 1e-7
-            && let Some(last) = combined.islands[0].clips.iter_mut().find(|item| {
-                item.clip.kind == align_core::MediaKind::Audio
-                    && !item.is_retimed("audio")
-                    && (end_for(item) - maximum_end).abs() < 1e-9
-            })
-        {
-            let sr = last.clip.audio.first().map_or(48000.0, |a| a.sample_rate);
-            // One extra sample covers nearest-sample placement rounding.
-            last.precision_tail_samples =
-                ((frame_end.ceil() / fps - maximum_end) * sr).ceil() as u64 + 1;
-        }
+    let mut combined = timeline.combined();
+    crate::media_assets::preserve_export(&mut combined, directory, cancel)
+        .map_err(ExportError::write_or_cancelled)?;
+    if options.wants(TimelineExportFormat::ResolveScript) {
+        extend_final_precision_tail(&mut combined, options.correct_drift);
     }
-    let timeline = &combined;
-    let all_items: Vec<&ExportItem> = timeline
-        .islands
-        .iter()
-        .flat_map(|i| i.clips.iter())
-        .collect();
 
-    let drift_ids: HashSet<&str> = all_items
-        .iter()
-        .filter(|item| {
-            correct_drift
-                && item.clip.kind == align_core::MediaKind::Audio
-                && needs_correction_points(&item.mapping_points)
-        })
-        .map(|item| item.clip.id.0.as_str())
-        .collect();
-
-    let wants_aaf = formats.contains(&TimelineExportFormat::Aaf);
-    if wants_aaf && include_replaced_sequence {
-        return Err(ExportError::Io(
-            "AAF replaced sequence export is not implemented".into(),
-        ));
-    }
-    let wants_script = formats.contains(&TimelineExportFormat::ResolveScript);
-    // Placement pads are a PremiereXML-only concern: no other writer reads
-    // them (OTIO/FCPXML place exactly already; the Resolve script locates
-    // stems through its own fractional API, so its stems stay unpadded).
-    let wants_pad = formats.contains(&TimelineExportFormat::PremiereXML);
-    let sequence_rate_fps = sequence_fps(timeline.frame_duration);
-    let wants_fcpxml = formats.contains(&TimelineExportFormat::FinalCutProXML);
-    let precision_items: Vec<&&ExportItem> = all_items
-        .iter()
-        .filter(|item| {
-            (wants_script || wants_aaf || wants_fcpxml)
-                && (item.clip.kind == align_core::MediaKind::Audio
-                    || (wants_aaf && !item.clip.audio.is_empty() && item.is_enabled("audio")))
-                && (wants_aaf
-                    || item.clip.audio.first().map_or(0, |a| a.channels) > 1
-                    || !item.is_full_source_selection()
-                    || item.precision_tail_samples > 0)
-        })
-        .collect();
-    let precision_keys: HashSet<String> = precision_items
-        .iter()
-        .map(|item| item.precision_asset_key())
-        .collect();
-
+    let plan = AudioPlan::new(&combined, options, directory, cancel)?;
     let media_dir = directory.join("Media Files");
-    let media_jobs = if include_media_files {
-        media_file_plans(timeline, &media_dir).len()
+    let media_plans = if options.include_media_files {
+        media_file_plans(&plan.timeline, &media_dir)
     } else {
-        0
+        Vec::new()
     };
-    // Stamp each source once. Unix inode + ctime detect replacements and
-    // same-size rewrites even with a restored mtime, without reading video.
-    let mut source_tags = HashMap::new();
-    for item in &all_items {
-        let needs_asset = drift_ids.contains(item.clip.id.0.as_str())
-            || precision_keys.contains(&item.precision_asset_key())
-            || (wants_pad
-                && pad_plan(item, sequence_rate_fps, &drift_ids, &media_dir, "preview").is_some());
-        if needs_asset && !source_tags.contains_key(&item.clip.url) {
-            source_tags.insert(
-                item.clip.url.clone(),
-                source_revision_tag(&item.clip.url, cancel)?,
-            );
-        }
+    let mut progress = Progress {
+        report: progress,
+        completed: 0,
+        total: plan.jobs.len() + media_plans.len(),
+    };
+    for job in &plan.jobs {
+        check_cancel(cancel)?;
+        progress.report(&job.media, ExportJobKind::Audio);
+        job.render(backend, cancel)?;
+        progress.complete(&job.media, ExportJobKind::Audio);
     }
-    // Unique pad sidecars are known upfront (per-item starts are fixed), so
-    // progress totals stay exact like the drift/precision counts.
-    let mut pad_dests: HashSet<PathBuf> = HashSet::new();
-    if wants_pad {
-        let preview_dir = directory.join("Corrected Audio");
-        for item in &all_items {
-            if let Some((_, dest)) = pad_plan(
-                item,
-                sequence_rate_fps,
-                &drift_ids,
-                &preview_dir,
-                source_tags.get(&item.clip.url).map_or("", String::as_str),
-            ) {
-                pad_dests.insert(dest);
-            }
-        }
-    }
-    let total_jobs = drift_ids.len() + pad_dests.len() + precision_keys.len() + media_jobs;
-    let audio_dir = directory.join("Corrected Audio");
-    if !drift_ids.is_empty() || !pad_dests.is_empty() {
-        std::fs::create_dir_all(&audio_dir).map_err(|e| ExportError::Io(e.to_string()))?;
-    }
-    let precision_dir = directory.join("Resolve Precision Audio");
-    if !precision_keys.is_empty() {
-        std::fs::create_dir_all(&precision_dir).map_err(|e| ExportError::Io(e.to_string()))?;
-    }
+    check_cancel(cancel)?;
 
-    let mut completed = 0usize;
-    let mut corrected_urls: HashMap<&str, PathBuf> = HashMap::new();
-    let mut precision_urls: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    let mut pad_rendered: HashSet<PathBuf> = HashSet::new();
-    let mut corrected_islands = Vec::with_capacity(timeline.islands.len());
-
-    for island in &timeline.islands {
-        let mut items = Vec::with_capacity(island.clips.len());
-        for item in &island.clips {
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(ExportError::Cancelled);
-            }
-            let stem = item
-                .clip
-                .url
-                .file_stem()
-                .and_then(|n| n.to_str())
-                .unwrap_or("clip");
-            let suffix: String = item.clip.id.0.chars().take(8).collect();
-            let mut prepared = item.clone();
-
-            if drift_ids.contains(item.clip.id.0.as_str()) {
-                if !corrected_urls.contains_key(item.clip.id.0.as_str()) {
-                    emit(
-                        &mut progress,
-                        completed,
-                        total_jobs,
-                        Some(item.clip.url.clone()),
-                        ExportJobKind::Audio,
-                    );
-                    let points: Vec<(f64, f64)> = item
-                        .mapping_points
-                        .iter()
-                        .map(|p| (p.source.as_seconds(), p.island.as_seconds()))
-                        .collect();
-                    let ppm = ((item.mapping_rate - 1.0) * 1_000_000.0).round() as i64;
-                    let correction = if item.mapping_points.len() > 2 {
-                        "piecewise warp".to_string()
-                    } else {
-                        format!("drift {}{}ppm", if ppm >= 0 { "+" } else { "" }, ppm)
-                    };
-                    let destination = audio_dir.join(format!(
-                        "{stem} – {correction} – {suffix}-{}-{}-r12.wav",
-                        item.mapping_digest(),
-                        source_tags[&item.clip.url]
-                    ));
-                    if !destination.is_file() {
-                        render_drift_cancellable(
-                            backend,
-                            &item.clip.url,
-                            &destination,
-                            &points,
-                            cancel,
-                        )
-                        .map_err(|e| ExportError::audio(&item.clip.url, "drift-corrected", e))?;
-                    }
-                    corrected_urls.insert(item.clip.id.0.as_str(), destination);
-                    completed += 1;
-                    emit(
-                        &mut progress,
-                        completed,
-                        total_jobs,
-                        Some(item.clip.url.clone()),
-                        ExportJobKind::Audio,
-                    );
-                }
-                prepared =
-                    prepared.with_corrected_audio(corrected_urls[item.clip.id.0.as_str()].clone());
-            }
-
-            if wants_pad
-                && let Some((pad_samples, destination)) = pad_plan(
-                    item,
-                    sequence_rate_fps,
-                    &drift_ids,
-                    &audio_dir,
-                    source_tags.get(&item.clip.url).map_or("", String::as_str),
-                )
-            {
-                if !pad_rendered.contains(&destination) {
-                    emit(
-                        &mut progress,
-                        completed,
-                        total_jobs,
-                        Some(item.clip.url.clone()),
-                        ExportJobKind::Audio,
-                    );
-                    if !destination.is_file() {
-                        // Pad the drift sidecar when one exists, else the
-                        // original: precision stems keep using the
-                        // unpadded source, so the script workflow is
-                        // unaffected by this file.
-                        let pad_source = prepared
-                            .corrected_audio_url
-                            .clone()
-                            .unwrap_or_else(|| item.clip.url.clone());
-                        let sr = item.clip.audio.first().unwrap().sample_rate;
-                        let (start, end) = if prepared.corrected_audio_url.is_some() {
-                            (item.corrected_source_in(), item.corrected_source_out())
-                        } else {
-                            (
-                                item.selected_source_in("audio"),
-                                item.selected_source_out("audio"),
-                            )
-                        };
-                        render_pad_cancellable(
-                            backend,
-                            &pad_source,
-                            &destination,
-                            pad_samples,
-                            Some(((start * sr).round() as u64, (end * sr).round() as u64)),
-                            cancel,
-                        )
-                        .map_err(|e| {
-                            ExportError::audio(&item.clip.url, "sample-accurate Premiere", e)
-                        })?;
-                    }
-                    pad_rendered.insert(destination.clone());
-                    completed += 1;
-                    emit(
-                        &mut progress,
-                        completed,
-                        total_jobs,
-                        Some(item.clip.url.clone()),
-                        ExportJobKind::Audio,
-                    );
-                }
-                let sample_rate = item.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);
-                prepared =
-                    prepared.with_placement_pad(destination, pad_samples as f64 / sample_rate);
-            }
-
-            if precision_keys.contains(&item.precision_asset_key()) {
-                let key = item.precision_asset_key();
-                if let std::collections::hash_map::Entry::Vacant(vacant) =
-                    precision_urls.entry(key.clone())
-                {
-                    emit(
-                        &mut progress,
-                        completed,
-                        total_jobs,
-                        Some(item.clip.url.clone()),
-                        ExportJobKind::Audio,
-                    );
-                    let channels = item.clip.audio.first().map_or(0, |a| a.channels);
-                    let source = prepared
-                        .corrected_audio_url
-                        .clone()
-                        .unwrap_or_else(|| item.clip.url.clone());
-                    let float_source = prepared.corrected_audio_url.is_some();
-                    let (bit_depth, is_float) = if float_source {
-                        (Some(32), true)
-                    } else {
-                        let a = item.clip.audio.first();
-                        (
-                            a.and_then(|a| a.bit_depth),
-                            a.and_then(|a| a.is_float).unwrap_or(false),
-                        )
-                    };
-                    // Older integer stems may contain rounded AVFoundation samples.
-                    let revision = if bit_depth == Some(32) && !is_float {
-                        "r13"
-                    } else {
-                        "r12"
-                    };
-                    let urls: Vec<_> = (0..channels)
-                        .map(|channel| {
-                            precision_dir.join(format!(
-                                "{stem} – channel {} – {suffix}-{}-{}-{}-{revision}.wav",
-                                channel + 1,
-                                prepared.precision_digest(),
-                                source_tags[&item.clip.url],
-                                if float_source {
-                                    "corrected"
-                                } else {
-                                    "original"
-                                }
-                            ))
-                        })
-                        .collect();
-                    let missing: Vec<_> = urls
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, path)| !path.is_file())
-                        .map(|(channel, path)| (channel, path.as_path()))
-                        .collect();
-                    render_channels_cancellable(
-                        backend,
-                        &source,
-                        &missing,
-                        bit_depth,
-                        is_float,
-                        prepared.precision_source_start(),
-                        prepared.precision_source_duration(),
-                        prepared.precision_tail_samples,
-                        cancel,
-                    )
-                    .map_err(|e| ExportError::audio(&item.clip.url, "channel-stem", e))?;
-                    vacant.insert(urls);
-                    completed += 1;
-                    emit(
-                        &mut progress,
-                        completed,
-                        total_jobs,
-                        Some(item.clip.url.clone()),
-                        ExportJobKind::Audio,
-                    );
-                }
-                prepared = prepared
-                    .with_precision_audio(precision_urls[&item.precision_asset_key()].clone());
-            }
-            items.push(prepared);
-        }
-        corrected_islands.push(ExportIsland {
-            id: island.id,
-            clips: items,
-            duration: island.duration,
-        });
-    }
-
-    let mut corrected =
-        ExportTimeline::new(corrected_islands, timeline.frame_duration, &timeline.name);
-    corrected.temporal_policy = timeline.temporal_policy.clone();
-    corrected.copy_assembly_policy_from(timeline);
-    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(ExportError::Cancelled);
-    }
-    let standard_formats: Vec<_> = formats
-        .iter()
-        .copied()
-        .filter(|f| *f != TimelineExportFormat::Aaf)
-        .collect();
+    let prepared = &plan.timeline;
     let mut artifacts = write_artifacts(
-        &corrected,
+        prepared,
         directory,
-        &standard_formats,
-        include_replaced_sequence,
-        include_fcpxml_timeline,
-        include_fcpxml_multicam,
-        group_fcpxml_storylines,
+        &options.formats,
+        options.include_replaced_sequence,
+        options.fcpxml,
     )?;
     let mut deferred_aaf = None;
-    if wants_aaf {
-        let manifest =
-            crate::aaf::timeline_manifest_with_frame_rate(&corrected, aaf_frame_duration, cancel)
-                .map_err(|e| ExportError::Io(e.to_string()))?;
+    if options.wants(TimelineExportFormat::Aaf) {
+        let manifest = crate::aaf::timeline_manifest_with_frame_rate(
+            prepared,
+            options.aaf_frame_duration,
+            cancel,
+        )?;
         if defer_aaf {
             deferred_aaf = Some(manifest);
         } else {
@@ -782,105 +455,496 @@ fn export_prepared_internal(
             });
         }
     }
-    if include_media_files {
-        std::fs::create_dir_all(&media_dir).map_err(|e| ExportError::Io(e.to_string()))?;
-        for plan in media_file_plans(&corrected, &media_dir) {
-            emit(
-                &mut progress,
-                completed,
-                total_jobs,
-                Some(plan.video_url.clone()),
-                ExportJobKind::Media,
-            );
-            let file = export_media_file(backend, &plan, cancel)?;
-            completed += 1;
-            emit(
-                &mut progress,
-                completed,
-                total_jobs,
-                Some(plan.video_url.clone()),
-                ExportJobKind::Media,
-            );
-            artifacts.push(ExportArtifact {
-                format: ExportArtifactFormat::MediaFile,
-                url: file,
+    if options.include_media_files {
+        std::fs::create_dir_all(&media_dir).map_err(ExportError::Write)?;
+    }
+    for plan in &media_plans {
+        progress.report(&plan.video_url, ExportJobKind::Media);
+        let file = export_media_file(backend, plan, cancel)?;
+        progress.complete(&plan.video_url, ExportJobKind::Media);
+        artifacts.push(ExportArtifact {
+            format: ExportArtifactFormat::MediaFile,
+            url: file,
+        });
+    }
+    Ok((artifacts, deferred_aaf))
+}
+
+/// Counts completed export jobs for an optional progress callback.
+struct Progress<'a> {
+    report: Option<&'a mut dyn FnMut(ExportJobProgress)>,
+    completed: usize,
+    total: usize,
+}
+
+impl Progress<'_> {
+    fn report(&mut self, current: &Path, kind: ExportJobKind) {
+        if let Some(report) = self.report.as_deref_mut() {
+            report(ExportJobProgress {
+                completed: self.completed,
+                total: self.total,
+                current: Some(current.to_path_buf()),
+                kind,
             });
         }
     }
-    Ok((artifacts, deferred_aaf))
+
+    fn complete(&mut self, current: &Path, kind: ExportJobKind) {
+        self.completed += 1;
+        self.report(current, kind);
+    }
+}
+
+/// Matches durations computed from an item's own source and timeline times.
+const SAME_END_TOLERANCE: f64 = 1e-9;
+/// A timeline end closer than this to a frame boundary is on that boundary.
+const FRAME_BOUNDARY_TOLERANCE: f64 = 1e-7;
+
+/// Resolve floors the timeline end even when the final audio item extends
+/// into the next partial frame. Extend only a final recorder's derived
+/// precision stem with silence so an Entire Timeline render retains it.
+fn extend_final_precision_tail(combined: &mut ExportTimeline, correct_drift: bool) {
+    let fps = sequence_fps(combined.frame_duration);
+    let end_for = |item: &ExportItem| {
+        let duration = if correct_drift
+            && needs_correction_points(&item.mapping_points)
+            && item.clip.kind == MediaKind::Audio
+        {
+            item.corrected_selected_duration()
+        } else {
+            item.selected_timeline_duration(MediaKind::Audio)
+        };
+        item.timeline_start(MediaKind::Audio) + duration
+    };
+    let Some(island) = combined.islands.first_mut() else {
+        return;
+    };
+    let maximum_end = island.clips.iter().map(end_for).fold(0.0, f64::max);
+    let frame_end = maximum_end * fps;
+    if (frame_end - frame_end.round()).abs() <= FRAME_BOUNDARY_TOLERANCE {
+        return;
+    }
+    if let Some(last) = island.clips.iter_mut().find(|item| {
+        item.clip.kind == MediaKind::Audio
+            && !item.is_retimed(MediaKind::Audio)
+            && (end_for(item) - maximum_end).abs() < SAME_END_TOLERANCE
+    }) {
+        let sr = last.clip.audio.first().map_or(48000.0, |a| a.sample_rate);
+        // One extra sample covers nearest-sample placement rounding.
+        last.precision_tail_samples =
+            ((frame_end.ceil() / fps - maximum_end) * sr).ceil() as u64 + 1;
+    }
+}
+
+// ------------------------------------------------------------ audio plan
+
+/// Version of the prepared-audio formats, part of every sidecar's identity:
+/// a change to how sidecars are rendered never reuses an older file.
+const AUDIO_SIDECAR_REVISION: u32 = 14;
+
+/// `"<media> – <label> – <identity hash>.wav"`. The readable part names the
+/// file in an editor's bin; the hash keeps every rendering input, so a file
+/// with this name can be reused as is.
+fn sidecar_name(media: &Path, label: &str, identity: &[&str]) -> String {
+    let stem = media
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("clip");
+    let mut hash = blake3::Hasher::new();
+    hash.update(&AUDIO_SIDECAR_REVISION.to_le_bytes());
+    for part in identity {
+        hash.update(&(part.len() as u64).to_le_bytes());
+        hash.update(part.as_bytes());
+    }
+    format!("{stem} – {label} – {}.wav", &hash.finalize().to_hex()[..16])
+}
+
+/// Every audio file one export renders, decided before rendering starts.
+struct AudioPlan {
+    /// The export timeline with each planned file attached to its items.
+    timeline: ExportTimeline,
+    /// Unique renders in timeline order.
+    jobs: Vec<AudioJob>,
+}
+
+struct AudioJob {
+    /// The timeline media this file is prepared from.
+    media: PathBuf,
+    kind: AudioJobKind,
+}
+
+enum AudioJobKind {
+    Drift {
+        destination: PathBuf,
+        points: Vec<(f64, f64)>,
+    },
+    Pad {
+        source: PathBuf,
+        destination: PathBuf,
+        samples: u64,
+        selection: (u64, u64),
+    },
+    Stems {
+        source: PathBuf,
+        outputs: Vec<PathBuf>,
+        bit_depth: Option<u32>,
+        is_float: bool,
+        source_start: f64,
+        duration: f64,
+        tail_samples: u64,
+    },
+}
+
+impl AudioPlan {
+    fn new(
+        combined: &ExportTimeline,
+        options: &ExportOptions,
+        directory: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<Self, ExportError> {
+        let wants_aaf = options.wants(TimelineExportFormat::Aaf);
+        let wants_precision = wants_aaf
+            || options.wants(TimelineExportFormat::ResolveScript)
+            || options.wants(TimelineExportFormat::FinalCutProXML);
+        // Placement pads are a PremiereXML-only concern: no other writer reads
+        // them (OTIO/FCPXML place exactly already; the Resolve script locates
+        // stems through its own fractional API, so its stems stay unpadded).
+        let wants_pad = options.wants(TimelineExportFormat::PremiereXML);
+        let fps = sequence_fps(combined.frame_duration);
+
+        let needs_drift = |item: &ExportItem| {
+            options.correct_drift
+                && item.clip.kind == MediaKind::Audio
+                && needs_correction_points(&item.mapping_points)
+        };
+        let pad = |item: &ExportItem| {
+            if wants_pad {
+                placement_pad(item, fps)
+            } else {
+                None
+            }
+        };
+        let needs_precision = |item: &ExportItem| {
+            let channels = item.clip.audio.first().map_or(0, |a| a.channels);
+            wants_precision
+                && (item.clip.kind == MediaKind::Audio
+                    || (wants_aaf
+                        && !item.clip.audio.is_empty()
+                        && item.is_enabled(MediaKind::Audio)))
+                && (wants_aaf
+                    || channels > 1
+                    || !item.is_full_source_selection()
+                    || item.precision_tail_samples > 0)
+        };
+
+        // Every item of a corrected clip plays its drift sidecar, and every
+        // item of a precision asset its stems.
+        let items = || combined.islands.iter().flat_map(|island| &island.clips);
+        let corrected_clips: HashSet<&str> = items()
+            .filter(|item| needs_drift(item))
+            .map(|item| item.clip.id.0.as_str())
+            .collect();
+        let precision_assets: HashSet<String> = items()
+            .filter(|item| needs_precision(item))
+            .map(ExportItem::precision_asset_key)
+            .collect();
+
+        // Stamp each source once. Unix inode + ctime detect replacements and
+        // same-size rewrites even with a restored mtime, without reading video.
+        let mut source_tags = HashMap::new();
+        for item in items() {
+            let needs_file = corrected_clips.contains(item.clip.id.0.as_str())
+                || pad(item).is_some()
+                || precision_assets.contains(&item.precision_asset_key());
+            if needs_file && !source_tags.contains_key(&item.clip.url) {
+                source_tags.insert(
+                    item.clip.url.clone(),
+                    source_revision_tag(&item.clip.url, cancel)?,
+                );
+            }
+        }
+
+        let audio_dir = directory.join("Corrected Audio");
+        let precision_dir = directory.join("Resolve Precision Audio");
+        let mut jobs = Vec::new();
+        let mut planned_pads = HashSet::new();
+        let mut drift_files: HashMap<&str, PathBuf> = HashMap::new();
+        let mut precision_files: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        let mut islands = Vec::with_capacity(combined.islands.len());
+        for island in &combined.islands {
+            let mut clips = Vec::with_capacity(island.clips.len());
+            for item in &island.clips {
+                let media = &item.clip.url;
+                let id = item.clip.id.0.as_str();
+                let mut prepared = item.clone();
+
+                if corrected_clips.contains(id) {
+                    let destination = drift_files.entry(id).or_insert_with(|| {
+                        let ppm = ((item.mapping_rate - 1.0) * 1_000_000.0).round() as i64;
+                        let correction = if item.mapping_points.len() > 2 {
+                            "piecewise warp".to_string()
+                        } else {
+                            format!("drift {ppm:+}ppm")
+                        };
+                        let destination = audio_dir.join(sidecar_name(
+                            media,
+                            &correction,
+                            &["drift", id, &item.mapping_digest(), &source_tags[media]],
+                        ));
+                        jobs.push(AudioJob {
+                            media: media.clone(),
+                            kind: AudioJobKind::Drift {
+                                destination: destination.clone(),
+                                points: item
+                                    .mapping_points
+                                    .iter()
+                                    .map(|p| (p.source.as_seconds(), p.island.as_seconds()))
+                                    .collect(),
+                            },
+                        });
+                        destination
+                    });
+                    prepared = prepared.with_corrected_audio(destination.clone());
+                }
+
+                if let Some((samples, sample_rate)) = pad(item) {
+                    // Pad the drift sidecar when one exists, else the
+                    // original: precision stems keep using the unpadded
+                    // source, so the script workflow is unaffected.
+                    let corrected = prepared.corrected_audio_url.clone();
+                    let mapping = if corrected.is_some() {
+                        item.mapping_digest()
+                    } else {
+                        "direct".to_string()
+                    };
+                    let (start, end) = if corrected.is_some() {
+                        (item.corrected_source_in(), item.corrected_source_out())
+                    } else {
+                        (
+                            item.selected_source_in(MediaKind::Audio),
+                            item.selected_source_out(MediaKind::Audio),
+                        )
+                    };
+                    let destination = audio_dir.join(sidecar_name(
+                        media,
+                        &format!("pad {samples}"),
+                        &[
+                            "pad",
+                            id,
+                            &mapping,
+                            &item
+                                .selected_source_in(MediaKind::Audio)
+                                .to_bits()
+                                .to_string(),
+                            &item
+                                .selected_source_out(MediaKind::Audio)
+                                .to_bits()
+                                .to_string(),
+                            &source_tags[media],
+                            &samples.to_string(),
+                        ],
+                    ));
+                    if planned_pads.insert(destination.clone()) {
+                        jobs.push(AudioJob {
+                            media: media.clone(),
+                            kind: AudioJobKind::Pad {
+                                source: corrected.unwrap_or_else(|| media.clone()),
+                                destination: destination.clone(),
+                                samples,
+                                selection: (
+                                    (start * sample_rate).round() as u64,
+                                    (end * sample_rate).round() as u64,
+                                ),
+                            },
+                        });
+                    }
+                    prepared =
+                        prepared.with_placement_pad(destination, samples as f64 / sample_rate);
+                }
+
+                let key = item.precision_asset_key();
+                if precision_assets.contains(&key) {
+                    let outputs = match precision_files.get(&key) {
+                        Some(outputs) => outputs.clone(),
+                        None => {
+                            let corrected = prepared.corrected_audio_url.clone();
+                            let audio = item.clip.audio.first();
+                            // Drift sidecars are always 32-bit float.
+                            let (bit_depth, is_float) = match corrected {
+                                Some(_) => (Some(32), true),
+                                None => (
+                                    audio.and_then(|a| a.bit_depth),
+                                    audio.and_then(|a| a.is_float).unwrap_or(false),
+                                ),
+                            };
+                            let origin = if corrected.is_some() {
+                                "corrected"
+                            } else {
+                                "original"
+                            };
+                            let digest = prepared.precision_digest();
+                            let outputs: Vec<_> = (0..audio.map_or(0, |a| a.channels))
+                                .map(|channel| {
+                                    precision_dir.join(sidecar_name(
+                                        media,
+                                        &format!("channel {}", channel + 1),
+                                        &[
+                                            "channel",
+                                            &channel.to_string(),
+                                            id,
+                                            &digest,
+                                            &source_tags[media],
+                                            origin,
+                                        ],
+                                    ))
+                                })
+                                .collect();
+                            jobs.push(AudioJob {
+                                media: media.clone(),
+                                kind: AudioJobKind::Stems {
+                                    source: corrected.unwrap_or_else(|| media.clone()),
+                                    outputs: outputs.clone(),
+                                    bit_depth,
+                                    is_float,
+                                    source_start: prepared.precision_source_start(),
+                                    duration: prepared.precision_source_duration(),
+                                    tail_samples: prepared.precision_tail_samples,
+                                },
+                            });
+                            precision_files.insert(key, outputs.clone());
+                            outputs
+                        }
+                    };
+                    prepared = prepared.with_precision_audio(outputs);
+                }
+                clips.push(prepared);
+            }
+            islands.push(ExportIsland {
+                id: island.id,
+                clips,
+                duration: island.duration,
+            });
+        }
+        Ok(Self {
+            timeline: combined.with_islands(islands),
+            jobs,
+        })
+    }
+}
+
+impl AudioJob {
+    /// Renders the files this job still lacks; existing files are reused.
+    fn render(&self, backend: &dyn MediaBackend, cancel: &AtomicBool) -> Result<(), ExportError> {
+        let create_parent = |path: &Path| match path.parent() {
+            Some(parent) => std::fs::create_dir_all(parent).map_err(ExportError::Write),
+            None => Ok(()),
+        };
+        match &self.kind {
+            AudioJobKind::Drift {
+                destination,
+                points,
+            } => {
+                if destination.is_file() {
+                    return Ok(());
+                }
+                create_parent(destination)?;
+                render_drift_cancellable(backend, &self.media, destination, points, cancel)
+                    .map_err(|e| ExportError::audio(&self.media, "drift-corrected", e))
+            }
+            AudioJobKind::Pad {
+                source,
+                destination,
+                samples,
+                selection,
+            } => {
+                if destination.is_file() {
+                    return Ok(());
+                }
+                create_parent(destination)?;
+                render_pad_cancellable(
+                    backend,
+                    source,
+                    destination,
+                    *samples,
+                    Some(*selection),
+                    cancel,
+                )
+                .map_err(|e| ExportError::audio(&self.media, "sample-accurate Premiere", e))
+            }
+            AudioJobKind::Stems {
+                source,
+                outputs,
+                bit_depth,
+                is_float,
+                source_start,
+                duration,
+                tail_samples,
+            } => {
+                let missing: Vec<_> = outputs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, path)| !path.is_file())
+                    .map(|(channel, path)| (channel, path.as_path()))
+                    .collect();
+                if let Some((_, first)) = missing.first() {
+                    create_parent(first)?;
+                }
+                render_channels_cancellable(
+                    backend,
+                    source,
+                    &ChannelStems {
+                        outputs: &missing,
+                        bit_depth: *bit_depth,
+                        is_float: *is_float,
+                        source_start: *source_start,
+                        duration: *duration,
+                        tail_samples: *tail_samples,
+                    },
+                    cancel,
+                )
+                .map_err(|e| ExportError::audio(&self.media, "channel-stem", e))
+            }
+        }
+    }
+}
+
+/// Samples of silence (and their rate) that land a fractional audio start
+/// sample-accurately in Premiere, when one is needed.
+///
+/// Skipped for retimed audio (time-remap graphs own subframe truth there),
+/// items without audio, and non-positive sample rates. Only audio clipitems
+/// reference the padded file; video sides are untouched (frame-grid
+/// limitation).
+fn placement_pad(item: &ExportItem, sequence_fps: f64) -> Option<(u64, f64)> {
+    let audio = item.clip.audio.first()?;
+    if audio.sample_rate <= 0.0 || audio.channels == 0 || item.is_retimed(MediaKind::Audio) {
+        return None;
+    }
+    let samples = placement_pad_samples(
+        item.timeline_start(MediaKind::Audio),
+        sequence_fps,
+        audio.sample_rate,
+    )?;
+    Some((samples, audio.sample_rate))
 }
 
 fn write_aaf_manifest(
     manifest: &serde_json::Value,
     directory: &Path,
     url: &Path,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: &AtomicBool,
 ) -> Result<(), ExportError> {
-    static NEXT_AAF_MANIFEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let serial = NEXT_AAF_MANIFEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let manifest_path = directory.join(format!(".align-aaf-{}-{serial}.json", std::process::id()));
-    let bytes = serde_json::to_vec(manifest).map_err(|e| ExportError::Io(e.to_string()))?;
-    if let Err(error) = std::fs::write(&manifest_path, bytes) {
-        let _ = std::fs::remove_file(&manifest_path);
-        return Err(ExportError::Io(error.to_string()));
-    }
-    let result = crate::aaf::write_audio(&manifest_path, url, cancel);
-    let _ = std::fs::remove_file(&manifest_path);
-    result.map_err(|e| match e {
-        crate::aaf::AafError::Cancelled => ExportError::Cancelled,
-        other => ExportError::Io(other.to_string()),
-    })
-}
-
-/// Placement-pad sidecar plan for one timeline item: `Some((samples, path))`
-/// when a fractional audio start needs a padded file. Pure (no I/O), so the
-/// progress total is exact upfront and re-exports resolve identical paths
-/// (existence short-circuits the render; existing files are never touched).
-///
-/// Skipped for retimed audio (time-remap graphs own subframe truth there),
-/// items without audio, and non-positive sample rates. Only audio clipitems
-/// reference the sidecar; video sides are untouched (frame-grid limitation).
-fn pad_plan(
-    item: &ExportItem,
-    sequence_fps: f64,
-    drift_ids: &HashSet<&str>,
-    audio_dir: &Path,
-    source_tag: &str,
-) -> Option<(u64, PathBuf)> {
-    let audio = item.clip.audio.first()?;
-    if audio.sample_rate <= 0.0 || audio.channels == 0 {
-        return None;
-    }
-    if item.is_retimed("audio") {
-        return None;
-    }
-    let pad = placement_pad_samples(
-        item.timeline_start("audio"),
-        sequence_fps,
-        audio.sample_rate,
-    )?;
-    let stem = item
-        .clip
-        .url
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .unwrap_or("clip");
-    let suffix: String = item.clip.id.0.chars().take(8).collect();
-    // Drift-derived pads inherit the item mapping tag so a re-sync with
-    // different drift cannot collide with an older pad in the same folder.
-    let tag = if drift_ids.contains(item.clip.id.0.as_str()) {
-        item.mapping_digest()
-    } else {
-        "direct".to_string()
-    };
-    Some((
-        pad,
-        audio_dir.join(format!(
-            "{stem} – pad {pad} – {suffix}-{tag}-{}-{}-{source_tag}-r12.wav",
-            item.selected_source_in("audio").to_bits(),
-            item.selected_source_out("audio").to_bits()
-        )),
-    ))
+    let bytes = serde_json::to_vec(manifest).map_err(|e| ExportError::Document(e.to_string()))?;
+    // Removed when dropped, after the AAF module has read it.
+    let manifest_path = tempfile::Builder::new()
+        .prefix(".align-aaf-")
+        .suffix(".json")
+        .tempfile_in(directory)
+        .map_err(ExportError::Write)?
+        .into_temp_path();
+    std::fs::write(&manifest_path, bytes).map_err(ExportError::Write)?;
+    crate::aaf::write_audio(&manifest_path, url, cancel)?;
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -894,17 +958,11 @@ struct MediaFilePlan {
     url: PathBuf,
 }
 
-fn source_revision_tag(
-    path: &Path,
-    cancel: &std::sync::atomic::AtomicBool,
-) -> Result<String, ExportError> {
-    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(ExportError::Cancelled);
-    }
+fn source_revision_tag(path: &Path, cancel: &AtomicBool) -> Result<String, ExportError> {
+    check_cancel(cancel)?;
     #[cfg(unix)]
     {
-        let revision =
-            align_core::cache::media_revision(path).map_err(|e| ExportError::Io(e.to_string()))?;
+        let revision = align_core::cache::media_revision(path).map_err(ExportError::read(path))?;
         Ok(blake3::hash(revision.as_bytes()).to_hex()[..32].to_string())
     }
     // Without an inode/change-time stamp, retain strict content invalidation.
@@ -913,20 +971,13 @@ fn source_revision_tag(
 }
 
 #[cfg(not(unix))]
-fn source_content_tag(
-    path: &Path,
-    cancel: &std::sync::atomic::AtomicBool,
-) -> Result<String, ExportError> {
-    let mut file = std::fs::File::open(path).map_err(|e| ExportError::Io(e.to_string()))?;
+fn source_content_tag(path: &Path, cancel: &AtomicBool) -> Result<String, ExportError> {
+    let mut file = std::fs::File::open(path).map_err(ExportError::read(path))?;
     let mut hash = blake3::Hasher::new();
     let mut buffer = vec![0u8; 1024 * 1024];
     loop {
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(ExportError::Cancelled);
-        }
-        let n = file
-            .read(&mut buffer)
-            .map_err(|e| ExportError::Io(e.to_string()))?;
+        check_cancel(cancel)?;
+        let n = file.read(&mut buffer).map_err(ExportError::read(path))?;
         if n == 0 {
             break;
         }
@@ -947,7 +998,9 @@ fn media_file_plans(timeline: &ExportTimeline, directory: &Path) -> Vec<MediaFil
         .iter()
         .filter(|item| item.clip.video.is_some())
     {
-        if video.is_retimed("video") || !planned_video.insert(video.clip.id.0.clone()) {
+        if video.is_retimed(align_core::MediaKind::Video)
+            || !planned_video.insert(video.clip.id.0.clone())
+        {
             continue;
         }
         let video_duration = video.source_duration();
@@ -957,7 +1010,7 @@ fn media_file_plans(timeline: &ExportTimeline, directory: &Path) -> Vec<MediaFil
             .clips
             .iter()
             .filter(|item| item.clip.kind == align_core::MediaKind::Audio)
-            .filter(|item| !item.is_retimed("audio"))
+            .filter(|item| !item.is_retimed(align_core::MediaKind::Audio))
             .find(|recorder| {
                 let start = recorder.start - recorder.source_in;
                 let end = start + recorder.source_duration();
@@ -1006,28 +1059,6 @@ fn media_file_plans(timeline: &ExportTimeline, directory: &Path) -> Vec<MediaFil
     plans
 }
 
-pub(crate) fn wait_render_process(
-    child: &mut std::process::Child,
-    cancel: &std::sync::atomic::AtomicBool,
-) -> Result<std::process::ExitStatus, RenderError> {
-    loop {
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(RenderError::Cancelled);
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(RenderError::PlacementPad(error.to_string()));
-            }
-        }
-    }
-}
-
 /// Remux one complete camera file without re-encoding its video stream. The
 /// external track is trimmed sample-accurately, padded to the camera duration,
 /// and encoded as uncompressed 32-bit float at the NLE-native 48 kHz rate.
@@ -1035,15 +1066,10 @@ pub(crate) fn wait_render_process(
 fn export_media_file(
     backend: &dyn MediaBackend,
     plan: &MediaFilePlan,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: &AtomicBool,
 ) -> Result<PathBuf, ExportError> {
-    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(ExportError::Cancelled);
-    }
-    let temp = plan
-        .url
-        .with_extension(format!("tmp-{}.mov", std::process::id()));
-    let _ = std::fs::remove_file(&temp);
+    check_cancel(cancel)?;
+    let staged = align_core::staged::StagedFile::new(&plan.url).map_err(ExportError::Write)?;
     let audio = crate::remux::ReplacementAudio {
         backend,
         source: &plan.recorder_url,
@@ -1052,25 +1078,27 @@ fn export_media_file(
         leading_silence: plan.leading_silence,
         total: plan.video_duration,
     };
-    match crate::remux::replace_audio(&plan.video_url, &temp, &audio, cancel) {
-        Ok(()) => return publish_media_file(&temp, &plan.url),
-        Err(crate::remux::RemuxError::Unsupported(_)) => {
-            let _ = std::fs::remove_file(&temp);
+    match crate::remux::replace_audio(&plan.video_url, staged.path(), &audio, cancel) {
+        Ok(()) => {
+            staged.commit().map_err(ExportError::Write)?;
+            return Ok(plan.url.clone());
         }
-        Err(error) => {
-            let _ = std::fs::remove_file(&temp);
-            return Err(match error {
-                crate::remux::RemuxError::Render(error) => ExportError::from(error),
-                other => ExportError::Media(format!("{}: {other}", plan.video_url.display())),
-            });
+        Err(crate::remux::RemuxError::Unsupported(_)) => {}
+        Err(crate::remux::RemuxError::Render(error)) => {
+            return Err(ExportError::audio(
+                &plan.recorder_url,
+                "replacement camera",
+                error,
+            ));
         }
+        Err(other) => return Err(ExportError::media(&plan.video_url, other)),
     }
     let ffmpeg = crate::ff::ffmpeg_bin()
-        .ok_or_else(|| ExportError::Media("ffmpeg not found in PATH.".into()))?;
+        .ok_or_else(|| ExportError::media(&plan.video_url, "FFmpeg was not found."))?;
     // FFmpeg decodes the recorder here, so trim the decoder delay its output
     // keeps (AC-3 in MPEG-TS), as the backends do.
     let decoder_delay = crate::ff::inspect(&plan.recorder_url)
-        .map_err(|error| ExportError::Media(format!("{}: {error}", plan.recorder_url.display())))?
+        .map_err(|error| ExportError::media(&plan.recorder_url, error))?
         .audio_streams
         .first()
         .map_or(0.0, |stream| stream.decoder_delay);
@@ -1079,7 +1107,7 @@ fn export_media_file(
         "[1:a:0]atrim=duration={:.9},asetpts=PTS-STARTPTS,aresample=48000,adelay={delay_samples}S:all=1,apad=whole_dur={:.9},atrim=duration={:.9}[clean]",
         plan.recorder_duration, plan.video_duration, plan.video_duration
     );
-    let mut child = crate::ff::command(ffmpeg)
+    let mut child = crate::process::command(ffmpeg)
         .args(["-y", "-v", "error", "-i"])
         .arg(&plan.video_url)
         .args([
@@ -1092,78 +1120,34 @@ fn export_media_file(
         .args(["-map", "0:v:0", "-map", "[clean]"])
         .args(["-map_metadata", "0", "-c:v", "copy", "-c:a", "pcm_f32le"])
         .args(["-t", &format!("{:.9}", plan.video_duration)])
-        .arg(&temp)
+        .arg(staged.path())
         .spawn()
-        .map_err(|e| ExportError::Io(e.to_string()))?;
-    let status = match wait_render_process(&mut child, cancel) {
-        Ok(status) => status,
-        Err(error) => {
-            let _ = std::fs::remove_file(&temp);
-            return Err(ExportError::from(error));
-        }
-    };
+        .map_err(|error| ExportError::media(&plan.video_url, error))?;
+    let status = crate::process::wait_cancellable(&mut child, cancel)?;
     if !status.success() {
-        let _ = std::fs::remove_file(&temp);
-        return Err(ExportError::Media(format!(
-            "ffmpeg failed for {}",
-            plan.video_url.display()
-        )));
+        return Err(ExportError::media(
+            &plan.video_url,
+            format!("FFmpeg failed ({status})."),
+        ));
     }
-    publish_media_file(&temp, &plan.url)
+    staged.commit().map_err(ExportError::Write)?;
+    Ok(plan.url.clone())
 }
 
-fn publish_media_file(temp: &Path, url: &Path) -> Result<PathBuf, ExportError> {
-    #[cfg(windows)]
-    if url.is_file() {
-        std::fs::remove_file(url).map_err(|e| ExportError::Io(e.to_string()))?;
-    }
-    if let Err(error) = std::fs::rename(temp, url) {
-        let _ = std::fs::remove_file(temp);
-        return Err(ExportError::Io(error.to_string()));
-    }
-    Ok(url.to_path_buf())
-}
-
-fn emit(
-    progress: &mut Option<&mut dyn FnMut(ExportJobProgress)>,
-    completed: usize,
-    total: usize,
-    current: Option<PathBuf>,
-    kind: ExportJobKind,
-) {
-    if let Some(p) = progress {
-        p(ExportJobProgress {
-            completed,
-            total,
-            current,
-            kind,
-        });
-    }
-}
-
+/// Writes the timeline documents. AAF is written separately, from the
+/// prepared audio manifest.
 fn write_artifacts(
     timeline: &ExportTimeline,
     directory: &Path,
     formats: &[TimelineExportFormat],
     include_replaced_sequence: bool,
-    include_fcpxml_timeline: bool,
-    include_fcpxml_multicam: bool,
-    group_fcpxml_storylines: bool,
+    fcpxml: FcpxmlOptions,
 ) -> Result<Vec<ExportArtifact>, ExportError> {
-    let mut combined = ExportTimeline::new(
-        vec![timeline.combined_island(1.0)],
-        timeline.frame_duration,
-        &timeline.name,
-    );
-    combined.temporal_policy = timeline.temporal_policy.clone();
-    combined.copy_assembly_policy_from(timeline);
+    let combined = timeline.combined();
     let mut artifacts = Vec::with_capacity(formats.len());
-    for format in formats {
-        if *format == TimelineExportFormat::Aaf {
-            return Err(ExportError::Io("AAF requires prepared audio export".into()));
-        }
+    for &format in formats {
         let application = match format {
-            TimelineExportFormat::Aaf => unreachable!(),
+            TimelineExportFormat::Aaf => continue,
             TimelineExportFormat::PremiereXML => "Adobe Premiere Pro",
             TimelineExportFormat::FinalCutProXML => "Final Cut Pro",
             TimelineExportFormat::ResolveOTIO
@@ -1172,48 +1156,33 @@ fn write_artifacts(
         };
         let url = directory.join(format!("Align – {application}.{}", format.file_extension()));
         let bytes: Vec<u8> = match format {
-            TimelineExportFormat::Aaf => unreachable!(),
+            TimelineExportFormat::Aaf => continue,
             TimelineExportFormat::ResolveOTIO => {
-                align_core::export::otio::data(&combined).map_err(ExportError::Io)?
+                align_core::export::otio::data(&combined).map_err(ExportError::Document)?
             }
             TimelineExportFormat::ResolveScript => {
                 align_core::export::script::write().as_bytes().to_vec()
             }
             TimelineExportFormat::ResolveXML | TimelineExportFormat::PremiereXML => {
-                align_core::export::premiere::write(&combined, *format, include_replaced_sequence)
+                align_core::export::premiere::write(&combined, format, include_replaced_sequence)
                     .into_bytes()
             }
-            TimelineExportFormat::FinalCutProXML => align_core::export::fcpxml::write_with_options(
-                &combined,
-                include_fcpxml_timeline,
-                include_fcpxml_multicam,
-                group_fcpxml_storylines,
-            )
-            .into_bytes(),
+            TimelineExportFormat::FinalCutProXML => {
+                align_core::export::fcpxml::write(&combined, fcpxml).into_bytes()
+            }
         };
-        write_atomic(&url, &bytes)?;
+        align_core::staged::write(&url, &bytes).map_err(ExportError::Write)?;
         #[cfg(unix)]
-        if *format == TimelineExportFormat::ResolveScript {
+        if format == TimelineExportFormat::ResolveScript {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&url, std::fs::Permissions::from_mode(0o755));
         }
         artifacts.push(ExportArtifact {
-            format: (*format).into(),
+            format: format.into(),
             url,
         });
     }
     Ok(artifacts)
-}
-
-fn write_atomic(url: &Path, bytes: &[u8]) -> Result<(), ExportError> {
-    let tmp = url.with_extension(format!("tmp-{}", std::process::id()));
-    let cleanup = DropGuard::new(&tmp, |path| {
-        let _ = std::fs::remove_file(path);
-    });
-    std::fs::write(&tmp, bytes).map_err(|error| ExportError::Io(error.to_string()))?;
-    std::fs::rename(&tmp, url).map_err(|error| ExportError::Io(error.to_string()))?;
-    DropGuard::dismiss(cleanup);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1349,14 +1318,11 @@ mod tests {
                     backend: &crate::portable::PortableBackend,
                     timeline: &timeline,
                     directory: &out,
-                    formats: &[TimelineExportFormat::PremiereXML],
-                    correct_drift: false,
-                    include_replaced_sequence: false,
-                    include_media_files: false,
-                    aaf_frame_duration: None,
-                    include_fcpxml_timeline: true,
-                    include_fcpxml_multicam: true,
-                    group_fcpxml_storylines: false,
+                    options: &ExportOptions {
+                        formats: vec![TimelineExportFormat::PremiereXML],
+                        correct_drift: false,
+                        ..ExportOptions::default()
+                    },
                     cancel: &std::sync::atomic::AtomicBool::new(false),
                 },
                 None,
@@ -1501,14 +1467,11 @@ mod tests {
                             backend: backend.as_ref(),
                             timeline: &timeline,
                             directory: &out,
-                            formats: &[TimelineExportFormat::PremiereXML],
-                            correct_drift: false,
-                            include_replaced_sequence: false,
-                            include_media_files: false,
-                            aaf_frame_duration: None,
-                            include_fcpxml_timeline: true,
-                            include_fcpxml_multicam: true,
-                            group_fcpxml_storylines: false,
+                            options: &ExportOptions {
+                                formats: vec![TimelineExportFormat::PremiereXML],
+                                correct_drift: false,
+                                ..ExportOptions::default()
+                            },
                             cancel: &std::sync::atomic::AtomicBool::new(false),
                         },
                         None,
@@ -1600,18 +1563,15 @@ mod tests {
                 backend: &crate::portable::PortableBackend,
                 timelines: &timelines,
                 directory: &dir,
-                formats: &[
-                    TimelineExportFormat::PremiereXML,
-                    TimelineExportFormat::FinalCutProXML,
-                    TimelineExportFormat::ResolveOTIO,
-                ],
-                correct_drift: false,
-                include_replaced_sequence: false,
-                include_media_files: false,
-                aaf_frame_duration: None,
-                include_fcpxml_timeline: true,
-                include_fcpxml_multicam: true,
-                group_fcpxml_storylines: false,
+                options: &ExportOptions {
+                    formats: vec![
+                        TimelineExportFormat::PremiereXML,
+                        TimelineExportFormat::FinalCutProXML,
+                        TimelineExportFormat::ResolveOTIO,
+                    ],
+                    correct_drift: false,
+                    ..ExportOptions::default()
+                },
                 cancel: &std::sync::atomic::AtomicBool::new(false),
             },
             None,
@@ -1690,17 +1650,14 @@ mod tests {
                     backend: &crate::portable::PortableBackend,
                     timeline: &timeline,
                     directory: &out,
-                    formats: &[
-                        TimelineExportFormat::ResolveScript,
-                        TimelineExportFormat::ResolveOTIO,
-                    ],
-                    correct_drift: false,
-                    include_replaced_sequence: false,
-                    include_media_files: false,
-                    aaf_frame_duration: None,
-                    include_fcpxml_timeline: true,
-                    include_fcpxml_multicam: true,
-                    group_fcpxml_storylines: false,
+                    options: &ExportOptions {
+                        formats: vec![
+                            TimelineExportFormat::ResolveScript,
+                            TimelineExportFormat::ResolveOTIO,
+                        ],
+                        correct_drift: false,
+                        ..ExportOptions::default()
+                    },
                     cancel: &std::sync::atomic::AtomicBool::new(false),
                 },
                 None,
@@ -1921,7 +1878,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let video = dir.path().join("camera.mts");
         let recorder = dir.path().join("recorder.mts");
-        let video_ok = crate::ff::command(&ffmpeg)
+        let video_ok = crate::process::command(&ffmpeg)
             .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
             .arg("color=c=black:s=160x90:r=25:d=2")
             .args(["-c:v", "mpeg2video", "-f", "mpegts"])

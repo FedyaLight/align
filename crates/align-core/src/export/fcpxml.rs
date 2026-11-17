@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use super::model::{ExportIsland, ExportItem, ExportTimeline, xml_text};
 use crate::allocator::{TimelineTrackRequest, allocate, source_key_for_url};
-use crate::model::MediaTime;
+use crate::model::{MediaKind, MediaTime};
 
 /// A single selected source channel remains mono even when its asset is stereo.
 fn audio_channel_end(item: &ExportItem) -> String {
@@ -33,36 +33,42 @@ fn timeline_time(seconds: f64, frame: MediaTime) -> String {
     xml_text::fcpxml_time(time)
 }
 
-pub fn write(timeline: &ExportTimeline, include_multicam_clip: bool) -> String {
-    write_with_storylines(timeline, include_multicam_clip, false)
+/// What a Final Cut Pro document contains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FcpxmlOptions {
+    /// The synchronized project timeline.
+    pub timeline: bool,
+    /// A multicam clip of the synchronized angles.
+    pub multicam: bool,
+    /// Group each camera's connected clips into one storyline.
+    pub group_storylines: bool,
 }
 
-pub fn write_with_storylines(
-    timeline: &ExportTimeline,
-    include_multicam_clip: bool,
-    group_storylines: bool,
-) -> String {
-    write_with_options(timeline, true, include_multicam_clip, group_storylines)
+impl FcpxmlOptions {
+    /// The project timeline alone.
+    pub const TIMELINE: Self = Self {
+        timeline: true,
+        multicam: false,
+        group_storylines: false,
+    };
 }
 
-pub fn write_with_options(
-    timeline: &ExportTimeline,
-    include_timeline: bool,
-    include_multicam_clip: bool,
-    group_storylines: bool,
-) -> String {
+impl Default for FcpxmlOptions {
+    fn default() -> Self {
+        Self {
+            multicam: true,
+            ..Self::TIMELINE
+        }
+    }
+}
+
+pub fn write(timeline: &ExportTimeline, options: FcpxmlOptions) -> String {
     let island = timeline.islands.first().cloned().unwrap_or(ExportIsland {
         id: 0,
         clips: Vec::new(),
         duration: 0.0,
     });
-    write_island(
-        timeline,
-        &island,
-        include_timeline,
-        include_multicam_clip,
-        group_storylines,
-    )
+    write_island(timeline, &island, options)
 }
 
 /// Combine self-contained FCPXML documents into one library. Each source
@@ -112,10 +118,13 @@ fn prefix_references(fragment: &str, prefix: &str) -> String {
 fn write_island(
     timeline: &ExportTimeline,
     island: &ExportIsland,
-    include_timeline: bool,
-    include_multicam: bool,
-    group_storylines: bool,
+    options: FcpxmlOptions,
 ) -> String {
+    let FcpxmlOptions {
+        timeline: include_timeline,
+        multicam: include_multicam,
+        group_storylines,
+    } = options;
     // Prepared precision stems contain exactly the selected source range.
     let mut prepared_island = island.clone();
     for item in &mut prepared_island.clips {
@@ -292,9 +301,9 @@ fn write_island(
                     timeline_time(item.timeline_duration, frame_duration),
                     timeline_time(item.source_in, frame_duration),
                     u8::from(item.is_enabled(if item.clip.video.is_some() {
-                        "video"
+                        MediaKind::Video
                     } else {
-                        "audio"
+                        MediaKind::Audio
                     })),
                 );
             }
@@ -427,7 +436,7 @@ fn write_island(
             timeline_time(item.start, frame_duration),
             timeline_time(item.timeline_duration, frame_duration),
             timeline_time(item.source_in, frame_duration),
-            u8::from(item.is_enabled("video")),
+            u8::from(item.is_enabled(MediaKind::Video)),
         );
     }
     for item in audio_items {
@@ -482,7 +491,7 @@ fn write_island(
             timeline_time(item.start, frame_duration),
             timeline_time(duration, frame_duration),
             timeline_time(item.source_in, frame_duration),
-            u8::from(item.is_enabled("audio")),
+            u8::from(item.is_enabled(MediaKind::Audio)),
         );
     }
     let mut stories = stories.into_iter().collect::<Vec<_>>();
@@ -556,8 +565,14 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let plain = directory.join("plain.fcpxml");
         let grouped = directory.join("grouped.fcpxml");
-        std::fs::write(&plain, write(&timeline, false)).unwrap();
-        let xml = write_with_storylines(&timeline, false, true);
+        std::fs::write(&plain, write(&timeline, FcpxmlOptions::TIMELINE)).unwrap();
+        let xml = write(
+            &timeline,
+            FcpxmlOptions {
+                group_storylines: true,
+                ..FcpxmlOptions::TIMELINE
+            },
+        );
         assert!(xml.contains("<spine lane="));
         assert!(xml.find("spine lane=\"-1\"").unwrap() < xml.find("spine lane=\"-2\"").unwrap());
         std::fs::write(&grouped, xml).unwrap();
@@ -591,7 +606,7 @@ mod tests {
     #[test]
     fn fcpxml_roundtrips_through_importer() {
         let timeline = fixture_timeline();
-        let xml = write(&timeline, true);
+        let xml = write(&timeline, FcpxmlOptions::default());
         assert!(xml.contains("<fcpxml version=\"1.10\">"));
         assert!(xml.contains("r_multicam"));
         assert!(xml.contains("– synced"));
@@ -629,11 +644,18 @@ mod tests {
     #[test]
     fn timeline_and_multicam_projects_can_be_selected_independently() {
         let timeline = fixture_timeline();
-        let timeline_only = write_with_options(&timeline, true, false, false);
+        let timeline_only = write(&timeline, FcpxmlOptions::TIMELINE);
         assert!(timeline_only.contains("– synced"));
         assert!(!timeline_only.contains("r_multicam"));
 
-        let multicam_only = write_with_options(&timeline, false, true, false);
+        let multicam_only = write(
+            &timeline,
+            FcpxmlOptions {
+                timeline: false,
+                multicam: true,
+                group_storylines: false,
+            },
+        );
         assert!(!multicam_only.contains("– synced"));
         assert!(multicam_only.contains("r_multicam"));
         assert!(multicam_only.contains("– multicam"));
@@ -641,10 +663,10 @@ mod tests {
 
     #[test]
     fn combined_fcpxml_keeps_each_sequence_and_scopes_resources() {
-        let first = write(&fixture_timeline(), false);
+        let first = write(&fixture_timeline(), FcpxmlOptions::TIMELINE);
         let mut second_timeline = fixture_timeline();
         second_timeline.name = "Second cut".into();
-        let second = write(&second_timeline, false);
+        let second = write(&second_timeline, FcpxmlOptions::TIMELINE);
         let combined = combine_documents(&[first, second]).expect("combined FCPXML");
         assert!(combined.contains("id=\"s1-r_fmt_0\""));
         assert!(combined.contains("id=\"s2-r_fmt_0\""));
@@ -674,11 +696,11 @@ mod tests {
                 item.audio_enabled = Some(false);
             }
         }
-        let xml = write(&timeline, false);
+        let xml = write(&timeline, FcpxmlOptions::TIMELINE);
         assert_eq!(xml.matches("<video ref=").count(), 1);
         assert_eq!(xml.matches("<audio ref=").count(), 1);
         timeline.islands[0].clips[0].enabled = false;
-        let xml = write(&timeline, false);
+        let xml = write(&timeline, FcpxmlOptions::TIMELINE);
         assert!(xml.contains("enabled=\"0\""));
         assert_eq!(xml.matches("<video ref=").count(), 1);
     }
@@ -687,7 +709,7 @@ mod tests {
     fn fcpxml_preserves_disabled_clip_state() {
         let mut timeline = fixture_timeline();
         timeline.islands[0].clips[0].enabled = false;
-        let xml = write(&timeline, false);
+        let xml = write(&timeline, FcpxmlOptions::TIMELINE);
         assert!(xml.contains("enabled=\"0\""));
     }
 
@@ -695,7 +717,7 @@ mod tests {
     fn fcpxml_preserves_audio_role() {
         let mut timeline = fixture_timeline();
         timeline.islands[0].clips[0].fcpxml_audio_role = Some("dialogue.interview".to_string());
-        let xml = write(&timeline, false);
+        let xml = write(&timeline, FcpxmlOptions::TIMELINE);
         assert!(xml.contains("audioRole=\"dialogue.interview\""));
     }
 
@@ -832,7 +854,7 @@ mod tests {
         };
         let timeline = ExportTimeline::from_result_with_options(&result, Default::default())
             .expect("timeline");
-        let xml = write(&timeline, false);
+        let xml = write(&timeline, FcpxmlOptions::TIMELINE);
         assert!(xml.contains("audioRole=\"dialogue\""));
         assert!(xml.contains("audioRole=\"effects\""));
         let _ = std::fs::remove_dir_all(&dir);

@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 use super::model::{ExportItem, ExportTimeline, ExportTransition};
 use crate::allocator::{TimelineTrackRequest, allocate, source_key_for_url};
+use crate::model::MediaKind;
 
 struct Entry<'a> {
     item: &'a ExportItem,
@@ -33,7 +34,7 @@ pub fn data(timeline: &ExportTimeline) -> Result<Vec<u8>, String> {
                 source_channel: 0,
             })
             .collect(),
-        "Video",
+        MediaKind::Video,
     );
     let audio_tracks = tracks(
         island
@@ -47,7 +48,7 @@ pub fn data(timeline: &ExportTimeline) -> Result<Vec<u8>, String> {
                 })
             })
             .collect(),
-        "Audio",
+        MediaKind::Audio,
     );
     let resolve_video: Vec<Vec<Entry>> = if video_tracks.is_empty() {
         vec![Vec::new()]
@@ -65,7 +66,7 @@ pub fn data(timeline: &ExportTimeline) -> Result<Vec<u8>, String> {
         children.push(track_json(
             track,
             &format!("Video {}", i + 1),
-            "Video",
+            MediaKind::Video,
             rate,
             &link_groups,
         ));
@@ -74,7 +75,7 @@ pub fn data(timeline: &ExportTimeline) -> Result<Vec<u8>, String> {
         children.push(track_json(
             track,
             &format!("Audio {}", i + 1),
-            "Audio",
+            MediaKind::Audio,
             rate,
             &link_groups,
         ));
@@ -107,7 +108,7 @@ pub fn data(timeline: &ExportTimeline) -> Result<Vec<u8>, String> {
 fn track_json(
     entries: &[Entry],
     name: &str,
-    kind: &str,
+    kind: MediaKind,
     rate: f64,
     link_groups: &HashMap<&str, usize>,
 ) -> Value {
@@ -143,9 +144,8 @@ fn track_json(
         }
         cursor = cursor.max(item_start + timeline_duration(entry, kind) - trim_end);
     }
-    let media = kind.to_lowercase();
     let mut resolve_meta = BTreeMap::from([("Locked".to_string(), json!(false))]);
-    if kind == "Audio" {
+    if kind == MediaKind::Audio {
         resolve_meta.insert("Audio Type".to_string(), json!("Mono"));
         resolve_meta.insert("SoloOn".to_string(), json!(false));
     }
@@ -154,7 +154,7 @@ fn track_json(
         json!(
             entries
                 .first()
-                .is_some_and(|e| e.item.is_track_locked(&media))
+                .is_some_and(|e| e.item.is_track_locked(kind))
         ),
     );
     json!({
@@ -164,8 +164,8 @@ fn track_json(
         "source_range": null,
         "effects": [],
         "markers": [],
-        "enabled": entries.first().is_none_or(|e| e.item.is_track_enabled(&media)),
-        "kind": kind,
+        "enabled": entries.first().is_none_or(|e| e.item.is_track_enabled(kind)),
+        "kind": otio_kind(kind),
         "children": children,
     })
 }
@@ -173,20 +173,19 @@ fn track_json(
 #[allow(clippy::too_many_arguments)]
 fn clip_json(
     entry: &Entry,
-    kind: &str,
+    kind: MediaKind,
     rate: f64,
     link_groups: &HashMap<&str, usize>,
     trim_start: f64,
     trim_end: f64,
 ) -> Value {
     let item = entry.item;
-    let media = kind.to_lowercase();
-    let precision_url = if kind == "Audio" {
+    let precision_url = if kind == MediaKind::Audio {
         item.precision_audio_url(entry.source_channel).cloned()
     } else {
         None
     };
-    let media_url: PathBuf = if kind == "Audio" {
+    let media_url: PathBuf = if kind == MediaKind::Audio {
         precision_url
             .clone()
             .or(item.corrected_audio_url.clone())
@@ -197,28 +196,28 @@ fn clip_json(
     let base = media_start(item, kind);
     let untrimmed_in = if precision_url.is_some() {
         0.0
-    } else if kind == "Audio" && item.corrected_audio_url.is_some() {
+    } else if kind == MediaKind::Audio && item.corrected_audio_url.is_some() {
         item.corrected_source_in()
     } else {
-        item.selected_source_in(&media)
+        item.selected_source_in(kind)
     };
     let duration = (timeline_duration(entry, kind) - trim_start - trim_end).max(0.0);
     let available = if precision_url.is_some() {
         item.precision_selected_duration()
-    } else if kind == "Audio" && item.corrected_audio_url.is_some() {
+    } else if kind == MediaKind::Audio && item.corrected_audio_url.is_some() {
         item.mapped_duration()
     } else {
         item.source_duration()
     };
-    let playback_rate = item.playback_rate(&media);
-    let plays_backward = item.plays_backward(&media);
+    let playback_rate = item.playback_rate(kind);
+    let plays_backward = item.plays_backward(kind);
     let source_in = untrimmed_in + trim_start * playback_rate;
 
     let mut resolve_meta = BTreeMap::new();
     if let Some(group) = link_groups.get(item.instance_id.as_str()) {
         resolve_meta.insert("Link Group ID".to_string(), json!(*group));
     }
-    if kind == "Audio" {
+    if kind == MediaKind::Audio {
         resolve_meta.insert(
             "Channels".to_string(),
             json!([{
@@ -235,18 +234,18 @@ fn clip_json(
     if !resolve_meta.is_empty() {
         metadata.insert("Resolve_OTIO".to_string(), json!(resolve_meta));
     }
-    if let Some(remap) = item.fcp7_time_remap_xml(&media) {
+    if let Some(remap) = item.fcp7_time_remap_xml(kind) {
         metadata.insert(
             "Align".to_string(),
             json!({
                 "FCP7 Time Remap XML": remap,
-                "Source In Seconds": item.selected_source_in(&media),
-                "Source Out Seconds": item.selected_source_out(&media),
+                "Source In Seconds": item.selected_source_in(kind),
+                "Source Out Seconds": item.selected_source_out(kind),
                 "Plays Backward": plays_backward,
             }),
         );
     }
-    let effects: Vec<Value> = if item.is_retimed(&media) {
+    let effects: Vec<Value> = if item.is_retimed(kind) {
         vec![json!({
             "OTIO_SCHEMA": "LinearTimeWarp.1",
             "metadata": {},
@@ -270,7 +269,7 @@ fn clip_json(
         "source_range": time_range(base + source_in, duration, rate),
         "effects": effects,
         "markers": [],
-        "enabled": item.is_enabled(&media),
+        "enabled": item.is_enabled(kind),
         "media_references": {
             "DEFAULT_MEDIA": {
                 "OTIO_SCHEMA": "ExternalReference.1",
@@ -339,34 +338,33 @@ fn rational_time(seconds: f64, rate: f64) -> Value {
     })
 }
 
-fn timeline_duration(entry: &Entry, kind: &str) -> f64 {
-    let media = kind.to_lowercase();
+fn timeline_duration(entry: &Entry, kind: MediaKind) -> f64 {
     let item = entry.item;
-    if item.is_retimed(&media) {
-        return item.selected_timeline_duration(&media);
+    if item.is_retimed(kind) {
+        return item.selected_timeline_duration(kind);
     }
-    if kind == "Audio" && !item.precision_audio_urls.is_empty() {
+    if kind == MediaKind::Audio && !item.precision_audio_urls.is_empty() {
         return item.precision_selected_duration();
     }
-    if kind == "Audio" && item.corrected_audio_url.is_some() {
+    if kind == MediaKind::Audio && item.corrected_audio_url.is_some() {
         return item.corrected_selected_duration();
     }
-    item.selected_timeline_duration(&media)
+    item.selected_timeline_duration(kind)
 }
 
-fn timeline_start(entry: &Entry, kind: &str) -> f64 {
-    entry.item.timeline_start(&kind.to_lowercase())
+fn timeline_start(entry: &Entry, kind: MediaKind) -> f64 {
+    entry.item.timeline_start(kind)
 }
 
-fn media_start(item: &ExportItem, kind: &str) -> f64 {
+fn media_start(item: &ExportItem, kind: MediaKind) -> f64 {
     if item.corrected_audio_url.is_some() {
         return 0.0;
     }
     if let Some(tc) = item.clip.source_timecode() {
         return tc.as_seconds();
     }
-    if kind == "Audio"
-        && item.clip.kind == crate::model::MediaKind::Audio
+    if kind == MediaKind::Audio
+        && item.clip.kind == MediaKind::Audio
         && item.clip.recorded_at_source
             == Some(crate::model::RecordingTimestampSource::EmbeddedMetadata)
         && let Some(date) = item.clip.recorded_at
@@ -377,16 +375,16 @@ fn media_start(item: &ExportItem, kind: &str) -> f64 {
     0.0
 }
 
-fn tracks<'a>(entries: Vec<Entry<'a>>, kind: &str) -> Vec<Vec<Entry<'a>>> {
+fn tracks<'a>(entries: Vec<Entry<'a>>, kind: MediaKind) -> Vec<Vec<Entry<'a>>> {
     // Keep a source's video dissolve on one track.
     let mut forced: Vec<Vec<Entry>> = Vec::new();
     let mut allocatable: Vec<Entry> = Vec::new();
-    if kind == "Video" {
+    if kind == MediaKind::Video {
         let mut groups: HashMap<String, Vec<Entry>> = HashMap::new();
         for entry in entries {
             let key = entry
                 .item
-                .preferred_source_key("video")
+                .preferred_source_key(MediaKind::Video)
                 .map(str::to_string)
                 .unwrap_or_else(|| source_key_for_url(&entry.item.clip.url));
             groups.entry(key).or_default().push(entry);
@@ -396,7 +394,7 @@ fn tracks<'a>(entries: Vec<Entry<'a>>, kind: &str) -> Vec<Vec<Entry<'a>>> {
             .filter(|(_, v)| {
                 let ts: Vec<_> = v
                     .iter()
-                    .filter_map(|e| e.item.transition_for("video"))
+                    .filter_map(|e| e.item.transition_for(MediaKind::Video))
                     .collect();
                 !ts.is_empty() && ts.iter().all(|t| t.is_otio_portable)
             })
@@ -421,16 +419,15 @@ fn tracks<'a>(entries: Vec<Entry<'a>>, kind: &str) -> Vec<Vec<Entry<'a>>> {
     } else {
         allocatable = entries;
     }
-    let media = kind.to_lowercase();
     let requests: Vec<TimelineTrackRequest> = allocatable
         .iter()
         .map(|entry| {
             let item = entry.item;
             let base_key = item
-                .preferred_source_key(&media)
+                .preferred_source_key(kind)
                 .map(str::to_string)
                 .unwrap_or_else(|| source_key_for_url(&item.clip.url));
-            let source_key = if kind == "Audio" {
+            let source_key = if kind == MediaKind::Audio {
                 format!("{base_key}#channel-{}", entry.source_channel)
             } else {
                 base_key
@@ -475,8 +472,16 @@ fn tracks<'a>(entries: Vec<Entry<'a>>, kind: &str) -> Vec<Vec<Entry<'a>>> {
     forced
 }
 
-fn entry_id(item: &ExportItem, kind: &str, channel: usize) -> String {
-    format!("{}#{kind}#{channel}", item.instance_id)
+fn entry_id(item: &ExportItem, kind: MediaKind, channel: usize) -> String {
+    format!("{}#{}#{channel}", item.instance_id, otio_kind(kind))
+}
+
+/// OTIO's track kind for one side of the timeline.
+fn otio_kind(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Audio => "Audio",
+        MediaKind::Video => "Video",
+    }
 }
 
 #[cfg(test)]

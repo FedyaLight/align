@@ -80,6 +80,9 @@ enum Rounding {
 
 // ------------------------------------------------------------ entries
 
+/// One clipitem: item instance, timeline side, and source channel.
+type ClipKey = (String, MediaKind, usize);
+
 #[derive(Clone, Copy)]
 struct TrackEntry<'a> {
     item: &'a ExportItem,
@@ -87,10 +90,10 @@ struct TrackEntry<'a> {
 }
 
 impl<'a> TrackEntry<'a> {
-    fn key(&self, media_type: &str) -> (String, String, usize) {
+    fn key(&self, media_type: MediaKind) -> ClipKey {
         (
             self.item.instance_id.clone(),
-            media_type.to_string(),
+            media_type,
             self.source_channel,
         )
     }
@@ -98,7 +101,7 @@ impl<'a> TrackEntry<'a> {
 
 struct LinkReference {
     clip_item_id: String,
-    media_type: Option<&'static str>,
+    media_type: Option<MediaKind>,
     track_index: Option<usize>,
     clip_index: Option<usize>,
     group_index: Option<usize>,
@@ -269,34 +272,39 @@ fn sequence(
             })
         })
         .collect();
-    let video_tracks = tracks_for(&video_entries, "video", format, rate);
-    let audio_tracks = tracks_for(&audio_entries, "audio", format, rate);
-    let video_ids = identifiers(&video_tracks, "video", 1, clip_id_prefix);
-    let audio_ids = identifiers(&audio_tracks, "audio", video_ids.len() + 1, clip_id_prefix);
-    let video_positions = positions(&video_tracks, "video");
-    let audio_positions = positions(&audio_tracks, "audio");
+    let video_tracks = tracks_for(&video_entries, MediaKind::Video, format, rate);
+    let audio_tracks = tracks_for(&audio_entries, MediaKind::Audio, format, rate);
+    let video_ids = identifiers(&video_tracks, MediaKind::Video, 1, clip_id_prefix);
+    let audio_ids = identifiers(
+        &audio_tracks,
+        MediaKind::Audio,
+        video_ids.len() + 1,
+        clip_id_prefix,
+    );
+    let video_positions = positions(&video_tracks, MediaKind::Video);
+    let audio_positions = positions(&audio_tracks, MediaKind::Audio);
 
     for track in &video_tracks {
         xml += "            <track>\n";
         for (index, entry) in track.iter().enumerate() {
             let before = if index > 0 {
-                transition_between(&track[index - 1], entry, "video")
+                transition_between(&track[index - 1], entry, MediaKind::Video)
             } else {
                 None
             };
             let after = if index + 1 < track.len() {
-                transition_between(entry, &track[index + 1], "video")
+                transition_between(entry, &track[index + 1], MediaKind::Video)
             } else {
                 None
             };
             xml += &clip_item(
                 entry,
-                "video",
+                MediaKind::Video,
                 format,
-                &video_ids[&entry.key("video")],
+                &video_ids[&entry.key(MediaKind::Video)],
                 &links(
                     entry,
-                    "video",
+                    MediaKind::Video,
                     format,
                     &video_ids,
                     &audio_ids,
@@ -314,10 +322,10 @@ fn sequence(
         }
         let enabled = track
             .first()
-            .is_none_or(|e| e.item.is_track_enabled("video"));
+            .is_none_or(|e| e.item.is_track_enabled(MediaKind::Video));
         let locked = track
             .first()
-            .is_some_and(|e| e.item.is_track_locked("video"));
+            .is_some_and(|e| e.item.is_track_locked(MediaKind::Video));
         xml += &format!(
             "              <enabled>{}</enabled><locked>{}</locked>\n            </track>\n",
             tf(enabled),
@@ -346,23 +354,23 @@ fn sequence(
         xml += "            <track>\n";
         for (index, entry) in track.iter().enumerate() {
             let before = if index > 0 {
-                transition_between(&track[index - 1], entry, "audio")
+                transition_between(&track[index - 1], entry, MediaKind::Audio)
             } else {
                 None
             };
             let after = if index + 1 < track.len() {
-                transition_between(entry, &track[index + 1], "audio")
+                transition_between(entry, &track[index + 1], MediaKind::Audio)
             } else {
                 None
             };
             xml += &clip_item(
                 entry,
-                "audio",
+                MediaKind::Audio,
                 format,
-                &audio_ids[&entry.key("audio")],
+                &audio_ids[&entry.key(MediaKind::Audio)],
                 &links(
                     entry,
-                    "audio",
+                    MediaKind::Audio,
                     format,
                     &video_ids,
                     &audio_ids,
@@ -380,10 +388,10 @@ fn sequence(
         }
         let enabled = track
             .first()
-            .is_none_or(|e| e.item.is_track_enabled("audio"));
+            .is_none_or(|e| e.item.is_track_enabled(MediaKind::Audio));
         let locked = track
             .first()
-            .is_some_and(|e| e.item.is_track_locked("audio"));
+            .is_some_and(|e| e.item.is_track_locked(MediaKind::Audio));
         xml += &format!(
             "              <enabled>{}</enabled><locked>{}</locked>\n            </track>\n",
             tf(enabled),
@@ -548,10 +556,10 @@ fn audio_duration(item: &ExportItem) -> f64 {
 
 fn identifiers(
     tracks: &[Vec<TrackEntry>],
-    media_type: &str,
+    media_type: MediaKind,
     first: usize,
     prefix: &str,
-) -> HashMap<(String, String, usize), String> {
+) -> HashMap<ClipKey, String> {
     let mut out = HashMap::new();
     for (number, entry) in (first..).zip(tracks.iter().flat_map(|t| t.iter())) {
         out.insert(entry.key(media_type), format!("clipitem-{prefix}{number}"));
@@ -561,8 +569,8 @@ fn identifiers(
 
 fn positions(
     tracks: &[Vec<TrackEntry>],
-    media_type: &str,
-) -> HashMap<(String, String, usize), (usize, usize)> {
+    media_type: MediaKind,
+) -> HashMap<ClipKey, (usize, usize)> {
     let mut out = HashMap::new();
     for (track_offset, track) in tracks.iter().enumerate() {
         for (clip_offset, entry) in track.iter().enumerate() {
@@ -574,14 +582,14 @@ fn positions(
 
 fn links(
     entry: &TrackEntry,
-    media_type: &str,
+    media_type: MediaKind,
     format: TimelineExportFormat,
-    video_ids: &HashMap<(String, String, usize), String>,
-    audio_ids: &HashMap<(String, String, usize), String>,
-    video_positions: &HashMap<(String, String, usize), (usize, usize)>,
-    audio_positions: &HashMap<(String, String, usize), (usize, usize)>,
+    video_ids: &HashMap<ClipKey, String>,
+    audio_ids: &HashMap<ClipKey, String>,
+    video_positions: &HashMap<ClipKey, (usize, usize)>,
+    audio_positions: &HashMap<ClipKey, (usize, usize)>,
 ) -> Vec<LinkReference> {
-    let video_key = (entry.item.instance_id.clone(), "video".to_string(), 0);
+    let video_key = (entry.item.instance_id.clone(), MediaKind::Video, 0);
     let (Some(video_id), Some(video_position)) =
         (video_ids.get(&video_key), video_positions.get(&video_key))
     else {
@@ -589,7 +597,7 @@ fn links(
     };
     let mut linked_audio: Vec<(String, (usize, usize))> = audio_ids
         .keys()
-        .filter(|k| k.0 == entry.item.instance_id && k.1 == "audio")
+        .filter(|k| k.0 == entry.item.instance_id && k.1 == MediaKind::Audio)
         .filter_map(|k| Some((audio_ids.get(k)?.clone(), *audio_positions.get(k)?)))
         .collect();
     linked_audio.sort_by(|a, b| {
@@ -611,14 +619,14 @@ fn links(
     if format == TimelineExportFormat::PremiereXML {
         let mut out = vec![LinkReference {
             clip_item_id: video_id.clone(),
-            media_type: Some("video"),
+            media_type: Some(MediaKind::Video),
             track_index: Some(video_position.0),
             clip_index: Some(video_position.1),
             group_index: None,
         }];
         out.extend(linked_audio.iter().map(|audio| LinkReference {
             clip_item_id: audio.0.clone(),
-            media_type: Some("audio"),
+            media_type: Some(MediaKind::Audio),
             track_index: Some(audio.1.0),
             clip_index: Some(audio.1.1),
             group_index: Some(1),
@@ -628,8 +636,8 @@ fn links(
     vec![
         LinkReference {
             clip_item_id: video_id.clone(),
-            media_type: if media_type == "audio" {
-                Some("video")
+            media_type: if media_type == MediaKind::Audio {
+                Some(MediaKind::Video)
             } else {
                 None
             },
@@ -649,7 +657,7 @@ fn links(
 
 fn tracks_for<'a>(
     entries: &[TrackEntry<'a>],
-    media_type: &str,
+    media_type: MediaKind,
     format: TimelineExportFormat,
     rate: SequenceRate,
 ) -> Vec<Vec<TrackEntry<'a>>> {
@@ -659,7 +667,7 @@ fn tracks_for<'a>(
             .preferred_source_key(media_type)
             .map(str::to_string)
             .unwrap_or_else(|| source_key_for_url(&item.clip.url));
-        if media_type == "audio" {
+        if media_type == MediaKind::Audio {
             format!("{base}#channel-{}", entry.source_channel)
         } else {
             base
@@ -673,10 +681,10 @@ fn tracks_for<'a>(
         .iter()
         .filter(|(_, v)| {
             v.iter().any(|e| {
-                if media_type == "audio" {
-                    e.item.transition_for("audio").is_some()
+                if media_type == MediaKind::Audio {
+                    e.item.transition_for(MediaKind::Audio).is_some()
                 } else {
-                    e.item.transition_for("video").is_some()
+                    e.item.transition_for(MediaKind::Video).is_some()
                 }
             })
         })
@@ -704,7 +712,7 @@ fn tracks_for<'a>(
         .iter()
         .map(|entry| {
             let item = entry.item;
-            let duration = if media_type == "audio"
+            let duration = if media_type == MediaKind::Audio
                 && item.corrected_audio_url.is_some()
                 && !item.is_retimed(media_type)
             {
@@ -771,7 +779,7 @@ fn tracks_for<'a>(
 #[allow(clippy::too_many_arguments)]
 fn clip_item(
     entry: &TrackEntry,
-    media_type: &str,
+    media_type: MediaKind,
     format: TimelineExportFormat,
     id: &str,
     links: &[LinkReference],
@@ -789,7 +797,7 @@ fn clip_item(
     // writer instead; the precision script restores sample placement.
     let mut start = rate.frames(
         stable_start,
-        if media_type == "video" || resolve {
+        if media_type == MediaKind::Video || resolve {
             Rounding::Nearest
         } else {
             Rounding::Down
@@ -799,7 +807,7 @@ fn clip_item(
     // adjacent integer frame so near-exact starts encode exactly instead of
     // as floor + a full-frame subframeoffset Premiere would drop.
     let mut start_frac = 0.0;
-    if media_type == "audio" && !resolve {
+    if media_type == MediaKind::Audio && !resolve {
         let sample_rate = item.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);
         let raw_frac = stable_start * rate.fps - start as f64;
         let (adjustment, effective) =
@@ -814,7 +822,7 @@ fn clip_item(
         .and_then(|v| v.frame_duration)
         .map(SequenceRate::new)
         .unwrap_or(rate);
-    let corrected = media_type == "audio" && item.corrected_audio_url.is_some();
+    let corrected = media_type == MediaKind::Audio && item.corrected_audio_url.is_some();
     // Pads are a PremiereXML-only essence swap: the Resolve bootstrap keeps
     // referencing drift/original files with the historical subframeoffset
     // encoding, byte-identical to before.
@@ -903,7 +911,7 @@ fn clip_item(
         rate.frames(selected_tl, Rounding::Nearest)
     };
     let end = start + timeline_duration;
-    let media_url: PathBuf = if media_type == "audio" {
+    let media_url: PathBuf = if media_type == MediaKind::Audio {
         let pad_url = if padded {
             item.placement_pad_url.clone()
         } else {
@@ -948,7 +956,7 @@ fn clip_item(
         start_override.unwrap_or(start),
         end_override.unwrap_or(end)
     );
-    if media_type == "audio" && !padded {
+    if media_type == MediaKind::Audio && !padded {
         let subframes = super::model::subframe_offset_80(start_frac);
         if subframes != 0 {
             xml += &format!("                <subframeoffset>{subframes}</subframeoffset>\n");
@@ -987,7 +995,7 @@ fn clip_item(
     } else {
         xml += &format!("                <file id=\"{file_id}\"/>\n");
     }
-    if media_type == "audio" {
+    if media_type == MediaKind::Audio {
         xml += &format!(
             "                <sourcetrack><mediatype>audio</mediatype><trackindex>{}</trackindex></sourcetrack>\n",
             entry.source_channel
@@ -1020,7 +1028,7 @@ fn clip_item(
 fn transition_between<'a>(
     left: &TrackEntry<'a>,
     right: &TrackEntry<'a>,
-    media_type: &str,
+    media_type: MediaKind,
 ) -> Option<&'a ExportTransition> {
     let t = left.item.transition_for(media_type)?;
     if t.right_instance_id == right.item.instance_id {
@@ -1064,7 +1072,7 @@ fn splice_pair(xml: &str, tag: &str, value: i64) -> Option<String> {
 
 #[allow(clippy::too_many_arguments)]
 fn time_remap(
-    media_type: &str,
+    media_type: MediaKind,
     graph_slope: f64,
     graph_in: i64,
     graph_out: i64,
@@ -1161,7 +1169,7 @@ fn xml_number(value: f64) -> String {
 fn file_block(
     item: &ExportItem,
     media_url: &Path,
-    media_type: &str,
+    media_type: MediaKind,
     id: &str,
     duration: i64,
     rate: SequenceRate,
@@ -1177,7 +1185,7 @@ fn file_block(
         xml_text::escape(&absolute),
     );
     xml += &rate.xml("                  ");
-    let timecode = if media_type == "video" {
+    let timecode = if media_type == MediaKind::Video {
         clip.video.as_ref().and_then(|v| v.source_timecode.clone())
     } else if format == TimelineExportFormat::ResolveXML && clip.video.is_none() {
         // Resolve derives an audio file's start timecode from its BWF time
@@ -1198,7 +1206,7 @@ fn file_block(
         );
         xml += &source_rate.xml("                    ");
         xml += "                  </timecode>\n";
-    } else if media_type == "video"
+    } else if media_type == MediaKind::Video
         && let Some(video) = &clip.video
     {
         let fallback = crate::model::SourceTimecode {
@@ -1218,7 +1226,7 @@ fn file_block(
         xml += "                  </timecode>\n";
     }
     xml += "                  <media>";
-    if media_type == "video"
+    if media_type == MediaKind::Video
         && let Some(video) = &clip.video
     {
         xml += &format!(
@@ -1288,7 +1296,7 @@ mod tests {
             .first()
             .and_then(|a| {
                 super::super::model::placement_pad_samples(
-                    rec.timeline_start("audio"),
+                    rec.timeline_start(MediaKind::Audio),
                     super::super::model::sequence_fps(timeline.frame_duration),
                     a.sample_rate,
                 )

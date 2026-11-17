@@ -1960,19 +1960,24 @@ impl AlignApp {
                     },
                 });
             };
+            let options = align_decode::export::ExportOptions {
+                formats,
+                correct_drift: drift,
+                include_replaced_sequence: replaced,
+                include_media_files: media,
+                aaf_frame_duration,
+                fcpxml: align_core::export::fcpxml::FcpxmlOptions {
+                    timeline: fcpxml_timeline,
+                    multicam: fcpxml_multicam,
+                    group_storylines: storylines,
+                },
+            };
             let out = align_decode::export::export_prepared_many(
                 align_decode::export::ExportBatchRequest {
                     backend: pipeline.backend(),
                     timelines: &timelines,
                     directory: &dir,
-                    formats: &formats,
-                    correct_drift: drift,
-                    include_replaced_sequence: replaced,
-                    include_media_files: media,
-                    aaf_frame_duration,
-                    include_fcpxml_timeline: fcpxml_timeline,
-                    include_fcpxml_multicam: fcpxml_multicam,
-                    group_fcpxml_storylines: storylines,
+                    options: &options,
                     cancel: &cancel,
                 },
                 Some(&mut progress),

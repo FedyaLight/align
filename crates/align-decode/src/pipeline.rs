@@ -2503,7 +2503,7 @@ mod tests {
 
     #[test]
     fn known_clock_drift_survives_pipeline_and_export() {
-        use crate::export::{ExportRequest, export_prepared};
+        use crate::export::{ExportOptions, ExportRequest, export_prepared};
         use align_core::export::{ExportTimeline, TimelineExportFormat};
         let body = noise(120 * 44100, 0xD21F7);
         for (tag, clock_rate) in [
@@ -2577,14 +2577,10 @@ mod tests {
                     backend: &crate::portable::PortableBackend,
                     timeline: &timeline,
                     directory: &output,
-                    formats: &[TimelineExportFormat::ResolveOTIO],
-                    correct_drift: true,
-                    include_replaced_sequence: false,
-                    include_media_files: false,
-                    aaf_frame_duration: None,
-                    include_fcpxml_timeline: true,
-                    include_fcpxml_multicam: true,
-                    group_fcpxml_storylines: false,
+                    options: &ExportOptions {
+                        formats: vec![TimelineExportFormat::ResolveOTIO],
+                        ..ExportOptions::default()
+                    },
                     cancel: &cancel,
                 },
                 None,

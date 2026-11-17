@@ -20,6 +20,7 @@ pub mod mono;
 mod pcm;
 pub mod pipeline;
 pub mod portable;
+pub mod process;
 pub mod provider;
 pub mod remux;
 pub mod render;
@@ -57,6 +58,10 @@ pub enum DecodeError {
     Apple(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// A block consumer stopped decoding with its own error, which the
+    /// caller receives unchanged (see `render::RenderError`).
+    #[error(transparent)]
+    Consumer(Box<dyn std::error::Error + Send + Sync>),
 }
 
 pub fn supported_extensions() -> &'static [&'static str] {

@@ -21,35 +21,16 @@ pub const OUTPUT_RATE: u32 = 48_000;
 /// Audio frames per written chunk (one second).
 const AUDIO_CHUNK_FRAMES: usize = OUTPUT_RATE as usize;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum RemuxError {
     /// The source is not a QuickTime/MP4 file this writer can copy; the
     /// caller may use another muxer.
+    #[error("unsupported camera file: {0}")]
     Unsupported(&'static str),
-    Render(RenderError),
-    Io(std::io::Error),
-}
-
-impl std::fmt::Display for RemuxError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unsupported(reason) => write!(f, "unsupported camera file: {reason}"),
-            Self::Render(error) => error.fmt(f),
-            Self::Io(error) => error.fmt(f),
-        }
-    }
-}
-
-impl From<std::io::Error> for RemuxError {
-    fn from(error: std::io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
-impl From<RenderError> for RemuxError {
-    fn from(error: RenderError) -> Self {
-        Self::Render(error)
-    }
+    #[error(transparent)]
+    Render(#[from] RenderError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 /// Replacement audio: `duration` seconds of `source` from `source_in`,
@@ -154,7 +135,7 @@ pub fn replace_audio(
             .min((total_frames - delay_frames) as f64 / OUTPUT_RATE as f64),
         OUTPUT_RATE as f64,
         cancel,
-        &mut |planes| sink.planar(&planes).map_err(|_| RenderError::CannotWrite),
+        &mut |planes| sink.planar(&planes).map_err(RenderError::Write),
     )?;
     let written = sink.frames;
     sink.silence(total_frames.saturating_sub(written))?;

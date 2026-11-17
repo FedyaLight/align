@@ -198,7 +198,7 @@ pub fn read_timeline(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, 
     // A file avoids stdout pipe deadlocks on large compositions while retaining
     // cancellable process supervision and automatic temporary-file cleanup.
     let mut output = tempfile::tempfile()?;
-    let mut child = crate::ff::command(executable)
+    let mut child = crate::process::command(executable)
         .arg("read-timeline")
         .arg(path)
         .arg(crate::media_assets::extraction_directory()?)
@@ -206,13 +206,7 @@ pub fn read_timeline(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, 
         .stdout(Stdio::from(output.try_clone()?))
         .stderr(Stdio::inherit())
         .spawn()?;
-    let status = crate::export::wait_render_process(&mut child, cancel).map_err(|error| {
-        if cancel.load(Ordering::Relaxed) {
-            AafError::Cancelled
-        } else {
-            AafError::Writer(error.to_string())
-        }
-    })?;
+    let status = crate::process::wait_cancellable(&mut child, cancel)?;
     if !status.success() {
         return Err(AafError::Writer(status.to_string()));
     }
@@ -281,6 +275,15 @@ pub enum AafError {
     Io(#[from] std::io::Error),
 }
 
+impl From<crate::process::WaitError> for AafError {
+    fn from(error: crate::process::WaitError) -> Self {
+        match error {
+            crate::process::WaitError::Cancelled => Self::Cancelled,
+            crate::process::WaitError::Io(error) => Self::Io(error),
+        }
+    }
+}
+
 /// Invoke a manifest already staged by the export job. No shell interpretation.
 /// The helper atomically commits the destination only after completing the AAF.
 pub fn write_audio(
@@ -292,7 +295,7 @@ pub fn write_audio(
         return Err(AafError::Cancelled);
     }
     let executable = crate::ff::resolve_bin("ALIGN_AAF", "align-aaf").ok_or(AafError::Missing)?;
-    let mut child = crate::ff::command(executable)
+    let mut child = crate::process::command(executable)
         .arg("write-audio")
         .arg(manifest)
         .arg(destination)
@@ -300,13 +303,7 @@ pub fn write_audio(
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()?;
-    let status = crate::export::wait_render_process(&mut child, cancel).map_err(|error| {
-        if cancel.load(Ordering::Relaxed) {
-            AafError::Cancelled
-        } else {
-            AafError::Writer(error.to_string())
-        }
-    })?;
+    let status = crate::process::wait_cancellable(&mut child, cancel)?;
     if !status.success() {
         return Err(AafError::Writer(status.to_string()));
     }
@@ -347,7 +344,7 @@ pub fn repair_paths(
     serde_json::to_writer(manifest.as_file_mut(), &document)
         .map_err(|error| AafError::Writer(error.to_string()))?;
     let mut output = tempfile::tempfile()?;
-    let mut child = crate::ff::command(executable)
+    let mut child = crate::process::command(executable)
         .arg("repair-paths")
         .arg(manifest.path())
         .arg(source)
@@ -356,13 +353,7 @@ pub fn repair_paths(
         .stdout(Stdio::from(output.try_clone()?))
         .stderr(Stdio::inherit())
         .spawn()?;
-    let status = crate::export::wait_render_process(&mut child, cancel).map_err(|error| {
-        if cancel.load(Ordering::Relaxed) {
-            AafError::Cancelled
-        } else {
-            AafError::Writer(error.to_string())
-        }
-    })?;
+    let status = crate::process::wait_cancellable(&mut child, cancel)?;
     if !status.success() {
         return Err(AafError::Writer(status.to_string()));
     }
@@ -393,8 +384,8 @@ pub fn audio_manifest(
         for item in &island.clips {
             if item.clip.video.is_some()
                 || item.linked_audio_edit.is_some()
-                || item.is_retimed("audio")
-                || item.transition_for("audio").is_some()
+                || item.is_retimed(align_core::MediaKind::Audio)
+                || item.transition_for(align_core::MediaKind::Audio).is_some()
                 || !item.enabled
                 || !item.track_enabled
             {
@@ -419,7 +410,7 @@ pub fn audio_manifest(
                 }
                 Ok(value.round() as u64)
             };
-            let start = samples(item.timeline_start("audio"))?;
+            let start = samples(item.timeline_start(align_core::MediaKind::Audio))?;
             let length = samples(item.precision_source_duration())?;
             let frames = length
                 .checked_add(item.precision_tail_samples)
@@ -428,7 +419,7 @@ pub fn audio_manifest(
                 return Err(fail("Invalid AAF clip length"));
             }
             let source = item
-                .preferred_source_key("audio")
+                .preferred_source_key(align_core::MediaKind::Audio)
                 .map(str::to_owned)
                 .unwrap_or_else(|| {
                     align_core::allocator::source_key_for_clip(
@@ -530,9 +521,9 @@ pub fn timeline_manifest_with_frame_rate(
         .transpose()?;
     let mut audio = timeline.clone();
     for island in &mut audio.islands {
-        island
-            .clips
-            .retain(|item| !item.clip.audio.is_empty() && item.is_enabled("audio"));
+        island.clips.retain(|item| {
+            !item.clip.audio.is_empty() && item.is_enabled(align_core::MediaKind::Audio)
+        });
         for item in &mut island.clips {
             item.clip.video = None;
             item.clip.kind = align_core::MediaKind::Audio;
@@ -549,9 +540,9 @@ pub fn timeline_manifest_with_frame_rate(
         let Some(video) = &item.clip.video else {
             continue;
         };
-        if item.is_retimed("video")
-            || item.transition_for("video").is_some()
-            || !item.is_enabled("video")
+        if item.is_retimed(align_core::MediaKind::Video)
+            || item.transition_for(align_core::MediaKind::Video).is_some()
+            || !item.is_enabled(align_core::MediaKind::Video)
             || !item.track_enabled
         {
             return Err(fail("AAF picture edit semantics not implemented"));
@@ -572,9 +563,9 @@ pub fn timeline_manifest_with_frame_rate(
             }
             Ok(value.round() as u64)
         };
-        let start = frame(item.timeline_start("video"))?;
-        let source_in = frame(item.selected_source_in("video"))?;
-        let length = frame(item.selected_timeline_duration("video"))?;
+        let start = frame(item.timeline_start(align_core::MediaKind::Video))?;
+        let source_in = frame(item.selected_source_in(align_core::MediaKind::Video))?;
+        let length = frame(item.selected_timeline_duration(align_core::MediaKind::Video))?;
         if length == 0 {
             return Err(fail("Empty AAF picture edit"));
         }
@@ -587,7 +578,7 @@ pub fn timeline_manifest_with_frame_rate(
             let probe = crate::ff::ffprobe_bin()
                 .ok_or_else(|| fail("AAF picture export requires ffprobe"))?;
             let mut output = tempfile::tempfile()?;
-            let mut child = crate::ff::command(probe)
+            let mut child = crate::process::command(probe)
                 .args([
                     "-v",
                     "error",
@@ -601,14 +592,7 @@ pub fn timeline_manifest_with_frame_rate(
                 .stdout(Stdio::from(output.try_clone()?))
                 .stderr(Stdio::inherit())
                 .spawn()?;
-            let status =
-                crate::export::wait_render_process(&mut child, cancel).map_err(|error| {
-                    if cancel.load(Ordering::Relaxed) {
-                        AafError::Cancelled
-                    } else {
-                        AafError::Writer(error.to_string())
-                    }
-                })?;
+            let status = crate::process::wait_cancellable(&mut child, cancel)?;
             if !status.success() {
                 return Err(fail("AAF picture media inspection failed"));
             }
@@ -619,7 +603,7 @@ pub fn timeline_manifest_with_frame_rate(
             metadata.insert(item.clip.url.clone(), value);
         }
         pictures.push(
-            json!({"name":item.preferred_source_key("video").unwrap_or("Video"),
+            json!({"name":item.preferred_source_key(align_core::MediaKind::Video).unwrap_or("Video"),
             "edit_rate":{"numerator":clock.timescale,"denominator":clock.value},
             "clips":[{"path":item.clip.url,"start":start,"source_in":source_in,"length":length,
                 "metadata":metadata[&item.clip.url]}]}),
@@ -775,7 +759,10 @@ mod tests {
                 "xml",
                 premiere::write(&timeline, TimelineExportFormat::PremiereXML, false),
             ),
-            ("fcpxml", fcpxml::write(&timeline, false)),
+            (
+                "fcpxml",
+                fcpxml::write(&timeline, fcpxml::FcpxmlOptions::TIMELINE),
+            ),
         ] {
             let path = temp.path().join(format!("roundtrip.{extension}"));
             std::fs::write(&path, xml).unwrap();
