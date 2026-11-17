@@ -186,8 +186,9 @@ version, operating system, steps to reproduce, and error message. For timeline
 problems, include the interchange format and editor version. Do not attach
 private recordings or project files to public issues.
 
-For code changes, use the [development checks](docs/development.md#verification)
-and describe the behavior you changed and how you tested it.
+Pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) explains how to
+set up, test, and describe a change. Report security problems privately as
+described in [SECURITY.md](SECURITY.md).
 
 ## License
 

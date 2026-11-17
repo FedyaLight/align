@@ -16,21 +16,8 @@ on:
       - "LICENSE"
       - "THIRD_PARTY_NOTICES.txt"
       - ".github/workflows/align-rs.yml"
+  # Every pull request runs, so the required "checks" status always reports.
   pull_request:
-    paths:
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - ".cargo/**"
-      - "about.toml"
-      - "script/**"
-      - "Support/**"
-      - "docs/**"
-      - "README.md"
-      - "LICENSE"
-      - "THIRD_PARTY_NOTICES.txt"
-      - ".github/workflows/align-rs.yml"
   workflow_dispatch:
 
 # A newer push to the same branch supersedes a running check; release
@@ -144,6 +131,18 @@ jobs:
           name: smoke-${{ runner.os }}
           path: release-smoke/
 
+  # One status for branch protection, independent of the platform matrix.
+  checks:
+    name: checks
+    if: always()
+    needs: check-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every platform to pass
+        if: needs.check-test.result != 'success'
+        run: |
+          echo "test · clippy finished with: ${{ needs.check-test.result }}"
+          exit 1
 
   # Tags vX.Y.Z build and publish every installer. A manual run on any
   # branch builds the same installers as artifacts without publishing.

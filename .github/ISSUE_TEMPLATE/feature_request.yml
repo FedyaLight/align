@@ -1,0 +1,31 @@
+name: Feature request
+description: Suggest a new feature or a change to how Align works.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Please check [existing issues](https://github.com/FedyaLight/align/issues) first.
+        Requests are public: remove private file names and paths before submitting.
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+      description: Describe the job, not only the feature. For example, which cameras and recorders you use and what you do with the result.
+    validations:
+      required: true
+  - type: textarea
+    id: today
+    attributes:
+      label: How do you do it today?
+      description: Optional. The workaround or another tool you use now.
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help?
+      description: What Align should do, and what you expect to see in Align or in your editor afterwards.
+  - type: input
+    id: editor
+    attributes:
+      label: Editor and version
+      description: Optional. Where you open Align's export, for example Premiere Pro 25.6 or DaVinci Resolve 21.1.
