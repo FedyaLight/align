@@ -105,7 +105,7 @@ def write_composition(container, document):
             start = integer(clip['start'], 'start')
             source_in = integer(clip['source_in'], 'source_in')
             length = integer(clip['length'], 'length', 1)
-            master, _, _ = container.content.create_ama_link(str(path), clip['metadata'])
+            master, _, tape = container.content.create_ama_link(str(path), clip['metadata'])
             sources = [source for source in master.slots if source.media_kind == 'Picture']
             if len(sources) != 1:
                 raise ValueError('AAF picture requires one video stream')
@@ -115,6 +115,17 @@ def write_composition(container, document):
             available = sum(part.length for part in source.segment.components)
             if start < cursor or source_in + length > available:
                 raise ValueError('Overlapping or out-of-bounds AAF picture clip')
+            if clip.get('timecode') is not None:
+                # Editors locate the file by its start timecode, which the
+                # tape mob carries; without it Resolve looks for frames from
+                # 00:00:00:00 and leaves the picture offline.
+                timecode = clip['timecode']
+                tape_clock = tape.create_timeline_slot(str(rate))
+                tape_clock.name = 'Timecode'
+                tape_clock.segment = container.create.Timecode(
+                    fps=integer(timecode['fps'], 'timecode fps', 1),
+                    drop=timecode['drop'] is True, length=available)
+                tape_clock.segment.start = integer(timecode['start'], 'timecode start')
             if start > cursor:
                 slot.segment.components.append(container.create.Filler('picture', start - cursor))
             slot.segment.components.append(master.create_source_clip(

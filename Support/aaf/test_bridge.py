@@ -224,10 +224,16 @@ class SourceValidation(unittest.TestCase):
             document = {'version': 2, 'name': 'Picture', 'tracks': [], 'picture_tracks': [{
                 'name': 'V1', 'edit_rate': {'numerator': 30000, 'denominator': 1001},
                 'clips': [{'path': str(media), 'start': 7, 'source_in': 11,
-                    'length': 101, 'metadata': metadata}]}]}
+                    'length': 101, 'metadata': metadata,
+                    'timecode': {'start': 1234, 'fps': 30, 'drop': True}}]}]}
             output = Path(directory) / 'picture.aaf'
             write_audio(document, output)
             with aaf2.open(str(output)) as container:
+                # The tape mob carries the file's start timecode.
+                tape_clocks = [slot.segment for mob in container.content.sourcemobs()
+                    for slot in mob.slots if slot.media_kind == 'Timecode']
+                self.assertEqual([(clock.start, clock.fps, clock.drop) for clock in tape_clocks],
+                    [(1234, 30, True)])
                 clocks = [slot for slot in next(container.content.toplevel()).slots
                     if slot.media_kind == 'Timecode']
                 self.assertEqual(len(clocks), 1)

@@ -602,11 +602,19 @@ pub fn timeline_manifest_with_frame_rate(
                 .map_err(|error| AafError::Writer(error.to_string()))?;
             metadata.insert(item.clip.url.clone(), value);
         }
+        // The file's start timecode in picture frames, so editors that
+        // locate media by timecode find the referenced frames.
+        let timecode = video.source_timecode.as_ref().map(|tc| {
+            let start =
+                tc.frame_number as f64 * tc.frame_duration.as_seconds() / clock.as_seconds();
+            json!({"start":start.round().max(0.0) as u64,
+                "fps":(1.0 / clock.as_seconds()).round() as u64,"drop":tc.drop_frame})
+        });
         pictures.push(
             json!({"name":item.preferred_source_key(align_core::MediaKind::Video).unwrap_or("Video"),
             "edit_rate":{"numerator":clock.timescale,"denominator":clock.value},
             "clips":[{"path":item.clip.url,"start":start,"source_in":source_in,"length":length,
-                "metadata":metadata[&item.clip.url]}]}),
+                "timecode":timecode,"metadata":metadata[&item.clip.url]}]}),
         );
     }
     pictures.sort_by_key(|track| track["clips"][0]["start"].as_u64().unwrap());
