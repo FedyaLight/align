@@ -170,7 +170,6 @@ fn track_json(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn clip_json(
     entry: &Entry,
     kind: MediaKind,

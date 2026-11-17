@@ -229,7 +229,6 @@ impl ExportItem {
             })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         clip: Clip,
         start: f64,

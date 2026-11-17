@@ -187,17 +187,16 @@ fn refine(
     } else {
         &[0.15, 0.5, 0.85]
     };
-    let window_duration = m.covered_seconds.mul_add(0.75, 0.0).clamp(2.1, 8.3);
-    let mut observations = observe(
+    let pair = Pair {
         m,
-        left_dur,
-        right_dur,
-        fractions,
-        window_duration,
+        left_duration: left_dur,
+        right_duration: right_dur,
         left_source,
         right_source,
         provider,
-    );
+    };
+    let window_duration = m.covered_seconds.mul_add(0.75, 0.0).clamp(2.1, 8.3);
+    let mut observations = pair.observe(fractions, window_duration);
     let needed = if fractions.len() == 1 { 1 } else { 2 };
     if observations.len() < needed {
         return None;
@@ -214,16 +213,7 @@ fn refine(
             && candidate.residual * 4.0 < affine.residual
             && crate::drift::needs_correction_rate(m.covered_seconds, candidate.rate)
         {
-            let checks = observe(
-                m,
-                left_dur,
-                right_dur,
-                &[0.3, 0.7],
-                2.1,
-                left_source,
-                right_source,
-                provider,
-            );
+            let checks = pair.observe(&[0.3, 0.7], 2.1);
             if checks.len() == 2
                 && checks.iter().all(|o| {
                     o.quality >= 0.6
@@ -243,16 +233,7 @@ fn refine(
     // windows used to estimate the affine rate. A line of hash collisions
     // alone is not enough to synchronize a long recording.
     if allow_rate && (m.rate - 1.0).abs() * m.covered_seconds >= 2.0 {
-        let checks = observe(
-            m,
-            left_dur,
-            right_dur,
-            &[0.25, 0.75],
-            2.1,
-            left_source,
-            right_source,
-            provider,
-        );
+        let checks = pair.observe(&[0.25, 0.75], 2.1);
         if checks.len() != 2
             || checks.iter().any(|o| {
                 o.quality < 0.6 || (o.right - (affine.rate * o.left + affine.offset)).abs() > 0.002
@@ -276,25 +257,8 @@ fn refine(
         if m.covered_seconds < 30.0 {
             return None;
         }
-        observations.extend(observe(
-            m,
-            left_dur,
-            right_dur,
-            &[0.06, 0.25, 0.35, 0.65, 0.75, 0.94],
-            2.1,
-            left_source,
-            right_source,
-            provider,
-        ));
-        observations.extend(refine_step(
-            m,
-            left_dur,
-            right_dur,
-            &observations,
-            left_source,
-            right_source,
-            provider,
-        ));
+        observations.extend(pair.observe(&[0.06, 0.25, 0.35, 0.65, 0.75, 0.94], 2.1));
+        observations.extend(refine_step(&pair, &observations));
         let piecewise = piecewise_fit(&observations)?;
         (piecewise.points, piecewise.residual)
     };
@@ -322,83 +286,66 @@ fn refine(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn observe(
-    m: &PairwiseMatch,
-    left_dur: f64,
-    right_dur: f64,
-    fractions: &[f64],
-    window_duration: f64,
+/// One coarse match and everything its refinement windows are cut from.
+struct Pair<'a> {
+    m: &'a PairwiseMatch,
+    left_duration: f64,
+    right_duration: f64,
     left_source: AudioAnalysisSource,
     right_source: AudioAnalysisSource,
-    provider: &dyn WindowProvider,
-) -> Vec<Observation> {
-    let mut out = Vec::new();
-    for &fraction in fractions {
-        let left_center = m.left_start_seconds + fraction * m.covered_seconds;
-        if let Some(o) = observe_one(
-            m,
-            left_dur,
-            right_dur,
-            left_center,
-            window_duration,
-            left_source,
-            right_source,
-            provider,
-        ) {
-            out.push(o);
-        }
-    }
-    out
+    provider: &'a dyn WindowProvider,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn observe_one(
-    m: &PairwiseMatch,
-    left_dur: f64,
-    right_dur: f64,
-    left_center: f64,
-    window_duration: f64,
-    left_source: AudioAnalysisSource,
-    right_source: AudioAnalysisSource,
-    provider: &dyn WindowProvider,
-) -> Option<Observation> {
-    let right_center = m.rate * left_center + m.offset;
-    let left_start = bounded_window_start(left_center, window_duration, left_dur);
-    let right_start = bounded_window_start(right_center, window_duration, right_dur);
-    let left_window = provider.window(&m.left, left_start, window_duration, left_source)?;
-    let right_window = provider.window(&m.right, right_start, window_duration, right_source)?;
-    let alignment = gccphat::align(
-        &left_window.samples,
-        &right_window.samples,
-        (0.25 * FINE_SAMPLE_RATE) as usize,
-    )?;
-    let common = 131_072.min(prev_pow2(
-        left_window.samples.len().min(right_window.samples.len()),
-    ));
-    if common == 0 {
-        return None;
+impl Pair<'_> {
+    /// Observations at `fractions` of the matched span.
+    fn observe(&self, fractions: &[f64], window_duration: f64) -> Vec<Observation> {
+        let m = self.m;
+        fractions
+            .iter()
+            .filter_map(|&fraction| {
+                let left_center = m.left_start_seconds + fraction * m.covered_seconds;
+                self.observe_at(left_center, window_duration)
+            })
+            .collect()
     }
-    Some(Observation {
-        left: left_window.start + (common / 2) as f64 / FINE_SAMPLE_RATE,
-        right: right_window.start
-            + ((common / 2) as f64 + alignment.lag_samples) / FINE_SAMPLE_RATE,
-        quality: alignment.quality,
-    })
+
+    /// Aligns the windows around `left_center` and its predicted right time.
+    fn observe_at(&self, left_center: f64, window_duration: f64) -> Option<Observation> {
+        let m = self.m;
+        let right_center = m.rate * left_center + m.offset;
+        let left_start = bounded_window_start(left_center, window_duration, self.left_duration);
+        let right_start = bounded_window_start(right_center, window_duration, self.right_duration);
+        let left_window =
+            self.provider
+                .window(&m.left, left_start, window_duration, self.left_source)?;
+        let right_window =
+            self.provider
+                .window(&m.right, right_start, window_duration, self.right_source)?;
+        let alignment = gccphat::align(
+            &left_window.samples,
+            &right_window.samples,
+            (0.25 * FINE_SAMPLE_RATE) as usize,
+        )?;
+        let common = 131_072.min(prev_pow2(
+            left_window.samples.len().min(right_window.samples.len()),
+        ));
+        if common == 0 {
+            return None;
+        }
+        Some(Observation {
+            left: left_window.start + (common / 2) as f64 / FINE_SAMPLE_RATE,
+            right: right_window.start
+                + ((common / 2) as f64 + alignment.lag_samples) / FINE_SAMPLE_RATE,
+            quality: alignment.quality,
+        })
+    }
 }
 
 /// Binary-search localization of a confirmed monotonic discontinuity
 /// (dropped/duplicated samples): up to 6 probes while the bracket spans
 /// more than a second; each probe must itself align well (quality ≥ 0.6).
-fn refine_step(
-    m: &PairwiseMatch,
-    left_dur: f64,
-    right_dur: f64,
-    input: &[Observation],
-    left_source: AudioAnalysisSource,
-    right_source: AudioAnalysisSource,
-    provider: &dyn WindowProvider,
-) -> Vec<Observation> {
+fn refine_step(pair: &Pair, input: &[Observation]) -> Vec<Observation> {
+    let m = pair.m;
     let mut points = input.to_vec();
     points.sort_by(|a, b| a.left.total_cmp(&b.left));
     if points.len() < 6 {
@@ -428,16 +375,7 @@ fn refine_step(
             break;
         }
         let center = (lower.left + upper.left) / 2.0;
-        let Some(o) = observe_one(
-            m,
-            left_dur,
-            right_dur,
-            center,
-            1.1,
-            left_source,
-            right_source,
-            provider,
-        ) else {
+        let Some(o) = pair.observe_at(center, 1.1) else {
             break;
         };
         if o.quality < 0.6 {
