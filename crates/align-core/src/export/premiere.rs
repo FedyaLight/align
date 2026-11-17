@@ -931,7 +931,7 @@ impl Document {
             xml += "</link>\n";
         }
         if self.defined_files.insert(media.resource_key.clone()) {
-            xml += &file_block(item, media_type, &media, format);
+            xml += &file_block(item, media_type, &media);
         } else {
             xml += &format!("                <file id=\"{file_id}\"/>\n");
         }
@@ -1332,7 +1332,7 @@ impl Document {
             );
             xml += &media.rate.xml("                    ");
             if index == 0 && self.defined_files.insert(media.resource_key.clone()) {
-                xml += &file_block(item, side, media, self.format);
+                xml += &file_block(item, side, media);
             } else {
                 xml += &format!("                <file id=\"{}\"/>\n", media.file_id());
             }
@@ -1360,12 +1360,7 @@ fn bin_open(name: &str) -> String {
     )
 }
 
-fn file_block(
-    item: &ExportItem,
-    media_type: MediaKind,
-    media: &MediaUse,
-    format: TimelineExportFormat,
-) -> String {
+fn file_block(item: &ExportItem, media_type: MediaKind, media: &MediaUse) -> String {
     let id = media.file_id();
     let (media_url, duration, rate) = (&media.url, media.duration, media.rate);
     let clip = &item.clip;
@@ -1379,12 +1374,14 @@ fn file_block(
     xml += &rate.xml("                  ");
     let timecode = if media_type == MediaKind::Video {
         clip.video.as_ref().and_then(|v| v.source_timecode.clone())
-    } else if format == TimelineExportFormat::ResolveXML && clip.video.is_none() {
+    } else if clip.video.is_none() {
         // Resolve derives an audio file's start timecode from its BWF time
         // reference itself (at NTSC timeline rates it differs from the
         // sample-exact label) and then offsets `<in>` by the difference
         // between that and this label: seconds of slip that grow with the
         // timecode. Without the label `<in>` counts from the file start.
+        // Premiere XML leaves it out too, because people import it into
+        // Resolve as well; Premiere reads the BWF timecode itself.
         None
     } else {
         clip.audio.first().and_then(|a| a.source_timecode.clone())
@@ -1551,9 +1548,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_audio_files_carry_no_timecode_label() {
+    fn audio_files_carry_no_timecode_label() {
         // Resolve offsets `<in>` by the gap between this label and the BWF
-        // timecode it reads itself; Premiere keeps the label.
+        // timecode it reads itself, also when it imports the Premiere XML.
         let mut timeline = fixture_timeline();
         let rec = timeline.islands[0]
             .clips
@@ -1580,7 +1577,8 @@ mod tests {
             TimelineExportFormat::PremiereXML,
             PremiereOptions::default(),
         );
-        assert!(premiere.contains("01:26:57:00"));
+        assert!(!premiere.contains("01:26:57:00"));
+        assert!(premiere.contains("<timecode><string>"));
     }
 
     #[test]
