@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use super::model::{ExportItem, ExportTimeline, ExportTransition};
 use crate::allocator::{TimelineTrackRequest, allocate, source_key_for_url};
-use crate::model::MediaKind;
+use crate::model::{MediaKind, TIME_TOLERANCE};
 
 struct Entry<'a> {
     item: &'a ExportItem,
@@ -126,7 +126,7 @@ fn track_json(
             None
         };
         let item_start = timeline_start(entry, kind);
-        if before.is_none() && item_start > cursor + 0.000_001 {
+        if before.is_none() && item_start > cursor + TIME_TOLERANCE {
             children.push(gap(item_start - cursor, rate));
         }
         let trim_start = before.map_or(0.0, |t| (t.end - t.start) / 2.0);

@@ -58,6 +58,11 @@ impl MediaTime {
     }
 }
 
+/// Seconds closer than this are the same instant (far below one sample).
+pub const TIME_TOLERANCE: f64 = 1e-6;
+/// Playback rates closer to 1 than this play at normal speed.
+pub const RATE_TOLERANCE: f64 = 1e-6;
+
 /// A clip's kind, and the audio or video side of an item on a timeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

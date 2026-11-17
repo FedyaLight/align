@@ -3,10 +3,11 @@
 //! project. Times are reduced `MediaTime` rationals (`0s`, `100/25s`).
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use super::model::{ExportIsland, ExportItem, ExportTimeline, xml_text};
 use crate::allocator::{TimelineTrackRequest, allocate, source_key_for_url};
-use crate::model::{MediaKind, MediaTime};
+use crate::model::{MediaKind, MediaTime, TIME_TOLERANCE};
 
 /// A single selected source channel remains mono even when its asset is stereo.
 fn audio_channel_end(item: &ExportItem) -> String {
@@ -25,7 +26,7 @@ fn audio_channel_end(item: &ExportItem) -> String {
 fn timeline_time(seconds: f64, frame: MediaTime) -> String {
     let frames = (seconds / frame.as_seconds()).round();
     let exact = frames * frame.as_seconds();
-    let time = if (seconds - exact).abs() <= 0.000001 {
+    let time = if (seconds - exact).abs() <= TIME_TOLERANCE {
         MediaTime::new(frames as i64 * frame.value, frame.timescale)
     } else {
         MediaTime::microseconds(seconds)
@@ -115,19 +116,60 @@ fn prefix_references(fragment: &str, prefix: &str) -> String {
         })
 }
 
-fn write_island(
-    timeline: &ExportTimeline,
-    island: &ExportIsland,
-    options: FcpxmlOptions,
-) -> String {
-    let FcpxmlOptions {
-        timeline: include_timeline,
-        multicam: include_multicam,
-        group_storylines,
-    } = options;
-    // Prepared precision stems contain exactly the selected source range.
-    let mut prepared_island = island.clone();
-    for item in &mut prepared_island.clips {
+const FORMAT_ID: &str = "r_fmt_0";
+const MULTICAM_ID: &str = "r_multicam";
+
+/// One FCPXML asset per media file and side: a camera file's video asset
+/// and an audio-only item of the same file are distinct resources.
+#[derive(Hash, PartialEq, Eq, Clone)]
+struct AssetKey {
+    url: String,
+    audio_only: bool,
+}
+
+/// Resources shared by the projects of one document.
+struct Library<'a> {
+    timeline: &'a ExportTimeline,
+    frame: MediaTime,
+    assets: HashMap<AssetKey, String>,
+}
+
+/// The file an item plays: its drift sidecar, else its source.
+fn media_url(item: &ExportItem) -> PathBuf {
+    item.corrected_audio_url
+        .clone()
+        .unwrap_or_else(|| item.clip.url.clone())
+}
+
+fn clip_name(item: &ExportItem, media_url: &Path) -> String {
+    xml_text::escape(&item.display_name.clone().unwrap_or_else(|| {
+        media_url
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string()
+    }))
+}
+
+fn audio_role_attribute(item: &ExportItem) -> String {
+    item.fcpxml_audio_role().map_or_else(String::new, |role| {
+        format!(" audioRole=\"{}\"", xml_text::escape(role))
+    })
+}
+
+/// A source timecode as a start time on the frame grid; zero without one.
+fn frame_start(timecode: Option<&crate::model::SourceTimecode>, frame: MediaTime) -> String {
+    let frames = timecode.map_or(0, |tc| {
+        (tc.as_seconds() * frame.timescale as f64 / frame.value as f64).round() as i64 * frame.value
+    });
+    xml_text::fcpxml_time(MediaTime::new(frames, frame.timescale))
+}
+
+/// Prepared precision stems contain exactly the selected source range, so
+/// recorder items reference their stem from its start.
+fn with_precision_stems(island: &ExportIsland) -> ExportIsland {
+    let mut prepared = island.clone();
+    for item in &mut prepared.clips {
         if item.clip.video.is_none()
             && let Some(channel) = item.selected_audio_source_channel()
             && let Some(path) = item.precision_audio_url(channel + 1).cloned()
@@ -145,101 +187,133 @@ fn write_island(
             item.precision_audio_urls.clear();
         }
     }
-    let island = &prepared_island;
-    let frame_duration = timeline.frame_duration;
-    let width = island
-        .clips
-        .iter()
-        .filter_map(|i| i.clip.video.as_ref().map(|v| v.width))
-        .next()
-        .unwrap_or(1920);
-    let height = island
-        .clips
-        .iter()
-        .filter_map(|i| i.clip.video.as_ref().map(|v| v.height))
-        .next()
-        .unwrap_or(1080);
-    let format_id = "r_fmt_0";
+    prepared
+}
+
+fn write_island(
+    timeline: &ExportTimeline,
+    island: &ExportIsland,
+    options: FcpxmlOptions,
+) -> String {
+    let island = &with_precision_stems(island);
+    let frame = timeline.frame_duration;
+    let dimension = |side: fn(&crate::model::VideoSummary) -> u32, fallback: u32| {
+        island
+            .clips
+            .iter()
+            .find_map(|i| i.clip.video.as_ref().map(side))
+            .unwrap_or(fallback)
+    };
+    let (width, height) = (dimension(|v| v.width, 1920), dimension(|v| v.height, 1080));
 
     let mut xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n".to_string();
     xml += "<!DOCTYPE fcpxml>\n<fcpxml version=\"1.10\">\n  <resources>\n";
     xml += &format!(
-        "    <format id=\"{format_id}\" name=\"FFVideoFormat{width}x{height}p\" frameDuration=\"{}\" width=\"{width}\" height=\"{height}\"/>\n",
-        xml_text::fcpxml_time(frame_duration)
+        "    <format id=\"{FORMAT_ID}\" name=\"FFVideoFormat{width}x{height}p\" frameDuration=\"{}\" width=\"{width}\" height=\"{height}\"/>\n",
+        xml_text::fcpxml_time(frame)
     );
-
-    #[derive(Hash, PartialEq, Eq, Clone)]
-    struct AssetDescriptor {
-        url: String,
-        audio_only: bool,
+    let mut library = Library {
+        timeline,
+        frame,
+        assets: HashMap::new(),
+    };
+    xml += &library.assets_xml(island);
+    if options.multicam {
+        xml += &library.multicam_xml(island);
     }
-    let mut asset_map: HashMap<AssetDescriptor, String> = HashMap::new();
-    let mut asset_index = 1;
-    for item in &island.clips {
-        let media_url = item
-            .corrected_audio_url
-            .clone()
-            .unwrap_or_else(|| item.clip.url.clone());
-        let desc = AssetDescriptor {
+    xml += "  </resources>\n";
+
+    let total_duration =
+        xml_text::fcpxml_time(MediaTime::microseconds(1.0f64.max(island.duration)));
+    let sequence_start = frame_start(
+        island.clips.iter().find_map(|i| i.clip.source_timecode()),
+        frame,
+    );
+    let sequence = format!(
+        "        <sequence format=\"{FORMAT_ID}\" duration=\"{total_duration}\" tcStart=\"{sequence_start}\" tcFormat=\"NDF\">\n"
+    );
+    let name = xml_text::escape(&timeline.name);
+    xml += "  <library>\n";
+    xml += &format!("    <event name=\"{name}\">\n");
+    if options.timeline {
+        xml += &format!("      <project name=\"{name} – synced\">\n{sequence}");
+        xml += &format!(
+            "          <spine>\n            <gap offset=\"0s\" duration=\"{total_duration}\" name=\"Master\">\n"
+        );
+        xml += &library.synced_clips_xml(island, options.group_storylines);
+        xml += "            </gap>\n          </spine>\n        </sequence>\n      </project>\n";
+    }
+    if options.multicam {
+        xml += &format!("      <project name=\"{name} – multicam\">\n{sequence}");
+        xml += &format!(
+            "          <spine>\n            <mc-clip name=\"{name} – Multicam\" ref=\"{MULTICAM_ID}\" offset=\"0s\" duration=\"{total_duration}\" tcStart=\"{sequence_start}\" format=\"{FORMAT_ID}\"/>\n          </spine>\n        </sequence>\n      </project>\n"
+        );
+    }
+    xml += "    </event>\n  </library>\n</fcpxml>\n";
+    xml
+}
+
+impl Library<'_> {
+    fn asset(&self, item: &ExportItem, audio_only: bool) -> Option<(PathBuf, &str)> {
+        let media_url = media_url(item);
+        let key = AssetKey {
             url: media_url.to_string_lossy().into_owned(),
-            audio_only: item.clip.video.is_none(),
+            audio_only,
         };
-        if asset_map.contains_key(&desc) {
-            continue;
-        }
-        let asset_id = format!("r_asset_{asset_index}");
-        asset_index += 1;
-        let duration =
-            xml_text::fcpxml_time(MediaTime::microseconds(item.clip.duration.as_seconds()));
-        let start = item
-            .clip
-            .source_timecode()
-            .map(|tc| {
-                let frames = (tc.as_seconds() * frame_duration.timescale as f64
-                    / frame_duration.value as f64)
-                    .round() as i64
-                    * frame_duration.value;
-                MediaTime::new(frames, frame_duration.timescale)
-            })
-            .map(xml_text::fcpxml_time)
-            .unwrap_or_else(|| xml_text::fcpxml_time(MediaTime::new(0, frame_duration.timescale)));
-        let name = xml_text::escape(media_url.file_name().and_then(|n| n.to_str()).unwrap_or(""));
-        let src = xml_text::escape(&crate::model::file_url(&media_url));
-        if desc.audio_only || item.clip.video.is_none() {
-            let channels = item.clip.audio.first().map_or(2, |a| a.channels);
-            let rate = item
-                .clip
-                .audio
-                .first()
-                .map_or(48000, |a| a.sample_rate.round() as i64);
-            xml += &format!(
-                "    <asset id=\"{asset_id}\" name=\"{name}\" start=\"{start}\" duration=\"{duration}\" hasAudio=\"1\" audioSources=\"1\" audioChannels=\"{channels}\" audioRate=\"{rate}\">\n"
-            );
-        } else {
-            let channels = item.clip.audio.first().map_or(2, |a| a.channels);
-            let rate = item
-                .clip
-                .audio
-                .first()
-                .map_or(48000, |a| a.sample_rate.round() as i64);
-            let has_audio = !item.clip.audio.is_empty();
-            xml += &format!(
-                "    <asset id=\"{asset_id}\" name=\"{name}\" start=\"{start}\" duration=\"{duration}\" format=\"{format_id}\" hasVideo=\"1\" hasAudio=\"{}\"",
-                if has_audio { 1 } else { 0 }
-            );
-            if has_audio {
-                xml += &format!(
-                    " audioSources=\"1\" audioChannels=\"{channels}\" audioRate=\"{rate}\""
-                );
-            }
-            xml += ">\n";
-        }
-        xml += &format!("      <media-rep kind=\"original-media\" src=\"{src}\"/>\n    </asset>\n");
-        asset_map.insert(desc, asset_id);
+        let id = self.assets.get(&key)?;
+        Some((media_url, id))
     }
 
-    let multicam_id = "r_multicam";
-    if include_multicam {
+    /// One `<asset>` per distinct media file and side, in item order.
+    fn assets_xml(&mut self, island: &ExportIsland) -> String {
+        let mut xml = String::new();
+        for item in &island.clips {
+            let media_url = media_url(item);
+            let audio_only = item.clip.video.is_none();
+            let key = AssetKey {
+                url: media_url.to_string_lossy().into_owned(),
+                audio_only,
+            };
+            if self.assets.contains_key(&key) {
+                continue;
+            }
+            let asset_id = format!("r_asset_{}", self.assets.len() + 1);
+            let duration =
+                xml_text::fcpxml_time(MediaTime::microseconds(item.clip.duration.as_seconds()));
+            let start = frame_start(item.clip.source_timecode(), self.frame);
+            let name =
+                xml_text::escape(media_url.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+            let src = xml_text::escape(&crate::model::file_url(&media_url));
+            let audio = item.clip.audio.first();
+            let channels = audio.map_or(2, |a| a.channels);
+            let rate = audio.map_or(48000, |a| a.sample_rate.round() as i64);
+            let audio_attributes =
+                format!(" audioSources=\"1\" audioChannels=\"{channels}\" audioRate=\"{rate}\"");
+            xml += &format!(
+                "    <asset id=\"{asset_id}\" name=\"{name}\" start=\"{start}\" duration=\"{duration}\""
+            );
+            if audio_only {
+                xml += &format!(" hasAudio=\"1\"{audio_attributes}");
+            } else {
+                let has_audio = audio.is_some();
+                xml += &format!(
+                    " format=\"{FORMAT_ID}\" hasVideo=\"1\" hasAudio=\"{}\"",
+                    u8::from(has_audio)
+                );
+                if has_audio {
+                    xml += &audio_attributes;
+                }
+            }
+            xml += &format!(
+                ">\n      <media-rep kind=\"original-media\" src=\"{src}\"/>\n    </asset>\n"
+            );
+            self.assets.insert(key, asset_id);
+        }
+        xml
+    }
+
+    /// The multicam resource: one angle per source, cameras first.
+    fn multicam_xml(&self, island: &ExportIsland) -> String {
         let mut angle_groups: HashMap<String, Vec<&ExportItem>> = HashMap::new();
         for item in &island.clips {
             angle_groups
@@ -255,14 +329,11 @@ fn write_island(
         keys.sort_by(|a, b| {
             let ga_video = angle_groups[a].iter().any(|i| i.clip.video.is_some());
             let gb_video = angle_groups[b].iter().any(|i| i.clip.video.is_some());
-            if ga_video != gb_video {
-                return gb_video.cmp(&ga_video);
-            }
-            a.cmp(b)
+            gb_video.cmp(&ga_video).then_with(|| a.cmp(b))
         });
-        xml += &format!(
-            "    <media id=\"{multicam_id}\" name=\"{} – Multicam\">\n      <multicam format=\"{format_id}\">\n",
-            xml_text::escape(&timeline.name)
+        let mut xml = format!(
+            "    <media id=\"{MULTICAM_ID}\" name=\"{} – Multicam\">\n      <multicam format=\"{FORMAT_ID}\">\n",
+            xml_text::escape(&self.timeline.name)
         );
         for (angle_index, key) in keys.iter().enumerate() {
             let mut items = angle_groups[key].clone();
@@ -273,252 +344,169 @@ fn write_island(
                 angle_index + 1
             );
             for item in items {
-                let media_url = item
-                    .corrected_audio_url
-                    .clone()
-                    .unwrap_or_else(|| item.clip.url.clone());
-                let desc = AssetDescriptor {
-                    url: media_url.to_string_lossy().into_owned(),
-                    audio_only: item.clip.video.is_none(),
+                let side = if item.clip.video.is_some() {
+                    MediaKind::Video
+                } else {
+                    MediaKind::Audio
                 };
-                let Some(asset_id) = asset_map.get(&desc) else {
+                let Some((media_url, asset_id)) = self.asset(item, side == MediaKind::Audio) else {
                     continue;
                 };
-                let clip_name = xml_text::escape(&item.display_name.clone().unwrap_or_else(|| {
-                    media_url
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_string()
-                }));
-                let audio_role = item.fcpxml_audio_role().map_or_else(String::new, |role| {
-                    format!(" audioRole=\"{}\"", xml_text::escape(role))
-                });
-                let audio_channel_end = audio_channel_end(item);
                 xml += &format!(
-                    "          <asset-clip name=\"{clip_name}\" ref=\"{asset_id}\" offset=\"{}\" duration=\"{}\" start=\"{}\" enabled=\"{}\"{audio_role}{audio_channel_end}\n",
-                    timeline_time(item.start, frame_duration),
-                    timeline_time(item.timeline_duration, frame_duration),
-                    timeline_time(item.source_in, frame_duration),
-                    u8::from(item.is_enabled(if item.clip.video.is_some() {
-                        MediaKind::Video
-                    } else {
-                        MediaKind::Audio
-                    })),
+                    "          <asset-clip name=\"{}\" ref=\"{asset_id}\" offset=\"{}\" duration=\"{}\" start=\"{}\" enabled=\"{}\"{}{}\n",
+                    clip_name(item, &media_url),
+                    timeline_time(item.start, self.frame),
+                    timeline_time(item.timeline_duration, self.frame),
+                    timeline_time(item.source_in, self.frame),
+                    u8::from(item.is_enabled(side)),
+                    audio_role_attribute(item),
+                    audio_channel_end(item),
                 );
             }
             xml += "        </mc-angle>\n";
         }
         xml += "      </multicam>\n    </media>\n";
+        xml
     }
-    xml += "  </resources>\n";
 
-    let total_duration =
-        xml_text::fcpxml_time(MediaTime::microseconds(1.0f64.max(island.duration)));
-    let sequence_start = island
-        .clips
-        .iter()
-        .filter_map(|i| i.clip.source_timecode())
-        .next()
-        .map(|tc| {
-            let frames = (tc.as_seconds() * frame_duration.timescale as f64
-                / frame_duration.value as f64)
-                .round() as i64
-                * frame_duration.value;
-            xml_text::fcpxml_time(MediaTime::new(frames, frame_duration.timescale))
-        })
-        .unwrap_or_else(|| xml_text::fcpxml_time(MediaTime::new(0, frame_duration.timescale)));
-
-    xml += "  <library>\n";
-    xml += &format!(
-        "    <event name=\"{}\">\n",
-        xml_text::escape(&timeline.name)
-    );
-    let mut synced_project = format!(
-        "      <project name=\"{} – synced\">\n",
-        xml_text::escape(&timeline.name)
-    );
-    synced_project += &format!(
-        "        <sequence format=\"{format_id}\" duration=\"{total_duration}\" tcStart=\"{sequence_start}\" tcFormat=\"NDF\">\n          <spine>\n            <gap offset=\"0s\" duration=\"{total_duration}\" name=\"Master\">\n"
-    );
-
-    let video_items: Vec<&ExportItem> = island
-        .clips
-        .iter()
-        .filter(|i| i.clip.video.is_some())
-        .collect();
-    let audio_items: Vec<&ExportItem> = island
-        .clips
-        .iter()
-        .filter(|i| {
-            // Disabled camera audio without a linked edit has nothing to place.
-            let muted_camera_audio = i.clip.video.is_some()
-                && i.audio_enabled == Some(false)
-                && i.linked_audio_edit.is_none();
-            !i.clip.audio.is_empty() && !muted_camera_audio
-        })
-        .collect();
-    let video_assignments = allocate(
-        &video_items
+    /// The synced project's connected clips: video above the spine, audio
+    /// below, on lanes allocated per source. With storylines grouped, each
+    /// lane becomes its own storyline.
+    fn synced_clips_xml(&self, island: &ExportIsland, group_storylines: bool) -> String {
+        let frame = self.frame;
+        let video_items: Vec<&ExportItem> = island
+            .clips
             .iter()
-            .map(|item| {
-                TimelineTrackRequest::new(
-                    item.instance_id.clone(),
-                    item.preferred_source_key
-                        .clone()
-                        .unwrap_or_else(|| source_key_for_url(&item.clip.url)),
-                    item.start,
-                    item.timeline_duration,
-                )
-            })
-            .collect::<Vec<_>>(),
-    );
-    let audio_assignments = allocate(
-        &audio_items
+            .filter(|i| i.clip.video.is_some())
+            .collect();
+        let audio_items: Vec<&ExportItem> = island
+            .clips
             .iter()
-            .map(|item| {
-                TimelineTrackRequest::new(
-                    item.instance_id.clone(),
-                    item.preferred_audio_source_key
-                        .clone()
-                        .or(item.preferred_source_key.clone())
-                        .unwrap_or_else(|| source_key_for_url(&item.clip.url)),
-                    item.start,
-                    if item.corrected_audio_url.is_none() {
-                        item.timeline_duration
-                    } else {
-                        item.corrected_selected_duration()
-                    },
-                )
+            .filter(|i| {
+                // Disabled camera audio without a linked edit has nothing to place.
+                let muted_camera_audio = i.clip.video.is_some()
+                    && i.audio_enabled == Some(false)
+                    && i.linked_audio_edit.is_none();
+                !i.clip.audio.is_empty() && !muted_camera_audio
             })
-            .collect::<Vec<_>>(),
-    );
+            .collect();
+        let audio_duration = |item: &ExportItem| {
+            if item.corrected_audio_url.is_none() {
+                item.timeline_duration
+            } else {
+                item.corrected_selected_duration()
+            }
+        };
+        let video_assignments = allocate(
+            &video_items
+                .iter()
+                .map(|item| {
+                    TimelineTrackRequest::new(
+                        item.instance_id.clone(),
+                        item.preferred_source_key
+                            .clone()
+                            .unwrap_or_else(|| source_key_for_url(&item.clip.url)),
+                        item.start,
+                        item.timeline_duration,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let audio_assignments = allocate(
+            &audio_items
+                .iter()
+                .map(|item| {
+                    TimelineTrackRequest::new(
+                        item.instance_id.clone(),
+                        item.preferred_audio_source_key
+                            .clone()
+                            .or(item.preferred_source_key.clone())
+                            .unwrap_or_else(|| source_key_for_url(&item.clip.url)),
+                        item.start,
+                        audio_duration(item),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
 
-    let mut stories = std::collections::BTreeMap::<i64, String>::new();
-    for item in video_items {
-        let media_url = item
-            .corrected_audio_url
-            .clone()
-            .unwrap_or_else(|| item.clip.url.clone());
-        let desc = AssetDescriptor {
-            url: media_url.to_string_lossy().into_owned(),
-            audio_only: false,
+        let mut spine = String::new();
+        let mut stories = std::collections::BTreeMap::<i64, String>::new();
+        let lane_attribute = |lane: i64| {
+            if group_storylines {
+                String::new()
+            } else {
+                format!(" lane=\"{lane}\"")
+            }
         };
-        let Some(asset_id) = asset_map.get(&desc) else {
-            continue;
+        let mut place = |lane: i64, clip: String| {
+            if group_storylines {
+                *stories.entry(lane).or_default() += &clip;
+            } else {
+                spine += &clip;
+            }
         };
-        let lane = video_assignments
-            .get(&item.instance_id)
-            .copied()
-            .unwrap_or(0)
-            + 1;
-        let clip_name = xml_text::escape(&item.display_name.clone().unwrap_or_else(|| {
-            media_url
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string()
-        }));
-        let target = if group_storylines {
-            stories.entry(lane as i64).or_default()
-        } else {
-            &mut synced_project
-        };
-        let lane_attribute = if group_storylines {
-            String::new()
-        } else {
-            format!(" lane=\"{lane}\"")
-        };
-        let source_start = timeline_time(item.source_in, frame_duration);
-        let source_duration = timeline_time(item.timeline_duration, frame_duration);
-        *target += &format!(
-            "              <clip {lane_attribute} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{clip_name}\" enabled=\"{}\"><video ref=\"{asset_id}\" offset=\"{source_start}\" start=\"{source_start}\" duration=\"{source_duration}\"/></clip>\n",
-            timeline_time(item.start, frame_duration),
-            timeline_time(item.timeline_duration, frame_duration),
-            timeline_time(item.source_in, frame_duration),
-            u8::from(item.is_enabled(MediaKind::Video)),
-        );
+        for item in video_items {
+            let Some((media_url, asset_id)) = self.asset(item, false) else {
+                continue;
+            };
+            let lane = video_assignments
+                .get(&item.instance_id)
+                .copied()
+                .unwrap_or(0) as i64
+                + 1;
+            let source_start = timeline_time(item.source_in, frame);
+            let source_duration = timeline_time(item.timeline_duration, frame);
+            place(
+                lane,
+                format!(
+                    "              <clip {} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{}\" enabled=\"{}\"><video ref=\"{asset_id}\" offset=\"{source_start}\" start=\"{source_start}\" duration=\"{source_duration}\"/></clip>\n",
+                    lane_attribute(lane),
+                    timeline_time(item.start, frame),
+                    timeline_time(item.timeline_duration, frame),
+                    timeline_time(item.source_in, frame),
+                    clip_name(item, &media_url),
+                    u8::from(item.is_enabled(MediaKind::Video)),
+                ),
+            );
+        }
+        for item in audio_items {
+            let Some((media_url, asset_id)) = self.asset(item, item.clip.video.is_none()) else {
+                continue;
+            };
+            let lane = -((audio_assignments
+                .get(&item.instance_id)
+                .copied()
+                .unwrap_or(0)
+                + 1) as i64);
+            let duration = audio_duration(item);
+            let source_start = timeline_time(item.source_in, frame);
+            let source_duration = timeline_time(duration, frame);
+            let channel_attribute = item
+                .selected_audio_source_channel()
+                .map_or_else(String::new, |channel| format!(" srcCh=\"{}\"", channel + 1));
+            place(
+                lane,
+                format!(
+                    "              <clip {} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{}\" enabled=\"{}\"{}><audio ref=\"{asset_id}\" offset=\"{source_start}\" start=\"{source_start}\" duration=\"{source_duration}\"{channel_attribute}/></clip>\n",
+                    lane_attribute(lane),
+                    timeline_time(item.start, frame),
+                    timeline_time(duration, frame),
+                    timeline_time(item.source_in, frame),
+                    clip_name(item, &media_url),
+                    u8::from(item.is_enabled(MediaKind::Audio)),
+                    audio_role_attribute(item),
+                ),
+            );
+        }
+        let mut stories = stories.into_iter().collect::<Vec<_>>();
+        stories.sort_by_key(|(lane, _)| (*lane >= 0, lane.unsigned_abs()));
+        for (lane, clips) in stories {
+            spine += &format!(
+                "              <spine lane=\"{lane}\" offset=\"0s\">\n{clips}              </spine>\n"
+            );
+        }
+        spine
     }
-    for item in audio_items {
-        let media_url = item
-            .corrected_audio_url
-            .clone()
-            .unwrap_or_else(|| item.clip.url.clone());
-        let desc = AssetDescriptor {
-            url: media_url.to_string_lossy().into_owned(),
-            audio_only: item.clip.video.is_none(),
-        };
-        let Some(asset_id) = asset_map.get(&desc) else {
-            continue;
-        };
-        let lane = -((audio_assignments
-            .get(&item.instance_id)
-            .copied()
-            .unwrap_or(0)
-            + 1) as i64);
-        let clip_name = xml_text::escape(&item.display_name.clone().unwrap_or_else(|| {
-            media_url
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string()
-        }));
-        let duration = if item.corrected_audio_url.is_none() {
-            item.timeline_duration
-        } else {
-            item.corrected_selected_duration()
-        };
-        let audio_role = item.fcpxml_audio_role().map_or_else(String::new, |role| {
-            format!(" audioRole=\"{}\"", xml_text::escape(role))
-        });
-        let source_start = timeline_time(item.source_in, frame_duration);
-        let source_duration = timeline_time(duration, frame_duration);
-        let channel_attribute = item
-            .selected_audio_source_channel()
-            .map_or_else(String::new, |channel| format!(" srcCh=\"{}\"", channel + 1));
-        let target = if group_storylines {
-            stories.entry(lane).or_default()
-        } else {
-            &mut synced_project
-        };
-        let lane_attribute = if group_storylines {
-            String::new()
-        } else {
-            format!(" lane=\"{lane}\"")
-        };
-        *target += &format!(
-            "              <clip {lane_attribute} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{clip_name}\" enabled=\"{}\"{audio_role}><audio ref=\"{asset_id}\" offset=\"{source_start}\" start=\"{source_start}\" duration=\"{source_duration}\"{channel_attribute}/></clip>\n",
-            timeline_time(item.start, frame_duration),
-            timeline_time(duration, frame_duration),
-            timeline_time(item.source_in, frame_duration),
-            u8::from(item.is_enabled(MediaKind::Audio)),
-        );
-    }
-    let mut stories = stories.into_iter().collect::<Vec<_>>();
-    stories.sort_by_key(|(lane, _)| (*lane >= 0, lane.unsigned_abs()));
-    for (lane, clips) in stories {
-        synced_project += &format!(
-            "              <spine lane=\"{lane}\" offset=\"0s\">\n{clips}              </spine>\n"
-        );
-    }
-    synced_project +=
-        "            </gap>\n          </spine>\n        </sequence>\n      </project>\n";
-    if include_timeline {
-        xml += &synced_project;
-    }
-
-    if include_multicam {
-        xml += &format!(
-            "      <project name=\"{} – multicam\">\n",
-            xml_text::escape(&timeline.name)
-        );
-        xml += &format!(
-            "        <sequence format=\"{format_id}\" duration=\"{total_duration}\" tcStart=\"{sequence_start}\" tcFormat=\"NDF\">\n          <spine>\n            <mc-clip name=\"{} – Multicam\" ref=\"{multicam_id}\" offset=\"0s\" duration=\"{total_duration}\" tcStart=\"{sequence_start}\" format=\"{format_id}\"/>\n          </spine>\n        </sequence>\n      </project>\n",
-            xml_text::escape(&timeline.name)
-        );
-    }
-    xml += "    </event>\n  </library>\n</fcpxml>\n";
-    xml
 }
 
 fn angle_name(source_key: &str, items: &[&ExportItem]) -> String {
