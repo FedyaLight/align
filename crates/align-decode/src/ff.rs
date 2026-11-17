@@ -63,6 +63,31 @@ pub fn ffmpeg_bin() -> Option<PathBuf> {
     resolve_bin("ALIGN_FFMPEG", "ffmpeg")
 }
 
+/// FFmpeg (or ffprobe) for a test that generates fixtures. Without it the
+/// test is skipped with a notice, or fails when `ALIGN_REQUIRE_FFMPEG` is set
+/// (as in CI), so a missing tool never lets a test pass silently.
+#[cfg(test)]
+pub(crate) fn test_tool(found: Option<PathBuf>, name: &str) -> Option<PathBuf> {
+    if found.is_none() {
+        assert!(
+            std::env::var_os("ALIGN_REQUIRE_FFMPEG").is_none(),
+            "{name} is required (ALIGN_REQUIRE_FFMPEG) but was not found"
+        );
+        eprintln!("skipped: {name} was not found");
+    }
+    found
+}
+
+#[cfg(test)]
+pub(crate) fn test_ffmpeg() -> Option<PathBuf> {
+    test_tool(ffmpeg_bin(), "FFmpeg")
+}
+
+#[cfg(test)]
+pub(crate) fn test_ffprobe() -> Option<PathBuf> {
+    test_tool(ffprobe_bin(), "ffprobe")
+}
+
 /// Format and stream headers as ffprobe JSON. Each ffprobe start analyses
 /// the opening packets (about 0.3 s for 4:2:2 10-bit camera video), so
 /// inspection asks once and parses this for audio and video alike.
@@ -104,6 +129,10 @@ fn num(value: &serde_json::Value) -> Option<f64> {
     }
 }
 
+/// An audio stream ending at least this long before its container has a
+/// shorter track rather than an imprecise duration estimate.
+const EARLY_AUDIO_END: f64 = 0.1;
+
 /// Pure parser (unit-tested without a binary on disk).
 pub fn parse_ffprobe_json(json: &[u8]) -> Option<ProbeReport> {
     let v: serde_json::Value = serde_json::from_slice(json).ok()?;
@@ -115,6 +144,10 @@ pub fn parse_ffprobe_json(json: &[u8]) -> Option<ProbeReport> {
         .and_then(|f| f.get("format_name"))
         .and_then(|n| n.as_str())
         .is_some_and(|n| n.split(',').any(|n| n == "mpegts"));
+    let format_start = v
+        .get("format")
+        .and_then(|f| num(f.get("start_time")?))
+        .unwrap_or(0.0);
     let mut audio_streams = Vec::new();
     let mut has_video = false;
     for s in streams {
@@ -143,7 +176,11 @@ pub fn parse_ffprobe_json(json: &[u8]) -> Option<ProbeReport> {
                         .map(|b| b as u32),
                     is_float,
                     decoder_delay,
-                    end_seconds: None,
+                    // Kept below only for a track that ends early.
+                    end_seconds: s.get("duration").and_then(num).map(|duration| {
+                        s.get("start_time").and_then(num).unwrap_or(format_start) - format_start
+                            + duration
+                    }),
                 })
             }
             "video" => {
@@ -169,6 +206,16 @@ pub fn parse_ffprobe_json(json: &[u8]) -> Option<ProbeReport> {
                 .fold(None::<f64>, |acc, d| Some(acc.map_or(d, |a: f64| a.max(d))))
         })
         .filter(|d| *d > 0.0)?;
+    // FFmpeg's stream extents are estimates in some containers (MPEG-TS,
+    // MXF) and may differ from the decodable audio by a few samples. Declare
+    // an end only for an audio track that clearly stops before its
+    // container, as a camera's can; otherwise rendering keeps its
+    // container-end tolerance.
+    for stream in &mut audio_streams {
+        stream.end_seconds = stream.end_seconds.filter(|end| {
+            end.is_finite() && *end > 0.0 && *end < duration_seconds - EARLY_AUDIO_END
+        });
+    }
     Some(ProbeReport {
         duration_seconds,
         audio_streams,
@@ -723,7 +770,7 @@ pub fn decode_window(
 /// `click` seconds. False (the test skips) without an AC-3 encoder.
 #[cfg(test)]
 pub(crate) fn write_ac3_transport_stream(path: &Path, click: f64, seconds: f64) -> bool {
-    let Some(ffmpeg) = ffmpeg_bin() else {
+    let Some(ffmpeg) = test_ffmpeg() else {
         return false;
     };
     let source = format!(
@@ -908,6 +955,25 @@ mod tests {
     }
 
     #[test]
+    fn audio_end_is_declared_only_for_a_track_that_ends_early() {
+        let json = br#"{"streams": [
+            {"codec_type": "video", "disposition": {}},
+            {"codec_type": "audio", "sample_rate": "48000", "channels": 2,
+             "start_time": "1.400000", "duration": "8.000000"},
+            {"codec_type": "audio", "sample_rate": "48000", "channels": 2,
+             "start_time": "1.400000", "duration": "9.980000"},
+            {"codec_type": "audio", "sample_rate": "48000", "channels": 2}],
+            "format": {"start_time": "1.400000", "duration": "10.000000"}}"#;
+        let ends: Vec<_> = parse_ffprobe_json(json)
+            .expect("parse")
+            .audio_streams
+            .iter()
+            .map(|stream| stream.end_seconds)
+            .collect();
+        assert_eq!(ends, [Some(8.0), None, None]);
+    }
+
+    #[test]
     fn attached_pic_is_not_video() {
         let json = br#"{"streams": [
             {"codec_type": "video", "disposition": {"attached_pic": 1}},
@@ -927,7 +993,7 @@ mod tests {
 
     #[test]
     fn ffmpeg_pipe_roundtrips_wav() {
-        if ffmpeg_bin().is_none() {
+        if crate::ff::test_ffmpeg().is_none() {
             eprintln!("SKIP: no ffmpeg binary");
             return;
         }
@@ -968,7 +1034,7 @@ mod tests {
     /// ffprobe reports in the format tags rather than on the video stream.
     #[test]
     fn mxf_timecode_comes_from_the_format_tags() {
-        let (Some(ffmpeg), Some(_)) = (ffmpeg_bin(), ffprobe_bin()) else {
+        let (Some(ffmpeg), Some(_)) = (crate::ff::test_ffmpeg(), crate::ff::test_ffprobe()) else {
             return;
         };
         let lists = |kind: &str| {

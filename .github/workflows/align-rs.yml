@@ -73,7 +73,10 @@ jobs:
         # Transitive future-incompat notices are not ours; fail only on real lints.
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test
-        run: cargo test --workspace
+        # Tests that generate fixtures with FFmpeg fail instead of skipping.
+        env:
+          ALIGN_REQUIRE_FFMPEG: "1"
+        run: cargo test --workspace --locked
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'

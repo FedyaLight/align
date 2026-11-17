@@ -488,7 +488,7 @@ mod tests {
     use std::process::Command;
 
     fn ffmpeg(args: &[&str], output: &Path) -> bool {
-        let Some(bin) = crate::ff::ffmpeg_bin() else {
+        let Some(bin) = crate::ff::test_ffmpeg() else {
             return false;
         };
         Command::new(bin)
@@ -500,7 +500,7 @@ mod tests {
     }
 
     fn stream_md5(path: &Path, map: &str) -> Vec<u8> {
-        Command::new(crate::ff::ffmpeg_bin().unwrap())
+        Command::new(crate::ff::test_ffmpeg().unwrap())
             .args(["-v", "error", "-i"])
             .arg(path)
             .args(["-map", map, "-c", "copy", "-f", "md5", "-"])
@@ -565,7 +565,7 @@ mod tests {
 
         // Picture packets are byte-identical and the file decodes cleanly.
         assert_eq!(stream_md5(&camera, "0:v:0"), stream_md5(&output, "0:v:0"));
-        let check = Command::new(crate::ff::ffmpeg_bin().unwrap())
+        let check = Command::new(crate::ff::test_ffmpeg().unwrap())
             .args(["-v", "error", "-i"])
             .arg(&output)
             .args(["-f", "null", "-"])
@@ -593,7 +593,7 @@ mod tests {
         );
 
         // Click: source 1.0 s − in 0.5 s + delay 0.25 s = 0.75 s (36000).
-        let decoded = Command::new(crate::ff::ffmpeg_bin().unwrap())
+        let decoded = Command::new(crate::ff::test_ffmpeg().unwrap())
             .args(["-v", "error", "-i"])
             .arg(&output)
             .args(["-map", "0:a:0", "-f", "f32le", "-c:a", "pcm_f32le", "-"])

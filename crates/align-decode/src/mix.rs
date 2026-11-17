@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn portable_backend_mixes_real_container_streams() {
-        let Some(ffmpeg) = crate::ff::ffmpeg_bin() else {
+        let Some(ffmpeg) = crate::ff::test_ffmpeg() else {
             eprintln!("SKIP: no ffmpeg binary");
             return;
         };

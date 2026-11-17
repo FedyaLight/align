@@ -1378,7 +1378,7 @@ mod tests {
 
     #[test]
     fn cancellation_terminates_running_ffmpeg_and_reaps_it() {
-        let Some(bin) = crate::ff::ffmpeg_bin() else {
+        let Some(bin) = crate::ff::test_ffmpeg() else {
             return;
         };
         let mut child = std::process::Command::new(bin)

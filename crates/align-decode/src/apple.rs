@@ -746,7 +746,7 @@ mod tests {
 
     #[test]
     fn standard_timecode_track_reads() {
-        let ffmpeg = match crate::ff::ffmpeg_bin() {
+        let ffmpeg = match crate::ff::test_ffmpeg() {
             Some(b) => b,
             None => {
                 eprintln!("SKIP: no ffmpeg binary");
@@ -801,7 +801,7 @@ mod tests {
     fn drop_frame_timecode_agrees_across_backends() {
         // Same 29.97 DF file through AVFoundation tmcd and ffprobe tags:
         // labels and elapsed must agree exactly (shared constructors).
-        let ffmpeg = match crate::ff::ffmpeg_bin() {
+        let ffmpeg = match crate::ff::test_ffmpeg() {
             Some(b) => b,
             None => {
                 eprintln!("SKIP: no ffmpeg binary");
@@ -864,7 +864,7 @@ mod tests {
     /// FFmpeg, with the same results as the portable engine.
     #[test]
     fn mxf_is_read_through_ffmpeg() {
-        let (Some(ffmpeg), Some(_)) = (crate::ff::ffmpeg_bin(), crate::ff::ffprobe_bin()) else {
+        let (Some(ffmpeg), Some(_)) = (crate::ff::test_ffmpeg(), crate::ff::test_ffprobe()) else {
             return;
         };
         let dir = fixture_dir("mxf");

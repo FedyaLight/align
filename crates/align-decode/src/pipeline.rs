@@ -1997,7 +1997,7 @@ mod tests {
     /// would shift it against the other.
     #[test]
     fn in_process_decode_failures_are_retried_with_ffmpeg() {
-        if crate::ff::ffmpeg_bin().is_none() {
+        if crate::ff::test_ffmpeg().is_none() {
             return;
         }
         let dir = fixture_dir("ffmpeg-retry");
@@ -3350,7 +3350,7 @@ mod tests {
     #[test]
     fn mp4_video_inspect_finds_cfr_track() {
         use crate::backend::MediaBackend;
-        let ffmpeg = match crate::ff::ffmpeg_bin() {
+        let ffmpeg = match crate::ff::test_ffmpeg() {
             Some(b) => b,
             None => {
                 eprintln!("SKIP: no ffmpeg binary");

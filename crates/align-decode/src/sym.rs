@@ -934,7 +934,7 @@ pub(crate) mod test_media {
         source: &str,
         codec: &[&str],
     ) -> Option<PathBuf> {
-        let ffmpeg = crate::ff::ffmpeg_bin()?;
+        let ffmpeg = crate::ff::test_ffmpeg()?;
         let clip = dir.join(name);
         let ok = std::process::Command::new(ffmpeg)
             .args(["-v", "error", "-y", "-f", "lavfi", "-i", source, "-ac", "2"])
@@ -1061,7 +1061,7 @@ mod damaged_packet_tests {
     /// exporting the last milliseconds must still work in process.
     #[test]
     fn short_final_pcm_packets_still_decode() {
-        let Some(ffmpeg) = crate::ff::ffmpeg_bin() else {
+        let Some(ffmpeg) = crate::ff::test_ffmpeg() else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();

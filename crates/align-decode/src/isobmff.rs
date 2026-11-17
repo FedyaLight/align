@@ -973,7 +973,7 @@ mod tests {
     use align_core::VideoFrameRateMode;
 
     fn ffmpeg(args: &[&str], output: &Path) -> bool {
-        let Some(bin) = crate::ff::ffmpeg_bin() else {
+        let Some(bin) = crate::ff::test_ffmpeg() else {
             return false;
         };
         std::process::Command::new(bin)
@@ -1085,7 +1085,7 @@ mod tests {
 
     #[test]
     fn ama_metadata_agrees_with_ffprobe_fields() {
-        let Some(ffprobe) = crate::ff::ffprobe_bin() else {
+        let Some(ffprobe) = crate::ff::test_ffprobe() else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();

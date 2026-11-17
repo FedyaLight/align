@@ -1270,7 +1270,7 @@ mod tests {
 
     #[test]
     fn premiere_export_renders_placement_pads_for_fractional_starts() {
-        if crate::ff::ffmpeg_bin().is_none() {
+        if crate::ff::test_ffmpeg().is_none() {
             eprintln!("SKIP: ffmpeg is unavailable");
             return;
         }
@@ -1390,7 +1390,7 @@ mod tests {
 
     #[test]
     fn premiere_export_keeps_a_camera_with_a_shorter_audio_track() {
-        let Some(ffmpeg) = crate::ff::ffmpeg_bin() else {
+        let Some(ffmpeg) = crate::ff::test_ffmpeg() else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -1767,7 +1767,7 @@ mod tests {
 
     #[test]
     fn media_export_remuxes_video_and_writes_float_audio() {
-        let Some(ffmpeg) = crate::ff::ffmpeg_bin() else {
+        let Some(ffmpeg) = crate::ff::test_ffmpeg() else {
             eprintln!("SKIP: ffmpeg is unavailable");
             return;
         };
@@ -1871,7 +1871,7 @@ mod tests {
     /// backends do, or the clean audio lands 256 samples late.
     #[test]
     fn ffmpeg_remux_trims_the_recorder_decoder_delay() {
-        let Some(ffmpeg) = crate::ff::ffmpeg_bin() else {
+        let Some(ffmpeg) = crate::ff::test_ffmpeg() else {
             eprintln!("SKIP: ffmpeg is unavailable");
             return;
         };

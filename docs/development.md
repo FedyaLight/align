@@ -81,10 +81,21 @@ are read by `isobmff` (probe, timecode, AAF link metadata), linear PCM in those
 files by `mp4pcm`, and camera-file export copies video through `remux`; FFmpeg
 serves only the remaining containers.
 
-Export assembles a writer-neutral timeline, prepares required audio, retains
-temporary sources, and invokes format writers. `media_assets` owns extracted AAF
-audio across the temporary-to-saved boundary. Desktop workers report indexed
-results and use cancellation flags; generation checks reject stale UI updates.
+Export assembles a writer-neutral timeline, plans every prepared audio file
+(drift corrections, Premiere placement pads, Resolve precision stems), renders
+the plan with progress, retains temporary sources, and invokes format writers.
+A prepared file's name ends with a hash of everything it was rendered from, so
+an existing file is reused as is; bump `AUDIO_SIDECAR_REVISION` in
+`align-decode/src/export.rs` when rendering changes. `media_assets` owns
+extracted AAF audio across the temporary-to-saved boundary. Desktop workers
+report indexed results and use cancellation flags; generation checks reject
+stale UI updates.
+
+Every generated file is written through `align_core::staged`: a temporary
+sibling replaces the destination only once complete, so readers never see a
+partial file and a failed write keeps the previous one. Helper processes
+(FFmpeg, the AAF module) start through `align_decode::process`, which hides
+console windows on Windows and stops them on cancellation.
 
 Keep algorithms in `align-core`, media I/O in `align-decode`, and presentation
 state in the frontend. Preserve existing serialized field names when changing
@@ -122,7 +133,9 @@ a `verification.json` containing status and the tested CLI's SHA-256. It does no
 open desktop or editor applications.
 
 Tests that require external media tools need those tools installed even when
-only the native backend is being developed. CI runs the same acceptance command
+only the native backend is being developed. Without FFmpeg those tests are
+skipped with a notice; set `ALIGN_REQUIRE_FFMPEG=1`, as CI does, to make a
+missing tool fail them instead. CI runs the same acceptance command
 on macOS, Windows, and Linux. Release tags matching `v*` also build and
 publish the installers.
 

@@ -446,7 +446,7 @@ mod tests {
     /// the direct reader and through Symphonia/FFmpeg.
     #[test]
     fn direct_reads_match_reference_decoders() {
-        let Some(ffmpeg) = crate::ff::ffmpeg_bin() else {
+        let Some(ffmpeg) = crate::ff::test_ffmpeg() else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
