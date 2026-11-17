@@ -577,7 +577,8 @@ pub struct ExportTimeline {
     order_only_islands: HashSet<usize>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum UnmatchedPlacement {
     #[default]
     ByOrderAndTime,

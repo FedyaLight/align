@@ -1202,7 +1202,9 @@ pub(super) fn export_sheet(
         settings = settings.child(export_unmatched_section(cx, sheet_context));
     }
     // Naming stays in the same scrollable form as the processing settings.
-    settings = settings.child(export_names_section(cx, sheet_context));
+    settings = settings
+        .child(export_names_section(cx, sheet_context))
+        .child(export_defaults_section(cx, sheet_context));
     columns = columns.child(div().id("export-settings").min_w(px(0.)).child(settings));
     sheet = sheet.child(
         div()
@@ -1263,6 +1265,73 @@ fn export_source_bins(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Statef
             cx.notify();
         },
     )
+}
+
+/// Saving the sheet as the starting point for new jobs, and loading the
+/// saved or Align's defaults back.
+fn export_defaults_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Div {
+    let SheetContext {
+        theme,
+        data,
+        busy,
+        panel: ExportPanel { inputs, .. },
+        ..
+    } = sheet;
+    let current = data.export_settings(inputs.labels(cx));
+    let align_defaults = crate::state::ExportSettings::default();
+    let saved = data.saved_export_settings.clone();
+    let status = match &saved {
+        Some(saved) if *saved == current => "Using your saved defaults.",
+        None if current == align_defaults => "Using Align's defaults.",
+        _ => "Changed for this export.",
+    };
+    let mut buttons = div().flex().flex_row().flex_wrap().gap_2().px_2();
+    buttons = buttons.child(button(
+        cx,
+        theme,
+        "btn-exp-save-defaults",
+        "Save as Default",
+        !busy && saved.as_ref() != Some(&current),
+        |this, _, _, cx| this.save_export_defaults(cx),
+    ));
+    if let Some(saved) = saved.filter(|saved| *saved != current) {
+        buttons = buttons.child(button(
+            cx,
+            theme,
+            "btn-exp-revert-defaults",
+            "Revert to Saved",
+            !busy,
+            move |this, _, _, cx| this.load_export_settings(saved.clone(), cx),
+        ));
+    }
+    if current != align_defaults {
+        buttons = buttons.child(button(
+            cx,
+            theme,
+            "btn-exp-align-defaults",
+            "Use Align Defaults",
+            !busy,
+            |this, _, _, cx| this.load_export_settings(crate::state::ExportSettings::default(), cx),
+        ));
+    }
+    let note = |text: &'static str| {
+        div()
+            .px_2()
+            .text_size(px(11.))
+            .text_color(rgb(theme.dim))
+            .child(text)
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(export_section_title(theme, "Defaults"))
+        .child(note(status))
+        .child(buttons)
+        .child(note(
+            "New jobs and Align's next launch start from the saved defaults. The \
+             destination and sequence name are not saved.",
+        ))
 }
 
 /// What every section of the export sheet reads.

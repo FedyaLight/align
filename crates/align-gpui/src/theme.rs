@@ -3,7 +3,7 @@
 //! Signal colors (matched/unmatched/pending bars) stay identical in both
 //! modes; window chrome adapts to the selected appearance.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use gpui::WindowAppearance;
@@ -21,22 +21,19 @@ pub enum AppearancePreference {
     Dark,
 }
 
-#[derive(Default, Serialize, Deserialize)]
-struct AppSettings {
-    #[serde(default)]
-    appearance: AppearancePreference,
-}
+/// The settings-file key of the appearance.
+const KEY: &str = "appearance";
 
 impl AppearancePreference {
     pub fn load() -> Self {
-        let preference = load_from(&settings_file());
+        let preference = load_from(&crate::settings::file());
         preference.set_current();
         preference
     }
 
     pub fn save(self) {
         self.set_current();
-        let _ = save_to(&settings_file(), self);
+        let _ = save_to(&crate::settings::file(), self);
     }
 
     fn set_current(self) {
@@ -44,27 +41,12 @@ impl AppearancePreference {
     }
 }
 
-fn settings_file() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("Align")
-        .join("settings.json")
-}
-
 fn load_from(path: &Path) -> AppearancePreference {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<AppSettings>(&bytes).ok())
-        .map(|settings| settings.appearance)
-        .unwrap_or_default()
+    crate::settings::read(path, KEY).unwrap_or_default()
 }
 
 fn save_to(path: &Path, appearance: AppearancePreference) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let bytes = serde_json::to_vec_pretty(&AppSettings { appearance })?;
-    std::fs::write(path, bytes)
+    crate::settings::write(path, KEY, Some(&appearance))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

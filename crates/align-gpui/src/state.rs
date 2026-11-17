@@ -104,13 +104,100 @@ pub struct SequencePicker {
     pub options: Vec<TimelineSequenceSummary>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ExportTarget {
     Aaf,
     ResolveOtio,
     ResolveXml,
     Premiere,
     FinalCutPro,
+}
+
+/// Export options a user saves as the starting point for new jobs. The
+/// destination folder and sequence name are per export and not included.
+/// Fields missing from an older settings file take Align's defaults.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ExportSettings {
+    /// In `ExportTarget::all` order.
+    pub targets: Vec<ExportTarget>,
+    pub correct_drift: bool,
+    pub replaced_sequence: bool,
+    pub media_bins: bool,
+    pub fcpxml_timeline: bool,
+    pub fcpxml_multicam: bool,
+    pub fcpxml_storylines: bool,
+    pub aaf_frame_duration: Option<align_core::MediaTime>,
+    pub media_files: bool,
+    pub unmatched: UnmatchedPlacement,
+    pub prevent_group_overlaps: bool,
+    pub disable_unmatched: bool,
+    pub label_synced: bool,
+    pub label_unmatched: bool,
+    pub cut_common_gaps: bool,
+    pub cut_lone_recorder: bool,
+    pub cut_shorter_than: f64,
+    pub trim_starts: f64,
+    pub trim_ends: f64,
+    pub synced_symbol_suffix: bool,
+    pub unmatched_symbol_suffix: bool,
+    pub labels: ExportLabels,
+}
+
+/// The export sheet's label and role text fields.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ExportLabels {
+    pub synced_symbol: String,
+    pub synced_color: String,
+    pub synced_role: String,
+    pub unmatched_symbol: String,
+    pub unmatched_color: String,
+    pub unmatched_role: String,
+}
+
+impl Default for ExportSettings {
+    /// Align's own defaults.
+    fn default() -> Self {
+        Self {
+            targets: vec![ExportTarget::ResolveOtio],
+            correct_drift: true,
+            replaced_sequence: false,
+            media_bins: false,
+            fcpxml_timeline: true,
+            fcpxml_multicam: true,
+            fcpxml_storylines: false,
+            aaf_frame_duration: None,
+            media_files: false,
+            unmatched: UnmatchedPlacement::ByOrderAndTime,
+            prevent_group_overlaps: false,
+            disable_unmatched: false,
+            label_synced: false,
+            label_unmatched: false,
+            cut_common_gaps: false,
+            cut_lone_recorder: false,
+            cut_shorter_than: 0.0,
+            trim_starts: 0.0,
+            trim_ends: 0.0,
+            synced_symbol_suffix: false,
+            unmatched_symbol_suffix: false,
+            labels: ExportLabels::default(),
+        }
+    }
+}
+
+impl ExportSettings {
+    /// The settings-file key of the saved export defaults.
+    const KEY: &'static str = "exportDefaults";
+
+    pub fn load_saved() -> Option<Self> {
+        crate::settings::read(&crate::settings::file(), Self::KEY)
+    }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        crate::settings::write(&crate::settings::file(), Self::KEY, Some(self))
+    }
 }
 
 impl ExportTarget {
@@ -309,6 +396,8 @@ pub struct AppData {
     pub export_synced_symbol_suffix: bool,
     pub export_unmatched_symbol_suffix: bool,
     pub export_started: bool,
+    /// The user's saved export defaults; new jobs start from these.
+    pub saved_export_settings: Option<ExportSettings>,
     // Overlays.
     pub show_warning_details: bool,
     pub show_about: bool,
@@ -395,6 +484,7 @@ impl Default for AppData {
             export_synced_symbol_suffix: false,
             export_unmatched_symbol_suffix: false,
             export_started: false,
+            saved_export_settings: None,
             show_warning_details: false,
             show_about: false,
             show_agent_setup: false,
@@ -408,10 +498,13 @@ impl Default for AppData {
 
 impl AppData {
     pub fn new() -> Self {
-        Self {
+        let mut data = Self {
             redirects: align_core::redirect::load_from(&align_core::redirect::config_file()),
+            saved_export_settings: ExportSettings::load_saved(),
             ..Default::default()
-        }
+        };
+        data.apply_export_settings(&data.export_baseline());
+        data
     }
 
     fn selected_sequence_indices(&self) -> Vec<usize> {
@@ -820,17 +913,79 @@ impl AppData {
         self.cancel
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let generation = self.generation.wrapping_add(1);
-        let export_drift = self.export_drift;
         let appearance = self.appearance;
         let redirects = self.redirects.clone();
+        let saved_export_settings = self.saved_export_settings.take();
         *self = Self {
             generation,
             appearance,
-            export_drift,
             redirects,
+            saved_export_settings,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ..Default::default()
         };
+        self.apply_export_settings(&self.export_baseline());
+    }
+
+    /// The export options in the sheet; `labels` come from its text fields.
+    pub fn export_settings(&self, labels: ExportLabels) -> ExportSettings {
+        ExportSettings {
+            targets: ExportTarget::all()
+                .into_iter()
+                .filter(|target| self.export_selected.contains(target))
+                .collect(),
+            correct_drift: self.export_drift,
+            replaced_sequence: self.export_replaced,
+            media_bins: self.export_media_bins,
+            fcpxml_timeline: self.export_fcpxml_timeline,
+            fcpxml_multicam: self.export_fcpxml_multicam,
+            fcpxml_storylines: self.export_storylines,
+            aaf_frame_duration: self.export_aaf_frame_duration,
+            media_files: self.export_media,
+            unmatched: self.export_unmatched,
+            prevent_group_overlaps: self.export_prevent_overlaps,
+            disable_unmatched: self.export_disable_unmatched,
+            label_synced: self.export_label_synced,
+            label_unmatched: self.export_label_unmatched,
+            cut_common_gaps: self.export_cut_common_gaps,
+            cut_lone_recorder: self.export_cut_lone_recorder,
+            cut_shorter_than: self.export_cut_shorter_than,
+            trim_starts: self.export_trim_starts,
+            trim_ends: self.export_trim_ends,
+            synced_symbol_suffix: self.export_synced_symbol_suffix,
+            unmatched_symbol_suffix: self.export_unmatched_symbol_suffix,
+            labels,
+        }
+    }
+
+    /// Put `settings` in the sheet, except the text fields the view owns.
+    pub fn apply_export_settings(&mut self, settings: &ExportSettings) {
+        self.export_selected = settings.targets.iter().copied().collect();
+        self.export_drift = settings.correct_drift;
+        self.export_replaced = settings.replaced_sequence;
+        self.export_media_bins = settings.media_bins;
+        self.export_fcpxml_timeline = settings.fcpxml_timeline;
+        self.export_fcpxml_multicam = settings.fcpxml_multicam;
+        self.export_storylines = settings.fcpxml_storylines;
+        self.export_aaf_frame_duration = settings.aaf_frame_duration;
+        self.export_media = settings.media_files;
+        self.export_unmatched = settings.unmatched;
+        self.export_prevent_overlaps = settings.prevent_group_overlaps;
+        self.export_disable_unmatched = settings.disable_unmatched;
+        self.export_label_synced = settings.label_synced;
+        self.export_label_unmatched = settings.label_unmatched;
+        self.export_cut_common_gaps = settings.cut_common_gaps;
+        self.export_cut_lone_recorder = settings.cut_lone_recorder;
+        self.export_cut_shorter_than = settings.cut_shorter_than;
+        self.export_trim_starts = settings.trim_starts;
+        self.export_trim_ends = settings.trim_ends;
+        self.export_synced_symbol_suffix = settings.synced_symbol_suffix;
+        self.export_unmatched_symbol_suffix = settings.unmatched_symbol_suffix;
+    }
+
+    /// What a new job starts from: the saved defaults, else Align's.
+    pub fn export_baseline(&self) -> ExportSettings {
+        self.saved_export_settings.clone().unwrap_or_default()
     }
 
     fn reset_preview(&mut self) {
@@ -3158,5 +3313,72 @@ mod tests {
 
         let after = (pointer_x - f32::from(data.timeline_scroll.offset().x)) / data.zoom() as f32;
         assert!((before - after).abs() < 0.001, "{before} != {after}");
+    }
+
+    #[test]
+    fn export_settings_start_from_align_defaults_and_round_trip() {
+        let mut data = AppData::default();
+        let labels = ExportLabels::default();
+        assert_eq!(
+            data.export_settings(labels.clone()),
+            ExportSettings::default()
+        );
+
+        let custom = ExportSettings {
+            targets: vec![ExportTarget::Premiere, ExportTarget::FinalCutPro],
+            correct_drift: false,
+            media_bins: true,
+            unmatched: UnmatchedPlacement::Remove,
+            trim_starts: 0.5,
+            labels: ExportLabels {
+                synced_color: "Iris".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        data.apply_export_settings(&custom);
+        assert_eq!(data.export_settings(custom.labels.clone()), custom);
+    }
+
+    #[test]
+    fn a_cleared_session_starts_from_the_saved_export_defaults() {
+        let saved = ExportSettings {
+            media_bins: true,
+            ..Default::default()
+        };
+        let mut data = AppData {
+            saved_export_settings: Some(saved.clone()),
+            ..Default::default()
+        };
+        data.export_media_bins = false;
+        data.export_drift = false;
+        data.clear();
+        assert_eq!(data.saved_export_settings.as_ref(), Some(&saved));
+        assert_eq!(data.export_settings(ExportLabels::default()), saved);
+
+        // Without saved defaults, Align's own apply.
+        data.saved_export_settings = None;
+        data.export_drift = false;
+        data.clear();
+        assert_eq!(
+            data.export_settings(ExportLabels::default()),
+            ExportSettings::default()
+        );
+    }
+
+    #[test]
+    fn saved_export_settings_tolerate_missing_and_unknown_fields() {
+        let settings: ExportSettings =
+            serde_json::from_str(r#"{"mediaBins": true, "removedLater": 1}"#).unwrap();
+        assert_eq!(
+            settings,
+            ExportSettings {
+                media_bins: true,
+                ..Default::default()
+            }
+        );
+        let text = serde_json::to_string(&ExportSettings::default()).unwrap();
+        assert!(text.contains(r#""targets":["resolveOtio"]"#), "{text}");
+        assert!(text.contains(r#""unmatched":"byOrderAndTime""#), "{text}");
     }
 }

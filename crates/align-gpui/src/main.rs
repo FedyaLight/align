@@ -10,6 +10,7 @@ mod feedback;
 mod icons;
 mod lane;
 mod motion;
+mod settings;
 mod state;
 mod text_input;
 mod theme;

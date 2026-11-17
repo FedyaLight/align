@@ -20,6 +20,12 @@ open "/Applications/Align.app"
 3. Synchronize. Review the resulting groups, unmatched clips, and warnings.
 4. Choose an export destination and the options appropriate for your editor.
 
+The export sheet starts from Align's defaults. **Save as Default** keeps the
+current export options for new sessions and later launches; the destination
+and sequence name are not saved. **Revert to Saved** and **Use Align Defaults**
+load either set back into the sheet. The command line and MCP server do not
+read these saved defaults.
+
 Search accuracy controls how much analysis work is performed. Start with
 Balanced; higher levels take more time and memory. Match threshold controls the
 confidence required to accept a match. These settings serve different purposes.

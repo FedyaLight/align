@@ -375,6 +375,31 @@ impl ExportInputs {
         let value = value.trim();
         (!value.is_empty()).then(|| value.to_string())
     }
+
+    fn labels(&self, cx: &App) -> crate::state::ExportLabels {
+        let text = |input: &Entity<TextInput>| input.read(cx).text();
+        crate::state::ExportLabels {
+            synced_symbol: text(&self.synced_symbol),
+            synced_color: text(&self.synced_color),
+            synced_role: text(&self.synced_role),
+            unmatched_symbol: text(&self.unmatched_symbol),
+            unmatched_color: text(&self.unmatched_color),
+            unmatched_role: text(&self.unmatched_role),
+        }
+    }
+
+    fn set_labels(&self, labels: &crate::state::ExportLabels, cx: &mut App) {
+        for (input, text) in [
+            (&self.synced_symbol, &labels.synced_symbol),
+            (&self.synced_color, &labels.synced_color),
+            (&self.synced_role, &labels.synced_role),
+            (&self.unmatched_symbol, &labels.unmatched_symbol),
+            (&self.unmatched_color, &labels.unmatched_color),
+            (&self.unmatched_role, &labels.unmatched_role),
+        ] {
+            input.update(cx, |input, cx| input.set_text(text.clone(), cx));
+        }
+    }
 }
 
 /// Exit and motion lengths, shared by an element's animation and the timer
@@ -495,7 +520,7 @@ impl Focusable for AlignApp {
 
 impl AlignApp {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        Self {
+        let app = Self {
             data: AppData::new(),
             focus_handle: cx.focus_handle(),
             export_inputs: ExportInputs::new(cx),
@@ -524,10 +549,54 @@ impl AlignApp {
             feedback_notice_pending: crate::feedback::notice_pending(),
             feedback_error: None,
             update_notice_dismissed: false,
-        }
+        };
+        app.export_inputs
+            .set_labels(&app.data.export_baseline().labels, cx);
+        app
     }
 
     // ---------------- actions
+
+    /// Clear the session, or remove the selected sources. A cleared session
+    /// starts the next job from the export defaults.
+    pub(crate) fn delete_or_clear(&mut self, cx: &mut Context<Self>) {
+        let clearing = self.data.selection.is_empty();
+        self.data.delete_or_clear();
+        if clearing {
+            self.export_inputs
+                .set_labels(&self.data.export_baseline().labels, cx);
+        }
+        cx.notify();
+    }
+
+    /// The export options in the sheet, text fields included.
+    fn export_settings(&self, cx: &App) -> crate::state::ExportSettings {
+        self.data.export_settings(self.export_inputs.labels(cx))
+    }
+
+    fn load_export_settings(
+        &mut self,
+        settings: crate::state::ExportSettings,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_export_options(cx, |data| data.apply_export_settings(&settings));
+        self.export_inputs.set_labels(&settings.labels, cx);
+        cx.notify();
+    }
+
+    fn save_export_defaults(&mut self, cx: &mut Context<Self>) {
+        let settings = self.export_settings(cx);
+        match settings.save() {
+            Ok(()) => self.data.saved_export_settings = Some(settings),
+            Err(_) => {
+                self.data.error = Some(
+                    "Could not save export defaults. Your current export options are unchanged."
+                        .to_string(),
+                );
+            }
+        }
+        cx.notify();
+    }
 
     pub(crate) fn add_media(&mut self, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {

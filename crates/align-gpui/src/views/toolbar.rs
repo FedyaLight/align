@@ -158,10 +158,7 @@ pub(super) fn toolbar(
         icons().trash.clone(),
         trash_tip,
         !data.clips.is_empty(),
-        |this, _, _, cx| {
-            this.data.delete_or_clear();
-            cx.notify();
-        },
+        |this, _, _, cx| this.delete_or_clear(cx),
     ));
     bar = bar.child(div().w(px(12.)));
     if has_timeline {
