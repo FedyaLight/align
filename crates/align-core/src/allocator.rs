@@ -11,8 +11,12 @@ use std::path::Path;
 
 // Adjacent recorder chunks can disagree at their seam after independent
 // waveform refinement. Keep a sub-half-second seam on one track; material
-// overlaps still split into additional lanes.
+// overlaps still split into additional lanes. The seam is between two parts
+// of one source, and each part extends well past it.
 const PLACEMENT_TOLERANCE: f64 = 0.5;
+// Clips of different sources, or channels of one recording, share a track
+// only where they do not overlap at all.
+const SHARED_TOLERANCE: f64 = 1e-6;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TimelineTrackRequest {
@@ -78,17 +82,25 @@ pub fn allocate(requests: &[TimelineTrackRequest]) -> HashMap<String, usize> {
                 .then_with(|| b.duration.total_cmp(&a.duration))
                 .then_with(|| a.id.cmp(&b.id))
         });
-        let mut ends: Vec<f64> = Vec::new();
+        // Each lane's end and the duration of the clip that ends it.
+        let mut ends: Vec<(f64, f64)> = Vec::new();
         for clip in clips {
+            let duration = clip.duration.max(0.0);
             let lane = ends
                 .iter()
-                .position(|e| *e <= clip.start + PLACEMENT_TOLERANCE)
+                .position(|&(end, last)| {
+                    let seam = PLACEMENT_TOLERANCE.min(duration / 2.0).min(last / 2.0);
+                    end <= clip.start + seam.max(SHARED_TOLERANCE)
+                })
                 .unwrap_or_else(|| {
-                    ends.push(0.0);
+                    ends.push((0.0, 0.0));
                     ends.len() - 1
                 });
             local.insert(clip.id.as_str(), lane);
-            ends[lane] = ends[lane].max(clip.start + clip.duration.max(0.0));
+            let end = clip.start + duration;
+            if end >= ends[lane].0 {
+                ends[lane] = (end, duration);
+            }
         }
     }
 
@@ -158,13 +170,13 @@ pub fn allocate(requests: &[TimelineTrackRequest]) -> HashMap<String, usize> {
 }
 
 // Both lists are sorted by start. Advance the interval that finishes before
-// the other begins, allowing the same refinement seam as source-local packing.
+// the other begins.
 fn intervals_fit(left: &[(f64, f64)], right: &[(f64, f64)]) -> bool {
     let (mut i, mut j) = (0, 0);
     while i < left.len() && j < right.len() {
-        if left[i].1 <= right[j].0 + PLACEMENT_TOLERANCE {
+        if left[i].1 <= right[j].0 + SHARED_TOLERANCE {
             i += 1;
-        } else if right[j].1 <= left[i].0 + PLACEMENT_TOLERANCE {
+        } else if right[j].1 <= left[i].0 + SHARED_TOLERANCE {
             j += 1;
         } else {
             return false;
@@ -200,6 +212,28 @@ mod tests {
             req("0030", "recorder", 7_200.231_711, 593.504_155),
         ]);
         assert_eq!(a["0029"], a["0030"]);
+    }
+
+    /// Clips shorter than the seam tolerance that play at once, such as the
+    /// channels of a short recording, never share a track.
+    #[test]
+    fn short_simultaneous_clips_get_distinct_lanes() {
+        let a = allocate(&[req("l", "rec#1", 1.0, 0.35), req("r", "rec#2", 1.0, 0.35)]);
+        assert_ne!(a["l"], a["r"]);
+        let a = allocate(&[req("a", "s", 1.0, 0.35), req("b", "s", 1.0, 0.35)]);
+        assert_ne!(a["a"], a["b"]);
+        // A short clip within the head of a long one of its source.
+        let a = allocate(&[req("short", "s", 1.0, 0.3), req("long", "s", 1.0, 10.0)]);
+        assert_ne!(a["short"], a["long"]);
+    }
+
+    /// Different sources share a track only without any overlap.
+    #[test]
+    fn sources_share_a_lane_only_without_overlap() {
+        let a = allocate(&[req("a", "one", 0.0, 10.0), req("b", "two", 9.9, 10.0)]);
+        assert_ne!(a["a"], a["b"]);
+        let a = allocate(&[req("a", "one", 0.0, 10.0), req("b", "two", 10.0, 10.0)]);
+        assert_eq!(a["a"], a["b"]);
     }
 
     #[test]
