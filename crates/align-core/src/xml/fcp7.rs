@@ -640,7 +640,7 @@ pub(super) fn read_fcp7(
     if portable_count > 0 {
         warn(
             &mut warnings,
-            "Cross Dissolve is preserved in Premiere XML and Resolve OTIO; the optional Resolve precision importer currently flattens transitions to overlapping media.".into(),
+            "Cross Dissolve is preserved in Premiere XML and Resolve OTIO; the Resolve import script currently flattens transitions to overlapping media.".into(),
         );
     }
     if transitions
@@ -649,7 +649,7 @@ pub(super) fn read_fcp7(
     {
         warn(
             &mut warnings,
-            "Audio transitions are preserved in Premiere XML when clip identity is unambiguous; Resolve OTIO and the optional precision importer keep their media overlap but cannot represent the FCP 7 audio effect portably.".into(),
+            "Audio transitions are preserved in Premiere XML when clip identity is unambiguous; Resolve OTIO and the Resolve import script keep their media overlap but cannot represent the FCP 7 audio effect portably.".into(),
         );
     }
     if edits.iter().any(|e| e.plays_backward)

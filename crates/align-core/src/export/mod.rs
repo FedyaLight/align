@@ -1,6 +1,6 @@
 //! NLE export: timeline assembly model (`model`), Resolve OTIO (`otio`),
 //! Premiere/Resolve FCP7 XML (`premiere`), Final Cut Pro FCPXML (`fcpxml`)
-//! and the Resolve precision importer script (`script`).
+//! and the Resolve import script (`script`).
 
 pub mod fcpxml;
 pub mod model;

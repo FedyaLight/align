@@ -82,7 +82,7 @@ files by `mp4pcm`, and camera-file export copies video through `remux`; FFmpeg
 serves only the remaining containers.
 
 Export assembles a writer-neutral timeline, plans every prepared audio file
-(drift corrections and precision stems), renders
+(drift corrections and AAF channel stems), renders
 the plan with progress, retains temporary sources, and invokes format writers.
 A prepared file's name ends with a hash of everything it was rendered from, so
 an existing file is reused as is; bump `AUDIO_SIDECAR_REVISION` in

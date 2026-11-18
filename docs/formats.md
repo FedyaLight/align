@@ -73,8 +73,8 @@ into one folder form one.
 Source clips keep their original audio; use the exported timeline for
 synchronized playback. `Align generated audio` holds the files Align rendered
 for the timelines: drift corrections of recorders whose clock drifts, and
-mono copies of each channel for the Resolve import script and AAF. The
-timelines play these files, so keep them with the export.
+for AAF a mono copy of each channel of a recording. The timelines play
+these files, so keep them with the export.
 
 Organizing never renames or moves files on disk. Each run of the Resolve import
 script creates its own folder, because Resolve imports a timeline's media again
@@ -91,7 +91,7 @@ This does not imply lossless interchange of an arbitrary edited project.
   forward or reverse retiming. Some nested structures are flattened.
 - Premiere XML can retain imported non-retime filters and transition data.
   Other writers do not translate every effect or audio gain curve.
-- Supported video dissolves can be represented in OTIO. The precision import
+- Supported video dissolves can be represented in OTIO. The Resolve import
   script does not reproduce all transition semantics.
 - Variable-speed retiming and complex nested edits are not generally preserved.
   Read import warnings and verify the exported result in the target editor.
@@ -130,7 +130,7 @@ not a general-purpose creative time-stretch tool. See
 | Embedded AAF audio referenced by saved inspect/sync JSON | OS local data directory under `Align/Saved AAF Media` | Keep while the saved results are needed. |
 | Temporary AAF extraction | A private temporary directory | Removed at normal process exit. |
 | Retained temporary sources for direct export | `Source Media` under the export directory | Keep with the exported timeline. |
-| Corrected audio, precision stems, and replacement media | Export directory | Keep with the exported timeline. |
+| Corrected audio, AAF channel stems, and replacement media | Export directory | Keep with the exported timeline. |
 
 Saved results and exports may also reference external recordings at their
 original paths. Export is not a general media-collection/archive command. Moving

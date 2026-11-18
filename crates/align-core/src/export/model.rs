@@ -150,8 +150,6 @@ pub struct ExportItem {
     pub confidence: f64,
     pub corrected_audio_url: Option<PathBuf>,
     pub precision_audio_urls: Vec<PathBuf>,
-    /// Trailing silence in precision stems to retain a final partial frame in Resolve.
-    pub precision_tail_samples: u64,
     pub enabled: bool,
     pub track_enabled: bool,
     pub track_locked: bool,
@@ -213,7 +211,6 @@ impl ExportItem {
             confidence,
             corrected_audio_url: None,
             precision_audio_urls: Vec::new(),
-            precision_tail_samples: 0,
             enabled: true,
             track_enabled: true,
             track_locked: false,
@@ -289,11 +286,6 @@ impl ExportItem {
             self.corrected_selected_duration()
         }
     }
-    pub fn precision_selected_duration(&self) -> f64 {
-        let rate = self.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);
-        ((self.precision_source_duration() * rate).round() + self.precision_tail_samples as f64)
-            / rate
-    }
     pub fn mapping_digest(&self) -> String {
         let Some(first) = self.mapping_points.first() else {
             return "empty".to_string();
@@ -315,11 +307,10 @@ impl ExportItem {
 
     pub fn precision_digest(&self) -> String {
         let range = format!(
-            "{};{};{};{}",
+            "{};{};{}",
             self.mapping_digest(),
             self.source_in,
-            self.source_out,
-            self.precision_tail_samples
+            self.source_out
         );
         hex_prefix(&Sha256::digest(range.as_bytes()), 6)
     }
@@ -336,12 +327,6 @@ impl ExportItem {
         let mut out = self.clone();
         out.precision_audio_urls = urls;
         out
-    }
-    pub fn precision_audio_url(&self, channel_1based: usize) -> Option<&PathBuf> {
-        if channel_1based == 0 {
-            return None;
-        }
-        self.precision_audio_urls.get(channel_1based - 1)
     }
 
     /// The separately edited audio of a linked clip, when `media` is its
@@ -1113,7 +1098,6 @@ impl ImportedAssembly<'_> {
             confidence: base.confidence,
             corrected_audio_url: None,
             precision_audio_urls: Vec::new(),
-            precision_tail_samples: 0,
             linked_audio_edit: linked,
         };
         if is_unmatched {

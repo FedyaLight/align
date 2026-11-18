@@ -662,8 +662,6 @@ pub struct ChannelStems<'a> {
     /// Selected source range, in seconds.
     pub source_start: f64,
     pub duration: f64,
-    /// Silence appended after the selected range.
-    pub tail_samples: u64,
 }
 
 /// Outputs written per decoding pass, bounding open files and buffers.
@@ -753,7 +751,6 @@ pub fn render_channels_cancellable(
                 1,
                 cancel,
             )?;
-            writer.write_silence(1, stems.tail_samples, cancel)?;
             writer.finalize()?;
             preserve_broadcast_extension(
                 source,
@@ -1102,7 +1099,6 @@ mod tests {
                 is_float: false,
                 source_start: 0.0,
                 duration: probe.duration_seconds,
-                tail_samples: 0,
             },
             &NEVER_CANCELLED,
         )
@@ -1192,7 +1188,6 @@ mod tests {
                         is_float: false,
                         source_start: 0.0,
                         duration: 1.0,
-                        tail_samples: 0,
                     },
                     &cancel,
                 ),
@@ -1232,7 +1227,6 @@ mod tests {
                     is_float: false,
                     source_start: 0.0,
                     duration: 1.0,
-                    tail_samples: 0,
                 },
                 &cancel,
             ),
@@ -1342,7 +1336,6 @@ mod tests {
                         is_float: format == hound::SampleFormat::Float,
                         source_start: 137.0 / 48000.0,
                         duration: 701.0 / 48000.0,
-                        tail_samples: 17,
                     },
                     &NEVER_CANCELLED,
                 )
@@ -1352,14 +1345,13 @@ mod tests {
                     assert_eq!(reader.spec().channels, 1);
                     assert_eq!(reader.spec().sample_rate, 48000);
                     assert_eq!(reader.spec().bits_per_sample, 32);
-                    assert_eq!(reader.duration(), 701 + 17);
+                    assert_eq!(reader.duration(), 701);
                     if bits == 32 && format == hound::SampleFormat::Int {
                         assert_eq!(reader.spec().sample_format, hound::SampleFormat::Int);
                         let samples: Vec<i32> = reader.into_samples().map(Result::unwrap).collect();
                         let expected: Vec<_> = frames[137..838]
                             .iter()
                             .map(|frame| frame[channel])
-                            .chain(std::iter::repeat_n(0, 17))
                             .collect();
                         assert_eq!(samples, expected, "{kind:?}, channel {channel}");
                     } else {
@@ -1370,7 +1362,6 @@ mod tests {
                             .map(|frame| {
                                 (frame[channel] >> (32 - bits)) as f32 / (1u64 << (bits - 1)) as f32
                             })
-                            .chain(std::iter::repeat_n(0.0, 17))
                             .collect();
                         assert_eq!(
                             samples, expected,
@@ -1408,7 +1399,6 @@ mod tests {
                 is_float: false,
                 source_start: 0.4004,
                 duration: (80080.0 - 0.00001) / 48000.0,
-                tail_samples: 0,
             },
             &NEVER_CANCELLED,
         )

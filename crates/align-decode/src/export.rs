@@ -1,7 +1,7 @@
 //! Export preparation and format dispatch.
 //!
 //! An export first plans every audio file the timeline writers will reference
-//! (drift corrections and precision stems) and
+//! (drift corrections and AAF channel stems) and
 //! attaches their paths to the timeline. The plan is then rendered job by job
 //! with progress, and the timelines are written last. Prepared audio is
 //! reused when its file name, which encodes its full identity, already exists.
@@ -18,7 +18,6 @@ use align_core::drift::needs_correction_points;
 use align_core::export::fcpxml::FcpxmlOptions;
 use align_core::export::model::{
     ExportIsland, ExportItem, ExportTimeline, TimelineExportError, TimelineExportFormat,
-    sequence_fps,
 };
 use align_core::export::premiere::PremiereOptions;
 use align_core::model::file_name;
@@ -381,16 +380,12 @@ fn export_prepared_internal(
         ));
     }
     std::fs::create_dir_all(directory).map_err(ExportError::Write)?;
-    // Combine up front, so the plan sees the starts the writers round, and
-    // the final precision stem's tail fits the combined timeline's end.
+    // Combine up front, so the plan sees the starts the writers round.
     // Re-combining inside write_artifacts is a no-op shift afterwards.
     // Drift mappings are shift-invariant (relative source/island coords).
     let mut combined = timeline.combined();
     crate::media_assets::preserve_export(&mut combined, directory, cancel)
         .map_err(ExportError::write_or_cancelled)?;
-    if options.wants(TimelineExportFormat::ResolveScript) {
-        extend_final_precision_tail(&mut combined, options.correct_drift);
-    }
 
     let plan = AudioPlan::new(&combined, options, directory, cancel)?;
     let media_dir = directory.join("Media Files");
@@ -472,52 +467,11 @@ impl Progress<'_> {
     }
 }
 
-/// Matches durations computed from an item's own source and timeline times.
-const SAME_END_TOLERANCE: f64 = 1e-9;
-/// A timeline end closer than this to a frame boundary is on that boundary.
-const FRAME_BOUNDARY_TOLERANCE: f64 = 1e-7;
-
-/// Resolve floors the timeline end even when the final audio item extends
-/// into the next partial frame. Extend only a final recorder's derived
-/// precision stem with silence so an Entire Timeline render retains it.
-fn extend_final_precision_tail(combined: &mut ExportTimeline, correct_drift: bool) {
-    let fps = sequence_fps(combined.frame_duration);
-    let end_for = |item: &ExportItem| {
-        let duration = if correct_drift
-            && needs_correction_points(&item.mapping_points)
-            && item.clip.kind == MediaKind::Audio
-        {
-            item.corrected_selected_duration()
-        } else {
-            item.selected_timeline_duration(MediaKind::Audio)
-        };
-        item.timeline_start(MediaKind::Audio) + duration
-    };
-    let Some(island) = combined.islands.first_mut() else {
-        return;
-    };
-    let maximum_end = island.clips.iter().map(end_for).fold(0.0, f64::max);
-    let frame_end = maximum_end * fps;
-    if (frame_end - frame_end.round()).abs() <= FRAME_BOUNDARY_TOLERANCE {
-        return;
-    }
-    if let Some(last) = island.clips.iter_mut().find(|item| {
-        item.clip.kind == MediaKind::Audio
-            && !item.is_retimed(MediaKind::Audio)
-            && (end_for(item) - maximum_end).abs() < SAME_END_TOLERANCE
-    }) {
-        let sr = last.clip.audio.first().map_or(48000.0, |a| a.sample_rate);
-        // One extra sample covers nearest-sample placement rounding.
-        last.precision_tail_samples =
-            ((frame_end.ceil() / fps - maximum_end) * sr).ceil() as u64 + 1;
-    }
-}
-
 // ------------------------------------------------------------ audio plan
 
 /// Version of the prepared-audio formats, part of every sidecar's identity:
 /// a change to how sidecars are rendered never reuses an older file.
-const AUDIO_SIDECAR_REVISION: u32 = 15;
+const AUDIO_SIDECAR_REVISION: u32 = 16;
 
 /// `"<media> – <label> – <identity hash>.wav"`. The readable part names the
 /// file in an editor's bin; the hash keeps every rendering input, so a file
@@ -562,7 +516,6 @@ enum AudioJobKind {
         is_float: bool,
         source_start: f64,
         duration: f64,
-        tail_samples: u64,
     },
 }
 
@@ -573,9 +526,9 @@ impl AudioPlan {
         directory: &Path,
         cancel: &AtomicBool,
     ) -> Result<Self, ExportError> {
+        // Editors other than through AAF pick channels and ranges of the
+        // original files themselves.
         let wants_aaf = options.wants(TimelineExportFormat::Aaf);
-        // Final Cut Pro picks channels and ranges of the original files.
-        let wants_precision = wants_aaf || options.wants(TimelineExportFormat::ResolveScript);
         let needs_drift = |item: &ExportItem| {
             options.correct_drift
                 && item.clip.kind == MediaKind::Audio
@@ -619,15 +572,7 @@ impl AudioPlan {
                 && within
                 && !item.is_retimed(MediaKind::Audio)
         };
-        let needs_precision = |item: &ExportItem| {
-            let channels = item.clip.audio.first().map_or(0, |a| a.channels);
-            let for_resolve_or_fcp = wants_precision
-                && item.clip.kind == MediaKind::Audio
-                && (channels > 1
-                    || !item.is_full_source_selection()
-                    || item.precision_tail_samples > 0);
-            for_resolve_or_fcp || (aaf_item(item) && !aaf_direct(item))
-        };
+        let needs_precision = |item: &ExportItem| aaf_item(item) && !aaf_direct(item);
 
         // Every item of a corrected clip plays its drift sidecar, and every
         // item of a precision asset its stems.
@@ -656,7 +601,7 @@ impl AudioPlan {
         }
 
         let audio_dir = directory.join("Corrected Audio");
-        let precision_dir = directory.join("Resolve Precision Audio");
+        let precision_dir = directory.join("AAF Audio");
         let mut jobs = Vec::new();
         let mut drift_files: HashMap<&str, PathBuf> = HashMap::new();
         let mut precision_files: HashMap<String, Vec<PathBuf>> = HashMap::new();
@@ -743,7 +688,6 @@ impl AudioPlan {
                                     is_float,
                                     source_start: prepared.precision_source_start(),
                                     duration: prepared.precision_source_duration(),
-                                    tail_samples: prepared.precision_tail_samples,
                                 },
                             });
                             precision_files.insert(key, outputs.clone());
@@ -793,7 +737,6 @@ impl AudioJob {
                 is_float,
                 source_start,
                 duration,
-                tail_samples,
             } => {
                 let missing: Vec<_> = outputs
                     .iter()
@@ -813,7 +756,6 @@ impl AudioJob {
                         is_float: *is_float,
                         source_start: *source_start,
                         duration: *duration,
-                        tail_samples: *tail_samples,
                     },
                     cancel,
                 )
@@ -1295,7 +1237,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_precision_stems_keep_selected_tail_and_reuse_completed_channels() {
+    /// The Resolve script and OTIO play the original stereo file, trimmed,
+    /// without copies; AAF links mono stems of its selection, and a second
+    /// export renders only the stems it lacks.
+    fn resolve_plays_the_original_file_and_aaf_stems_are_reused() {
         let dir = std::env::temp_dir().join(format!("align-resolve-tail-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1334,53 +1279,78 @@ mod tests {
             "tail",
         );
         let out = dir.join("out");
-        let run_export = || {
-            export_prepared(
-                ExportRequest {
-                    backend: &crate::portable::PortableBackend,
-                    timeline: &timeline,
-                    directory: &out,
-                    options: &ExportOptions {
-                        formats: vec![
-                            TimelineExportFormat::ResolveScript,
-                            TimelineExportFormat::ResolveOTIO,
-                        ],
-                        correct_drift: false,
-                        ..ExportOptions::default()
-                    },
-                    cancel: &std::sync::atomic::AtomicBool::new(false),
-                },
-                None,
-            )
-            .unwrap()
+        let options = |formats| ExportOptions {
+            formats,
+            correct_drift: false,
+            ..ExportOptions::default()
         };
-        run_export();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        export_prepared(
+            ExportRequest {
+                backend: &crate::portable::PortableBackend,
+                timeline: &timeline,
+                directory: &out,
+                options: &options(vec![
+                    TimelineExportFormat::ResolveScript,
+                    TimelineExportFormat::ResolveOTIO,
+                ]),
+                cancel: &cancel,
+            },
+            None,
+        )
+        .unwrap();
         let doc: serde_json::Value = serde_json::from_slice(
             &std::fs::read(out.join("Align – DaVinci Resolve.otio")).unwrap(),
         )
         .unwrap();
-        let audio = doc["tracks"]["children"]
+        let clips: Vec<&serde_json::Value> = doc["tracks"]["children"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|t| t["kind"] == "Audio")
-            .unwrap();
-        let c = &audio["children"][0];
-        let reference = &c["media_references"]["DEFAULT_MEDIA"];
-        let reader = hound::WavReader::open(reference["target_url"].as_str().unwrap()).unwrap();
-        let samples: Vec<f32> = reader.into_samples::<f32>().map(Result::unwrap).collect();
-        assert!((3841..=3842).contains(&samples.len()));
-        assert!(samples[2999] > 0.4);
-        assert!(samples[3000..].iter().all(|v| *v == 0.0));
-        assert_eq!(samples.iter().filter(|v| **v != 0.0).count(), 1);
-        let duration = c["source_range"]["duration"]["value"].as_f64().unwrap() / 25.0;
-        assert!((0.08..=0.08 + 2.0 / 48000.0).contains(&duration));
-        let mut stems: Vec<_> = std::fs::read_dir(out.join("Resolve Precision Audio"))
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
+            .filter(|t| t["kind"] == "Audio")
+            .flat_map(|t| t["children"].as_array().unwrap())
             .collect();
-        stems.sort();
+        assert_eq!(clips.len(), 2);
+        for (channel, clip) in clips.iter().enumerate() {
+            let reference = &clip["media_references"]["DEFAULT_MEDIA"];
+            assert_eq!(reference["target_url"], src.to_string_lossy().as_ref());
+            assert_eq!(
+                clip["source_range"]["start_time"]["value"].as_f64(),
+                Some(0.25)
+            );
+            assert_eq!(clip["metadata"]["Align"]["Channel"], channel + 1);
+            assert_eq!(clip["metadata"]["Align"]["Channels"], 2);
+        }
+        assert!(!out.join("AAF Audio").exists());
+        assert!(!out.join("Corrected Audio").exists());
+
+        let combined = timeline.combined();
+        let render = || {
+            let plan = AudioPlan::new(
+                &combined,
+                &options(vec![TimelineExportFormat::Aaf]),
+                &out,
+                &cancel,
+            )
+            .unwrap();
+            for job in &plan.jobs {
+                job.render(&crate::portable::PortableBackend, &cancel)
+                    .unwrap();
+            }
+            plan.timeline.islands[0].clips[0]
+                .precision_audio_urls
+                .clone()
+        };
+        let stems = render();
         assert_eq!(stems.len(), 2);
+        for (channel, path) in stems.iter().enumerate() {
+            let reader = hound::WavReader::open(path).unwrap();
+            assert_eq!(reader.duration(), 3000);
+            let samples: Vec<f32> = reader.into_samples::<f32>().map(Result::unwrap).collect();
+            let sign = if channel == 0 { 1.0 } else { -1.0 };
+            assert!(samples[2999] * sign > 0.4, "{channel}");
+            assert_eq!(samples.iter().filter(|v| **v != 0.0).count(), 1);
+        }
         let expected: Vec<_> = stems
             .iter()
             .map(|path| std::fs::read(path).unwrap())
@@ -1393,7 +1363,7 @@ mod tests {
             .unwrap();
         let modified = std::fs::metadata(&stems[0]).unwrap().modified().unwrap();
         std::fs::remove_file(&stems[1]).unwrap();
-        run_export();
+        assert_eq!(render(), stems);
         assert_eq!(
             std::fs::metadata(&stems[0]).unwrap().modified().unwrap(),
             modified

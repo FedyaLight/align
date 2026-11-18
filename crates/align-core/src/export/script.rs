@@ -1,5 +1,6 @@
-//! Resolve precision importer script with sample-grid placement and
-//! render-compatible audio-only timelines. When the OTIO lists media bins,
+//! Resolve import script: places recordings between frames, on the sample
+//! nearest their place, each one clip on a track of its channel format, and
+//! makes render-compatible audio-only timelines. When the OTIO lists media bins,
 //! the script imports into a new media pool folder and files each source
 //! into a subfolder per camera and recorder. Resolve imports neither clip
 //! names nor colors, so the script applies them and the enabled state.
@@ -162,32 +163,130 @@ def otio_clips(track):
     return [child for child in track['children'] if child['OTIO_SCHEMA'] == 'Clip.2']
 
 
-def append_audio(entry):
-    source_rate = float(entry['media'].GetClipProperty('FPS') or rate)
-    start = entry['source_in'] * source_rate
-    sample_rate = float(entry['media'].GetClipProperty('Sample Rate') or 48000)
+def audio_entries():
+    """Each OTIO audio clip with its track, place and range."""
+    entries = []
+    for track_index, track in enumerate(audio_tracks, 1):
+        cursor = 0.0
+        for child in track['children']:
+            duration = seconds(child['source_range']['duration'])
+            if child['OTIO_SCHEMA'] == 'Clip.2':
+                reference = child['media_references'][child['active_media_reference_key']]
+                source_in = seconds(child['source_range']['start_time']) - seconds(
+                    reference['available_range']['start_time']
+                )
+                available_duration = seconds(reference['available_range']['duration'])
+                entries.append({
+                    'clip': child,
+                    'align': (child.get('metadata') or {}).get('Align') or {},
+                    'linked': (child.get('metadata') or {}).get('Resolve_OTIO', {}).get('Link Group ID') is not None,
+                    'track': track_index,
+                    'cursor': cursor,
+                    'path': reference['target_url'],
+                    'source_in': source_in,
+                    'duration': duration,
+                    'full_source': abs(source_in) < 0.000001 and abs(duration - available_duration) < 0.00001,
+                    'name': child['name'],
+                })
+            cursor += duration
+    return entries
+
+
+def recordings(entries):
+    """The recordings the script places: every channel of a recording played
+    whole as one clip on a track of its format, a mono recording or one
+    selected channel on a mono track."""
+    groups = {}
+    for entry in entries:
+        groups.setdefault(entry['align'].get('Item') or id(entry['clip']), []).append(entry)
+    result = []
+    for group in groups.values():
+        group.sort(key=lambda entry: entry['align'].get('Channel', 1))
+        first = group[0]
+        channels = int(first['align'].get('Channels', 1))
+        if channels > 1 and not first['align'].get('Selected Channel') and len(group) == channels:
+            result.append(dict(
+                first,
+                entries=group,
+                format='stereo' if channels == 2 else f'adaptive{channels}',
+                channel=None,
+            ))
+            continue
+        for entry in group:
+            result.append(dict(
+                entry,
+                entries=[entry],
+                format='mono',
+                channel=entry['align'].get('Channel') if channels > 1 else None,
+            ))
+    result.sort(key=lambda recording: (recording['track'], recording['cursor']))
+    return result
+
+
+typed_tracks = {}
+
+
+def track_for(recording):
+    """A mono recording keeps its track; the channels of a recording played
+    whole share a track of their format, one per track they came from."""
+    if recording['format'] == 'mono':
+        return recording['track']
+    key = (recording['track'], recording['format'])
+    if key not in typed_tracks:
+        if not timeline.AddTrack('audio', recording['format']):
+            raise RuntimeError(f"Resolve could not add a {recording['format']} audio track")
+        typed_tracks[key] = timeline.GetTrackCount('audio')
+    return typed_tracks[key]
+
+
+def place(recording, media):
+    source_rate = float(media.GetClipProperty('FPS') or rate)
+    sample_rate = float(media.GetClipProperty('Sample Rate') or 48000)
+    record = timeline_start + recording['cursor'] * rate
+    clip_info = {
+        'mediaPoolItem': media,
+        'mediaType': 2,
+        'trackIndex': track_for(recording),
+    }
+    if not recording['full_source']:
+        # Resolve starts a recording only on a frame of it, so the clip
+        # moves as far as its start does and its sound keeps its place.
+        exact = recording['source_in'] * source_rate
+        start = round(exact)
+        if record + (start - exact) * rate / source_rate < timeline_start:
+            start = math.ceil(exact)
+        record += (start - exact) * rate / source_rate
+        clip_info['startFrame'] = start
+        clip_info['endFrame'] = start + max(1, round(recording['duration'] * source_rate))
     # Resolve's audio renderer rounds fractional sample starts upward. Place
     # on the nearest sample first; a tiny inward epsilon avoids float noise
     # promoting an exact sample to its successor.
-    relative_samples = (entry['record'] - timeline_start) / rate * sample_rate
+    relative_samples = (record - timeline_start) / rate * sample_rate
     record = timeline_start + (math.floor(relative_samples + 0.5) - 0.0001) / sample_rate * rate
-    record = max(timeline_start, record)
-    clip_info = {
-        'mediaPoolItem': entry['media'],
-        'recordFrame': record,
-        'mediaType': 2,
-        'trackIndex': entry['track'],
-    }
-    if not entry['full_source']:
-        clip_info['startFrame'] = start
-        clip_info['endFrame'] = start + entry['duration'] * source_rate
+    clip_info['recordFrame'] = max(timeline_start, record)
     result = pool.AppendToTimeline([clip_info]) or []
     if len(result) != 1:
-        raise RuntimeError(f"Resolve could not place {entry['name']}")
-    actual = float(result[0].GetStart(True))
-    if abs(actual - entry['record']) > rate / sample_rate:
-        raise RuntimeError(f"Resolve quantized {entry['name']} to {actual}")
-    apply_clip(result[0], entry['clip'])
+        raise RuntimeError(f"Resolve could not place {recording['name']}")
+    item = result[0]
+    actual = float(item.GetStart(True))
+    if abs(actual - clip_info['recordFrame']) > rate / sample_rate:
+        raise RuntimeError(f"Resolve quantized {recording['name']} to {actual}")
+    if recording['channel'] is not None:
+        mapping = {'track_mapping': {'1': {
+            'channel_idx': [recording['channel']], 'mute': False, 'type': 'mono',
+        }}}
+        if not item.SetSourceAudioChannelMapping(json.dumps(mapping)):
+            raise RuntimeError(f"Resolve could not play channel {recording['channel']} of {recording['name']}")
+    apply_clip(item, recording['clip'])
+
+
+def remove_empty_tracks(count):
+    """Drop the first `count` audio tracks that the recordings left empty."""
+    for index in range(count, 0, -1):
+        if timeline.GetItemListInTrack('audio', index) or timeline.GetTrackCount('audio') <= 1:
+            continue
+        if not timeline.DeleteTrack('audio', index):
+            warnings.append(f'Could not remove empty audio track {index}')
 
 
 if not video_clips:
@@ -213,15 +312,10 @@ if not video_clips:
     while timeline.GetTrackCount('audio') < len(audio_tracks):
         if not timeline.AddTrack('audio', 'mono'):
             raise RuntimeError('Resolve could not add an audio track')
+    original_tracks = timeline.GetTrackCount('audio')
     timeline_start = float(timeline.GetStartFrame())
-    paths = []
-    for track in audio_tracks:
-        for child in track['children']:
-            if child['OTIO_SCHEMA'] == 'Clip.2':
-                reference = child['media_references'][child['active_media_reference_key']]
-                path = reference['target_url']
-                if path not in paths:
-                    paths.append(path)
+    entries = audio_entries()
+    paths = list(dict.fromkeys(entry['path'] for entry in entries))
     # With media bins, use this run's own media like the timeline import does.
     media_by_path = media_paths(collect_media(export_folder or pool.GetRootFolder()))
     missing = [path for path in paths if os.path.realpath(path) not in media_by_path]
@@ -232,33 +326,13 @@ if not video_clips:
     })
     if any(os.path.realpath(path) not in media_by_path for path in paths):
         raise RuntimeError('Resolve could not import every audio source')
-    placed = 0
-    for track_index, track in enumerate(audio_tracks, 1):
-        cursor = 0.0
-        for child in track['children']:
-            duration = seconds(child['source_range']['duration'])
-            if child['OTIO_SCHEMA'] == 'Clip.2':
-                reference = child['media_references'][child['active_media_reference_key']]
-                path = reference['target_url']
-                source_in = seconds(child['source_range']['start_time']) - seconds(
-                    reference['available_range']['start_time']
-                )
-                available_duration = seconds(reference['available_range']['duration'])
-                append_audio({
-                    'media': media_by_path[os.path.realpath(path)],
-                    'track': track_index,
-                    'record': timeline_start + cursor * rate,
-                    'source_in': source_in,
-                    'duration': duration,
-                    'full_source': abs(source_in) < 0.000001 and abs(duration - available_duration) < 0.00001,
-                    'name': child['name'],
-                    'clip': child,
-                })
-                placed += 1
-            cursor += duration
+    placed = recordings(entries)
+    for recording in placed:
+        place(recording, media_by_path[os.path.realpath(recording['path'])])
+    remove_empty_tracks(original_tracks)
     organize_media()
     project.SetCurrentTimeline(timeline)
-    print(f'Created {timeline.GetName()} with {placed} sample-accurate audio clips')
+    print(f'Created {timeline.GetName()} with {len(placed)} sample-accurate audio clips')
     for warning in warnings:
         print('Warning:', warning, file=sys.stderr)
     sys.exit(0)
@@ -271,7 +345,6 @@ if not timeline:
     raise RuntimeError('Resolve could not import the adjacent OTIO timeline')
 
 timeline_start = float(timeline.GetStartFrame())
-replacements = []
 
 video_tracks = [track for track in document['tracks']['children'] if track['kind'] == 'Video']
 for track_index, track in enumerate(video_tracks, 1):
@@ -283,53 +356,35 @@ for track_index, track in enumerate(video_tracks, 1):
     for clip, item in zip(clips, resolve_items):
         apply_clip(item, clip)
 
+entries = audio_entries()
 for track_index, track in enumerate(audio_tracks, 1):
     resolve_items = timeline.GetItemListInTrack('audio', track_index) or []
-    if len(otio_clips(track)) != len(resolve_items):
+    track_entries = [entry for entry in entries if entry['track'] == track_index]
+    if len(track_entries) != len(resolve_items):
         raise RuntimeError(f'Audio track {track_index} did not conform one-to-one')
-    cursor = 0.0
-    clip_index = 0
-    for child in track['children']:
-        duration = seconds(child['source_range']['duration'])
-        if child['OTIO_SCHEMA'] == 'Clip.2':
-            item = resolve_items[clip_index]
-            clip_index += 1
-            metadata = child.get('metadata', {}).get('Resolve_OTIO', {})
-            if metadata.get('Link Group ID') is not None:
-                apply_clip(item, child)
-            else:
-                media = item.GetMediaPoolItem()
-                if str(media.GetClipProperty('Audio Ch')) != '1':
-                    warnings.append(f"Kept frame-quantized multichannel clip: {child['name']}")
-                    apply_clip(item, child)
-                else:
-                    reference = child['media_references'][child['active_media_reference_key']]
-                    source_in = seconds(child['source_range']['start_time']) - seconds(
-                        reference['available_range']['start_time']
-                    )
-                    available_duration = seconds(reference['available_range']['duration'])
-                    replacements.append({
-                        'item': item,
-                        'media': media,
-                        'track': track_index,
-                        'record': timeline_start + cursor * rate,
-                        'source_in': source_in,
-                        'duration': duration,
-                        'full_source': abs(source_in) < 0.000001 and abs(duration - available_duration) < 0.00001,
-                        'name': child['name'],
-                        'clip': child,
-                    })
-        cursor += duration
+    for entry, item in zip(track_entries, resolve_items):
+        entry['item'] = item
 
-if replacements and not timeline.DeleteClips([entry['item'] for entry in replacements], False):
+# Camera sound stays linked to its picture. A selected channel of a recording
+# keeps the clip the timeline import gave it, which plays that channel.
+for entry in entries:
+    if entry['linked'] or entry['align'].get('Selected Channel'):
+        apply_clip(entry['item'], entry['clip'])
+replaced = recordings([
+    entry for entry in entries
+    if not entry['linked'] and not entry['align'].get('Selected Channel')
+])
+replaced_items = [entry['item'] for recording in replaced for entry in recording['entries']]
+if replaced_items and not timeline.DeleteClips(replaced_items, False):
     raise RuntimeError('Resolve could not replace the frame-quantized recorder clips')
-
-for entry in replacements:
-    append_audio(entry)
+original_tracks = timeline.GetTrackCount('audio')
+for recording in replaced:
+    place(recording, recording['item'].GetMediaPoolItem())
+remove_empty_tracks(original_tracks)
 
 organize_media()
 project.SetCurrentTimeline(timeline)
-print(f'Created {timeline.GetName()} with {len(replacements)} sample-accurate recorder clips')
+print(f'Created {timeline.GetName()} with {len(replaced)} sample-accurate recorder clips')
 for warning in warnings:
     print('Warning:', warning, file=sys.stderr)
 "#

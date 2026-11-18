@@ -1,12 +1,13 @@
 //! OpenTimelineIO output for Resolve.
 //!
-//! Frame-quantized portable timeline (the sample-accurate path is the
-//! sibling precision importer script): video tracks with camera A/V link
-//! groups, per-channel mono audio tracks, gaps, portable Cross Dissolves
-//! as `SMPTE_Dissolve`, and `LinearTimeWarp` for constant retimes
-//! (negative scalar for reverse). Serialized pretty-printed with sorted
-//! keys and unescaped slashes. Optional `Align` metadata lists the media
-//! bins the import script creates.
+//! Frame-quantized portable timeline (the sibling import script places its
+//! recordings between frames): video tracks with camera A/V link groups,
+//! per-channel mono audio tracks of the original files, gaps, portable
+//! Cross Dissolves as `SMPTE_Dissolve`, and `LinearTimeWarp` for constant
+//! retimes (negative scalar for reverse). Serialized pretty-printed with
+//! sorted keys and unescaped slashes. `Align` metadata tells the import
+//! script which channels form one recording, and optionally lists the media
+//! bins it creates.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -117,16 +118,14 @@ fn metadata(island: &ExportIsland, media_bins: bool) -> Value {
     if media_bins {
         let bins = MediaBins::new(island.clips.iter().map(|item| &item.clip));
         let mut generated: Vec<String> = Vec::new();
-        for item in &island.clips {
-            for url in item
-                .corrected_audio_url
-                .iter()
-                .chain(&item.precision_audio_urls)
-            {
-                let path = url.to_string_lossy().into_owned();
-                if !generated.contains(&path) {
-                    generated.push(path);
-                }
+        for url in island
+            .clips
+            .iter()
+            .filter_map(|item| item.corrected_audio_url.as_ref())
+        {
+            let path = url.to_string_lossy().into_owned();
+            if !generated.contains(&path) {
+                generated.push(path);
             }
         }
         metadata["Align"] = json!({
@@ -222,31 +221,19 @@ fn clip_json(
     trim_end: f64,
 ) -> Value {
     let item = entry.item;
-    let precision_url = if kind == MediaKind::Audio {
-        item.precision_audio_url(entry.source_channel).cloned()
-    } else {
-        None
-    };
-    let media_url: PathBuf = if kind == MediaKind::Audio {
-        precision_url
-            .clone()
-            .or(item.corrected_audio_url.clone())
-            .unwrap_or_else(|| item.clip.url.clone())
-    } else {
-        item.clip.url.clone()
+    let corrected = kind == MediaKind::Audio && item.corrected_audio_url.is_some();
+    let media_url: PathBuf = match &item.corrected_audio_url {
+        Some(url) if corrected => url.clone(),
+        _ => item.clip.url.clone(),
     };
     let base = media_start(item, kind);
-    let untrimmed_in = if precision_url.is_some() {
-        0.0
-    } else if kind == MediaKind::Audio && item.corrected_audio_url.is_some() {
+    let untrimmed_in = if corrected {
         item.corrected_source_in()
     } else {
         item.selected_source_in(kind)
     };
     let duration = (timeline_duration(entry, kind) - trim_start - trim_end).max(0.0);
-    let available = if precision_url.is_some() {
-        item.precision_selected_duration()
-    } else if kind == MediaKind::Audio && item.corrected_audio_url.is_some() {
+    let available = if corrected {
         item.mapped_duration()
     } else {
         item.source_duration()
@@ -263,11 +250,7 @@ fn clip_json(
         resolve_meta.insert(
             "Channels".to_string(),
             json!([{
-                "Source Channel ID": if precision_url.is_none() {
-                    entry.source_channel as i64 - 1
-                } else {
-                    0
-                },
+                "Source Channel ID": entry.source_channel as i64 - 1,
                 "Source Track ID": 0,
             }]),
         );
@@ -276,16 +259,25 @@ fn clip_json(
     if !resolve_meta.is_empty() {
         metadata.insert("Resolve_OTIO".to_string(), json!(resolve_meta));
     }
-    if let Some(remap) = item.fcp7_time_remap_xml(kind) {
+    if kind == MediaKind::Audio {
+        // The import script places a recording once, all its channels on a
+        // track of their format, or its one selected channel.
         metadata.insert(
             "Align".to_string(),
             json!({
-                "FCP7 Time Remap XML": remap,
-                "Source In Seconds": item.selected_source_in(kind),
-                "Source Out Seconds": item.selected_source_out(kind),
-                "Plays Backward": plays_backward,
+                "Item": item.instance_id,
+                "Channel": entry.source_channel,
+                "Channels": item.clip.audio.first().map_or(1, |audio| audio.channels),
+                "Selected Channel": item.selected_audio_source_channel().is_some(),
             }),
         );
+    }
+    if let Some(remap) = item.fcp7_time_remap_xml(kind) {
+        let align = metadata.entry("Align").or_insert_with(|| json!({}));
+        align["FCP7 Time Remap XML"] = json!(remap);
+        align["Source In Seconds"] = json!(item.selected_source_in(kind));
+        align["Source Out Seconds"] = json!(item.selected_source_out(kind));
+        align["Plays Backward"] = json!(plays_backward);
     }
     if let Some(color) = item.fcp7_labels_xml(kind).and_then(resolve_clip_color) {
         metadata.entry("Align").or_insert_with(|| json!({}))["Resolve Clip Color"] = json!(color);
@@ -419,9 +411,6 @@ fn timeline_duration(entry: &Entry, kind: MediaKind) -> f64 {
     let item = entry.item;
     if item.is_retimed(kind) {
         return item.selected_timeline_duration(kind);
-    }
-    if kind == MediaKind::Audio && !item.precision_audio_urls.is_empty() {
-        return item.precision_selected_duration();
     }
     if kind == MediaKind::Audio && item.corrected_audio_url.is_some() {
         return item.corrected_selected_duration();

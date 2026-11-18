@@ -416,7 +416,7 @@ fn audio_manifest_linking(
             if !rate.is_finite() || rate < 1.0 || rate > u32::MAX as f64 || rate.fract() != 0.0 {
                 return Err(fail("Invalid AAF sample rate"));
             }
-            let (stems, tail) = (&item.precision_audio_urls, item.precision_tail_samples);
+            let stems = &item.precision_audio_urls;
             let direct = stems.is_empty() && cameras.contains(&item.clip.url);
             if !direct && (stems.len() != audio.channels || audio.channels == 0) {
                 return Err(fail("AAF requires prepared mono stems for every channel"));
@@ -436,10 +436,7 @@ fn audio_manifest_linking(
                     samples(item.clip.duration.as_seconds())?,
                 )
             } else {
-                let frames = length
-                    .checked_add(tail)
-                    .ok_or_else(|| fail("AAF length overflow"))?;
-                (0, frames)
+                (0, length)
             };
             if length == 0 || start.checked_add(length).is_none() {
                 return Err(fail("Invalid AAF clip length"));

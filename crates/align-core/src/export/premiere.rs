@@ -595,7 +595,6 @@ fn replaced_island(island: &ExportIsland) -> Option<ExportIsland> {
             confidence: video.confidence.min(recorder.confidence),
             corrected_audio_url: recorder.corrected_audio_url.clone(),
             precision_audio_urls: Vec::new(),
-            precision_tail_samples: 0,
             enabled: recorder.enabled,
             track_enabled: recorder.track_enabled,
             track_locked: recorder.track_locked,
