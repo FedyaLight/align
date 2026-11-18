@@ -66,22 +66,25 @@ with aaf2.open(artifacts[0]['url']) as container:
     assert len(timecode) == 1 and str(timecode[0].edit_rate) == "30000/1001"
     slots = [slot for slot in all_slots if slot.media_kind != "Timecode"]
     assert [slot.media_kind for slot in slots] == ['Picture', 'Sound', 'Sound']
-    assert [str(slot.edit_rate) for slot in slots] == ['30000/1001', '48000', '48000']
-    assert [slot.segment.length for slot in slots] == [100, 160160, 160160]
+    # Picture and sound count in the composition's frames: Premiere takes its
+    # sequence rate from the sound tracks too.
+    assert [str(slot.edit_rate) for slot in slots] == ['30000/1001'] * 3
+    assert [slot.segment.length for slot in slots] == [100, 100, 100]
     assert len(slots[0].segment.components) == 2
 override = run(['export-json', '--aaf', '--aaf-fps', '25', '--no-drift',
     root / 'sync.json', root / 'export-25'], 'export-25')
 with aaf2.open(override[0]['url']) as container:
     all_slots = list(next(container.content.toplevel()).slots)
     timecode = next(slot for slot in all_slots if slot.media_kind == 'Timecode')
-    picture = next(slot for slot in all_slots if slot.media_kind == 'Picture')
     assert str(timecode.edit_rate) == '25' and timecode.segment.length == 84
-    assert str(picture.edit_rate) == '30000/1001' and picture.segment.length == 100
+    # The 29.97 picture and its sound count in the 25 fps composition's
+    # frames: 3.34 s is 83 of them, the timecode covering 84.
+    assert all(str(slot.edit_rate) == '25' for slot in all_slots)
+    assert all(slot.segment.length == 83 for slot in all_slots if slot.media_kind != 'Timecode')
 readback = run(['sync', artifacts[0]['url']], 'readback')
 assert len(readback['project']['importedTimeline']['edits']) == 4
 assert not readback['project']['warnings']
 (root / 'verification.json').write_text(json.dumps({'passed': True,
     'isolated_runtime': args.isolated_runtime,
     'picture_rate': '30000/1001', 'picture_frames': 100, 'sound_tracks': 2,
-    'sound_samples': 160160, 'override_timecode_rate': '25',
-    'override_picture_rate': '30000/1001'}, indent=2) + '\n')
+    'sound_frames': 100, 'override_rate': '25'}, indent=2) + '\n')

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check bundled AAF discovery using the release smoke's saved sync result."""
 import argparse
+from fractions import Fraction
 import json
 import os
 from pathlib import Path
@@ -42,17 +43,20 @@ assert len(artifacts) == 1 and artifacts[0]['format'] == 'aaf'
 with aaf2.open(artifacts[0]['url']) as container:
     compositions = list(container.content.toplevel())
     assert len(compositions) == 1
-    slots = list(compositions[0].slots)
+    slots = [slot for slot in compositions[0].slots if slot.media_kind == 'Sound']
     assert len(slots) == 4, 'Two overlapping stereo recordings require four mono tracks'
-    assert all(str(slot.edit_rate) == '48000' for slot in slots)
-    assert sorted(slot.segment.length for slot in slots) == [672000, 672000, 768000, 768000]
+    # Sound counts in the composition's 25 fps frames: 14 s, and 16 s
+    # with the second recording 2 s in.
+    assert all(str(slot.edit_rate) == '25' for slot in slots)
+    assert sorted(slot.segment.length for slot in slots) == [350, 350, 400, 400]
 restored = run_cli(['sync', artifacts[0]['url']], 'import')
 edits = restored['project']['importedTimeline']['edits']
 assert len(edits) == 4 and len(restored['project']['clips']) == 4
 assert len(restored['islands']) == 1 and not restored['unmatched']
 assert not restored['project']['warnings']
-assert sorted(edit['timelineStart']['value'] for edit in edits) == [0, 0, 96000, 96000]
-assert all(edit['timelineStart']['timescale'] == 48000 and edit['audioSourceChannel'] == 0 for edit in edits)
+assert sorted(Fraction(edit['timelineStart']['value'], edit['timelineStart']['timescale'])
+    for edit in edits) == [0, 0, 2, 2]
+assert all(edit['audioSourceChannel'] == 0 for edit in edits)
 
 # An external AAF links both physical channels of the original stereo files.
 # A one-sample source trim exercises the native sample clock through import,
@@ -139,13 +143,17 @@ artifacts = run_cli(['export-json', '--aaf', '--no-drift', output / 'stereo-impo
     output / 'stereo-reexport'], 'stereo-export')
 channel_evidence = []
 with aaf2.open(artifacts[0]['url']) as container:
-    slots = list(next(container.content.toplevel()).slots)
+    slots = [slot for slot in next(container.content.toplevel()).slots
+        if slot.media_kind == 'Sound']
     assert len(slots) == 4
     for index, slot in enumerate(slots):
         components = list(slot.segment.components)
         clips = [component for component in components if isinstance(component, aaf2.components.SourceClip)]
-        assert len(clips) == 1 and clips[0].length == 671999
-        assert slot.segment.length == (671999 if index < 2 else 767999)
+        # 671999 samples of each stem fill 349 whole 25 fps frames; the
+        # second recording starts 2 s, 50 frames, later.
+        assert str(slot.edit_rate) == '25'
+        assert len(clips) == 1 and clips[0].length == 349
+        assert slot.segment.length == (349 if index < 2 else 399)
         master_segment = clips[0].mob.slot_at(clips[0].slot_id).segment
         assert isinstance(master_segment, aaf2.components.Sequence) and len(master_segment.components) == 1
         source_mob = master_segment.components[0].mob

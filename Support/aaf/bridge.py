@@ -459,6 +459,14 @@ def read_timeline(path, audio_only=False, extract_dir=None):
             # A clip's start counts in its own track's edit units, as Resolve
             # writes it: frame 48 of a 24 fps file on a 25 fps track is 50.
             source_start = Fraction(int(clip.start), 1) / rate + offset
+            # Other writers count it in the source's units, a 48 kHz sample on
+            # a 29.97 fps track. Where the track's units reach past the
+            # source and the source's do not, the start is the source's.
+            if source_rate != rate and slot.segment is not None and slot.segment.length is not None:
+                available = Fraction(int(slot.segment.length), 1) / source_rate
+                in_source_units = Fraction(int(clip.start), 1) / source_rate + offset
+                if source_start + length > available >= in_source_units + length:
+                    source_start = in_source_units
             if isinstance(mob, aaf2.mobs.SourceMob):
                 descriptor = mob.descriptor
                 if slot.media_kind == 'Sound' and mob.essence is not None:
