@@ -353,6 +353,57 @@ class SourceValidation(unittest.TestCase):
             clip = read_timeline(output, audio_only=True)['sequences'][0]['tracks'][0]['clips'][0]
             self.assertEqual((clip['start'], clip['length']), (4004, 48200))
 
+    def test_camera_sound_links_the_camera_file_itself(self):
+        # Like Resolve's AAF, a camera's channels come from the file its
+        # picture links, without mono copies.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media = root / 'camera.mov'
+            subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i',
+                'color=c=blue:s=64x64:r=25', '-f', 'lavfi', '-i',
+                'sine=frequency=440:sample_rate=48000', '-t', '2',
+                '-ac', '2', '-c:v', 'mpeg4', '-c:a', 'pcm_s16le', str(media)],
+                check=True, timeout=30)
+            metadata = json.loads(subprocess.check_output(['ffprobe', '-v', 'error',
+                '-show_format', '-show_streams', '-of', 'json', str(media)], timeout=30))
+            sound = lambda channel: {'name': f'A{channel + 1}', 'sample_rate': 48000, 'clips': [{
+                'path': str(media), 'start': 0, 'source_in': 1920, 'length': 48000,
+                'source_frames': 96000, 'channels': 2, 'channel': channel,
+                'metadata': metadata}]}
+            document = {'version': 2, 'name': 'Camera', 'tracks': [sound(0), sound(1)],
+                'composition_edit_rate': {'numerator': 25, 'denominator': 1},
+                'picture_tracks': [{'name': 'V1', 'edit_rate': {'numerator': 25, 'denominator': 1},
+                    'clips': [{'path': str(media), 'start': 0, 'source_in': 1, 'length': 25,
+                        'metadata': metadata}]}]}
+            output = root / 'camera.aaf'
+            write_audio(document, output)
+            with aaf2.open(str(output)) as container:
+                self.assertEqual(len(list(container.content.mastermobs())), 1)
+                top = next(container.content.toplevel())
+                sounds = [slot for slot in top.slots if slot.media_kind == 'Sound']
+                clips = [slot.segment.components[0] for slot in sounds]
+                self.assertEqual([(clip.start, clip.length) for clip in clips], [(1, 25), (1, 25)])
+                master = clips[0].mob
+                channels = [master.slot_at(clip.slot_id)['PhysicalTrackNumber'].value
+                    for clip in clips]
+                self.assertEqual(channels, [1, 2])
+            read = read_timeline(output)['sequences'][0]['tracks']
+            heard = [clip for track in read if track['media_kind'] == 'sound'
+                for clip in track['clips']]
+            self.assertEqual([(Path(clip['path']), clip['channel']) for clip in heard],
+                [(media.resolve(), 0), (media.resolve(), 1)])
+            # Sound ending before its picture (a longer file) ends the clip
+            # with it.
+            for track in document['tracks']:
+                track['clips'][0].update(source_in=72000, length=48000, source_frames=144000)
+            write_audio(document, output)
+            with aaf2.open(str(output)) as container:
+                top = next(container.content.toplevel())
+                clip = next(slot for slot in top.slots
+                    if slot.media_kind == 'Sound').segment.components[0]
+                self.assertEqual((clip.start, clip.length), (38, 12))
+            read_timeline(output)
+
     def test_linked_picture_preserves_fractional_edit_rate(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'picture.aaf'

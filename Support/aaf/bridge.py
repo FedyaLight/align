@@ -73,6 +73,14 @@ def write_composition(container, document):
     composition = container.create.CompositionMob(document['name'])
     composition.usage = 'Usage_TopLevel'
     container.content.mobs.append(composition)
+    links = {}
+
+    def link(path, metadata):
+        """One media link per file, shared by its picture and sound."""
+        if path not in links:
+            links[path] = container.content.create_ama_link(str(path), metadata)
+        return links[path]
+
     clock = document.get('composition_edit_rate')
     if clock is None and picture_tracks:
         clock = picture_tracks[0]['edit_rate']
@@ -95,7 +103,7 @@ def write_composition(container, document):
         timecode.segment.start = 0
     clock = None
     if picture_tracks:
-        write_picture(container, composition, picture_tracks, rate)
+        write_picture(container, composition, picture_tracks, rate, link)
         # Premiere takes its sequence rate from the sound tracks too: at the
         # sample rate it opens 23.976 and 59.94 as 29.97. So with picture,
         # sound counts in composition frames, as Resolve writes it.
@@ -114,6 +122,24 @@ def write_composition(container, document):
             frames = integer(clip['source_frames'], 'source_frames', 1)
             if start < cursor or source_in + length > frames:
                 raise ValueError('Overlapping or out-of-bounds AAF clip')
+            if clip.get('channel') is not None:
+                # A camera's own channel, through the link its picture uses.
+                channel = integer(clip['channel'], 'channel') + 1
+                master, _, _ = link(path, clip['metadata'])
+                slots = [slot for slot in master.slots if slot.media_kind == 'Sound'
+                    and 'PhysicalTrackNumber' in slot
+                    and slot['PhysicalTrackNumber'].value == channel]
+                if len(slots) != 1 or Fraction(str(slots[0].edit_rate)) != rate:
+                    raise ValueError('AAF camera sound has no such channel')
+                # A camera's sound can end before its picture; the clip ends
+                # with it.
+                available = sum(part.length for part in slots[0].segment.components)
+                if source_in >= available:
+                    continue
+                length = min(length, available - source_in)
+                sound.append((master, slots[0].slot_id, start, source_in, length, available))
+                cursor = start + length
+                continue
             if clip['channels'] != 1:
                 raise ValueError('AAF audio requires one lossless mono stem per channel')
             validate_wave(path, rate, frames)
@@ -122,7 +148,7 @@ def write_composition(container, document):
                 'duration_ts': frames, 'channels': 1,
             }]}
             master, _, _ = container.content.create_ama_link(str(path), metadata)
-            sound.append((master, start, source_in, length, frames))
+            sound.append((master, 1, start, source_in, length, frames))
             cursor = start + length
         write_sound(container, slot, sound, rate, clock)
 
@@ -145,7 +171,7 @@ def write_sound(container, slot, sound, rate, clock):
         return (2 * exact.numerator + exact.denominator) // (2 * exact.denominator)
 
     cursor = 0
-    for master, start, source_in, length, frames in sound:
+    for master, slot_id, start, source_in, length, frames in sound:
         begin, first = units(start, 'nearest'), units(source_in, 'nearest')
         end = min(units(start + length, 'up'), begin + units(frames, 'down') - first)
         if begin < cursor or end <= begin:
@@ -154,12 +180,12 @@ def write_sound(container, slot, sound, rate, clock):
             slot.segment.components.append(
                 container.create.Filler(media_kind='sound', length=begin - cursor))
         slot.segment.components.append(master.create_source_clip(
-            slot_id=1, start=first, length=end - begin, media_kind='sound'))
+            slot_id=slot_id, start=first, length=end - begin, media_kind='sound'))
         cursor = end
     slot.segment.length = cursor
 
 
-def write_picture(container, composition, picture_tracks, rate):
+def write_picture(container, composition, picture_tracks, rate, link):
     """One picture track at the composition rate, layered like Resolve's own.
 
     Resolve opens a single picture track; with one per camera it asks which
@@ -183,7 +209,7 @@ def write_picture(container, composition, picture_tracks, rate):
             start = integer(clip['start'], 'start')
             source_in = integer(clip['source_in'], 'source_in')
             length = integer(clip['length'], 'length', 1)
-            master, _, tape = container.content.create_ama_link(str(path), clip['metadata'])
+            master, _, tape = link(path, clip['metadata'])
             sources = [source for source in master.slots if source.media_kind == 'Picture']
             if len(sources) != 1:
                 raise ValueError('AAF picture requires one video stream')
@@ -193,10 +219,12 @@ def write_picture(container, composition, picture_tracks, rate):
             available = sum(part.length for part in source.segment.components)
             if start < cursor or source_in + length > available:
                 raise ValueError('Overlapping or out-of-bounds AAF picture clip')
-            if clip.get('timecode') is not None:
+            has_clock = any(slot.media_kind == 'Timecode' for slot in tape.slots)
+            if clip.get('timecode') is not None and not has_clock:
                 # Editors locate the file by its start timecode, which the
                 # tape mob carries; without it Resolve looks for frames from
-                # 00:00:00:00 and leaves the picture offline.
+                # 00:00:00:00 and leaves the picture offline. Clips of one
+                # file share its link and so its clock.
                 timecode = clip['timecode']
                 tape_clock = tape.create_timeline_slot(str(native))
                 tape_clock.name = 'Timecode'

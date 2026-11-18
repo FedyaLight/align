@@ -26,6 +26,12 @@ pub struct AudioClip {
     pub length: u64,
     pub source_frames: u64,
     pub channels: u16,
+    /// The channel of a camera file linked as it is, without a mono stem.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<usize>,
+    /// The camera file's stream description for its media link.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -377,6 +383,16 @@ pub fn repair_paths(
 pub fn audio_manifest(
     timeline: &align_core::export::ExportTimeline,
 ) -> Result<AudioManifest, AafError> {
+    audio_manifest_linking(timeline, &std::collections::HashSet::new())
+}
+
+/// The audio manifest, linking the sound of `cameras` without stems as it
+/// is: an item of one of them without prepared stems refers to the file's
+/// own channels.
+fn audio_manifest_linking(
+    timeline: &align_core::export::ExportTimeline,
+    cameras: &std::collections::HashSet<PathBuf>,
+) -> Result<AudioManifest, AafError> {
     use std::collections::BTreeMap;
     let fail = |text: &str| AafError::Writer(text.to_owned());
     let mut groups: BTreeMap<(String, u32, usize), Vec<AudioClip>> = BTreeMap::new();
@@ -410,7 +426,8 @@ pub fn audio_manifest(
                     item.aaf_tail_samples,
                 )
             };
-            if stems.len() != audio.channels || audio.channels == 0 {
+            let direct = stems.is_empty() && cameras.contains(&item.clip.url);
+            if !direct && (stems.len() != audio.channels || audio.channels == 0) {
                 return Err(fail("AAF requires prepared mono stems for every channel"));
             }
             let samples = |seconds: f64| -> Result<u64, AafError> {
@@ -424,9 +441,17 @@ pub fn audio_manifest(
                 .checked_sub(lead)
                 .ok_or_else(|| fail("AAF audio lead precedes the timeline"))?;
             let length = samples(item.precision_source_duration())? + lead;
-            let frames = length
-                .checked_add(tail)
-                .ok_or_else(|| fail("AAF length overflow"))?;
+            let (source_in, frames) = if direct {
+                (
+                    samples(item.precision_source_start())?,
+                    samples(item.clip.duration.as_seconds())?,
+                )
+            } else {
+                let frames = length
+                    .checked_add(tail)
+                    .ok_or_else(|| fail("AAF length overflow"))?;
+                (0, frames)
+            };
             if length == 0 || start.checked_add(length).is_none() {
                 return Err(fail("Invalid AAF clip length"));
             }
@@ -440,24 +465,39 @@ pub fn audio_manifest(
                         None,
                     )
                 });
-            for (channel, path) in stems.iter().enumerate() {
+            for channel in 0..audio.channels {
                 if item
                     .selected_audio_source_channel()
                     .is_some_and(|selected| selected != channel)
                 {
                     continue;
                 }
-                groups
-                    .entry((source.clone(), rate as u32, channel))
-                    .or_default()
-                    .push(AudioClip {
-                        path: path.clone(),
+                let clip = match stems.get(channel) {
+                    None => AudioClip {
+                        path: item.clip.url.clone(),
                         start,
-                        source_in: 0,
+                        source_in,
+                        length,
+                        source_frames: frames,
+                        channels: audio.channels as u16,
+                        channel: Some(channel),
+                        metadata: None,
+                    },
+                    Some(stem) => AudioClip {
+                        path: stem.clone(),
+                        start,
+                        source_in,
                         length,
                         source_frames: frames,
                         channels: 1,
-                    });
+                        channel: None,
+                        metadata: None,
+                    },
+                };
+                groups
+                    .entry((source.clone(), rate as u32, channel))
+                    .or_default()
+                    .push(clip);
             }
         }
     }
@@ -531,6 +571,18 @@ pub fn timeline_manifest_with_frame_rate(
             Ok(json!({"numerator":frame.timescale,"denominator":frame.value}))
         })
         .transpose()?;
+    // Camera sound without stems links the camera file itself.
+    let cameras: std::collections::HashSet<PathBuf> = timeline
+        .islands
+        .iter()
+        .flat_map(|island| &island.clips)
+        .filter(|item| {
+            item.clip.video.is_some()
+                && item.precision_audio_urls.is_empty()
+                && item.aaf_audio_urls.is_empty()
+        })
+        .map(|item| item.clip.url.clone())
+        .collect();
     let mut audio = timeline.clone();
     for island in &mut audio.islands {
         island.clips.retain(|item| {
@@ -541,10 +593,10 @@ pub fn timeline_manifest_with_frame_rate(
             item.clip.kind = align_core::MediaKind::Audio;
         }
     }
-    let tracks = if audio.islands.iter().all(|island| island.clips.is_empty()) {
+    let mut tracks = if audio.islands.iter().all(|island| island.clips.is_empty()) {
         Vec::new()
     } else {
-        audio_manifest(&audio)?.tracks
+        audio_manifest_linking(&audio, &cameras)?.tracks
     };
     let mut pictures = Vec::new();
     let mut metadata = std::collections::HashMap::new();
@@ -646,6 +698,17 @@ pub fn timeline_manifest_with_frame_rate(
                 .push(track["clips"][0].take());
         } else {
             lanes.push(track);
+        }
+    }
+    // Linked camera sound shares its picture's media description.
+    for clip in tracks.iter_mut().flat_map(|track| &mut track.clips) {
+        if clip.channel.is_some() {
+            clip.metadata = Some(
+                metadata
+                    .get(&clip.path)
+                    .cloned()
+                    .ok_or_else(|| fail("AAF camera sound has no picture link"))?,
+            );
         }
     }
     // Editors count picture in the composition's frames, so with picture
@@ -944,6 +1007,52 @@ mod tests {
         assert_eq!(clip.path, PathBuf::from("/stems/lead.wav"));
         assert_eq!((clip.start, clip.length), (48000, 48200));
         assert_eq!(clip.source_frames, 48200);
+    }
+    /// A camera's sound without stems links the camera file's channels.
+    #[test]
+    fn camera_sound_without_stems_links_the_camera_file() {
+        use align_core::export::{ExportIsland, ExportItem, ExportTimeline};
+        use align_core::{Clip, MediaTime};
+        let clip: Clip = serde_json::from_value(serde_json::json!({
+            "id":"cam", "url":"/cameras/a.mov", "kind":"audio",
+            "duration":{"value":10,"timescale":1},
+            "audio":[{"sampleRate":48000.0,"channels":2,"bitDepth":16}]
+        }))
+        .unwrap();
+        let mut item = ExportItem::new(clip, 0.04, 1.0, vec![], 1.0);
+        item.source_in = 0.5;
+        item.source_out = 2.5;
+        item.timeline_duration = 2.0;
+        let timeline = ExportTimeline::new(
+            vec![ExportIsland {
+                id: 0,
+                clips: vec![item],
+                duration: 2.04,
+            }],
+            MediaTime::new(1, 25),
+            "Camera",
+        );
+        assert!(audio_manifest(&timeline).is_err());
+        let cameras = [PathBuf::from("/cameras/a.mov")].into_iter().collect();
+        let manifest = audio_manifest_linking(&timeline, &cameras).unwrap();
+        let clips: Vec<_> = manifest
+            .tracks
+            .iter()
+            .map(|track| &track.clips[0])
+            .collect();
+        assert_eq!(
+            clips
+                .iter()
+                .map(|clip| (clip.channel, clip.start, clip.source_in, clip.length))
+                .collect::<Vec<_>>(),
+            vec![(Some(0), 1920, 24000, 96000), (Some(1), 1920, 24000, 96000)]
+        );
+        assert!(
+            clips
+                .iter()
+                .all(|clip| clip.path == Path::new("/cameras/a.mov"))
+        );
+        assert_eq!(clips[0].source_frames, 480_000);
     }
     #[test]
     fn cancelled_export_does_not_start_writer() {

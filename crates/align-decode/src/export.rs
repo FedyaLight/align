@@ -622,13 +622,31 @@ impl AudioPlan {
         let aaf_item = |item: &ExportItem| {
             wants_aaf && !item.clip.audio.is_empty() && item.is_enabled(MediaKind::Audio)
         };
+        let aaf_lead = |item: &ExportItem| {
+            let rate = item.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);
+            aaf_lead_samples(item.timeline_start(MediaKind::Audio), aaf_frame, rate).unwrap_or(0)
+        };
+        // A camera starting on a whole-sample frame links its own file's
+        // channels, as Resolve's AAF does; MXF keeps its stems, since its
+        // sound often lives in other files.
+        let aaf_direct = |item: &ExportItem| {
+            let mxf = item
+                .clip
+                .url
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("mxf"));
+            aaf_item(item)
+                && item.clip.video.is_some()
+                && !mxf
+                && !item.is_retimed(MediaKind::Audio)
+                && aaf_lead(item) == 0
+        };
         let aaf_stems = |item: &ExportItem| {
             let rate = item.clip.audio.first()?.sample_rate;
-            if !aaf_item(item) || item.is_retimed(MediaKind::Audio) {
+            if !aaf_item(item) || item.is_retimed(MediaKind::Audio) || aaf_direct(item) {
                 return None;
             }
-            let lead = aaf_lead_samples(item.timeline_start(MediaKind::Audio), aaf_frame, rate)
-                .unwrap_or(0);
+            let lead = aaf_lead(item);
             let tail = if aaf_in_frames {
                 (rate * aaf_frame.as_seconds()).ceil() as u64 + 1
             } else {
@@ -643,7 +661,7 @@ impl AudioPlan {
                 && (channels > 1
                     || !item.is_full_source_selection()
                     || item.precision_tail_samples > 0);
-            for_resolve_or_fcp || (aaf_item(item) && aaf_stems(item).is_none())
+            for_resolve_or_fcp || (aaf_item(item) && !aaf_direct(item) && aaf_stems(item).is_none())
         };
 
         // Every item of a corrected clip plays its drift sidecar, and every
