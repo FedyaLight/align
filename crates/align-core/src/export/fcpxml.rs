@@ -84,16 +84,13 @@ fn whole_frames(time: MediaTime, frame: MediaTime, up: bool) -> MediaTime {
 /// rounds the leading gap to whole frames, taking the clip after it along,
 /// but keeps later gaps as they are; so the leading space is whole frames
 /// followed by a gap of the remainder.
-fn with_gaps(
-    mut clips: Vec<(MediaTime, MediaTime, String)>,
-    frame: MediaTime,
-    indent: &str,
-) -> String {
-    clips.sort_by(|a, b| a.0.as_seconds().total_cmp(&b.0.as_seconds()));
-    // Shorter than half a sample, a gap is float dust.
-    let gap = |from: MediaTime, to: MediaTime| {
+fn with_gaps(mut clips: Vec<StoryClip>, frame: MediaTime, indent: &str) -> String {
+    clips.sort_by(|a, b| a.start.as_seconds().total_cmp(&b.start.as_seconds()));
+    // A gap shorter than the clip after it can resolve, half a sample of its
+    // sound or a microsecond before a picture, is rounding dust.
+    let gap = |from: MediaTime, to: MediaTime, dust: f64| {
         let space = difference(to, from);
-        if space.as_seconds() > 0.5 / 48_000.0 {
+        if space.as_seconds() > dust {
             format!(
                 "{indent}<gap offset=\"{}\" duration=\"{}\"/>\n",
                 xml_text::fcpxml_time(from),
@@ -105,14 +102,20 @@ fn with_gaps(
     };
     let mut xml = String::new();
     let mut cursor: Option<MediaTime> = None;
-    for (start, end, clip) in clips {
+    for StoryClip {
+        start,
+        end,
+        dust,
+        xml: clip,
+    } in clips
+    {
         match cursor {
             None => {
                 let frames = whole_frames(start, frame, false);
-                xml += &gap(MediaTime::new(0, 1), frames);
-                xml += &gap(frames, start);
+                xml += &gap(MediaTime::new(0, 1), frames, dust);
+                xml += &gap(frames, start, dust);
             }
-            Some(cursor) => xml += &gap(cursor, start),
+            Some(cursor) => xml += &gap(cursor, start, dust),
         }
         xml += &clip;
         if cursor.is_none_or(|cursor| end.as_seconds() > cursor.as_seconds()) {
@@ -163,6 +166,24 @@ fn media_start(clip: &Clip) -> MediaTime {
                 tc.frame_duration.timescale,
             )
         })
+}
+
+/// A clip of a storyline or multicam angle, with the shortest gap that can
+/// precede it.
+struct StoryClip {
+    start: MediaTime,
+    end: MediaTime,
+    dust: f64,
+    xml: String,
+}
+
+/// The shortest meaningful gap before an item: half a sample of its sound,
+/// or a microsecond before a picture.
+fn dust(item: &ExportItem, side: MediaKind) -> f64 {
+    match (side, item.clip.audio.first()) {
+        (MediaKind::Audio, Some(audio)) if audio.sample_rate >= 1.0 => 0.5 / audio.sample_rate,
+        _ => TIME_TOLERANCE,
+    }
 }
 
 /// A picture position on whole frames of the sequence: Resolve drops a
@@ -672,10 +693,11 @@ impl Library<'_> {
                         )),
                     ),
                 };
-                clips.push((
+                clips.push(StoryClip {
                     start,
-                    sum(start, duration),
-                    format!(
+                    end: sum(start, duration),
+                    dust: dust(item, side),
+                    xml: format!(
                         "          <asset-clip name=\"{}\" ref=\"{asset_id}\" offset=\"{}\" duration=\"{}\" start=\"{}\" enabled=\"{}\"{}{}\n",
                         clip_name(item, &media_url),
                         xml_text::fcpxml_time(start),
@@ -685,7 +707,7 @@ impl Library<'_> {
                         audio_role_attribute(item, "audioRole"),
                         audio_channel_end(item),
                     ),
-                ));
+                });
             }
             xml += &with_gaps(clips, self.frame, "          ");
             xml += "        </mc-angle>\n";
@@ -777,16 +799,19 @@ impl Library<'_> {
                 format!(" lane=\"{lane}\"")
             }
         };
-        let mut place = |lane: i64, start: MediaTime, duration: MediaTime, clip: String| {
-            if group_storylines {
-                stories
-                    .entry(lane)
-                    .or_default()
-                    .push((start, sum(start, duration), clip));
-            } else {
-                spine += &clip;
-            }
-        };
+        let mut place =
+            |lane: i64, start: MediaTime, duration: MediaTime, dust: f64, clip: String| {
+                if group_storylines {
+                    stories.entry(lane).or_default().push(StoryClip {
+                        start,
+                        end: sum(start, duration),
+                        dust,
+                        xml: clip,
+                    });
+                } else {
+                    spine += &clip;
+                }
+            };
         for item in video_items {
             let Some((media_url, asset_id, origin)) = self.asset(item, false) else {
                 continue;
@@ -812,6 +837,7 @@ impl Library<'_> {
                 lane,
                 start,
                 duration,
+                dust(item, MediaKind::Video),
                 format!(
                     "              <clip{} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{}\" enabled=\"{}\"><video ref=\"{asset_id}\" offset=\"{source_start}\" start=\"{media_start}\" duration=\"{source_duration}\"/></clip>\n",
                     lane_attribute(lane),
@@ -844,6 +870,7 @@ impl Library<'_> {
                 lane,
                 start,
                 duration,
+                dust(item, MediaKind::Audio),
                 format!(
                     "              <clip{} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{}\" enabled=\"{}\"><audio ref=\"{asset_id}\" offset=\"{source_start}\" start=\"{media_start}\" duration=\"{source_duration}\"{channel_attribute}{}/></clip>\n",
                     lane_attribute(lane),

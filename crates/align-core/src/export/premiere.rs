@@ -1255,8 +1255,12 @@ impl Document {
     fn media_use(&self, item: &ExportItem, media_type: MediaKind) -> MediaUse {
         let corrected = media_type == MediaKind::Audio && item.corrected_audio_url.is_some();
         // Premiere and Resolve both place XML audio on whole frames; a padded
-        // sidecar carries the remainder to the exact sample in either.
-        let padded = item.has_placement_pad(media_type);
+        // sidecar carries the remainder to the exact sample in either. A copy
+        // without silence serves only Resolve, which counts a trimmed WAV's in
+        // point from its broadcast start; Premiere plays the original.
+        let padded = item.has_placement_pad(media_type)
+            && (self.format == TimelineExportFormat::ResolveXML
+                || item.placement_pad_seconds > 0.0);
         let (in_seconds, out_seconds) = if corrected {
             (item.corrected_source_in(), item.corrected_source_out())
         } else {
@@ -1688,6 +1692,27 @@ mod tests {
                 .iter()
                 .any(|track| track.contains("first.wav") && track.contains("second.wav"))
         );
+    }
+
+    /// A copy of a trimmed WAV without silence serves only Resolve; the
+    /// Premiere XML plays the original from the file's first sample.
+    #[test]
+    fn only_the_resolve_xml_plays_a_trim_copy() {
+        let mut timeline = fixture_timeline();
+        let rec = timeline.islands[0]
+            .clips
+            .iter_mut()
+            .find(|i| i.clip.id.0 == "rec")
+            .expect("recorder item");
+        rec.start = 1.0;
+        rec.source_in = 0.5;
+        *rec = rec.with_placement_pad(PathBuf::from("/pad/rec-trim.wav"), 0.0);
+        let xml = |format| write(&timeline, format, PremiereOptions::default());
+        let resolve = xml(TimelineExportFormat::ResolveXML);
+        assert!(resolve.contains("<pathurl>file:///pad/rec-trim.wav</pathurl>"));
+        let premiere = xml(TimelineExportFormat::PremiereXML);
+        assert!(!premiere.contains("rec-trim.wav"));
+        assert!(premiere.contains("<pathurl>file:///v/rec.wav</pathurl>"));
     }
 
     #[test]

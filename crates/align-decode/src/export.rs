@@ -598,9 +598,11 @@ impl AudioPlan {
                 && item.clip.kind == MediaKind::Audio
                 && needs_correction_points(&item.mapping_points)
         };
+        // Only Resolve needs copies of trimmed WAVs starting inside a frame.
+        let trim_copies = options.wants(TimelineExportFormat::ResolveXML);
         let pad = |item: &ExportItem| {
             if wants_pad {
-                placement_pad(item, fps)
+                placement_pad(item, fps, trim_copies)
             } else {
                 None
             }
@@ -992,7 +994,7 @@ impl AudioJob {
 /// items without audio, and non-positive sample rates. Only audio clipitems
 /// reference the padded file; video sides are untouched (frame-grid
 /// limitation).
-fn placement_pad(item: &ExportItem, sequence_fps: f64) -> Option<(u64, f64)> {
+fn placement_pad(item: &ExportItem, sequence_fps: f64, trim_copies: bool) -> Option<(u64, f64)> {
     let audio = item.clip.audio.first()?;
     if audio.sample_rate <= 0.0 || audio.channels == 0 || item.is_retimed(MediaKind::Audio) {
         return None;
@@ -1006,8 +1008,11 @@ fn placement_pad(item: &ExportItem, sequence_fps: f64) -> Option<(u64, f64)> {
         // Resolve counts a trimmed WAV's in point from its broadcast start
         // rounded to a frame, so a WAV starting inside a frame played a
         // frame late. A copy of the selection, with no silence, starts at
-        // its own beginning instead.
-        None if trimmed_inside_a_frame(item, sequence_fps) => Some((0, audio.sample_rate)),
+        // its own beginning instead. Premiere counts from the file's first
+        // sample, so its XML keeps the original.
+        None if trim_copies && trimmed_inside_a_frame(item, sequence_fps) => {
+            Some((0, audio.sample_rate))
+        }
         None => None,
     }
 }
@@ -1798,6 +1803,20 @@ mod tests {
                 ..
             }
         )));
+        // Premiere counts from the file's first sample: no copy for it alone.
+        let premiere = ExportOptions {
+            formats: vec![TimelineExportFormat::PremiereXML],
+            ..options
+        };
+        let plan = AudioPlan::new(
+            &timeline,
+            &premiere,
+            dir.path(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!plan.timeline.islands[0].clips[0].has_placement_pad(MediaKind::Audio));
+        assert!(plan.jobs.is_empty());
     }
 
     /// Premiere starts AAF audio on a frame, so a recorder 200 samples past
