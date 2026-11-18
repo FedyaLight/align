@@ -627,6 +627,19 @@ fn reverse_retime_imports_backward_with_negative_otio_scalar() {
         text.contains("\"time_scalar\": -1.0"),
         "negative warp missing"
     );
+    // Premiere XML keeps the imported graph; Resolve plays it as a still
+    // frame, so its XML takes the graph Align writes, reverse and in full.
+    let write = |format| crate::export::premiere::write(&timeline, format, Default::default());
+    let premiere = write(crate::export_model::TimelineExportFormat::PremiereXML);
+    let imported = "<keyframe><when>0</when><value>101</value></keyframe>";
+    assert!(premiere.contains(imported), "{premiere}");
+    let resolve = write(crate::export_model::TimelineExportFormat::ResolveXML);
+    assert!(!resolve.contains(imported), "{resolve}");
+    assert!(
+        resolve
+            .contains("<parameterid>reverse</parameterid><name>reverse</name><value>TRUE</value>")
+    );
+    assert!(resolve.contains("<speedkfin>TRUE</speedkfin>"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

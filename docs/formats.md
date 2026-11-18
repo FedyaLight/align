@@ -91,8 +91,9 @@ This does not imply lossless interchange of an arbitrary edited project.
   forward or reverse retiming. Some nested structures are flattened.
 - Premiere XML can retain imported non-retime filters and transition data.
   Other writers do not translate every effect or audio gain curve.
-- Supported video dissolves can be represented in OTIO. The Resolve import
-  script does not reproduce all transition semantics.
+- Supported video dissolves and audio crossfades can be represented in OTIO,
+  and the Resolve import script keeps them. FCPXML does not carry transitions
+  or speed changes: such clips play there as cuts at normal speed.
 - Variable-speed retiming and complex nested edits are not generally preserved.
   Read import warnings and verify the exported result in the target editor.
 

@@ -967,7 +967,10 @@ impl Document {
         } else {
             source_rate
         };
-        let geometry = item.fcp7_retime_geometry(media_type);
+        // Resolve plays an imported Time Remap graph as a still frame, and
+        // the graph Align writes as recorded, so Resolve XML takes Align's.
+        let preserved = format == TimelineExportFormat::PremiereXML;
+        let geometry = item.fcp7_retime_geometry(media_type).filter(|_| preserved);
         // The source range moves with the start's rounding, so the sound
         // stays within half a frame of its place; two separate roundings
         // could add up to almost a frame.
@@ -1117,7 +1120,7 @@ impl Document {
             );
         }
         if retimed {
-            xml += &match item.fcp7_time_remap_xml(media_type) {
+            xml += &match item.fcp7_time_remap_xml(media_type).filter(|_| preserved) {
                 Some(preserved) => format!("                {preserved}\n"),
                 None => TimeRemap {
                     media_type,
