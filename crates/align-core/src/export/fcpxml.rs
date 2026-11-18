@@ -12,7 +12,8 @@ use crate::allocator::{TimelineTrackRequest, allocate, source_key_for_url};
 use crate::bins::{GENERATED_AUDIO, MediaBins};
 use crate::model::{Clip, MediaKind, MediaTime, TIME_TOLERANCE};
 
-/// A single selected source channel remains mono even when its asset is stereo.
+/// A single selected source channel remains mono even when its asset is
+/// stereo; a recording of more than two channels plays every channel.
 fn audio_channel_end(item: &ExportItem) -> String {
     match item.selected_audio_source_channel() {
         Some(channel) => format!(
@@ -20,8 +21,40 @@ fn audio_channel_end(item: &ExportItem) -> String {
             channel + 1,
             xml_text::escape(item.fcpxml_audio_role().unwrap_or("dialogue")),
         ),
+        None if plays_each_channel(item) => format!("{}</asset-clip>", channel_sources(item)),
         None => "/>".into(),
     }
+}
+
+/// A recording of more than two channels, played whole: Final Cut Pro plays
+/// such a file in one clip through one channel source per channel.
+fn plays_each_channel(item: &ExportItem) -> bool {
+    item.clip.video.is_none()
+        && item.selected_audio_source_channel().is_none()
+        && item
+            .clip
+            .audio
+            .first()
+            .is_some_and(|audio| audio.channels > 2)
+}
+
+/// `>` and an `<audio-channel-source>` per channel, each with its own
+/// subrole of the item's role, the way Final Cut Pro names dual mono
+/// channels (`dialogue.dialogue-1`).
+fn channel_sources(item: &ExportItem) -> String {
+    let role = item.fcpxml_audio_role().unwrap_or("dialogue");
+    let subrole = if role.contains('.') {
+        role.to_string()
+    } else {
+        format!("{role}.{role}")
+    };
+    let channels = item.clip.audio.first().map_or(0, |audio| audio.channels);
+    (1..=channels).fold(">".to_string(), |xml, channel| {
+        xml + &format!(
+            "<audio-channel-source srcCh=\"{channel}\" role=\"{}\"/>",
+            xml_text::escape(&format!("{subrole}-{channel}"))
+        )
+    })
 }
 
 // Keep frame-aligned values exact instead of rounding them below a frame
@@ -305,6 +338,10 @@ fn prefix_references(fragment: &str, prefix: &str) -> String {
 }
 
 const FORMAT_ID: &str = "r_fmt_0";
+/// The projects' and the multicam's format: the sequence's parameters with
+/// a color space, which Final Cut Pro expects of a project format. Media
+/// keep formats without one, so each file keeps its own color.
+const SEQUENCE_FORMAT_ID: &str = "r_fmt_sequence";
 const MULTICAM_ID: &str = "r_multicam";
 
 /// One FCPXML asset per media file and side: a camera file's video asset
@@ -441,6 +478,10 @@ fn write_island(
             xml_text::fcpxml_time(duration)
         );
     }
+    xml += &format!(
+        "    <format id=\"{SEQUENCE_FORMAT_ID}\" frameDuration=\"{}\" width=\"{width}\" height=\"{height}\" colorSpace=\"1-1-1 (Rec. 709)\"/>\n",
+        xml_text::fcpxml_time(frame)
+    );
     xml += &assets;
     if options.multicam {
         xml += &library.multicam_xml(island);
@@ -456,7 +497,7 @@ fn write_island(
         && matches!(frame.timescale, 30_000 | 60_000);
     let tc_format = if drop_frame { "DF" } else { "NDF" };
     let sequence = format!(
-        "        <sequence format=\"{FORMAT_ID}\" duration=\"{total_duration}\" tcStart=\"{sequence_start}\" tcFormat=\"{tc_format}\">\n"
+        "        <sequence format=\"{SEQUENCE_FORMAT_ID}\" duration=\"{total_duration}\" tcStart=\"{sequence_start}\" tcFormat=\"{tc_format}\">\n"
     );
     let name = xml_text::escape(&timeline.name);
     xml += "  <library>\n";
@@ -649,7 +690,7 @@ impl Library<'_> {
             gb_video.cmp(&ga_video).then_with(|| a.cmp(b))
         });
         let mut xml = format!(
-            "    <media id=\"{MULTICAM_ID}\" name=\"{} – Multicam\">\n      <multicam format=\"{FORMAT_ID}\">\n",
+            "    <media id=\"{MULTICAM_ID}\" name=\"{} – Multicam\">\n      <multicam format=\"{SEQUENCE_FORMAT_ID}\">\n",
             xml_text::escape(&self.timeline.name)
         );
         for (angle_index, key) in keys.iter().enumerate() {
@@ -737,15 +778,16 @@ impl Library<'_> {
                 !i.clip.audio.is_empty() && !muted_camera_audio
             })
             .collect();
-        // Final Cut Pro plays a file of more than two channels in a clip only
-        // through chosen channels, so each channel becomes its own clip.
+        // A camera's sound of more than two channels plays through chosen
+        // channels of a clip, so each channel becomes its own clip; an asset
+        // clip of the camera file would bring its picture too.
         let audio_entries: Vec<(&ExportItem, Option<usize>, String)> = audio_items
             .iter()
             .flat_map(|&item| {
                 let channels = item.clip.audio.first().map_or(0, |a| a.channels);
                 match item.selected_audio_source_channel() {
                     Some(channel) => vec![(item, Some(channel), item.instance_id.clone())],
-                    None if channels > 2 => (0..channels)
+                    None if channels > 2 && item.clip.video.is_some() => (0..channels)
                         .map(|channel| {
                             (
                                 item,
@@ -864,6 +906,23 @@ impl Library<'_> {
                 xml_text::fcpxml_time(source_in),
                 xml_text::fcpxml_time(duration),
             );
+            if plays_each_channel(item) {
+                place(
+                    lane,
+                    start,
+                    duration,
+                    dust(item, MediaKind::Audio),
+                    format!(
+                        "              <asset-clip{} ref=\"{asset_id}\" offset=\"{}\" duration=\"{source_duration}\" start=\"{media_start}\" name=\"{}\" enabled=\"{}\"{}\n",
+                        lane_attribute(lane),
+                        xml_text::fcpxml_time(start),
+                        clip_name(item, &media_url),
+                        u8::from(item.is_enabled(MediaKind::Audio)),
+                        channel_sources(item) + "</asset-clip>",
+                    ),
+                );
+                continue;
+            }
             let channel_attribute =
                 channel.map_or_else(String::new, |channel| format!(" srcCh=\"{}\"", channel + 1));
             place(
@@ -1121,30 +1180,73 @@ mod tests {
         assert!(angle.contains("offset=\"24001/48000s\""), "{angle}");
     }
 
-    /// Final Cut Pro plays a clip's file of more than two channels only
-    /// through chosen channels: each channel is a clip of the original file
-    /// with its `srcCh`, without mono copies.
+    /// A recording of more than two channels is one clip of the original
+    /// file, without mono copies, playing every channel through a channel
+    /// source with its own subrole. A chosen channel plays alone.
     #[test]
-    fn multichannel_audio_plays_each_channel_of_the_original_file() {
+    fn multichannel_recording_is_one_clip_playing_every_channel() {
         let mut timeline = fixture_timeline();
         let recorder = &mut timeline.islands[0].clips[1];
         recorder.clip.audio[0].channels = 4;
         recorder.precision_audio_urls = (1..=4)
             .map(|channel| PathBuf::from(format!("/stems/rec-{channel}.wav")))
             .collect();
-        let xml = write(&timeline, FcpxmlOptions::TIMELINE);
+        let xml = write(&timeline, FcpxmlOptions::default());
         assert!(!xml.contains("/stems/"), "{xml}");
-        for channel in 1..=4 {
-            let audio = format!(
-                "<audio ref=\"r_asset_2\" offset=\"0s\" start=\"0s\" duration=\"12s\" srcCh=\"{channel}\""
+        let clips: Vec<&str> = xml
+            .lines()
+            .filter(|line| line.contains("<asset-clip ") && line.contains("ref=\"r_asset_2\""))
+            .collect();
+        // One in the synced project, one in the recorder's angle.
+        assert_eq!(clips.len(), 2, "{xml}");
+        for clip in clips {
+            assert!(clip.contains("start=\"0s\" "), "{clip}");
+            let sources: Vec<String> = (1..=4)
+                .map(|channel| {
+                    format!(
+                        "<audio-channel-source srcCh=\"{channel}\" role=\"dialogue.dialogue-{channel}\"/>"
+                    )
+                })
+                .collect();
+            assert!(
+                clip.ends_with(&format!(">{}</asset-clip>", sources.concat())),
+                "{clip}"
             );
-            assert!(xml.contains(&audio), "{xml}");
         }
-        // A chosen channel is its own clip already.
+        assert!(!xml.contains("<audio ref=\"r_asset_2\""), "{xml}");
+
+        timeline.islands[0].clips[1].fcpxml_audio_role = Some("dialogue.boom".into());
+        let xml = write(&timeline, FcpxmlOptions::TIMELINE);
+        assert!(
+            xml.contains("srcCh=\"4\" role=\"dialogue.boom-4\""),
+            "{xml}"
+        );
+
         timeline.islands[0].clips[1].audio_source_channel = Some(2);
         let xml = write(&timeline, FcpxmlOptions::TIMELINE);
         assert_eq!(xml.matches("srcCh=").count(), 1);
         assert!(xml.contains("srcCh=\"3\""));
+    }
+
+    /// The projects and the multicam use a Rec. 709 format of the
+    /// sequence's parameters; Final Cut Pro warns about a project format
+    /// without a color space. Media formats keep none.
+    #[test]
+    fn projects_use_a_format_with_a_color_space() {
+        let xml = write(&fixture_timeline(), FcpxmlOptions::default());
+        assert!(xml.contains(
+            "<format id=\"r_fmt_sequence\" frameDuration=\"1/25s\" width=\"1920\" height=\"1080\" colorSpace=\"1-1-1 (Rec. 709)\"/>"
+        ), "{xml}");
+        assert_eq!(xml.matches("colorSpace=").count(), 1, "{xml}");
+        assert_eq!(
+            xml.matches("<sequence format=\"r_fmt_sequence\"").count(),
+            2,
+            "{xml}"
+        );
+        assert!(
+            xml.contains("<multicam format=\"r_fmt_sequence\">"),
+            "{xml}"
+        );
     }
 
     /// A drop-frame camera labels the sequence's timecode drop-frame, or
