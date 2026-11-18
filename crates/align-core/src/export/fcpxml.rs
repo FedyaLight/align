@@ -228,6 +228,18 @@ fn picture_time(seconds: f64, frame: MediaTime) -> MediaTime {
     )
 }
 
+/// The frame nearest `time`, or the next one where that one starts before
+/// the file does at `origin`.
+fn frame_within(time: MediaTime, origin: MediaTime, frame: MediaTime) -> MediaTime {
+    let frames = (time.as_seconds() / frame.as_seconds()).round() as i64;
+    let nearest = MediaTime::new(frames * frame.value, frame.timescale);
+    if nearest.as_seconds() < origin.as_seconds() - TIME_TOLERANCE {
+        sum(nearest, frame)
+    } else {
+        nearest
+    }
+}
+
 /// A sound position on whole frames when it is on one, else on whole samples
 /// of its file: cuts between samples written in microseconds left a sample
 /// of silence at Final Cut Pro's edits.
@@ -725,14 +737,21 @@ impl Library<'_> {
                             frame,
                         ),
                     ),
-                    MediaKind::Audio => (
-                        sound_time(item.start, frame, &item.clip),
-                        sound_time(audio_duration(item), frame, &item.clip),
-                        xml_text::fcpxml_time(sum(
-                            origin,
-                            sound_time(audio_source_in(item), frame, &item.clip),
-                        )),
-                    ),
+                    MediaKind::Audio => {
+                        let start = sound_time(item.start, frame, &item.clip);
+                        let duration = sound_time(audio_duration(item), frame, &item.clip);
+                        let source =
+                            sum(origin, sound_time(audio_source_in(item), frame, &item.clip));
+                        // Final Cut Pro moves an angle clip's source start
+                        // onto a frame within its file, keeping its offset,
+                        // so the clip starts there and moves with it.
+                        let shift = difference(frame_within(source, origin, frame), source);
+                        (
+                            sum(start, shift),
+                            difference(duration, shift),
+                            xml_text::fcpxml_time(sum(source, shift)),
+                        )
+                    }
                 };
                 clips.push(StoryClip {
                     start,
@@ -1047,8 +1066,10 @@ mod tests {
             .lines()
             .find(|line| line.contains("<asset-clip ") && line.contains("rec.wav"))
             .unwrap();
+        // In an angle the clip starts on the file's first whole frame, 1720
+        // samples in, and plays that much later, so its sound keeps its place.
         assert!(
-            angle.contains(&format!(" start=\"{recorder_start}\"")),
+            angle.contains(" offset=\"643/1200s\" duration=\"14357/1200s\" start=\"1030426/25s\""),
             "{angle}"
         );
 
