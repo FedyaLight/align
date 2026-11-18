@@ -90,6 +90,9 @@ type ClipKey = (String, MediaKind, usize);
 struct TrackEntry<'a> {
     item: &'a ExportItem,
     source_channel: usize,
+    /// A channel of a stereo clip: its left and right play on a pair of
+    /// tracks Premiere joins into one stereo track.
+    stereo: bool,
 }
 
 impl<'a> TrackEntry<'a> {
@@ -136,13 +139,18 @@ pub fn write(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE xmeml>\n<xmeml version=\"5\">\n"
             .to_string();
     if let Some(island) = timeline.islands.first() {
+        let premiere = format == TimelineExportFormat::PremiereXML;
         let mut document = Document {
             rate,
             format,
             defined_files: HashSet::new(),
             master_clips: HashMap::new(),
+            stereo_files: if premiere {
+                stereo_files(island)
+            } else {
+                HashSet::new()
+            },
         };
-        let premiere = format == TimelineExportFormat::PremiereXML;
         let replaced = if premiere && options.replaced_sequence {
             replaced_island(island)
         } else {
@@ -261,6 +269,9 @@ struct Document {
     defined_files: HashSet<String>,
     /// Master clip ids by the resource key of the file they define.
     master_clips: HashMap<String, String>,
+    /// Resource keys of two-channel files every item plays whole, which
+    /// Premiere XML plays as stereo clips.
+    stereo_files: HashSet<String>,
 }
 
 /// Clipitem ids and 1-based track/clip positions of one sequence, which
@@ -281,7 +292,42 @@ impl Document {
     ) -> String {
         let rate = self.rate;
         let duration = rate.frames(island.duration, Rounding::Up);
-        let mut xml = format!("      <sequence id=\"{id}\">\n");
+        let video_entries: Vec<TrackEntry> = island
+            .clips
+            .iter()
+            .filter(|i| i.clip.video.is_some())
+            .map(|item| TrackEntry {
+                item,
+                source_channel: 0,
+                stereo: false,
+            })
+            .collect();
+        let audio_entries: Vec<TrackEntry> = island
+            .clips
+            .iter()
+            .filter(|i| {
+                !i.clip.audio.is_empty()
+                    && (include_embedded_audio || i.clip.kind == MediaKind::Audio)
+            })
+            .flat_map(|item| {
+                let stereo = item.selected_audio_source_channel().is_none()
+                    && self.stereo_files.contains(&base_resource_key(item));
+                item.audio_source_channels().map(move |ch| TrackEntry {
+                    item,
+                    source_channel: ch,
+                    stereo,
+                })
+            })
+            .collect();
+        let stereo = audio_entries.iter().any(|entry| entry.stereo);
+        // Premiere writes each channel of a stereo track as a track of its
+        // own, and joins them where the sequence says it explodes tracks.
+        let exploded = if stereo {
+            " explodedTracks=\"true\""
+        } else {
+            ""
+        };
+        let mut xml = format!("      <sequence id=\"{id}\"{exploded}>\n");
         xml += &format!("        <name>{}</name>\n", xml_text::escape(&name));
         xml += &format!(
             "        <duration>{duration}</duration>\n{}",
@@ -309,29 +355,6 @@ impl Document {
             rate.xml("              ")
         );
 
-        let video_entries: Vec<TrackEntry> = island
-            .clips
-            .iter()
-            .filter(|i| i.clip.video.is_some())
-            .map(|item| TrackEntry {
-                item,
-                source_channel: 0,
-            })
-            .collect();
-        let audio_entries: Vec<TrackEntry> = island
-            .clips
-            .iter()
-            .filter(|i| {
-                !i.clip.audio.is_empty()
-                    && (include_embedded_audio || i.clip.kind == MediaKind::Audio)
-            })
-            .flat_map(|item| {
-                item.audio_source_channels().map(|ch| TrackEntry {
-                    item,
-                    source_channel: ch,
-                })
-            })
-            .collect();
         let video_tracks = tracks_for(&video_entries, MediaKind::Video);
         let audio_tracks = tracks_for(&audio_entries, MediaKind::Audio);
         let mut ids = identifiers(&video_tracks, MediaKind::Video, 1, clip_id_prefix);
@@ -361,6 +384,15 @@ impl Document {
         xml += &format!(
             "          </video>\n          <audio>\n            <format><samplecharacteristics><depth>{audio_depth}</depth><samplerate>48000</samplerate></samplecharacteristics></format>\n"
         );
+        if stereo {
+            xml += "            <numOutputChannels>2</numOutputChannels>\n            <outputs>\n";
+            for channel in 1..=2 {
+                xml += &format!(
+                    "              <group><index>{channel}</index><numchannels>1</numchannels><downmix>0</downmix><channel><index>{channel}</index></channel></group>\n"
+                );
+            }
+            xml += "            </outputs>\n";
+        }
         for track in &audio_tracks {
             xml += &self.track(track, MediaKind::Audio, &layout);
         }
@@ -370,7 +402,17 @@ impl Document {
 
     /// One `<track>` of clipitems and transitions.
     fn track(&mut self, track: &[TrackEntry], media_type: MediaKind, layout: &Layout) -> String {
-        let mut xml = "            <track>\n".to_string();
+        let stereo = track
+            .first()
+            .filter(|entry| entry.stereo)
+            .map(|entry| entry.source_channel);
+        let mut xml = match stereo {
+            Some(channel) => format!(
+                "            <track premiereTrackType=\"Stereo\" currentExplodedTrackIndex=\"{}\" totalExplodedTrackCount=\"2\">\n",
+                channel - 1
+            ),
+            None => "            <track>\n".to_string(),
+        };
         for (index, entry) in track.iter().enumerate() {
             let before = index
                 .checked_sub(1)
@@ -401,10 +443,14 @@ impl Document {
             .first()
             .is_some_and(|e| e.item.is_track_locked(media_type));
         xml += &format!(
-            "              <enabled>{}</enabled><locked>{}</locked>\n            </track>\n",
+            "              <enabled>{}</enabled><locked>{}</locked>\n",
             tf(enabled),
             tf(locked)
         );
+        if let Some(channel) = stereo {
+            xml += &format!("              <outputchannelindex>{channel}</outputchannelindex>\n");
+        }
+        xml += "            </track>\n";
         xml
     }
 }
@@ -415,6 +461,31 @@ fn base_resource_key(item: &ExportItem) -> String {
     } else {
         format!("{}-corrected-audio", item.clip.id.0)
     }
+}
+
+/// Resource keys of the two-channel files, sources and drift sidecars, that
+/// no item plays a single channel of. Premiere plays a single channel only
+/// of a file described channel by channel.
+fn stereo_files(island: &ExportIsland) -> HashSet<String> {
+    let mut stereo = HashSet::new();
+    let mut single = HashSet::new();
+    for item in &island.clips {
+        if item
+            .clip
+            .audio
+            .first()
+            .is_none_or(|audio| audio.channels != 2)
+        {
+            continue;
+        }
+        let keys = [base_resource_key(item), item.clip.id.0.clone()];
+        if item.selected_audio_source_channel().is_some() {
+            single.extend(keys);
+        } else {
+            stereo.extend(keys);
+        }
+    }
+    &stereo - &single
 }
 
 fn tf(value: bool) -> &'static str {
@@ -592,7 +663,23 @@ fn links(
     let video_key = (entry.item.instance_id.clone(), MediaKind::Video, 0);
     let (Some(video_id), Some(video_position)) = (ids.get(&video_key), positions.get(&video_key))
     else {
-        return Vec::new();
+        // The two channels of a stereo clip without picture link each other.
+        if !entry.stereo || format != TimelineExportFormat::PremiereXML {
+            return Vec::new();
+        }
+        return (1..=2)
+            .filter_map(|channel| {
+                let key = (entry.item.instance_id.clone(), MediaKind::Audio, channel);
+                let (track, clip) = *positions.get(&key)?;
+                Some(LinkReference {
+                    clip_item_id: ids.get(&key)?.clone(),
+                    media_type: Some(MediaKind::Audio),
+                    track_index: Some(track),
+                    clip_index: Some(clip),
+                    group_index: Some(1),
+                })
+            })
+            .collect();
     };
     let mut linked_audio: Vec<(String, (usize, usize))> = ids
         .keys()
@@ -654,14 +741,63 @@ fn links(
     ]
 }
 
+/// Tracks of `entries`. The channels of stereo clips take pairs of
+/// adjacent tracks, left then right, each pair holding stereo clips alone.
 fn tracks_for<'a>(entries: &[TrackEntry<'a>], media_type: MediaKind) -> Vec<Vec<TrackEntry<'a>>> {
+    if !entries.iter().any(|entry| entry.stereo) {
+        return lanes_for(entries, media_type);
+    }
+    let (stereo, single): (Vec<TrackEntry<'a>>, Vec<TrackEntry<'a>>) =
+        entries.iter().partition(|entry| entry.stereo);
+    let right: HashMap<&str, TrackEntry<'a>> = stereo
+        .iter()
+        .filter(|entry| entry.source_channel == 2)
+        .map(|entry| (entry.item.instance_id.as_str(), *entry))
+        .collect();
+    let left: Vec<TrackEntry<'a>> = stereo
+        .into_iter()
+        .filter(|entry| entry.source_channel == 1)
+        .collect();
+    let source = |track: &[TrackEntry<'a>]| {
+        track
+            .iter()
+            .map(|entry| {
+                entry
+                    .item
+                    .preferred_source_key(media_type)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| source_key_for_url(&entry.item.clip.url))
+            })
+            .min()
+            .unwrap_or_default()
+    };
+    // Pairs and single tracks in the order of their sources.
+    let mut units: Vec<(String, Vec<Vec<TrackEntry<'a>>>)> = lanes_for(&single, media_type)
+        .into_iter()
+        .map(|track| (source(&track), vec![track]))
+        .collect();
+    units.extend(lanes_for(&left, media_type).into_iter().map(|track| {
+        let mirrored = track
+            .iter()
+            .filter_map(|entry| right.get(entry.item.instance_id.as_str()).copied())
+            .collect();
+        (source(&track), vec![track, mirrored])
+    }));
+    units.sort_by(|a, b| a.0.cmp(&b.0));
+    units.into_iter().flat_map(|(_, tracks)| tracks).collect()
+}
+
+/// Tracks of `entries`, packed by the allocator.
+fn lanes_for<'a>(entries: &[TrackEntry<'a>], media_type: MediaKind) -> Vec<Vec<TrackEntry<'a>>> {
     let source_key = |entry: &TrackEntry<'a>| -> String {
         let item = entry.item;
         let base = item
             .preferred_source_key(media_type)
             .map(str::to_string)
             .unwrap_or_else(|| source_key_for_url(&item.clip.url));
-        if media_type == MediaKind::Audio {
+        if entry.stereo {
+            format!("{base}#stereo")
+        } else if media_type == MediaKind::Audio {
             format!("{base}#channel-{}", entry.source_channel)
         } else {
             base
@@ -916,7 +1052,12 @@ impl Document {
                 .unwrap_or_else(|| crate::model::file_name(&media.url)),
         );
         let file_id = media.file_id();
-        let mut xml = format!("              <clipitem id=\"{id}\">\n");
+        let channel_type = if entry.stereo && media_type == MediaKind::Audio {
+            " premiereChannelType=\"stereo\""
+        } else {
+            ""
+        };
+        let mut xml = format!("              <clipitem id=\"{id}\"{channel_type}>\n");
         if let Some(master) = self.master_clips.get(&media.resource_key) {
             xml += &format!("                <masterclipid>{master}</masterclipid>\n");
         }
@@ -956,7 +1097,8 @@ impl Document {
             xml += "</link>\n";
         }
         if self.defined_files.insert(media.resource_key.clone()) {
-            xml += &file_block(item, media_type, &media);
+            let stereo = self.stereo_files.contains(&media.resource_key);
+            xml += &file_block(item, media_type, &media, stereo);
         } else {
             xml += &format!("                <file id=\"{file_id}\"/>\n");
         }
@@ -1358,7 +1500,8 @@ impl Document {
             );
             xml += &media.rate.xml("                    ");
             if index == 0 && self.defined_files.insert(media.resource_key.clone()) {
-                xml += &file_block(item, side, media);
+                let stereo = self.stereo_files.contains(&media.resource_key);
+                xml += &file_block(item, side, media, stereo);
             } else {
                 xml += &format!("                <file id=\"{}\"/>\n", media.file_id());
             }
@@ -1386,7 +1529,9 @@ fn bin_open(name: &str) -> String {
     )
 }
 
-fn file_block(item: &ExportItem, media_type: MediaKind, media: &MediaUse) -> String {
+/// A file's `<file>` element. A stereo file is one two-channel audio, as
+/// Premiere writes a file it plays as a stereo clip.
+fn file_block(item: &ExportItem, media_type: MediaKind, media: &MediaUse, stereo: bool) -> String {
     let id = media.file_id();
     let (media_url, duration, rate) = (&media.url, media.duration, media.rate);
     let clip = &item.clip;
@@ -1460,7 +1605,7 @@ fn file_block(item: &ExportItem, media_type: MediaKind, media: &MediaUse) -> Str
             "<samplecharacteristics><depth>{depth}</depth><samplerate>{}</samplerate></samplecharacteristics>",
             audio.sample_rate.round() as i64,
         );
-        if audio.channels > 1 {
+        if audio.channels > 1 && !stereo {
             // Premiere plays a clip's `<sourcetrack>` channel only when the
             // file lists that channel as its own mono audio, as Premiere
             // writes multichannel files itself. A single multichannel
@@ -1764,6 +1909,85 @@ mod tests {
                 assert!(described.contains(&format!("<sourcechannel>{channel}</sourcechannel>")));
             }
         }
+    }
+
+    /// A stereo recording is one stereo clip in Premiere, as Premiere writes
+    /// it: its file is one two-channel audio, its channels play on a pair
+    /// of tracks Premiere joins, and they link as one group. Resolve XML
+    /// keeps a mono track per channel, which Resolve reads alike either way.
+    #[test]
+    fn premiere_plays_a_stereo_recording_as_one_stereo_clip() {
+        let mut timeline = fixture_timeline();
+        let rec = timeline.islands[0]
+            .clips
+            .iter_mut()
+            .find(|i| i.clip.id.0 == "rec")
+            .expect("recorder item");
+        rec.clip.audio[0].channels = 2;
+        let xml = write(
+            &timeline,
+            TimelineExportFormat::PremiereXML,
+            PremiereOptions::default(),
+        );
+        assert!(xml.contains("<sequence id=\"sequence-1\" explodedTracks=\"true\">"));
+        assert!(xml.contains("<numOutputChannels>2</numOutputChannels>"));
+        let tracks: Vec<&str> = xml
+            .split("\n            <track")
+            .skip(1)
+            .filter(|track| track.contains("<name>rec.wav</name>"))
+            .collect();
+        assert_eq!(tracks.len(), 2, "{xml}");
+        for (index, track) in tracks.iter().enumerate() {
+            assert!(track.starts_with(&format!(
+                " premiereTrackType=\"Stereo\" currentExplodedTrackIndex=\"{index}\" totalExplodedTrackCount=\"2\">"
+            )), "{track}");
+            assert!(track.contains("premiereChannelType=\"stereo\""));
+            assert!(track.contains(&format!(
+                "<sourcetrack><mediatype>audio</mediatype><trackindex>{}</trackindex></sourcetrack>",
+                index + 1
+            )));
+            assert!(track.contains(&format!(
+                "<outputchannelindex>{}</outputchannelindex>",
+                index + 1
+            )));
+            assert_eq!(
+                track.matches("<groupindex>1</groupindex>").count(),
+                2,
+                "{track}"
+            );
+        }
+        let left = tracks[0];
+        let id = |track: &str| {
+            let start = track.find("<clipitem id=\"").unwrap() + 14;
+            track[start..start + track[start..].find('"').unwrap()].to_string()
+        };
+        for track in &tracks {
+            assert!(left.contains(&format!("<linkclipref>{}</linkclipref>", id(track))));
+        }
+        let file = &left[left.find("<file id=").unwrap()..left.find("</file>").unwrap()];
+        assert_eq!(file.matches("<audio>").count(), 1, "{file}");
+        assert!(file.contains("<channelcount>2</channelcount>"), "{file}");
+
+        let resolve = write(
+            &timeline,
+            TimelineExportFormat::ResolveXML,
+            PremiereOptions::default(),
+        );
+        assert!(!resolve.contains("premiereTrackType") && !resolve.contains("explodedTracks"));
+
+        // A single channel plays alone, on a mono track.
+        let rec = timeline.islands[0]
+            .clips
+            .iter_mut()
+            .find(|i| i.clip.id.0 == "rec")
+            .expect("recorder item");
+        rec.audio_source_channel = Some(1);
+        let xml = write(
+            &timeline,
+            TimelineExportFormat::PremiereXML,
+            PremiereOptions::default(),
+        );
+        assert!(!xml.contains("premiereTrackType"), "{xml}");
     }
 
     #[test]
