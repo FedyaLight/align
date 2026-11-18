@@ -88,10 +88,44 @@ pub(crate) fn test_ffprobe() -> Option<PathBuf> {
     test_tool(ffprobe_bin(), "ffprobe")
 }
 
+/// Headers already read, by file and revision: decoding a file's windows,
+/// and each stage of a run, asked ffprobe for the same header again.
+static PROBED: std::sync::LazyLock<std::sync::Mutex<ProbedHeaders>> =
+    std::sync::LazyLock::new(Default::default);
+/// ffprobe JSON and the revision it describes, by file.
+type ProbedHeaders = std::collections::HashMap<PathBuf, (String, Vec<u8>)>;
+/// Headers kept at most; a long session starts over past it.
+const PROBED_LIMIT: usize = 4096;
+
 /// Format and stream headers as ffprobe JSON. Each ffprobe start analyses
 /// the opening packets (about 0.3 s for 4:2:2 10-bit camera video), so
-/// inspection asks once and parses this for audio and video alike.
+/// inspection asks once and parses this for audio and video alike, and
+/// asks again only once the file changes.
 fn probe_json(path: &Path) -> Result<Vec<u8>, DecodeError> {
+    let revision = media_revision(path);
+    let lock = || {
+        PROBED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    if let Some(revision) = &revision
+        && let Some((cached, json)) = lock().get(path)
+        && cached == revision
+    {
+        return Ok(json.clone());
+    }
+    let json = run_probe(path)?;
+    if let Some(revision) = revision {
+        let mut probed = lock();
+        if probed.len() >= PROBED_LIMIT {
+            probed.clear();
+        }
+        probed.insert(path.to_path_buf(), (revision, json.clone()));
+    }
+    Ok(json)
+}
+
+fn run_probe(path: &Path) -> Result<Vec<u8>, DecodeError> {
     let bin =
         ffprobe_bin().ok_or_else(|| DecodeError::FfmpegMissing("ffprobe not found".into()))?;
     let out = command(bin)
@@ -876,6 +910,48 @@ mod tests {
         ],
         "format": {"duration": "123.456"}
     }"#;
+
+    /// A file's header is read once while the file stays the same, and read
+    /// again once it changes.
+    #[test]
+    fn headers_are_read_again_only_once_a_file_changes() {
+        if test_ffprobe().is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe.wav");
+        let write = |rate: u32| {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: rate,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+            for _ in 0..rate / 10 {
+                writer.write_sample(0i16).unwrap();
+            }
+            writer.finalize().unwrap();
+        };
+        write(48_000);
+        assert_eq!(
+            inspect(&path).unwrap().audio_streams[0].sample_rate,
+            48_000.0
+        );
+        let cached = PROBED.lock().unwrap().get(&path).cloned();
+        assert!(cached.is_some());
+        assert_eq!(
+            inspect(&path).unwrap().audio_streams[0].sample_rate,
+            48_000.0
+        );
+        assert_eq!(PROBED.lock().unwrap().get(&path).cloned(), cached);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write(44_100);
+        assert_eq!(
+            inspect(&path).unwrap().audio_streams[0].sample_rate,
+            44_100.0
+        );
+    }
 
     #[test]
     fn parses_ffprobe_json() {
