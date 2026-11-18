@@ -643,6 +643,49 @@ fn reverse_retime_imports_backward_with_negative_otio_scalar() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Premiere's own 200% reverse graph runs from 400 to 1, a frame short of
+/// its stated speed at the ends; the stated speed wins, or the clip's
+/// reverse out point, and so its frames, came out a frame early.
+#[test]
+fn premiere_reverse_takes_its_stated_speed() {
+    let dir = std::env::temp_dir().join(format!("align-xml-rev200-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let xml = dir.join("rev200.xml");
+    std::fs::write(
+        &xml,
+        r#"<?xml version="1.0"?><xmeml version="4"><sequence><name>R</name>
+<rate><timebase>25</timebase><ntsc>FALSE</ntsc></rate>
+<media><video><track>
+<clipitem id="r1"><name>Rev</name><duration>200</duration>
+<in>163</in><out>187</out><start>0</start><end>24</end>
+<file id="f"><pathurl>file:///tmp/r200.mov</pathurl><rate><timebase>25</timebase><ntsc>FALSE</ntsc></rate><duration>400</duration></file>
+<filter><effect><name>Time Remap</name><effectid>timeremap</effectid>
+<parameter><parameterid>variablespeed</parameterid><value>0</value></parameter>
+<parameter><parameterid>speed</parameterid><value>200</value></parameter>
+<parameter><parameterid>reverse</parameterid><value>TRUE</value></parameter>
+<parameter><parameterid>graphdict</parameterid>
+<keyframe><when>0</when><value>400</value></keyframe>
+<keyframe><when>13</when><value>374</value></keyframe>
+<keyframe><when>37</when><value>326</value></keyframe>
+<keyframe><when>200</when><value>1</value></keyframe>
+</parameter></effect></filter>
+</clipitem>
+</track></video></media>
+</sequence></xmeml>"#,
+    )
+    .unwrap();
+    let draft = read_timeline(&xml, None).expect("read");
+    let edit = &draft.edits[0];
+    assert!(edit.plays_backward);
+    assert!(
+        (edit.playback_rate - 2.0).abs() < 1e-9,
+        "{}",
+        edit.playback_rate
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn non_portable_dissolve_warns_and_flattens_in_otio() {
     // Odd duration (not centered-even) → Premiere keeps it, OTIO gets

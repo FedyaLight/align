@@ -153,6 +153,22 @@ pub(super) struct ConstantRetime {
     pub(super) source_out: f64,
 }
 
+/// The constant speed, in percent, a Time Remap effect states, unless it
+/// varies.
+fn stated_speed(doc: &XmlDoc, effect: usize) -> Option<f64> {
+    let parameter = |id: &str| {
+        doc.children_named(effect, "parameter")
+            .into_iter()
+            .find(|&p| doc.child_text(p, "parameterid").as_deref() == Some(id))
+            .and_then(|p| doc.child_text(p, "value"))
+    };
+    if parameter("variablespeed").as_deref().map(str::trim) != Some("0") {
+        return None;
+    }
+    let speed: f64 = parameter("speed")?.trim().parse().ok()?;
+    (speed.is_finite() && speed.abs() > 0.0).then_some(speed.abs())
+}
+
 pub(super) fn graph_retime(
     doc: &XmlDoc,
     effect: usize,
@@ -196,7 +212,7 @@ pub(super) fn graph_retime(
     if l0 <= f0 {
         return None;
     }
-    let slope = (lv1 - fv0) / (l0 - f0);
+    let mut slope = (lv1 - fv0) / (l0 - f0);
     if require_linear {
         let tolerance = 0.05f64.max((lv1 - fv0).abs() * 0.000_001);
         if !points
@@ -209,6 +225,15 @@ pub(super) fn graph_retime(
     let file_rate = fcp7_rate(doc, file, item_rate);
     let item_fps = 1.0 / item_rate.as_seconds();
     let file_fps = 1.0 / file_rate.as_seconds();
+    // Premiere states a constant speed, and the ends of its graph can be a
+    // frame off it: a 200% reverse runs from 400 to 1, not to 0. A stated
+    // speed the graph agrees with wins.
+    if let Some(percent) = stated_speed(doc, effect) {
+        let stated = percent / 100.0 * file_fps / item_fps;
+        if (slope.abs() - stated).abs() <= stated * 0.01 {
+            slope = stated.copysign(slope);
+        }
+    }
     let at = |frame: i64| fv0 + (frame as f64 - f0) * slope;
     let (a, b) = (at(graph_in) / file_fps, at(graph_out) / file_fps);
     let (source_in, source_out) = (a.min(b), a.max(b));
