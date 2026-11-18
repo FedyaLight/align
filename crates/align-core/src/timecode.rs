@@ -169,6 +169,7 @@ mod tests {
                     frame_number: (s * 25.0) as i64,
                     frame_duration: MediaTime::new(1, 25),
                     drop_frame: false,
+                    derived: false,
                 }),
                 frame_rate_mode: None,
             }),

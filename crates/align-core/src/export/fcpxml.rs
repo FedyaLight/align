@@ -26,15 +26,65 @@ fn audio_channel_end(item: &ExportItem) -> String {
 
 // Keep frame-aligned values exact instead of rounding them below a frame
 // boundary at fractional rates; retain subframe audio positions otherwise.
-fn timeline_time(seconds: f64, frame: MediaTime) -> String {
+fn grid_time(seconds: f64, frame: MediaTime) -> MediaTime {
     let frames = (seconds / frame.as_seconds()).round();
     let exact = frames * frame.as_seconds();
-    let time = if (seconds - exact).abs() <= TIME_TOLERANCE {
+    if (seconds - exact).abs() <= TIME_TOLERANCE {
         MediaTime::new(frames as i64 * frame.value, frame.timescale)
     } else {
         MediaTime::microseconds(seconds)
-    };
-    xml_text::fcpxml_time(time)
+    }
+}
+
+fn timeline_time(seconds: f64, frame: MediaTime) -> String {
+    xml_text::fcpxml_time(grid_time(seconds, frame))
+}
+
+/// Whole frames covering `seconds`: Final Cut Pro rounds a sequence or gap
+/// that ends inside a frame up to the next frame, with a warning.
+fn frames_covering(seconds: f64, frame: MediaTime) -> String {
+    let frames = (seconds / frame.as_seconds() - TIME_TOLERANCE)
+        .ceil()
+        .max(1.0);
+    xml_text::fcpxml_time(MediaTime::new(frames as i64 * frame.value, frame.timescale))
+}
+
+fn sum(a: MediaTime, b: MediaTime) -> MediaTime {
+    let (ta, tb) = (i64::from(a.timescale), i64::from(b.timescale));
+    let (mut x, mut y) = (ta, tb);
+    while y != 0 {
+        (x, y) = (y, x % y);
+    }
+    let lcm = ta / x * tb;
+    match i32::try_from(lcm) {
+        Ok(timescale) => MediaTime::new(a.value * (lcm / ta) + b.value * (lcm / tb), timescale),
+        Err(_) => MediaTime::microseconds(a.as_seconds() + b.as_seconds()),
+    }
+}
+
+/// Where Final Cut Pro starts a file: exactly at its own timecode, which FCP
+/// reads from the file itself. Timecode Align derived from LTC or camera XML
+/// is not in the file, so FCP starts such a file at zero.
+fn media_start(clip: &Clip) -> MediaTime {
+    clip.source_timecode()
+        .filter(|tc| !tc.derived)
+        .map_or(MediaTime::new(0, 1), |tc| {
+            MediaTime::new(
+                tc.frame_number * tc.frame_duration.value,
+                tc.frame_duration.timescale,
+            )
+        })
+}
+
+/// A source position `seconds` into a file starting at `origin`. FCPXML
+/// source times count from the file's timecode, not from zero.
+fn source_time(origin: MediaTime, seconds: f64, clip: &Clip, frame: MediaTime) -> String {
+    let grid = clip
+        .video
+        .as_ref()
+        .and_then(|video| video.frame_duration)
+        .unwrap_or(frame);
+    xml_text::fcpxml_time(sum(origin, grid_time(seconds, grid)))
 }
 
 /// What a Final Cut Pro document contains.
@@ -138,7 +188,12 @@ struct AssetKey {
 struct Library<'a> {
     timeline: &'a ExportTimeline,
     frame: MediaTime,
-    assets: HashMap<AssetKey, String>,
+    /// The sequence's frame size.
+    size: (u32, u32),
+    /// Each asset's id and media start.
+    assets: HashMap<AssetKey, (String, MediaTime)>,
+    /// Video formats besides the sequence's: frame duration and size by id.
+    formats: Vec<(String, MediaTime, (u32, u32))>,
     /// Each asset as a clip of the event's browser, in resource order.
     browser_clips: Vec<BrowserClip>,
 }
@@ -149,6 +204,8 @@ struct BrowserClip {
     /// Escaped file name.
     name: String,
     id: String,
+    /// The asset's format, for a video asset.
+    format: Option<String>,
     start: String,
     duration: String,
 }
@@ -170,9 +227,11 @@ fn clip_name(item: &ExportItem, media_url: &Path) -> String {
     }))
 }
 
-fn audio_role_attribute(item: &ExportItem) -> String {
+/// `name` set to the item's FCPXML audio role, or nothing without one.
+/// Asset clips carry it as `audioRole`, the audio inside a clip as `role`.
+fn audio_role_attribute(item: &ExportItem, name: &str) -> String {
     item.fcpxml_audio_role().map_or_else(String::new, |role| {
-        format!(" audioRole=\"{}\"", xml_text::escape(role))
+        format!(" {name}=\"{}\"", xml_text::escape(role))
     })
 }
 
@@ -194,6 +253,22 @@ fn with_precision_stems(island: &ExportIsland) -> ExportIsland {
             && let Some(path) = item.precision_audio_url(channel + 1).cloned()
         {
             let duration = item.corrected_selected_duration();
+            // A stem starts at its source's timecode plus the selected start,
+            // in whole samples, as its broadcast extension says.
+            let rate = item.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);
+            let start = MediaTime::new(
+                (item.precision_source_start() * rate).round() as i64,
+                rate.round() as i32,
+            );
+            let origin = sum(media_start(&item.clip), start);
+            for audio in &mut item.clip.audio {
+                if let Some(tc) = &mut audio.source_timecode
+                    && !tc.derived
+                {
+                    tc.frame_number = origin.value;
+                    tc.frame_duration = MediaTime::new(1, origin.timescale);
+                }
+            }
             item.clip.url = path;
             item.clip.duration = MediaTime::microseconds(duration);
             for audio in &mut item.clip.audio {
@@ -225,34 +300,44 @@ fn write_island(
     };
     let (width, height) = (dimension(|v| v.width, 1920), dimension(|v| v.height, 1080));
 
-    let mut xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n".to_string();
-    xml += "<!DOCTYPE fcpxml>\n<fcpxml version=\"1.10\">\n  <resources>\n";
-    xml += &format!(
-        "    <format id=\"{FORMAT_ID}\" name=\"FFVideoFormat{width}x{height}p\" frameDuration=\"{}\" width=\"{width}\" height=\"{height}\"/>\n",
-        xml_text::fcpxml_time(frame)
-    );
     let mut library = Library {
         timeline,
         frame,
+        size: (width, height),
         assets: HashMap::new(),
+        formats: Vec::new(),
         browser_clips: Vec::new(),
     };
-    xml += &library.assets_xml(island);
+    let mut assets = library.assets_xml(island);
     let bins = options
         .media_bins
         .then(|| MediaBins::new(sources.clips.iter().map(|item| &item.clip)));
     if let Some(bins) = &bins {
         for clip in bins.bins().iter().flat_map(|bin| &bin.clips) {
-            xml += &library.asset_xml(clip, &clip.url);
+            assets += &library.asset_xml(clip, &clip.url);
         }
     }
+
+    // Final Cut Pro names its standard formats itself; an unknown name only
+    // earns a warning, so formats carry their parameters alone.
+    let mut xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n".to_string();
+    xml += "<!DOCTYPE fcpxml>\n<fcpxml version=\"1.10\">\n  <resources>\n";
+    for (id, duration, (width, height)) in
+        std::iter::once((FORMAT_ID.to_string(), frame, (width, height)))
+            .chain(library.formats.iter().cloned())
+    {
+        xml += &format!(
+            "    <format id=\"{id}\" frameDuration=\"{}\" width=\"{width}\" height=\"{height}\"/>\n",
+            xml_text::fcpxml_time(duration)
+        );
+    }
+    xml += &assets;
     if options.multicam {
         xml += &library.multicam_xml(island);
     }
     xml += "  </resources>\n";
 
-    let total_duration =
-        xml_text::fcpxml_time(MediaTime::microseconds(1.0f64.max(island.duration)));
+    let total_duration = frames_covering(island.duration, frame);
     let sequence_start = frame_start(
         island.clips.iter().find_map(|i| i.clip.source_timecode()),
         frame,
@@ -269,7 +354,7 @@ fn write_island(
     if options.timeline {
         xml += &format!("      <project name=\"{name} – synced\">\n{sequence}");
         xml += &format!(
-            "          <spine>\n            <gap offset=\"0s\" duration=\"{total_duration}\" name=\"Master\">\n"
+            "          <spine>\n            <gap offset=\"{sequence_start}\" duration=\"{total_duration}\" name=\"Master\">\n"
         );
         xml += &library.synced_clips_xml(island, options.group_storylines);
         xml += "            </gap>\n          </spine>\n        </sequence>\n      </project>\n";
@@ -277,7 +362,7 @@ fn write_island(
     if options.multicam {
         xml += &format!("      <project name=\"{name} – multicam\">\n{sequence}");
         xml += &format!(
-            "          <spine>\n            <mc-clip name=\"{name} – Multicam\" ref=\"{MULTICAM_ID}\" offset=\"0s\" duration=\"{total_duration}\"/>\n          </spine>\n        </sequence>\n      </project>\n"
+            "          <spine>\n            <mc-clip name=\"{name} – Multicam\" ref=\"{MULTICAM_ID}\" offset=\"{sequence_start}\" duration=\"{total_duration}\"/>\n          </spine>\n        </sequence>\n      </project>\n"
         );
     }
     xml += "    </event>\n  </library>\n</fcpxml>\n";
@@ -285,14 +370,35 @@ fn write_island(
 }
 
 impl Library<'_> {
-    fn asset(&self, item: &ExportItem, audio_only: bool) -> Option<(PathBuf, &str)> {
+    /// The file an item plays, its asset id and the file's start.
+    fn asset(&self, item: &ExportItem, audio_only: bool) -> Option<(PathBuf, &str, MediaTime)> {
         let media_url = media_url(item);
         let key = AssetKey {
             url: media_url.to_string_lossy().into_owned(),
             audio_only,
         };
-        let id = self.assets.get(&key)?;
-        Some((media_url, id))
+        let (id, start) = self.assets.get(&key)?;
+        Some((media_url, id, *start))
+    }
+
+    /// The format of a video file: the sequence's when frame duration and
+    /// size match, else one of its own.
+    fn format_id(&mut self, video: &crate::model::VideoSummary) -> String {
+        let duration = video.frame_duration.unwrap_or(self.frame);
+        let size = (video.width, video.height);
+        if (duration, size) == (self.frame, self.size) {
+            return FORMAT_ID.to_string();
+        }
+        if let Some((id, ..)) = self
+            .formats
+            .iter()
+            .find(|(_, d, s)| (*d, *s) == (duration, size))
+        {
+            return id.clone();
+        }
+        let id = format!("r_fmt_{}", self.formats.len() + 1);
+        self.formats.push((id.clone(), duration, size));
+        id
     }
 
     /// One `<asset>` per distinct media file and side, in item order.
@@ -316,7 +422,8 @@ impl Library<'_> {
         }
         let id = format!("r_asset_{}", self.assets.len() + 1);
         let duration = xml_text::fcpxml_time(MediaTime::microseconds(clip.duration.as_seconds()));
-        let start = frame_start(clip.source_timecode(), self.frame);
+        let origin = media_start(clip);
+        let start = xml_text::fcpxml_time(origin);
         let name = xml_text::escape(media_url.file_name().and_then(|n| n.to_str()).unwrap_or(""));
         let src = xml_text::escape(&crate::model::file_url(media_url));
         let audio = clip.audio.first();
@@ -327,17 +434,18 @@ impl Library<'_> {
         let mut xml = format!(
             "    <asset id=\"{id}\" name=\"{name}\" start=\"{start}\" duration=\"{duration}\""
         );
-        if audio_only {
-            xml += &format!(" hasAudio=\"1\"{audio_attributes}");
-        } else {
+        let format = clip.video.as_ref().map(|video| self.format_id(video));
+        if let Some(format) = &format {
             let has_audio = audio.is_some();
             xml += &format!(
-                " format=\"{FORMAT_ID}\" hasVideo=\"1\" hasAudio=\"{}\"",
+                " format=\"{format}\" hasVideo=\"1\" hasAudio=\"{}\"",
                 u8::from(has_audio)
             );
             if has_audio {
                 xml += &audio_attributes;
             }
+        } else {
+            xml += &format!(" hasAudio=\"1\"{audio_attributes}");
         }
         xml +=
             &format!(">\n      <media-rep kind=\"original-media\" src=\"{src}\"/>\n    </asset>\n");
@@ -345,10 +453,11 @@ impl Library<'_> {
             key: key.clone(),
             name,
             id: id.clone(),
+            format,
             start,
             duration,
         });
-        self.assets.insert(key, id);
+        self.assets.insert(key, (id, origin));
         xml
     }
 
@@ -389,11 +498,10 @@ impl Library<'_> {
                 duration,
                 ..
             } = clip;
-            let format = if clip.key.audio_only {
-                String::new()
-            } else {
-                format!(" format=\"{FORMAT_ID}\"")
-            };
+            let format = clip
+                .format
+                .as_ref()
+                .map_or_else(String::new, |format| format!(" format=\"{format}\""));
             xml += &format!(
                 "      <asset-clip name=\"{name}\" ref=\"{id}\" start=\"{start}\" duration=\"{duration}\"{format}>\n        <keyword start=\"{start}\" duration=\"{duration}\" value=\"{}\"/>\n      </asset-clip>\n",
                 keyword_value(keyword)
@@ -445,7 +553,9 @@ impl Library<'_> {
                 } else {
                     MediaKind::Audio
                 };
-                let Some((media_url, asset_id)) = self.asset(item, side == MediaKind::Audio) else {
+                let Some((media_url, asset_id, origin)) =
+                    self.asset(item, side == MediaKind::Audio)
+                else {
                     continue;
                 };
                 xml += &format!(
@@ -453,9 +563,9 @@ impl Library<'_> {
                     clip_name(item, &media_url),
                     timeline_time(item.start, self.frame),
                     timeline_time(item.timeline_duration, self.frame),
-                    timeline_time(item.source_in, self.frame),
+                    source_time(origin, item.source_in, &item.clip, self.frame),
                     u8::from(item.is_enabled(side)),
-                    audio_role_attribute(item),
+                    audio_role_attribute(item, "audioRole"),
                     audio_channel_end(item),
                 );
             }
@@ -542,7 +652,7 @@ impl Library<'_> {
             }
         };
         for item in video_items {
-            let Some((media_url, asset_id)) = self.asset(item, false) else {
+            let Some((media_url, asset_id, origin)) = self.asset(item, false) else {
                 continue;
             };
             let lane = video_assignments
@@ -550,12 +660,15 @@ impl Library<'_> {
                 .copied()
                 .unwrap_or(0) as i64
                 + 1;
+            // The clip's own time runs from the source in point, where the
+            // video starts its file at that position past the file's start.
             let source_start = timeline_time(item.source_in, frame);
+            let media_start = source_time(origin, item.source_in, &item.clip, frame);
             let source_duration = timeline_time(item.timeline_duration, frame);
             place(
                 lane,
                 format!(
-                    "              <clip {} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{}\" enabled=\"{}\"><video ref=\"{asset_id}\" offset=\"{source_start}\" start=\"{source_start}\" duration=\"{source_duration}\"/></clip>\n",
+                    "              <clip{} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{}\" enabled=\"{}\"><video ref=\"{asset_id}\" offset=\"{source_start}\" start=\"{media_start}\" duration=\"{source_duration}\"/></clip>\n",
                     lane_attribute(lane),
                     timeline_time(item.start, frame),
                     timeline_time(item.timeline_duration, frame),
@@ -566,7 +679,8 @@ impl Library<'_> {
             );
         }
         for item in audio_items {
-            let Some((media_url, asset_id)) = self.asset(item, item.clip.video.is_none()) else {
+            let Some((media_url, asset_id, origin)) = self.asset(item, item.clip.video.is_none())
+            else {
                 continue;
             };
             let lane = -((audio_assignments
@@ -576,6 +690,7 @@ impl Library<'_> {
                 + 1) as i64);
             let duration = audio_duration(item);
             let source_start = timeline_time(item.source_in, frame);
+            let media_start = source_time(origin, item.source_in, &item.clip, frame);
             let source_duration = timeline_time(duration, frame);
             let channel_attribute = item
                 .selected_audio_source_channel()
@@ -583,14 +698,14 @@ impl Library<'_> {
             place(
                 lane,
                 format!(
-                    "              <clip {} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{}\" enabled=\"{}\"{}><audio ref=\"{asset_id}\" offset=\"{source_start}\" start=\"{source_start}\" duration=\"{source_duration}\"{channel_attribute}/></clip>\n",
+                    "              <clip{} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{}\" enabled=\"{}\"><audio ref=\"{asset_id}\" offset=\"{source_start}\" start=\"{media_start}\" duration=\"{source_duration}\"{channel_attribute}{}/></clip>\n",
                     lane_attribute(lane),
                     timeline_time(item.start, frame),
                     timeline_time(duration, frame),
                     timeline_time(item.source_in, frame),
                     clip_name(item, &media_url),
                     u8::from(item.is_enabled(MediaKind::Audio)),
-                    audio_role_attribute(item),
+                    audio_role_attribute(item, "role"),
                 ),
             );
         }
@@ -644,6 +759,92 @@ mod tests {
         let frame = MediaTime::new(1001, 30000);
         assert_eq!(timeline_time(50.0 * frame.as_seconds(), frame), "1001/600s");
         assert_eq!(timeline_time(0.012345, frame), "2469/200000s");
+    }
+
+    /// The fixture with timecode 11:26:57:00 on the camera and a recorder
+    /// whose broadcast extension starts 200 samples later.
+    fn timecoded_timeline(recorder_derived: bool) -> ExportTimeline {
+        use crate::model::SourceTimecode;
+        let mut result = super::super::otio::tests::fixture_result();
+        let camera = SourceTimecode::from_label("11:26:57:00", MediaTime::new(1, 25)).unwrap();
+        result.project.clips[0]
+            .video
+            .as_mut()
+            .unwrap()
+            .source_timecode = Some(camera);
+        let recorder = SourceTimecode::from_samples(
+            41_217 * 48_000 + 200,
+            48_000.0,
+            MediaTime::new(1, 25),
+            false,
+        )
+        .unwrap();
+        result.project.clips[1].audio[0].source_timecode = Some(SourceTimecode {
+            derived: recorder_derived,
+            ..recorder
+        });
+        ExportTimeline::from_result(&result, true).unwrap()
+    }
+
+    /// Final Cut Pro reads each file's start from the file and drops clips
+    /// whose source range lies before it, so source times count from the
+    /// file's exact timecode and the spine starts at the sequence's.
+    #[test]
+    fn source_times_count_from_each_files_timecode() {
+        let timeline = timecoded_timeline(false);
+        let xml = write(&timeline, FcpxmlOptions::default());
+        let recorder_start = xml_text::fcpxml_time(MediaTime::new(41_217 * 48_000 + 200, 48_000));
+        let asset = |name: &str| {
+            let line = xml
+                .lines()
+                .find(|line| line.contains("<asset ") && line.contains(name))
+                .unwrap();
+            line.to_string()
+        };
+        assert!(asset("cam.mov").contains(" start=\"41217s\""));
+        assert!(asset("rec.wav").contains(&format!(" start=\"{recorder_start}\"")));
+        assert!(xml.contains("<video ref=\"r_asset_1\" offset=\"0s\" start=\"41217s\""));
+        assert!(xml.contains(&format!(
+            "<audio ref=\"r_asset_2\" offset=\"0s\" start=\"{recorder_start}\""
+        )));
+        assert!(xml.contains("<gap offset=\"41217s\""));
+        assert!(xml.contains("offset=\"41217s\" duration=\"313/25s\"/>"));
+        let angle = xml
+            .lines()
+            .find(|line| line.contains("<asset-clip ") && line.contains("rec.wav"))
+            .unwrap();
+        assert!(
+            angle.contains(&format!(" start=\"{recorder_start}\"")),
+            "{angle}"
+        );
+
+        // Align reads its own document back at the same places.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("timecode.fcpxml");
+        std::fs::write(&path, write(&timeline, FcpxmlOptions::TIMELINE)).unwrap();
+        let draft = read_timeline(&path, None).unwrap();
+        for edit in &draft.edits {
+            let expected = if edit.url.ends_with("rec.wav") {
+                0.5
+            } else {
+                0.0
+            };
+            assert!(edit.source_in.abs() < 1e-6, "{edit:?}");
+            assert!((edit.timeline_start - expected).abs() < 1e-6, "{edit:?}");
+        }
+    }
+
+    /// Timecode Align derived from LTC is not in the file, so Final Cut Pro
+    /// starts that file at zero.
+    #[test]
+    fn derived_timecode_leaves_the_file_starting_at_zero() {
+        let xml = write(&timecoded_timeline(true), FcpxmlOptions::TIMELINE);
+        let asset = xml
+            .lines()
+            .find(|line| line.contains("<asset ") && line.contains("rec.wav"))
+            .unwrap();
+        assert!(asset.contains(" start=\"0s\""), "{asset}");
+        assert!(xml.contains("<audio ref=\"r_asset_2\" offset=\"0s\" start=\"0s\""));
     }
 
     #[test]
@@ -857,12 +1058,30 @@ mod tests {
         assert!(xml.contains("enabled=\"0\""));
     }
 
+    /// Final Cut Pro rejects a whole document whose `clip` carries
+    /// `audioRole`: a clip's audio takes the role, as `role`.
     #[test]
-    fn fcpxml_preserves_audio_role() {
+    fn audio_roles_sit_where_the_dtd_declares_them() {
         let mut timeline = fixture_timeline();
-        timeline.islands[0].clips[0].fcpxml_audio_role = Some("dialogue.interview".to_string());
-        let xml = write(&timeline, FcpxmlOptions::TIMELINE);
-        assert!(xml.contains("audioRole=\"dialogue.interview\""));
+        for item in &mut timeline.islands[0].clips {
+            item.fcpxml_audio_role = Some("dialogue.interview".to_string());
+        }
+        let xml = write(&timeline, FcpxmlOptions::default());
+        for line in xml.lines().filter(|line| line.contains("<clip ")) {
+            assert!(!line.contains("audioRole"), "{line}");
+            assert!(
+                !line.contains("<audio ") || line.contains(" role=\"dialogue.interview\""),
+                "{line}"
+            );
+        }
+        let angle = xml
+            .lines()
+            .find(|line| line.contains("<asset-clip ") && line.contains("rec.wav"))
+            .expect("recorder angle");
+        assert!(
+            angle.contains("audioRole=\"dialogue.interview\""),
+            "{angle}"
+        );
     }
 
     #[test]
@@ -999,8 +1218,8 @@ mod tests {
         let timeline = ExportTimeline::from_result_with_options(&result, Default::default())
             .expect("timeline");
         let xml = write(&timeline, FcpxmlOptions::TIMELINE);
-        assert!(xml.contains("audioRole=\"dialogue\""));
-        assert!(xml.contains("audioRole=\"effects\""));
+        assert!(xml.contains(" role=\"dialogue\""));
+        assert!(xml.contains(" role=\"effects\""));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

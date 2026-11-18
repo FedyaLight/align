@@ -696,6 +696,10 @@ impl Pipeline {
             let source_timecode = v.source_timecode.clone().or_else(|| {
                 sony.as_deref()
                     .and_then(|xml| align_core::meta::sony_timecode(xml, fallback))
+                    .map(|timecode| align_core::SourceTimecode {
+                        derived: true,
+                        ..timecode
+                    })
             });
             align_core::VideoSummary {
                 width: v.width,
@@ -736,7 +740,10 @@ impl Pipeline {
                 }
                 for samples in &channels {
                     if let Some(timecode) = crate::ltc::detect(samples, sample_rate) {
-                        audio[stream_index].source_timecode = Some(timecode);
+                        audio[stream_index].source_timecode = Some(align_core::SourceTimecode {
+                            derived: true,
+                            ..timecode
+                        });
                         break 'streams;
                     }
                 }

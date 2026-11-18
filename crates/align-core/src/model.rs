@@ -148,6 +148,10 @@ pub struct SourceTimecode {
     /// field.
     pub frame_duration: MediaTime,
     pub drop_frame: bool,
+    /// Read from an LTC signal or a camera's XML instead of the file's own
+    /// timecode. Editors that take timecode from the file start it at zero.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub derived: bool,
 }
 
 impl SourceTimecode {
@@ -219,6 +223,7 @@ impl SourceTimecode {
             frame_number,
             frame_duration,
             drop_frame,
+            derived: false,
         })
     }
 
@@ -276,6 +281,7 @@ impl SourceTimecode {
             frame_number,
             frame_duration,
             drop_frame,
+            derived: false,
         })
     }
 
@@ -359,6 +365,7 @@ impl SourceTimecode {
             frame_number: samples.try_into().ok()?,
             frame_duration: MediaTime::new(1, rate as i32),
             drop_frame,
+            derived: false,
         })
     }
 }
@@ -1093,6 +1100,7 @@ mod tests {
                     frame_number: 1500,
                     frame_duration: MediaTime::new(1, 25),
                     drop_frame: false,
+                    derived: false,
                 }),
             }],
             video: None,

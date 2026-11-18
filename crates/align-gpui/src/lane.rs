@@ -614,6 +614,7 @@ mod tests {
                     frame_number: (tc_secs * 25.0) as i64,
                     frame_duration: MediaTime::new(1, 25),
                     drop_frame: false,
+                    derived: false,
                 }),
             }],
             video: None,

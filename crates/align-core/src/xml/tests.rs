@@ -1322,3 +1322,60 @@ fn byte_order_mark_keeps_verbatim_payloads_whole() {
     );
 }
 
+/// Final Cut Pro counts source times from each file's timecode and places
+/// the spine at the sequence's timecode start.
+#[test]
+fn fcpxml_times_count_from_file_and_sequence_timecode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fcp.fcpxml");
+    std::fs::write(
+        &path,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.14">
+<resources>
+<format id="r1" frameDuration="1/25s" width="640" height="360"/>
+<asset id="r3" name="camera.mov" start="41217s" duration="16s" hasVideo="1" format="r1" hasAudio="1">
+<media-rep kind="original-media" src="file:///tmp/camera.mov"/></asset>
+<asset id="r6" name="recorder.wav" start="41217s" duration="16s" hasAudio="1">
+<media-rep kind="original-media" src="file:///tmp/recorder.wav"/></asset>
+</resources>
+<library><event name="E"><project name="P">
+<sequence format="r1" duration="401/25s" tcStart="41217s" tcFormat="NDF">
+<spine>
+<gap name="Master" offset="41217s" duration="401/25s">
+<clip lane="1" offset="0s" name="camera.mov" duration="16s"><video ref="r3" offset="0s" start="41217s" duration="16s"/></clip>
+<clip lane="-1" offset="2087/500000s" name="recorder.wav" duration="16s"><audio ref="r6" offset="0s" start="41217s" duration="16s" role="dialogue.dialogue-1"/></clip>
+<clip lane="2" offset="1s" name="trimmed" start="2s" duration="3s"><video ref="r3" offset="0s" start="41217s" duration="16s"/></clip>
+<asset-clip lane="3" ref="r3" offset="5s" name="asset" start="41220s" duration="2s"/>
+</gap>
+</spine>
+</sequence>
+</project></event></library>
+</fcpxml>"#,
+    )
+    .unwrap();
+    let draft = read_timeline(&path, None).unwrap();
+    let edit = |name: &str, kind: DraftMediaKind| {
+        draft
+            .edits
+            .iter()
+            .find(|e| e.name.as_deref() == Some(name) && e.media_type == kind)
+            .unwrap_or_else(|| panic!("{name}"))
+    };
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+    let camera = edit("camera.mov", DraftMediaKind::Video);
+    assert!(near(camera.source_in, 0.0) && near(camera.timeline_start, 0.0));
+    let recorder = edit("recorder.wav", DraftMediaKind::Audio);
+    assert!(near(recorder.source_in, 0.0));
+    assert!(near(recorder.timeline_start, 2087.0 / 500000.0));
+    assert_eq!(
+        recorder.fcpxml_audio_role.as_deref(),
+        Some("dialogue.dialogue-1")
+    );
+    let trimmed = edit("trimmed", DraftMediaKind::Video);
+    assert!(near(trimmed.source_in, 2.0) && near(trimmed.source_out, 5.0));
+    assert!(near(trimmed.timeline_start, 1.0) && near(trimmed.timeline_end, 4.0));
+    let asset = edit("asset", DraftMediaKind::Video);
+    assert!(near(asset.source_in, 3.0) && near(asset.timeline_start, 5.0));
+}

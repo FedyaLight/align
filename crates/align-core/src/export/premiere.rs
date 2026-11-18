@@ -1418,6 +1418,7 @@ fn file_block(item: &ExportItem, media_type: MediaKind, media: &MediaUse) -> Str
                 .frame_duration
                 .unwrap_or(crate::model::MediaTime::new(1, rate.timebase as i32)),
             drop_frame: false,
+            derived: false,
         };
         let source_rate = SequenceRate::new(fallback.frame_duration);
         xml += &format!(
@@ -1609,6 +1610,7 @@ mod tests {
             frame_number: 5_217 * 48_000,
             frame_duration: crate::model::MediaTime::new(1, 48_000),
             drop_frame: false,
+            derived: false,
         });
         let resolve = write(
             &timeline,

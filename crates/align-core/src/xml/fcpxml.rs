@@ -223,6 +223,7 @@ pub(super) fn read_fcpxml(
                             id.to_string(),
                             AssetInfo {
                                 url: fcpxml_url(src, base),
+                                start: fcpxml_time(doc.attr(c, "start")),
                                 has_video: doc.attr(c, "hasVideo") != Some("0"),
                                 has_audio: doc.attr(c, "hasAudio") != Some("0"),
                             },
@@ -284,7 +285,7 @@ pub(super) fn read_fcpxml(
         multicams: &multicams,
     };
     let root = StoryPlacement {
-        shift: 0.0,
+        shift: -sequence_origin(doc, seq),
         enabled_and: true,
         lane_shift: 0,
         depth: 0,
@@ -308,10 +309,46 @@ pub(super) fn read_fcpxml(
     })
 }
 
+/// Where a sequence's spine starts. Final Cut Pro places it at the
+/// sequence's timecode start; Align's earlier FCPXML placed it at zero.
+fn sequence_origin(doc: &XmlDoc, sequence: usize) -> f64 {
+    let tc_start = fcpxml_time(doc.attr(sequence, "tcStart"));
+    let first = doc
+        .children_named(sequence, "spine")
+        .first()
+        .and_then(|&spine| {
+            doc.nodes[spine]
+                .children
+                .iter()
+                .map(|&item| fcpxml_time(doc.attr(item, "offset")))
+                .reduce(f64::min)
+        });
+    if first.is_some_and(|first| first >= tc_start - TIME_TOLERANCE) {
+        tc_start
+    } else {
+        0.0
+    }
+}
+
 pub(super) struct AssetInfo {
     pub(super) url: PathBuf,
+    /// The file's own start: source times count from it.
+    pub(super) start: f64,
     pub(super) has_video: bool,
     pub(super) has_audio: bool,
+}
+
+impl AssetInfo {
+    /// Seconds into the file at FCPXML source time `time`. Align's earlier
+    /// FCPXML counted source times from zero whatever the file's start, so
+    /// a time before the start is taken as counted from zero.
+    fn source_seconds(&self, time: f64) -> f64 {
+        if time >= self.start - TIME_TOLERANCE {
+            time - self.start
+        } else {
+            time
+        }
+    }
 }
 
 /// Shared FCPXML lookup tables for the story walker.
@@ -348,7 +385,11 @@ pub(super) fn emit_fcpxml_asset_clip(
     let _ = id;
     let offset = fcpxml_time(refs.doc.attr(clip, "offset"));
     let duration = fcpxml_time(refs.doc.attr(clip, "duration"));
-    let start = fcpxml_time(refs.doc.attr(clip, "start"));
+    // Without a start the clip begins at the file's start.
+    let start = refs
+        .doc
+        .attr(clip, "start")
+        .map_or(0.0, |start| asset.source_seconds(fcpxml_time(Some(start))));
     let lane: i64 = refs
         .doc
         .attr(clip, "lane")
@@ -470,31 +511,51 @@ pub(super) fn emit_fcpxml_std_clip(
         .unwrap_or(0);
     let enabled = refs.doc.attr(clip, "enabled") != Some("0") && place.enabled_and;
     let clip_name = refs.doc.attr(clip, "name").map(str::to_string);
-    let mut videos = Vec::new();
-    let mut audios = Vec::new();
+    let mut media = Vec::new();
     {
         let mut stack = vec![clip];
         while let Some(n) = stack.pop() {
             for &c in refs.doc.nodes[n].children.iter().rev() {
-                if refs.doc.nodes[c].name == "video" {
-                    videos.push(c);
-                } else if refs.doc.nodes[c].name == "audio" {
-                    audios.push(c);
+                match refs.doc.nodes[c].name.as_str() {
+                    "video" => media.push((c, DraftMediaKind::Video)),
+                    "audio" => media.push((c, DraftMediaKind::Audio)),
+                    _ => {}
                 }
                 stack.push(c);
             }
         }
     }
-    for vid in videos {
-        let (Some(id), Some(asset)) = (
-            refs.doc.attr(vid, "ref"),
-            refs.doc.attr(vid, "ref").and_then(|r| refs.assets.get(r)),
-        ) else {
+    for (element, media_type) in media {
+        let Some(asset) = refs
+            .doc
+            .attr(element, "ref")
+            .and_then(|r| refs.assets.get(r))
+        else {
             continue;
         };
-        let _ = id;
+        // The element sits at `offset` in the clip's own time, which the
+        // clip shows from its `start`, and plays its file from `start`.
+        let element_offset = fcpxml_time(refs.doc.attr(element, "offset"));
+        let element_end = refs
+            .doc
+            .attr(element, "duration")
+            .map_or(f64::INFINITY, |value| {
+                element_offset + fcpxml_time(Some(value))
+            });
+        let local_in = start.max(element_offset);
+        let local_out = (start + duration).min(element_end);
+        if local_out <= local_in {
+            continue;
+        }
+        let media_in = refs
+            .doc
+            .attr(element, "start")
+            .map_or(0.0, |value| asset.source_seconds(fcpxml_time(Some(value))))
+            + (local_in - element_offset);
+        let timeline_start = offset + place.shift + (local_in - start);
         let edit_id = format!("edit-{next_number}");
         *next_number += 1;
+        let audio = media_type == DraftMediaKind::Audio;
         edits.push(DraftEdit {
             id: edit_id,
             name: clip_name.clone().or_else(|| {
@@ -505,11 +566,11 @@ pub(super) fn emit_fcpxml_std_clip(
                     .map(str::to_string)
             }),
             url: asset.url.clone(),
-            media_type: DraftMediaKind::Video,
-            source_in: start,
-            source_out: start + duration,
-            timeline_start: offset + place.shift,
-            timeline_end: offset + place.shift + duration,
+            media_type,
+            source_in: media_in,
+            source_out: media_in + (local_out - local_in),
+            timeline_start,
+            timeline_end: timeline_start + (local_out - local_in),
             playback_rate: 1.0,
             plays_backward: false,
             fcp7_time_remap_xml: None,
@@ -520,61 +581,27 @@ pub(super) fn emit_fcpxml_std_clip(
             fcp7_labels_xml: None,
             time_scale: 1_000_000,
             include_embedded_audio: true,
-            audio_source_channel: None,
-            fcpxml_audio_role: None,
-            track_index: (lane + place.lane_shift).max(0) as usize,
-            enabled,
-            track_enabled: true,
-            track_locked: false,
-            linked_edit_ids: HashSet::new(),
-        });
-    }
-    for aud in audios {
-        let (Some(id), Some(asset)) = (
-            refs.doc.attr(aud, "ref"),
-            refs.doc.attr(aud, "ref").and_then(|r| refs.assets.get(r)),
-        ) else {
-            continue;
-        };
-        let _ = id;
-        let edit_id = format!("edit-{next_number}");
-        *next_number += 1;
-        edits.push(DraftEdit {
-            id: edit_id,
-            name: clip_name.clone().or_else(|| {
-                asset
-                    .url
-                    .file_name()
-                    .and_then(|n| n.to_str())
+            audio_source_channel: if audio {
+                refs.doc
+                    .attr(element, "srcCh")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .and_then(|channel| channel.checked_sub(1))
+            } else {
+                None
+            },
+            fcpxml_audio_role: if audio {
+                refs.doc
+                    .attr(element, "role")
+                    .or_else(|| refs.doc.attr(clip, "audioRole"))
                     .map(str::to_string)
-            }),
-            url: asset.url.clone(),
-            media_type: DraftMediaKind::Audio,
-            source_in: start,
-            source_out: start + duration,
-            timeline_start: offset + place.shift,
-            timeline_end: offset + place.shift + duration,
-            playback_rate: 1.0,
-            plays_backward: false,
-            fcp7_time_remap_xml: None,
-            fcp7_filter_xmls: Vec::new(),
-            fcp7_retime_in: None,
-            fcp7_retime_out: None,
-            fcp7_retime_duration: None,
-            fcp7_labels_xml: None,
-            time_scale: 1_000_000,
-            include_embedded_audio: true,
-            audio_source_channel: refs
-                .doc
-                .attr(aud, "srcCh")
-                .and_then(|value| value.trim().parse::<usize>().ok())
-                .and_then(|channel| channel.checked_sub(1)),
-            fcpxml_audio_role: refs
-                .doc
-                .attr(aud, "role")
-                .or_else(|| refs.doc.attr(clip, "audioRole"))
-                .map(str::to_string),
-            track_index: (lane + place.lane_shift).abs().max(0) as usize,
+            } else {
+                None
+            },
+            track_index: if audio {
+                (lane + place.lane_shift).unsigned_abs() as usize
+            } else {
+                (lane + place.lane_shift).max(0) as usize
+            },
             enabled,
             track_enabled: true,
             track_locked: false,
@@ -639,7 +666,6 @@ pub(super) fn read_fcpxml_story(
                 }
                 let offset = fcpxml_time(refs.doc.attr(node, "offset")) + place.shift;
                 let duration = fcpxml_time(refs.doc.attr(node, "duration"));
-                let start = fcpxml_time(refs.doc.attr(node, "start"));
                 let enabled = refs.doc.attr(node, "enabled") != Some("0") && place.enabled_and;
                 let lane = refs
                     .doc
@@ -647,15 +673,19 @@ pub(super) fn read_fcpxml_story(
                     .and_then(|s| s.parse::<i64>().ok())
                     .unwrap_or(0)
                     + place.lane_shift;
-                let spine = refs
+                // Compound media wraps one sequence; its spine holds the
+                // story elements, and the clip shows it from its start.
+                let inner = refs
                     .doc
                     .children_named(seq_node, "sequence")
                     .first()
-                    .and_then(|&s| {
-                        // Compound media wraps one sequence; its spine
-                        // holds the story elements.
-                        refs.doc.children_named(s, "spine").first().copied()
-                    });
+                    .copied();
+                let start = refs.doc.attr(node, "start").map_or_else(
+                    || inner.map_or(0.0, |s| sequence_origin(refs.doc, s)),
+                    |start| fcpxml_time(Some(start)),
+                );
+                let spine =
+                    inner.and_then(|s| refs.doc.children_named(s, "spine").first().copied());
                 let Some(spine) = spine else {
                     warn(
                         &mut *warnings,
@@ -780,6 +810,24 @@ pub(super) fn read_fcpxml_story(
                     &mut *next_number,
                 );
             }
+            // Clips connected to a gap sit in the gap's own time.
+            "gap" => {
+                let child = StoryPlacement {
+                    shift: place.shift + fcpxml_time(refs.doc.attr(node, "offset"))
+                        - fcpxml_time(refs.doc.attr(node, "start")),
+                    ..place
+                };
+                let kids = refs.doc.nodes[node].children.clone();
+                read_fcpxml_story(
+                    refs,
+                    &kids,
+                    child,
+                    &mut *visited,
+                    &mut *warnings,
+                    &mut *edits,
+                    &mut *next_number,
+                );
+            }
             "spine" => {
                 let offset = fcpxml_time(refs.doc.attr(node, "offset"));
                 let lane = refs
@@ -862,7 +910,16 @@ pub(super) fn read_fcpxml_multicam(
     }
     let offset = fcpxml_time(refs.doc.attr(node, "offset")) + place.shift;
     let duration = fcpxml_time(refs.doc.attr(node, "duration"));
-    let start = fcpxml_time(refs.doc.attr(node, "start"));
+    let multicam = refs
+        .doc
+        .children_named(mc_node, "multicam")
+        .first()
+        .copied();
+    // Without a start the clip shows its angles from the multicam's start.
+    let start = refs.doc.attr(node, "start").map_or_else(
+        || multicam.map_or(0.0, |m| fcpxml_time(refs.doc.attr(m, "tcStart"))),
+        |start| fcpxml_time(Some(start)),
+    );
     let enabled = refs.doc.attr(node, "enabled") != Some("0") && place.enabled_and;
     let lane = refs
         .doc
@@ -872,7 +929,7 @@ pub(super) fn read_fcpxml_multicam(
         + place.lane_shift;
     let mc_end = offset + duration;
     let mut angles: HashMap<String, usize> = HashMap::new();
-    if let Some(&mcam) = refs.doc.children_named(mc_node, "multicam").first() {
+    if let Some(mcam) = multicam {
         for angle in refs.doc.children_named(mcam, "mc-angle") {
             if let Some(id) = refs.doc.attr(angle, "angleID") {
                 angles.entry(id.to_string()).or_insert(angle);

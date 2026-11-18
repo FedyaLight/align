@@ -43,6 +43,10 @@ import script, and FCPXML. A batch combines sequences into one Premiere XML,
 one FCPXML, or one AAF where applicable; Resolve artifacts are written per
 sequence. AAF is selected explicitly with `--aaf`.
 
+Final Cut Pro counts source times from the start timecode it reads from each
+file. Timecode that Align reads from LTC audio or from a camera's XML is not
+in the file, so in FCPXML such a file starts at zero, as Final Cut Pro shows it.
+
 ## Organized source clips
 
 **Organize imported source clips** in the export sheet, or `--media-bins`,
