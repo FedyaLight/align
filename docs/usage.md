@@ -168,6 +168,20 @@ proxy media when available. `--omit-extensions` excludes selected
 comma-separated extensions referenced by the timeline. Repair writes a copy;
 it cannot replace the source project.
 
+## Opening the export
+
+| Editor | Open | Sound |
+| --- | --- | --- |
+| Premiere Pro | `Align – Adobe Premiere Pro.xml` (File → Import) | Starts on the nearest frame. A two-channel recording is one stereo clip; a recording of more channels has a mono track per channel, as Premiere imports it itself. |
+| Final Cut Pro | `Align – Final Cut Pro.fcpxml` (File → Import → XML) | Keeps its exact place. A multichannel recording is one clip with a subrole per channel. |
+| DaVinci Resolve | Run `Align – DaVinci Resolve.py` with Resolve open and its external scripting set to Local | Placed on the sample nearest its place; each recording is one clip on a mono, stereo, or adaptive track of its format. The script also names and colors clips and files media into folders. |
+| DaVinci Resolve, without scripting | `Align – DaVinci Resolve.xml` (File → Import → Timeline) | Starts on the nearest frame, each channel on a mono track. Clip names and colors are not imported. |
+| Other AAF editors | The AAF export | Starts on the nearest frame, each channel on a mono track. |
+
+The OTIO file is the script's timeline; imported on its own, Resolve places
+its sound on frames too. Sound on the nearest frame is within half a frame of
+its place, as with other synchronization tools.
+
 ## Export options
 
 By default, export writes the standard editor formats. `--aaf` selects AAF
