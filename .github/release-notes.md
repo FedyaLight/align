@@ -3,40 +3,56 @@ matching, timecode, and recording metadata.
 
 ## What's new in @VERSION@
 
-- **Damaged audio no longer stops synchronization.** On Windows and Linux, one
-  file with a damaged audio packet could stop the whole run with "Decode error:
-  symphonia: unexpected end of bitstream." The damaged part now becomes silence
-  of the same length, and the rest of the file synchronizes at its correct
-  offset. When Align's built-in decoder cannot read a file, FFmpeg reads it
-  again. A file neither can read is left out with a warning that names it, and
-  the other files still synchronize.
-- **MXF on macOS.** macOS could not read MXF: Canon XF-AVC, Sony XAVC and
-  other MXF clips were left out with "Decode error: invalid PCM." The macOS app
-  now includes a minimal FFmpeg (about 7 MB) and uses it only for MXF.
-- **Camera metadata XML is skipped.** Selecting camera clips together with the
-  XML files cameras write beside them stopped the run with "Add one timeline
-  at a time." Only FCP 7 XML and FCPXML documents are now imported as
-  timelines.
-- **Faster loading.** Each file is inspected with one ffprobe call instead of
-  up to three, four files at a time. With eight Canon C70 MXF clips and five
-  other files, reading metadata took 1.2 seconds instead of 24, and the
-  timecode of the MXF clips, which was missing before, is now read.
-- **FCPXML bundles.** `.fcpxmld` bundles from Final Cut Pro 10.6 and later
-  import as timelines, and Path Fixer saves a repaired bundle as a bundle.
-  Media paths relative to an FCPXML document now resolve from its folder.
-- **More accurate offsets on Windows and Linux.** MP3 files were placed 23 to
-  25 ms early, and AVCHD clips with AC-3 audio 5.3 ms early; both are now on
-  time. MXF is no longer mistaken for MP3 audio. MP4 files with HE-AAC audio,
-  which did not match at all, now match, though their offset can still be
-  about 60 ms off.
+- **Source clips organized by camera and recorder.** With **Organize imported
+  source clips** in the export sheet (`--media-bins` in the CLI), editors open the
+  export with the source files grouped by the folder they were copied into:
+  Premiere Pro bins, Final Cut Pro keyword collections, and folders in the
+  DaVinci Resolve media pool made by the import script. Files Align rendered
+  for the timeline, such as drift corrections, get a group of their own.
+  Thanks to @yingaboy for suggesting it (#26).
+- **Premiere export of a camera whose audio ends early.** Exporting a MOV whose
+  audio track is shorter than its video failed with "Cannot decode audio for
+  drift correction." It now exports. Thanks to @Manuel36791 for reporting it
+  (#27).
+- **Exports checked in the editors.** Every export was opened and played back
+  in Premiere Pro 2027, Final Cut Pro 12.3 and DaVinci Resolve 21.1, and what
+  they showed is fixed:
+  - Premiere and Resolve start imported sound only on a frame, so Premiere XML,
+    Resolve XML and AAF place it on the nearest frame, within half a frame, as
+    other synchronization tools do. Align no longer renders copies of
+    recordings to shift them between frames; only drift corrections, and mono
+    channel copies for AAF, are rendered.
+  - A stereo recording or camera is one stereo clip in Premiere Pro, and a
+    multichannel recording one clip in Final Cut Pro. The Resolve import script
+    places every recording, and a camera's sound linked to its picture, as one
+    clip on a mono, stereo or adaptive track, on the sample nearest its place.
+  - Final Cut Pro imports projects without format warnings, multicam angles
+    play their sound in time, and recordings that start inside a frame stay
+    in place.
+  - Takes of one recorder stay on one track, and where two takes overlap, the
+    first now ends where the second starts in every format.
+  - In edits kept from an imported timeline, Premiere no longer freezes on
+    reversed clips, Resolve XML plays speed changes, and the Resolve import
+    script keeps dissolves, crossfades and locked tracks.
+  - Premiere opens AAF without picture at its frame rate rather than 29.97,
+    AAF timecode is drop-frame when the source's is, and AAF cameras share one
+    picture track.
+  - The usage guide lists which file to open in each editor.
+- **Faster synchronization.** Matches that would be discarded anyway are no
+  longer refined, FFmpeg reads each file's header once rather than for every
+  analysis window, and an AAF project is read once for all its sequences.
+  Eight overlapping takes synchronized in 0.85 s instead of 1.34 s, and with
+  the decoder Windows and Linux use, six AVCHD clips with AC-3 audio in 175 ms
+  instead of 317 ms.
+- **More reliable synchronization.** On macOS, a file AVFoundation stops
+  reading is read with the bundled decoder instead of stopping the run. A
+  clip whose timecode alignment with one partner was rejected now joins the
+  next one. MCP tool results are JSON objects, as MCP clients expect.
 
-On Windows and Linux, the first synchronization after the update analyses
-every file again, because fingerprints from the previous decoder are not
-reused.
-
-Thanks to @Opragopa for reporting the decode error with Canon footage (#16),
-which also led to the MXF and camera XML fixes, and for proposing parallel
-inspection (#17).
+Exports from this version place sound in Premiere Pro, DaVinci Resolve and AAF
+on frames: an edit that relied on sub-frame placement in those formats can
+move by up to half a frame. Final Cut Pro and the Resolve import script keep
+sound on its sample.
 
 ## Downloads
 
