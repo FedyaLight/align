@@ -18,7 +18,7 @@ use align_core::drift::needs_correction_points;
 use align_core::export::fcpxml::FcpxmlOptions;
 use align_core::export::model::{
     ExportIsland, ExportItem, ExportTimeline, TimelineExportError, TimelineExportFormat,
-    placement_pad_samples, sequence_fps,
+    aaf_lead_samples, placement_pad_samples, sequence_fps,
 };
 use align_core::export::premiere::PremiereOptions;
 use align_core::model::file_name;
@@ -571,6 +571,7 @@ enum AudioJobKind {
         is_float: bool,
         source_start: f64,
         duration: f64,
+        lead_samples: u64,
         tail_samples: u64,
     },
 }
@@ -604,17 +605,29 @@ impl AudioPlan {
                 None
             }
         };
+        // AAF audio that does not start on a whole-sample composition frame
+        // plays stems that lead with silence instead of the plain ones.
+        let aaf_frame = options
+            .aaf_frame_duration
+            .unwrap_or(combined.frame_duration);
+        let aaf_item = |item: &ExportItem| {
+            wants_aaf && !item.clip.audio.is_empty() && item.is_enabled(MediaKind::Audio)
+        };
+        let aaf_lead = |item: &ExportItem| {
+            let rate = item.clip.audio.first()?.sample_rate;
+            if !aaf_item(item) || item.is_retimed(MediaKind::Audio) {
+                return None;
+            }
+            aaf_lead_samples(item.timeline_start(MediaKind::Audio), aaf_frame, rate)
+        };
         let needs_precision = |item: &ExportItem| {
             let channels = item.clip.audio.first().map_or(0, |a| a.channels);
-            wants_precision
-                && (item.clip.kind == MediaKind::Audio
-                    || (wants_aaf
-                        && !item.clip.audio.is_empty()
-                        && item.is_enabled(MediaKind::Audio)))
-                && (wants_aaf
-                    || channels > 1
+            let for_resolve_or_fcp = wants_precision
+                && item.clip.kind == MediaKind::Audio
+                && (channels > 1
                     || !item.is_full_source_selection()
-                    || item.precision_tail_samples > 0)
+                    || item.precision_tail_samples > 0);
+            for_resolve_or_fcp || (aaf_item(item) && aaf_lead(item).is_none())
         };
 
         // Every item of a corrected clip plays its drift sidecar, and every
@@ -635,7 +648,8 @@ impl AudioPlan {
         for item in items() {
             let needs_file = corrected_clips.contains(item.clip.id.0.as_str())
                 || pad(item).is_some()
-                || precision_assets.contains(&item.precision_asset_key());
+                || precision_assets.contains(&item.precision_asset_key())
+                || aaf_lead(item).is_some();
             if needs_file && !source_tags.contains_key(&item.clip.url) {
                 source_tags.insert(
                     item.clip.url.clone(),
@@ -742,60 +756,74 @@ impl AudioPlan {
                         prepared.with_placement_pad(destination, samples as f64 / sample_rate);
                 }
 
-                let key = item.precision_asset_key();
-                if precision_assets.contains(&key) {
-                    let outputs = match precision_files.get(&key) {
-                        Some(outputs) => outputs.clone(),
-                        None => {
-                            let corrected = prepared.corrected_audio_url.clone();
-                            let audio = item.clip.audio.first();
-                            // Drift sidecars are always 32-bit float.
-                            let (bit_depth, is_float) = match corrected {
-                                Some(_) => (Some(32), true),
-                                None => (
-                                    audio.and_then(|a| a.bit_depth),
-                                    audio.and_then(|a| a.is_float).unwrap_or(false),
-                                ),
-                            };
-                            let origin = if corrected.is_some() {
-                                "corrected"
-                            } else {
-                                "original"
-                            };
-                            let digest = prepared.precision_digest();
-                            let outputs: Vec<_> = (0..audio.map_or(0, |a| a.channels))
-                                .map(|channel| {
-                                    precision_dir.join(sidecar_name(
-                                        media,
-                                        &format!("channel {}", channel + 1),
-                                        &[
-                                            "channel",
-                                            &channel.to_string(),
-                                            id,
-                                            &digest,
-                                            &source_tags[media],
-                                            origin,
-                                        ],
-                                    ))
-                                })
-                                .collect();
-                            jobs.push(AudioJob {
-                                media: media.clone(),
-                                kind: AudioJobKind::Stems {
-                                    source: corrected.unwrap_or_else(|| media.clone()),
-                                    outputs: outputs.clone(),
-                                    bit_depth,
-                                    is_float,
-                                    source_start: prepared.precision_source_start(),
-                                    duration: prepared.precision_source_duration(),
-                                    tail_samples: prepared.precision_tail_samples,
-                                },
-                            });
-                            precision_files.insert(key, outputs.clone());
-                            outputs
-                        }
+                // Mono stems of every channel over the selected range, after
+                // `lead` samples of silence; one render per distinct range.
+                let mut stems = |prepared: &ExportItem, lead: u64| {
+                    let key = format!("{}-{lead}", item.precision_asset_key());
+                    if let Some(outputs) = precision_files.get(&key) {
+                        return outputs.clone();
+                    }
+                    let corrected = prepared.corrected_audio_url.clone();
+                    let audio = item.clip.audio.first();
+                    // Drift sidecars are always 32-bit float.
+                    let (bit_depth, is_float) = match corrected {
+                        Some(_) => (Some(32), true),
+                        None => (
+                            audio.and_then(|a| a.bit_depth),
+                            audio.and_then(|a| a.is_float).unwrap_or(false),
+                        ),
                     };
+                    let origin = if corrected.is_some() {
+                        "corrected"
+                    } else {
+                        "original"
+                    };
+                    let digest = prepared.precision_digest();
+                    let lead_tag = lead.to_string();
+                    let outputs: Vec<_> = (0..audio.map_or(0, |a| a.channels))
+                        .map(|channel| {
+                            let label = match lead {
+                                0 => format!("channel {}", channel + 1),
+                                _ => format!("channel {} – pad {lead}", channel + 1),
+                            };
+                            let channel = channel.to_string();
+                            let mut identity = vec![
+                                "channel",
+                                &channel,
+                                id,
+                                &digest,
+                                &source_tags[media],
+                                origin,
+                            ];
+                            if lead > 0 {
+                                identity.extend(["lead", &lead_tag]);
+                            }
+                            precision_dir.join(sidecar_name(media, &label, &identity))
+                        })
+                        .collect();
+                    jobs.push(AudioJob {
+                        media: media.clone(),
+                        kind: AudioJobKind::Stems {
+                            source: corrected.unwrap_or_else(|| media.clone()),
+                            outputs: outputs.clone(),
+                            bit_depth,
+                            is_float,
+                            source_start: prepared.precision_source_start(),
+                            duration: prepared.precision_source_duration(),
+                            lead_samples: lead,
+                            tail_samples: prepared.precision_tail_samples,
+                        },
+                    });
+                    precision_files.insert(key, outputs.clone());
+                    outputs
+                };
+                if precision_assets.contains(&item.precision_asset_key()) {
+                    let outputs = stems(&prepared, 0);
                     prepared = prepared.with_precision_audio(outputs);
+                }
+                if let Some(lead) = aaf_lead(item) {
+                    let outputs = stems(&prepared, lead);
+                    prepared = prepared.with_aaf_audio(outputs, lead);
                 }
                 clips.push(prepared);
             }
@@ -858,6 +886,7 @@ impl AudioJob {
                 is_float,
                 source_start,
                 duration,
+                lead_samples,
                 tail_samples,
             } => {
                 let missing: Vec<_> = outputs
@@ -878,6 +907,7 @@ impl AudioJob {
                         is_float: *is_float,
                         source_start: *source_start,
                         duration: *duration,
+                        lead_samples: *lead_samples,
                         tail_samples: *tail_samples,
                     },
                     cancel,
@@ -1600,6 +1630,73 @@ mod tests {
         assert!(dir.join("Sequence 01 – First_cut").is_dir());
         assert!(dir.join("Sequence 02 – Second cut").is_dir());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Premiere starts AAF audio on a frame, so a recorder 200 samples past
+    /// one plays stems that lead with that much silence; Resolve's plain
+    /// stems are planned as before.
+    #[test]
+    fn aaf_audio_past_a_frame_plays_stems_that_lead_with_silence() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("recorder.wav");
+        let mut writer = hound::WavWriter::create(
+            &source,
+            hound::WavSpec {
+                channels: 2,
+                sample_rate: 48000,
+                bits_per_sample: 24,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for _ in 0..48000 * 2 {
+            writer.write_sample(0).unwrap();
+        }
+        writer.finalize().unwrap();
+        let mut recorder = item("rec", MediaKind::Audio, 200.0 / 48000.0, 1.0);
+        recorder.clip.url = source;
+        let mut aligned = recorder.clone();
+        aligned.instance_id = "aligned".into();
+        aligned.start = 0.04;
+        let timeline = ExportTimeline::new(
+            vec![ExportIsland {
+                id: 0,
+                clips: vec![recorder, aligned],
+                duration: 1.04,
+            }],
+            MediaTime::new(1, 25),
+            "AAF",
+        );
+        let options = ExportOptions {
+            formats: vec![
+                TimelineExportFormat::Aaf,
+                TimelineExportFormat::ResolveScript,
+            ],
+            correct_drift: false,
+            ..ExportOptions::default()
+        };
+        let plan = AudioPlan::new(
+            &timeline,
+            &options,
+            dir.path(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        let items = &plan.timeline.islands[0].clips;
+        assert_eq!(items[0].aaf_lead_samples, 200);
+        assert_eq!(items[0].aaf_audio_urls.len(), 2);
+        assert_eq!(items[0].precision_audio_urls.len(), 2);
+        assert!(items[1].aaf_audio_urls.is_empty());
+        let leads: Vec<u64> = plan
+            .jobs
+            .iter()
+            .filter_map(|job| match &job.kind {
+                AudioJobKind::Stems { lead_samples, .. } => Some(*lead_samples),
+                _ => None,
+            })
+            .collect();
+        // Both items select the same range, so they share the plain stems.
+        assert_eq!(leads, vec![0, 200]);
     }
 
     #[test]

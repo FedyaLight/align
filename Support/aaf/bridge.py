@@ -89,49 +89,12 @@ def write_composition(container, document):
         frames = duration * rate
         timecode = composition.create_timeline_slot(str(rate))
         timecode.name = 'Timecode'
+        timecode['PhysicalTrackNumber'].value = 1
         timecode.segment = container.create.Timecode(fps=round(rate), drop=False,
             length=(frames.numerator + frames.denominator - 1) // frames.denominator)
         timecode.segment.start = 0
-    for track in picture_tracks:
-        numerator = integer(track['edit_rate']['numerator'], 'edit_rate numerator', 1)
-        denominator = integer(track['edit_rate']['denominator'], 'edit_rate denominator', 1)
-        rate = Fraction(numerator, denominator)
-        slot = composition.create_timeline_slot(str(rate))
-        slot.name = track['name']
-        slot.segment = container.create.Sequence(media_kind='picture')
-        cursor = 0
-        for clip in track['clips']:
-            path = Path(clip['path']).resolve(strict=True)
-            start = integer(clip['start'], 'start')
-            source_in = integer(clip['source_in'], 'source_in')
-            length = integer(clip['length'], 'length', 1)
-            master, _, tape = container.content.create_ama_link(str(path), clip['metadata'])
-            sources = [source for source in master.slots if source.media_kind == 'Picture']
-            if len(sources) != 1:
-                raise ValueError('AAF picture requires one video stream')
-            source = sources[0]
-            if Fraction(str(source.edit_rate)) != rate:
-                raise ValueError('AAF picture rate conversion is not implemented')
-            available = sum(part.length for part in source.segment.components)
-            if start < cursor or source_in + length > available:
-                raise ValueError('Overlapping or out-of-bounds AAF picture clip')
-            if clip.get('timecode') is not None:
-                # Editors locate the file by its start timecode, which the
-                # tape mob carries; without it Resolve looks for frames from
-                # 00:00:00:00 and leaves the picture offline.
-                timecode = clip['timecode']
-                tape_clock = tape.create_timeline_slot(str(rate))
-                tape_clock.name = 'Timecode'
-                tape_clock.segment = container.create.Timecode(
-                    fps=integer(timecode['fps'], 'timecode fps', 1),
-                    drop=timecode['drop'] is True, length=available)
-                tape_clock.segment.start = integer(timecode['start'], 'timecode start')
-            if start > cursor:
-                slot.segment.components.append(container.create.Filler('picture', start - cursor))
-            slot.segment.components.append(master.create_source_clip(
-                slot_id=source.slot_id, start=source_in, length=length, media_kind='picture'))
-            cursor = start + length
-        slot.segment.length = cursor
+    if picture_tracks:
+        write_picture(container, composition, picture_tracks, rate)
     for track in tracks:
         rate = integer(track['sample_rate'], 'sample_rate', 1)
         slot = composition.create_sound_slot(edit_rate=rate)
@@ -160,6 +123,97 @@ def write_composition(container, document):
                 slot_id=1, start=source_in, length=length, media_kind='sound'))
             cursor = start + length
         slot.segment.length = cursor
+
+
+def write_picture(container, composition, picture_tracks, rate):
+    """One picture track at the composition rate, layered like Resolve's own.
+
+    Resolve opens a single picture track; with one per camera it asks which
+    one to open and drops the others. Premiere counts every picture unit at
+    its sequence rate. So each camera's frames are counted in composition
+    frames, and cameras that overlap are stacked as layers of a nested scope,
+    the upper layers showing the one below where they have no clip.
+    """
+    def frames(value, native):
+        exact = Fraction(value) * rate / native
+        return (2 * exact.numerator + exact.denominator) // (2 * exact.denominator)
+
+    layers = []
+    for track in picture_tracks:
+        native = Fraction(integer(track['edit_rate']['numerator'], 'edit_rate numerator', 1),
+            integer(track['edit_rate']['denominator'], 'edit_rate denominator', 1))
+        layer = []
+        cursor = 0
+        for clip in track['clips']:
+            path = Path(clip['path']).resolve(strict=True)
+            start = integer(clip['start'], 'start')
+            source_in = integer(clip['source_in'], 'source_in')
+            length = integer(clip['length'], 'length', 1)
+            master, _, tape = container.content.create_ama_link(str(path), clip['metadata'])
+            sources = [source for source in master.slots if source.media_kind == 'Picture']
+            if len(sources) != 1:
+                raise ValueError('AAF picture requires one video stream')
+            source = sources[0]
+            if Fraction(str(source.edit_rate)) != native:
+                raise ValueError('AAF picture rate differs from its media')
+            available = sum(part.length for part in source.segment.components)
+            if start < cursor or source_in + length > available:
+                raise ValueError('Overlapping or out-of-bounds AAF picture clip')
+            if clip.get('timecode') is not None:
+                # Editors locate the file by its start timecode, which the
+                # tape mob carries; without it Resolve looks for frames from
+                # 00:00:00:00 and leaves the picture offline.
+                timecode = clip['timecode']
+                tape_clock = tape.create_timeline_slot(str(native))
+                tape_clock.name = 'Timecode'
+                tape_clock.segment = container.create.Timecode(
+                    fps=integer(timecode['fps'], 'timecode fps', 1),
+                    drop=timecode['drop'] is True, length=available)
+                tape_clock.segment.start = integer(timecode['start'], 'timecode start')
+            # Boundaries convert separately, so gaps and clips do not
+            # accumulate rounding; the clip stays within its file.
+            begin, first = frames(start, native), frames(source_in, native)
+            end = begin + min(frames(start + length, native) - begin,
+                available * rate // native - first)
+            if end <= begin:
+                raise ValueError('AAF picture clip is shorter than a composition frame')
+            layer.append((begin, end, master, source.slot_id, first))
+            cursor = start + length
+        layers.append(layer)
+    duration = max(layer[-1][1] for layer in layers)
+
+    def gap(length, below):
+        if not below:
+            return container.create.Filler('picture', length)
+        reference = container.create.ScopeReference(media_kind='picture', length=length)
+        reference['RelativeScope'].value = 0
+        reference['RelativeSlot'].value = 1
+        return reference
+
+    def sequence(layer, below, length):
+        segment = container.create.Sequence(media_kind='picture')
+        cursor = 0
+        for begin, end, master, slot_id, first in layer:
+            if begin > cursor:
+                segment.components.append(gap(begin - cursor, below))
+            segment.components.append(master.create_source_clip(
+                slot_id=slot_id, start=first, length=end - begin, media_kind='picture'))
+            cursor = end
+        if length > cursor:
+            segment.components.append(gap(length - cursor, below))
+        segment.length = length
+        return segment
+
+    slot = composition.create_timeline_slot(str(rate))
+    slot.name = 'V1'
+    slot['PhysicalTrackNumber'].value = 1
+    if len(layers) == 1:
+        slot.segment = sequence(layers[0], False, layers[0][-1][1])
+        return
+    stack = container.create.NestedScope(media_kind='picture', length=duration)
+    for index, layer in enumerate(layers):
+        stack.slots.append(sequence(layer, index > 0, duration))
+    slot.segment = stack
 
 
 def write_audio(document, destination):
@@ -244,6 +298,29 @@ def repair_paths(document, source, destination):
     return changed
 
 
+def track_document(name, media_kind, rate, clips, audio_only):
+    """A read track with times in its edit rate, or an exact tick clock."""
+    # Keep the declared frame clock when it represents every boundary.
+    # Otherwise use an exact shared tick clock, retaining the edit rate.
+    times = [clip[field] for clip in clips for field in ('start', 'source_in', 'length')]
+    clock = rate
+    if any((value * rate).denominator != 1 for value in times):
+        clock = Fraction(math.lcm(rate.numerator, *(value.denominator for value in times)), 1)
+    if audio_only and clock.denominator != 1:
+        clock = Fraction(clock.numerator, 1)
+    if clock.numerator > 2147483647:
+        raise ValueError('AAF exact clock exceeds supported precision')
+    for clip in clips:
+        for field in ('start', 'source_in', 'length'):
+            clip[field] = int(clip[field] * clock)
+    if audio_only:
+        return {'name': name, 'sample_rate': int(clock), 'clips': clips}
+    return {'name': name, 'media_kind': media_kind.lower(),
+        'edit_rate': {'numerator': rate.numerator, 'denominator': rate.denominator},
+        'time_rate': {'numerator': clock.numerator, 'denominator': clock.denominator},
+        'clips': clips}
+
+
 def read_timeline(path, audio_only=False, extract_dir=None):
     """Read linked picture/sound edits; retain each track's rational clock."""
     with aaf2.open(str(path), 'r') as container:
@@ -315,7 +392,9 @@ def read_timeline(path, audio_only=False, extract_dir=None):
             source_rate = Fraction(str(slot.edit_rate))
             if source_rate <= 0:
                 raise ValueError('Invalid AAF source edit rate')
-            source_start = Fraction(int(clip.start), 1) / source_rate + offset
+            # A clip's start counts in its own track's edit units, as Resolve
+            # writes it: frame 48 of a 24 fps file on a 25 fps track is 50.
+            source_start = Fraction(int(clip.start), 1) / rate + offset
             if isinstance(mob, aaf2.mobs.SourceMob):
                 descriptor = mob.descriptor
                 if slot.media_kind == 'Sound' and mob.essence is not None:
@@ -356,7 +435,7 @@ def read_timeline(path, audio_only=False, extract_dir=None):
                 if begin < end:
                     if isinstance(part, aaf2.components.SourceClip):
                         output.extend(resolve(part, source_rate, visited | {key}, begin - cursor, end - begin))
-                    elif isinstance(part, aaf2.components.Filler):
+                    elif isinstance(part, (aaf2.components.Filler, aaf2.components.ScopeReference)):
                         output.append((None, 0, None, end - begin))
                     else:
                         raise ValueError('Unsupported AAF source component')
@@ -377,44 +456,34 @@ def read_timeline(path, audio_only=False, extract_dir=None):
                 rate = Fraction(str(slot.edit_rate))
                 if rate <= 0:
                     raise ValueError('Unsupported AAF edit rate')
-                parts = components(slot.segment)
-                clips = []
-                cursor = Fraction(0)
-                for part in parts:
-                    part = selected(part)
-                    length = Fraction(int(part.length), 1) / rate
-                    if length < 0:
-                        raise ValueError('Negative AAF component length')
-                    if isinstance(part, aaf2.components.SourceClip):
-                        position = cursor
-                        for media, source_in, channel, span in resolve(part, rate, set()):
-                            if media is not None and span:
-                                clips.append({'path': media, 'start': position, 'source_in': source_in,
-                                    'length': span, 'channel': channel})
-                            position += span
-                    elif not isinstance(part, aaf2.components.Filler):
-                        raise ValueError('Unsupported AAF timeline component')
-                    cursor += length
-                # Keep the declared frame clock when it represents every boundary.
-                # Otherwise use an exact shared tick clock, retaining the edit rate.
-                times = [clip[field] for clip in clips for field in ('start', 'source_in', 'length')]
-                clock = rate
-                if any((value * rate).denominator != 1 for value in times):
-                    clock = Fraction(math.lcm(rate.numerator, *(value.denominator for value in times)), 1)
-                if audio_only and clock.denominator != 1:
-                    clock = Fraction(clock.numerator, 1)
-                if clock.numerator > 2147483647:
-                    raise ValueError('AAF exact clock exceeds supported precision')
-                for clip in clips:
-                    for field in ('start', 'source_in', 'length'):
-                        clip[field] = int(clip[field] * clock)
-                if audio_only:
-                    tracks.append({'name': slot.name or '', 'sample_rate': int(clock), 'clips': clips})
-                else:
-                    tracks.append({'name': slot.name or '', 'media_kind': slot.media_kind.lower(),
-                        'edit_rate': {'numerator': rate.numerator, 'denominator': rate.denominator},
-                        'time_rate': {'numerator': clock.numerator, 'denominator': clock.denominator},
-                        'clips': clips})
+                # A nested scope stacks layers, each its own track; where an
+                # upper layer refers to the scope it shows the layer below.
+                segment = selected(slot.segment)
+                layers = (list(segment['Slots'].value)
+                    if isinstance(segment, aaf2.components.NestedScope) else [segment])
+                for index, layer in enumerate(layers):
+                    clips = []
+                    cursor = Fraction(0)
+                    for part in components(layer):
+                        part = selected(part)
+                        length = Fraction(int(part.length), 1) / rate
+                        if length < 0:
+                            raise ValueError('Negative AAF component length')
+                        if isinstance(part, aaf2.components.SourceClip):
+                            position = cursor
+                            for media, source_in, channel, span in resolve(part, rate, set()):
+                                if media is not None and span:
+                                    clips.append({'path': media, 'start': position,
+                                        'source_in': source_in, 'length': span, 'channel': channel})
+                                position += span
+                        elif not isinstance(part, (aaf2.components.Filler,
+                                aaf2.components.ScopeReference)):
+                            raise ValueError('Unsupported AAF timeline component')
+                        cursor += length
+                    name = slot.name or ''
+                    if len(layers) > 1:
+                        name = f'{name} {index + 1}'.strip()
+                    tracks.append(track_document(name, slot.media_kind, rate, clips, audio_only))
             sequences.append({'name': composition.name, 'tracks': tracks})
         if not sequences:
             raise ValueError('AAF has no top-level composition')

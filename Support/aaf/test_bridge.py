@@ -129,8 +129,9 @@ class SourceValidation(unittest.TestCase):
                 middle = container.create.MasterMob('Edit 25')
                 container.content.mobs.append(middle)
                 middle_slot = middle.create_timeline_slot(25)
+                # Starts count in the containing track's edit units.
                 middle_slot.segment = mob.create_source_clip(slot_id=native.slot_id,
-                    start=48001, length=5, media_kind='sound')
+                    start=26, length=5, media_kind='sound')
                 composition = container.create.CompositionMob('Edit 29.97')
                 composition.usage = 'Usage_TopLevel'
                 container.content.mobs.append(composition)
@@ -142,9 +143,10 @@ class SourceValidation(unittest.TestCase):
             result = read_timeline(path, extract_dir=root / 'extracted')
             track = result['sequences'][0]['tracks'][0]
             self.assertEqual(track['edit_rate'], {'numerator': 30000, 'denominator': 1001})
-            self.assertEqual(track['time_rate'], {'numerator': 240000, 'denominator': 1})
+            self.assertEqual(track['time_rate'], {'numerator': 30000, 'denominator': 1})
             clip = track['clips'][0]
-            self.assertEqual((clip['start'], clip['source_in'], clip['length']), (8008, 249605, 24024))
+            # 1/29.97 s into the 25 fps edit, whose clip starts 26/25 s in.
+            self.assertEqual((clip['start'], clip['source_in'], clip['length']), (1001, 32201, 3003))
             # Embedded PCM's sample rate can differ from its SourceMob slot clock.
             with aaf2.open(str(path), 'rw') as container:
                 native_mob = next(container.content.sourcemobs())
@@ -155,7 +157,7 @@ class SourceValidation(unittest.TestCase):
             clip = track['clips'][0]
             from fractions import Fraction
             clock = Fraction(track['time_rate']['numerator'], track['time_rate']['denominator'])
-            self.assertEqual(Fraction(clip['source_in'], 1) / clock, Fraction(26, 25))
+            self.assertEqual(Fraction(clip['source_in'], 1) / clock, Fraction(31001, 30000))
 
 
     def test_nested_source_sequence_splits_cuts_and_preserves_gaps(self):
@@ -255,13 +257,56 @@ class SourceValidation(unittest.TestCase):
                 picture = next(slot for slot in top.slots if slot.media_kind == 'Picture')
                 self.assertEqual(str(timecode.edit_rate), '25')
                 self.assertEqual(timecode.segment.length, 91)
-                self.assertEqual(str(picture.edit_rate), '30000/1001')
+                # Picture counts in composition frames, as editors read it.
+                self.assertEqual(str(picture.edit_rate), '25')
+                clip = picture.segment.components[-1]
+                self.assertEqual((clip.start, clip.length), (9, 84))
+                self.assertEqual(picture.segment.components[0].length, 6)
             original = output.read_bytes()
             document['picture_tracks'][0]['clips'][0]['length'] = 121
             with self.assertRaises(ValueError):
                 write_audio(document, output)
             self.assertEqual(output.read_bytes(), original)
             self.assertFalse(list(Path(directory).glob('.align-aaf-*')))
+
+    def test_cameras_stack_as_layers_of_one_composition_rate_track(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tracks = []
+            for name, rate, start, source_in, length in (
+                    ('cam24', '24', 0, 0, 48), ('cam25', '25', 30, 5, 25)):
+                media = root / f'{name}.mov'
+                subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i',
+                    f'color=c=blue:s=64x64:r={rate}', '-frames:v', '60',
+                    '-c:v', 'mpeg4', str(media)], check=True, timeout=30)
+                metadata = json.loads(subprocess.check_output(['ffprobe', '-v', 'error',
+                    '-show_format', '-show_streams', '-of', 'json', str(media)], timeout=30))
+                tracks.append({'name': name, 'edit_rate': {'numerator': int(rate), 'denominator': 1},
+                    'clips': [{'path': str(media), 'start': start, 'source_in': source_in,
+                        'length': length, 'metadata': metadata}]})
+            document = {'version': 2, 'name': 'Cameras', 'tracks': [], 'picture_tracks': tracks,
+                'composition_edit_rate': {'numerator': 25, 'denominator': 1}}
+            output = root / 'cameras.aaf'
+            write_audio(document, output)
+            with aaf2.open(str(output)) as container:
+                top = next(container.content.toplevel())
+                pictures = [slot for slot in top.slots if slot.media_kind == 'Picture']
+                self.assertEqual(len(pictures), 1)
+                self.assertEqual(str(pictures[0].edit_rate), '25')
+                stack = pictures[0].segment
+                self.assertIsInstance(stack, aaf2.components.NestedScope)
+                layers = [[(type(part).__name__, part.length) for part in layer.components]
+                    for layer in stack['Slots'].value]
+                # 48 frames at 24 fps last 50 composition frames.
+                self.assertEqual(layers, [[('SourceClip', 50), ('Filler', 5)],
+                    [('ScopeReference', 30), ('SourceClip', 25)]])
+                reference = stack['Slots'].value[1].components[0]
+                self.assertEqual((reference['RelativeScope'].value,
+                    reference['RelativeSlot'].value), (0, 1))
+            read = read_timeline(output)['sequences'][0]['tracks']
+            self.assertEqual([track['name'] for track in read], ['V1 1', 'V1 2'])
+            self.assertEqual([(clip['start'], clip['source_in'], clip['length'])
+                for track in read for clip in track['clips']], [(0, 0, 50), (30, 5, 25)])
 
     def test_linked_picture_preserves_fractional_edit_rate(self):
         with tempfile.TemporaryDirectory() as directory:

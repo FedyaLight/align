@@ -400,7 +400,13 @@ pub fn audio_manifest(
             if !rate.is_finite() || rate < 1.0 || rate > u32::MAX as f64 || rate.fract() != 0.0 {
                 return Err(fail("Invalid AAF sample rate"));
             }
-            if item.precision_audio_urls.len() != audio.channels || audio.channels == 0 {
+            // Stems that lead with silence start their clip that much earlier.
+            let (stems, lead) = if item.aaf_audio_urls.is_empty() {
+                (&item.precision_audio_urls, 0)
+            } else {
+                (&item.aaf_audio_urls, item.aaf_lead_samples)
+            };
+            if stems.len() != audio.channels || audio.channels == 0 {
                 return Err(fail("AAF requires prepared mono stems for every channel"));
             }
             let samples = |seconds: f64| -> Result<u64, AafError> {
@@ -410,8 +416,10 @@ pub fn audio_manifest(
                 }
                 Ok(value.round() as u64)
             };
-            let start = samples(item.timeline_start(align_core::MediaKind::Audio))?;
-            let length = samples(item.precision_source_duration())?;
+            let start = samples(item.timeline_start(align_core::MediaKind::Audio))?
+                .checked_sub(lead)
+                .ok_or_else(|| fail("AAF audio lead precedes the timeline"))?;
+            let length = samples(item.precision_source_duration())? + lead;
             let frames = length
                 .checked_add(item.precision_tail_samples)
                 .ok_or_else(|| fail("AAF length overflow"))?;
@@ -428,7 +436,7 @@ pub fn audio_manifest(
                         None,
                     )
                 });
-            for (channel, path) in item.precision_audio_urls.iter().enumerate() {
+            for (channel, path) in stems.iter().enumerate() {
                 if item
                     .selected_audio_source_channel()
                     .is_some_and(|selected| selected != channel)
@@ -501,9 +509,9 @@ fn picture_metadata(path: &Path) -> Option<serde_json::Value> {
     crate::isobmff::ama_metadata(path)
 }
 
-/// Assemble an AAF manifest with an optional composition timecode rate.
-/// Picture tracks keep their native edit rates; the override only supplies
-/// the top-level clock Resolve uses when creating its timeline.
+/// Assemble an AAF manifest with an optional composition rate. Picture is
+/// counted in composition frames, the timeline's unless overridden; each
+/// file keeps its own rate.
 pub fn timeline_manifest_with_frame_rate(
     timeline: &align_core::export::ExportTimeline,
     frame_duration: Option<align_core::MediaTime>,
@@ -636,6 +644,13 @@ pub fn timeline_manifest_with_frame_rate(
             lanes.push(track);
         }
     }
+    // Editors count picture in the composition's frames, so with picture
+    // the composition runs at the timeline's rate unless overridden.
+    let composition_edit_rate = composition_edit_rate.or_else(|| {
+        let frame = timeline.frame_duration;
+        (!lanes.is_empty() && frame.value > 0)
+            .then(|| json!({"numerator":frame.timescale,"denominator":frame.value}))
+    });
     Ok(
         json!({"version":2,"name":timeline.name,"tracks":tracks,"picture_tracks":lanes,
         "composition_edit_rate":composition_edit_rate}),
@@ -895,6 +910,36 @@ mod tests {
             overridden["composition_edit_rate"],
             serde_json::json!({"numerator":30000,"denominator":1001})
         );
+    }
+    /// Premiere starts AAF audio on a frame: a clip whose stems lead with
+    /// silence starts that much earlier, on the frame, and lasts that much
+    /// longer, so the content keeps its sample.
+    #[test]
+    fn leading_silence_moves_the_clip_start_onto_a_frame() {
+        use align_core::export::{ExportIsland, ExportItem, ExportTimeline};
+        use align_core::{Clip, MediaTime};
+        let clip: Clip = serde_json::from_value(serde_json::json!({
+            "id":"a", "url":"/recordings/a.wav", "kind":"audio",
+            "duration":{"value":1,"timescale":1},
+            "audio":[{"sampleRate":48000.0,"channels":1,"bitDepth":24}]
+        }))
+        .unwrap();
+        let mut item = ExportItem::new(clip, 1.0 + 200.0 / 48000.0, 1.0, vec![], 1.0);
+        item.precision_audio_urls = vec!["/stems/plain.wav".into()];
+        let item = item.with_aaf_audio(vec!["/stems/lead.wav".into()], 200);
+        let timeline = ExportTimeline::new(
+            vec![ExportIsland {
+                id: 0,
+                clips: vec![item],
+                duration: 2.0,
+            }],
+            MediaTime::new(1, 25),
+            "Test",
+        );
+        let clip = &audio_manifest(&timeline).unwrap().tracks[0].clips[0];
+        assert_eq!(clip.path, PathBuf::from("/stems/lead.wav"));
+        assert_eq!((clip.start, clip.length), (48000, 48200));
+        assert_eq!(clip.source_frames, 48200);
     }
     #[test]
     fn cancelled_export_does_not_start_writer() {

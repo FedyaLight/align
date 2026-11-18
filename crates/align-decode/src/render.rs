@@ -722,6 +722,8 @@ pub struct ChannelStems<'a> {
     /// Selected source range, in seconds.
     pub source_start: f64,
     pub duration: f64,
+    /// Silence before the selected range.
+    pub lead_samples: u64,
     /// Silence appended after the selected range.
     pub tail_samples: u64,
 }
@@ -774,10 +776,11 @@ pub fn render_channels_cancellable(
             .iter()
             .zip(&staged)
             .map(|((channel, _), staged)| {
-                WavWriter::create(staged.path(), sample_rate as u32, 1, int32)
-                    .map(|writer| (*channel, writer))
+                let mut writer = WavWriter::create(staged.path(), sample_rate as u32, 1, int32)?;
+                writer.write_silence(1, stems.lead_samples, cancel)?;
+                Ok((*channel, writer))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, RenderError>>()?;
         let mut remaining = take_frames;
         if int32 {
             backend.decode_native_i32(source, 0, range, &mut |block: NativeBlockI32| {
@@ -822,7 +825,7 @@ pub fn render_channels_cancellable(
                 1,
                 32,
                 &format!("channel {} extraction", channel + 1),
-                start_frame,
+                start_frame - stems.lead_samples as i64,
             )?;
         }
         for staged in staged {
@@ -1208,6 +1211,7 @@ mod tests {
                 is_float: false,
                 source_start: 0.0,
                 duration: probe.duration_seconds,
+                lead_samples: 0,
                 tail_samples: 0,
             },
             &NEVER_CANCELLED,
@@ -1316,6 +1320,7 @@ mod tests {
                         is_float: false,
                         source_start: 0.0,
                         duration: 1.0,
+                        lead_samples: 0,
                         tail_samples: 0,
                     },
                     &cancel,
@@ -1365,6 +1370,7 @@ mod tests {
                     is_float: false,
                     source_start: 0.0,
                     duration: 1.0,
+                    lead_samples: 0,
                     tail_samples: 0,
                 },
                 &cancel,
@@ -1484,6 +1490,7 @@ mod tests {
                         is_float: format == hound::SampleFormat::Float,
                         source_start: 137.0 / 48000.0,
                         duration: 701.0 / 48000.0,
+                        lead_samples: 5,
                         tail_samples: 17,
                     },
                     &NEVER_CANCELLED,
@@ -1494,24 +1501,22 @@ mod tests {
                     assert_eq!(reader.spec().channels, 1);
                     assert_eq!(reader.spec().sample_rate, 48000);
                     assert_eq!(reader.spec().bits_per_sample, 32);
-                    assert_eq!(reader.duration(), 718);
+                    assert_eq!(reader.duration(), 5 + 701 + 17);
                     if bits == 32 && format == hound::SampleFormat::Int {
                         assert_eq!(reader.spec().sample_format, hound::SampleFormat::Int);
                         let samples: Vec<i32> = reader.into_samples().map(Result::unwrap).collect();
-                        let expected: Vec<_> = frames[137..838]
-                            .iter()
-                            .map(|frame| frame[channel])
+                        let expected: Vec<_> = std::iter::repeat_n(0, 5)
+                            .chain(frames[137..838].iter().map(|frame| frame[channel]))
                             .chain(std::iter::repeat_n(0, 17))
                             .collect();
                         assert_eq!(samples, expected, "{kind:?}, channel {channel}");
                     } else {
                         assert_eq!(reader.spec().sample_format, hound::SampleFormat::Float);
                         let samples: Vec<f32> = reader.into_samples().map(Result::unwrap).collect();
-                        let expected: Vec<_> = frames[137..838]
-                            .iter()
-                            .map(|frame| {
+                        let expected: Vec<_> = std::iter::repeat_n(0.0, 5)
+                            .chain(frames[137..838].iter().map(|frame| {
                                 (frame[channel] >> (32 - bits)) as f32 / (1u64 << (bits - 1)) as f32
-                            })
+                            }))
                             .chain(std::iter::repeat_n(0.0, 17))
                             .collect();
                         assert_eq!(
@@ -1519,9 +1524,10 @@ mod tests {
                             "{kind:?}, {bits}, {format:?}, channel {channel}"
                         );
                     }
+                    // The stem starts at its lead silence.
                     assert_eq!(
                         align_core::meta::read_bwf(path).unwrap().time_reference,
-                        Some(48137)
+                        Some(48132)
                     );
                     let wav = std::fs::read(path).unwrap();
                     let history = format!("T=Align channel {} extraction", channel + 1);
@@ -1550,6 +1556,7 @@ mod tests {
                 is_float: false,
                 source_start: 0.4004,
                 duration: (80080.0 - 0.00001) / 48000.0,
+                lead_samples: 0,
                 tail_samples: 0,
             },
             &NEVER_CANCELLED,

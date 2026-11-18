@@ -191,8 +191,9 @@ align-cli export-json --unmatched order-only --disable-unmatched \
   this is separate from timeline-only export.
 - `--no-fcpxml-multicam` or `--no-fcpxml-timeline` omits the corresponding
   FCPXML project. `--fcpxml-storylines` groups tracks into separate storylines.
-- `--aaf-fps` overrides the composition timecode rate. Source picture edit rates
-  are retained; this option does not retime the footage.
+- `--aaf-fps` sets the AAF composition rate, the timeline's by default. Picture
+  is counted in composition frames, as editors read it, and every camera is a
+  layer of one picture track; this option does not retime the footage.
 
 Labels, roles, sequence names, gap removal, and trimming are listed in
 `align-cli export --help`. DaVinci Resolve ignores clip names and color labels
