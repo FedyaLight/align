@@ -62,6 +62,47 @@ fn sum(a: MediaTime, b: MediaTime) -> MediaTime {
     }
 }
 
+/// The time from `from` to `to`.
+fn difference(to: MediaTime, from: MediaTime) -> MediaTime {
+    sum(to, MediaTime::new(-from.value, from.timescale))
+}
+
+/// Gaps between the clips of a storyline or multicam angle. Final Cut Pro
+/// places the clips at their offsets, but Resolve plays a storyline's clips
+/// back to back, so every space between them is an explicit gap.
+fn with_gaps(mut clips: Vec<(MediaTime, MediaTime, String)>, indent: &str) -> String {
+    clips.sort_by(|a, b| a.0.as_seconds().total_cmp(&b.0.as_seconds()));
+    let mut xml = String::new();
+    let mut cursor = MediaTime::new(0, 1);
+    for (start, end, clip) in clips {
+        let space = difference(start, cursor);
+        if space.as_seconds() > TIME_TOLERANCE {
+            xml += &format!(
+                "{indent}<gap offset=\"{}\" duration=\"{}\"/>\n",
+                xml_text::fcpxml_time(cursor),
+                xml_text::fcpxml_time(space)
+            );
+        }
+        xml += &clip;
+        if end.as_seconds() > cursor.as_seconds() {
+            cursor = end;
+        }
+    }
+    xml
+}
+
+/// A video source position on its file's own frames. Final Cut Pro moves a
+/// picture's start to a frame of its file, flooring it; the nearest frame
+/// keeps the picture closer to its sound.
+fn picture_seconds(seconds: f64, clip: &Clip) -> f64 {
+    match clip.video.as_ref().and_then(|video| video.frame_duration) {
+        Some(frame) if frame.value > 0 => {
+            (seconds / frame.as_seconds()).round() * frame.as_seconds()
+        }
+        _ => seconds,
+    }
+}
+
 /// Where Final Cut Pro starts a file: exactly at its own timecode, which FCP
 /// reads from the file itself. Timecode Align derived from LTC or camera XML
 /// is not in the file, so FCP starts such a file at zero.
@@ -338,12 +379,15 @@ fn write_island(
     xml += "  </resources>\n";
 
     let total_duration = frames_covering(island.duration, frame);
-    let sequence_start = frame_start(
-        island.clips.iter().find_map(|i| i.clip.source_timecode()),
-        frame,
-    );
+    let first_timecode = island.clips.iter().find_map(|i| i.clip.source_timecode());
+    let sequence_start = frame_start(first_timecode, frame);
+    // Drop-frame labels exist only at 29.97 and 59.94.
+    let drop_frame = first_timecode.is_some_and(|tc| tc.drop_frame)
+        && frame.value == 1001
+        && matches!(frame.timescale, 30_000 | 60_000);
+    let tc_format = if drop_frame { "DF" } else { "NDF" };
     let sequence = format!(
-        "        <sequence format=\"{FORMAT_ID}\" duration=\"{total_duration}\" tcStart=\"{sequence_start}\" tcFormat=\"NDF\">\n"
+        "        <sequence format=\"{FORMAT_ID}\" duration=\"{total_duration}\" tcStart=\"{sequence_start}\" tcFormat=\"{tc_format}\">\n"
     );
     let name = xml_text::escape(&timeline.name);
     xml += "  <library>\n";
@@ -547,6 +591,7 @@ impl Library<'_> {
                 "        <mc-angle name=\"{angle_name}\" angleID=\"a{}\">\n",
                 angle_index + 1
             );
+            let mut clips = Vec::new();
             for item in items {
                 let side = if item.clip.video.is_some() {
                     MediaKind::Video
@@ -558,17 +603,28 @@ impl Library<'_> {
                 else {
                     continue;
                 };
-                xml += &format!(
-                    "          <asset-clip name=\"{}\" ref=\"{asset_id}\" offset=\"{}\" duration=\"{}\" start=\"{}\" enabled=\"{}\"{}{}\n",
-                    clip_name(item, &media_url),
-                    timeline_time(item.start, self.frame),
-                    timeline_time(item.timeline_duration, self.frame),
-                    source_time(origin, item.source_in, &item.clip, self.frame),
-                    u8::from(item.is_enabled(side)),
-                    audio_role_attribute(item, "audioRole"),
-                    audio_channel_end(item),
-                );
+                let source_in = match side {
+                    MediaKind::Video => picture_seconds(item.source_in, &item.clip),
+                    MediaKind::Audio => item.source_in,
+                };
+                let start = grid_time(item.start, self.frame);
+                let duration = grid_time(item.timeline_duration, self.frame);
+                clips.push((
+                    start,
+                    sum(start, duration),
+                    format!(
+                        "          <asset-clip name=\"{}\" ref=\"{asset_id}\" offset=\"{}\" duration=\"{}\" start=\"{}\" enabled=\"{}\"{}{}\n",
+                        clip_name(item, &media_url),
+                        xml_text::fcpxml_time(start),
+                        xml_text::fcpxml_time(duration),
+                        source_time(origin, source_in, &item.clip, self.frame),
+                        u8::from(item.is_enabled(side)),
+                        audio_role_attribute(item, "audioRole"),
+                        audio_channel_end(item),
+                    ),
+                ));
             }
+            xml += &with_gaps(clips, "          ");
             xml += "        </mc-angle>\n";
         }
         xml += "      </multicam>\n    </media>\n";
@@ -636,7 +692,7 @@ impl Library<'_> {
         );
 
         let mut spine = String::new();
-        let mut stories = std::collections::BTreeMap::<i64, String>::new();
+        let mut stories = std::collections::BTreeMap::<i64, Vec<_>>::new();
         let lane_attribute = |lane: i64| {
             if group_storylines {
                 String::new()
@@ -644,9 +700,11 @@ impl Library<'_> {
                 format!(" lane=\"{lane}\"")
             }
         };
-        let mut place = |lane: i64, clip: String| {
+        let mut place = |lane: i64, start: f64, duration: f64, clip: String| {
             if group_storylines {
-                *stories.entry(lane).or_default() += &clip;
+                let start = grid_time(start, frame);
+                let end = sum(start, grid_time(duration, frame));
+                stories.entry(lane).or_default().push((start, end, clip));
             } else {
                 spine += &clip;
             }
@@ -661,12 +719,20 @@ impl Library<'_> {
                 .unwrap_or(0) as i64
                 + 1;
             // The clip's own time runs from the source in point, where the
-            // video starts its file at that position past the file's start.
+            // video starts its file at that position past the file's start,
+            // on a frame of the file.
             let source_start = timeline_time(item.source_in, frame);
-            let media_start = source_time(origin, item.source_in, &item.clip, frame);
+            let media_start = source_time(
+                origin,
+                picture_seconds(item.source_in, &item.clip),
+                &item.clip,
+                frame,
+            );
             let source_duration = timeline_time(item.timeline_duration, frame);
             place(
                 lane,
+                item.start,
+                item.timeline_duration,
                 format!(
                     "              <clip{} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{}\" enabled=\"{}\"><video ref=\"{asset_id}\" offset=\"{source_start}\" start=\"{media_start}\" duration=\"{source_duration}\"/></clip>\n",
                     lane_attribute(lane),
@@ -697,6 +763,8 @@ impl Library<'_> {
                 .map_or_else(String::new, |channel| format!(" srcCh=\"{}\"", channel + 1));
             place(
                 lane,
+                item.start,
+                duration,
                 format!(
                     "              <clip{} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{}\" enabled=\"{}\"><audio ref=\"{asset_id}\" offset=\"{source_start}\" start=\"{media_start}\" duration=\"{source_duration}\"{channel_attribute}{}/></clip>\n",
                     lane_attribute(lane),
@@ -713,7 +781,8 @@ impl Library<'_> {
         stories.sort_by_key(|(lane, _)| (*lane >= 0, lane.unsigned_abs()));
         for (lane, clips) in stories {
             spine += &format!(
-                "              <spine lane=\"{lane}\" offset=\"0s\">\n{clips}              </spine>\n"
+                "              <spine lane=\"{lane}\" offset=\"0s\">\n{}              </spine>\n",
+                with_gaps(clips, "              ")
             );
         }
         spine
@@ -845,6 +914,75 @@ mod tests {
             .unwrap();
         assert!(asset.contains(" start=\"0s\""), "{asset}");
         assert!(xml.contains("<audio ref=\"r_asset_2\" offset=\"0s\" start=\"0s\""));
+    }
+
+    /// Resolve plays a storyline's clips back to back, so the space before
+    /// a clip is an explicit gap, in storylines and multicam angles alike.
+    #[test]
+    fn storylines_and_angles_spell_out_their_gaps() {
+        let mut timeline = fixture_timeline();
+        // A recorder in its own folder is its own angle.
+        timeline.islands[0].clips[1].clip.url = PathBuf::from("/r/rec.wav");
+        let xml = write(
+            &timeline,
+            FcpxmlOptions {
+                group_storylines: true,
+                ..FcpxmlOptions::default()
+            },
+        );
+        // The recorder starts 0.5 s in, after a gap, in its storyline and
+        // in its angle.
+        assert_eq!(
+            xml.matches("<gap offset=\"0s\" duration=\"1/2s\"/>")
+                .count(),
+            2,
+            "{xml}"
+        );
+    }
+
+    /// Final Cut Pro moves a picture's source start to a frame of its file:
+    /// 0.2 s into a 24 fps camera is between frames 4 and 5, so Align writes
+    /// the nearest, frame 5.
+    #[test]
+    fn picture_starts_on_a_frame_of_its_file() {
+        let mut timeline = fixture_timeline();
+        let camera = &mut timeline.islands[0].clips[0];
+        camera.clip.video.as_mut().unwrap().frame_duration = Some(MediaTime::new(1, 24));
+        camera.source_in = 0.2;
+        let xml = write(&timeline, FcpxmlOptions::default());
+        assert!(
+            xml.contains("<video ref=\"r_asset_1\" offset=\"1/5s\" start=\"5/24s\""),
+            "{xml}"
+        );
+        let angle = xml
+            .lines()
+            .find(|line| line.contains("<asset-clip ") && line.contains("cam.mov"))
+            .unwrap();
+        assert!(angle.contains(" start=\"5/24s\""), "{angle}");
+        // Its sound keeps the exact position.
+        assert!(xml.contains("<audio ref=\"r_asset_1\" offset=\"1/5s\" start=\"1/5s\""));
+    }
+
+    /// A drop-frame camera labels the sequence's timecode drop-frame, or
+    /// Resolve shows its start as a different, non-drop label.
+    #[test]
+    fn drop_frame_timecode_labels_the_sequence() {
+        use crate::model::SourceTimecode;
+        let ntsc = MediaTime::new(1001, 30_000);
+        let mut timeline = fixture_timeline();
+        timeline.frame_duration = ntsc;
+        let camera = timeline.islands[0].clips[0].clip.video.as_mut().unwrap();
+        camera.frame_duration = Some(ntsc);
+        camera.source_timecode = SourceTimecode::from_label("11:26:57;00", ntsc);
+        let xml = write(&timeline, FcpxmlOptions::TIMELINE);
+        assert!(xml.contains("tcFormat=\"DF\""), "{xml}");
+        timeline.islands[0].clips[0]
+            .clip
+            .video
+            .as_mut()
+            .unwrap()
+            .source_timecode = SourceTimecode::from_label("11:26:57:00", ntsc);
+        assert!(write(&timeline, FcpxmlOptions::TIMELINE).contains("tcFormat=\"NDF\""));
     }
 
     #[test]
