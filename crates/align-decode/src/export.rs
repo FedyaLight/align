@@ -606,19 +606,35 @@ impl AudioPlan {
             }
         };
         // AAF audio that does not start on a whole-sample composition frame
-        // plays stems that lead with silence instead of the plain ones.
+        // plays stems that lead with silence instead of the plain ones. With
+        // picture the AAF counts audio in frames, as Premiere needs to take
+        // the picture's rate, so the stems also end with up to a frame of
+        // silence that the clip's last frame covers.
         let aaf_frame = options
             .aaf_frame_duration
             .unwrap_or(combined.frame_duration);
+        let aaf_in_frames = wants_aaf
+            && combined
+                .islands
+                .iter()
+                .flat_map(|island| &island.clips)
+                .any(|item| item.clip.video.is_some());
         let aaf_item = |item: &ExportItem| {
             wants_aaf && !item.clip.audio.is_empty() && item.is_enabled(MediaKind::Audio)
         };
-        let aaf_lead = |item: &ExportItem| {
+        let aaf_stems = |item: &ExportItem| {
             let rate = item.clip.audio.first()?.sample_rate;
             if !aaf_item(item) || item.is_retimed(MediaKind::Audio) {
                 return None;
             }
-            aaf_lead_samples(item.timeline_start(MediaKind::Audio), aaf_frame, rate)
+            let lead = aaf_lead_samples(item.timeline_start(MediaKind::Audio), aaf_frame, rate)
+                .unwrap_or(0);
+            let tail = if aaf_in_frames {
+                (rate * aaf_frame.as_seconds()).ceil() as u64 + 1
+            } else {
+                0
+            };
+            (lead > 0 || tail > 0).then_some((lead, tail))
         };
         let needs_precision = |item: &ExportItem| {
             let channels = item.clip.audio.first().map_or(0, |a| a.channels);
@@ -627,7 +643,7 @@ impl AudioPlan {
                 && (channels > 1
                     || !item.is_full_source_selection()
                     || item.precision_tail_samples > 0);
-            for_resolve_or_fcp || (aaf_item(item) && aaf_lead(item).is_none())
+            for_resolve_or_fcp || (aaf_item(item) && aaf_stems(item).is_none())
         };
 
         // Every item of a corrected clip plays its drift sidecar, and every
@@ -649,7 +665,7 @@ impl AudioPlan {
             let needs_file = corrected_clips.contains(item.clip.id.0.as_str())
                 || pad(item).is_some()
                 || precision_assets.contains(&item.precision_asset_key())
-                || aaf_lead(item).is_some();
+                || aaf_stems(item).is_some();
             if needs_file && !source_tags.contains_key(&item.clip.url) {
                 source_tags.insert(
                     item.clip.url.clone(),
@@ -756,10 +772,11 @@ impl AudioPlan {
                         prepared.with_placement_pad(destination, samples as f64 / sample_rate);
                 }
 
-                // Mono stems of every channel over the selected range, after
-                // `lead` samples of silence; one render per distinct range.
-                let mut stems = |prepared: &ExportItem, lead: u64| {
-                    let key = format!("{}-{lead}", item.precision_asset_key());
+                // Mono stems of every channel over the selected range, plain
+                // or for AAF between `lead` and `tail` samples of silence;
+                // one render per distinct range.
+                let mut stems = |prepared: &ExportItem, aaf: Option<(u64, u64)>| {
+                    let key = format!("{}-{aaf:?}", item.precision_asset_key());
                     if let Some(outputs) = precision_files.get(&key) {
                         return outputs.clone();
                     }
@@ -779,12 +796,14 @@ impl AudioPlan {
                         "original"
                     };
                     let digest = prepared.precision_digest();
-                    let lead_tag = lead.to_string();
+                    let (lead, tail) = aaf.unwrap_or((0, prepared.precision_tail_samples));
+                    let (lead_tag, tail_tag) = (lead.to_string(), tail.to_string());
                     let outputs: Vec<_> = (0..audio.map_or(0, |a| a.channels))
                         .map(|channel| {
-                            let label = match lead {
-                                0 => format!("channel {}", channel + 1),
-                                _ => format!("channel {} – pad {lead}", channel + 1),
+                            let label = match (aaf, lead) {
+                                (None, _) => format!("channel {}", channel + 1),
+                                (Some(_), 0) => format!("channel {} – AAF", channel + 1),
+                                (Some(_), _) => format!("channel {} – pad {lead}", channel + 1),
                             };
                             let channel = channel.to_string();
                             let mut identity = vec![
@@ -795,8 +814,8 @@ impl AudioPlan {
                                 &source_tags[media],
                                 origin,
                             ];
-                            if lead > 0 {
-                                identity.extend(["lead", &lead_tag]);
+                            if aaf.is_some() {
+                                identity.extend(["aaf", &lead_tag, &tail_tag]);
                             }
                             precision_dir.join(sidecar_name(media, &label, &identity))
                         })
@@ -811,19 +830,19 @@ impl AudioPlan {
                             source_start: prepared.precision_source_start(),
                             duration: prepared.precision_source_duration(),
                             lead_samples: lead,
-                            tail_samples: prepared.precision_tail_samples,
+                            tail_samples: tail,
                         },
                     });
                     precision_files.insert(key, outputs.clone());
                     outputs
                 };
                 if precision_assets.contains(&item.precision_asset_key()) {
-                    let outputs = stems(&prepared, 0);
+                    let outputs = stems(&prepared, None);
                     prepared = prepared.with_precision_audio(outputs);
                 }
-                if let Some(lead) = aaf_lead(item) {
-                    let outputs = stems(&prepared, lead);
-                    prepared = prepared.with_aaf_audio(outputs, lead);
+                if let Some((lead, tail)) = aaf_stems(item) {
+                    let outputs = stems(&prepared, Some((lead, tail)));
+                    prepared = prepared.with_aaf_audio(outputs, lead, tail);
                 }
                 clips.push(prepared);
             }
@@ -1686,6 +1705,9 @@ mod tests {
         assert_eq!(items[0].aaf_lead_samples, 200);
         assert_eq!(items[0].aaf_audio_urls.len(), 2);
         assert_eq!(items[0].precision_audio_urls.len(), 2);
+        // Without picture the AAF keeps samples: no tail, and the aligned
+        // item plays the plain stems.
+        assert_eq!(items[0].aaf_tail_samples, 0);
         assert!(items[1].aaf_audio_urls.is_empty());
         let leads: Vec<u64> = plan
             .jobs
@@ -1697,6 +1719,31 @@ mod tests {
             .collect();
         // Both items select the same range, so they share the plain stems.
         assert_eq!(leads, vec![0, 200]);
+
+        // Beside picture the AAF counts audio in frames: every AAF stem ends
+        // with a frame and a sample of silence for the clip's last frame.
+        let mut camera = item("cam", MediaKind::Video, 0.0, 1.0);
+        camera.clip.url = timeline.islands[0].clips[0].clip.url.clone();
+        camera.clip.audio.clear();
+        let mut with_picture = timeline.clone();
+        with_picture.islands[0].clips.push(camera);
+        let plan = AudioPlan::new(
+            &with_picture,
+            &options,
+            dir.path(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        let items = &plan.timeline.islands[0].clips;
+        assert_eq!(
+            (items[0].aaf_lead_samples, items[0].aaf_tail_samples),
+            (200, 1921)
+        );
+        assert_eq!(
+            (items[1].aaf_lead_samples, items[1].aaf_tail_samples),
+            (0, 1921)
+        );
+        assert_eq!(items[1].aaf_audio_urls.len(), 2);
     }
 
     #[test]

@@ -308,6 +308,51 @@ class SourceValidation(unittest.TestCase):
             self.assertEqual([(clip['start'], clip['source_in'], clip['length'])
                 for track in read for clip in track['clips']], [(0, 0, 50), (30, 5, 25)])
 
+    def test_sound_counts_in_composition_frames_beside_picture(self):
+        # Premiere takes its sequence rate from sound tracks too, so beside
+        # picture sound counts in composition frames, as Resolve writes it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media = root / 'camera.mov'
+            subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i',
+                'color=c=blue:s=64x64:r=24000/1001', '-frames:v', '48',
+                '-c:v', 'mpeg4', str(media)], check=True, timeout=30)
+            metadata = json.loads(subprocess.check_output(['ffprobe', '-v', 'error',
+                '-show_format', '-show_streams', '-of', 'json', str(media)], timeout=30))
+            stem = root / 'stem.wav'
+            with wave.open(str(stem), 'wb') as writer:
+                writer.setparams((1, 2, 48000, 0, 'NONE', 'not compressed'))
+                writer.writeframes(b'\0' * 2 * 50203)
+            rate = {'numerator': 24000, 'denominator': 1001}
+            document = {'version': 2, 'name': 'Frames', 'composition_edit_rate': rate,
+                'picture_tracks': [{'name': 'V1', 'edit_rate': rate, 'clips': [{
+                    'path': str(media), 'start': 0, 'source_in': 0, 'length': 48,
+                    'metadata': metadata}]}],
+                # Two frames in (2002 samples each), 1.004 s long; the stem
+                # ends with a frame of silence, as Align renders it.
+                'tracks': [{'name': 'A1', 'sample_rate': 48000, 'clips': [{
+                    'path': str(stem), 'start': 4004, 'source_in': 0, 'length': 48200,
+                    'source_frames': 50203, 'channels': 1}]}]}
+            output = root / 'frames.aaf'
+            write_audio(document, output)
+            with aaf2.open(str(output)) as container:
+                top = next(container.content.toplevel())
+                sound = next(slot for slot in top.slots if slot.media_kind == 'Sound')
+                self.assertEqual(str(sound.edit_rate), '24000/1001')
+                self.assertEqual([(type(part).__name__, part.length)
+                    for part in sound.segment.components], [('Filler', 2), ('SourceClip', 25)])
+            track = next(track for track in read_timeline(output)['sequences'][0]['tracks']
+                if track['media_kind'] == 'sound')
+            self.assertEqual(track['edit_rate'], rate)
+            clip = track['clips'][0]
+            self.assertEqual((clip['start'], clip['source_in'], clip['length']), (2, 0, 25))
+            # Without picture sound keeps its samples.
+            del document['picture_tracks']
+            del document['composition_edit_rate']
+            write_audio(document, output)
+            clip = read_timeline(output, audio_only=True)['sequences'][0]['tracks'][0]['clips'][0]
+            self.assertEqual((clip['start'], clip['length']), (4004, 48200))
+
     def test_linked_picture_preserves_fractional_edit_rate(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'picture.aaf'

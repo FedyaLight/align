@@ -75,8 +75,9 @@ pub fn subframe_offset_80(frac_frames: f64) -> i64 {
 /// composition frame whose boundary is a whole sample, so editors that
 /// start AAF audio on frames (Premiere) and editors that keep samples
 /// (Resolve) both play it at the same sample. `None` when the start already
-/// is such a boundary, or when those boundaries are more than five frames
-/// apart (44.1 kHz at NTSC rates), where the silence would grow long.
+/// is such a boundary. Where those boundaries are more than five frames
+/// apart (44.1 kHz at NTSC rates) the clip starts at the first whole sample
+/// of the preceding frame instead, within a sample in either editor.
 pub fn aaf_lead_samples(timeline_start_s: f64, frame: MediaTime, sample_rate: f64) -> Option<u64> {
     if !timeline_start_s.is_finite()
         || timeline_start_s < 0.0
@@ -94,12 +95,22 @@ pub fn aaf_lead_samples(timeline_start_s: f64, frame: MediaTime, sample_rate: f6
         (a, b) = (b, a % b);
     }
     let step = samples_per_frame.1 / a;
-    if step > 5 {
-        return None;
-    }
-    let boundary = step * samples_per_frame.0 / samples_per_frame.1;
-    let lead = ((timeline_start_s * sample_rate).round() as i64).rem_euclid(boundary) as u64;
-    (lead > 0).then_some(lead)
+    let start = i128::from((timeline_start_s * sample_rate).round() as i64);
+    let (per, frames) = (
+        i128::from(samples_per_frame.0),
+        i128::from(samples_per_frame.1),
+    );
+    let lead = if step <= 5 {
+        start.rem_euclid(i128::from(step) * per / frames)
+    } else {
+        let first_sample = |frame: i128| (frame * per + frames - 1) / frames;
+        let mut frame = start * frames / per;
+        if first_sample(frame) > start {
+            frame -= 1;
+        }
+        start - first_sample(frame)
+    };
+    (lead > 0).then_some(lead as u64)
 }
 
 /// Whole-sample silence prepend that makes an integer-frame placement
@@ -225,8 +236,11 @@ pub struct ExportItem {
     /// AAF stems of every channel that lead the selected range with
     /// `aaf_lead_samples` of silence. Premiere starts AAF audio on a frame,
     /// so the clip starts on one and the silence carries the remainder.
+    /// `aaf_tail_samples` of silence follow, so an AAF counting audio in
+    /// frames can end it on the next frame.
     pub aaf_audio_urls: Vec<PathBuf>,
     pub aaf_lead_samples: u64,
+    pub aaf_tail_samples: u64,
     /// Sample-accurate placement sidecar for Premiere: this file prepends
     /// `placement_pad_seconds` of silence to the (possibly drift-corrected)
     /// source so the integer-frame XML placement lands the content exactly.
@@ -299,6 +313,7 @@ impl ExportItem {
             precision_tail_samples: 0,
             aaf_audio_urls: Vec::new(),
             aaf_lead_samples: 0,
+            aaf_tail_samples: 0,
             placement_pad_url: None,
             placement_pad_seconds: 0.0,
             enabled: true,
@@ -433,10 +448,11 @@ impl ExportItem {
             && self.placement_pad_url.is_some()
             && self.placement_pad_seconds > 0.0
     }
-    pub fn with_aaf_audio(&self, urls: Vec<PathBuf>, lead_samples: u64) -> Self {
+    pub fn with_aaf_audio(&self, urls: Vec<PathBuf>, lead_samples: u64, tail_samples: u64) -> Self {
         let mut out = self.clone();
         out.aaf_audio_urls = urls;
         out.aaf_lead_samples = lead_samples;
+        out.aaf_tail_samples = tail_samples;
         out
     }
     pub fn with_precision_audio(&self, urls: Vec<PathBuf>) -> Self {
@@ -1216,6 +1232,7 @@ impl ImportedAssembly<'_> {
             precision_tail_samples: 0,
             aaf_audio_urls: Vec::new(),
             aaf_lead_samples: 0,
+            aaf_tail_samples: 0,
             placement_pad_url: None,
             placement_pad_seconds: 0.0,
             linked_audio_edit: linked,
@@ -1861,8 +1878,12 @@ mod tests {
             at(2002.0 + 7.0, MediaTime::new(1001, 24_000), 48_000.0),
             Some(7)
         );
-        // 44.1 kHz at 29.97 reaches a sample only every 100 frames.
-        assert_eq!(at(200.0, ntsc, 44_100.0), None);
+        // 44.1 kHz at 29.97 reaches a sample only every 100 frames, so the
+        // clip starts at the first whole sample of its frame: frame 1 starts
+        // at 1471.47, so sample 1472.
+        assert_eq!(at(200.0, ntsc, 44_100.0), Some(200));
+        assert_eq!(at(1500.0, ntsc, 44_100.0), Some(28));
+        assert_eq!(at(1472.0, ntsc, 44_100.0), None);
     }
     use crate::model::{
         AudioSummary, Clip, ClipId, MediaKind, RecordingTimestampSource, SourceTimecode,

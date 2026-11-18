@@ -530,6 +530,7 @@ fn replaced_island(island: &ExportIsland) -> Option<ExportIsland> {
             precision_tail_samples: 0,
             aaf_audio_urls: Vec::new(),
             aaf_lead_samples: 0,
+            aaf_tail_samples: 0,
             // Deliberately not copied: replacement items start at
             // video-overlap positions whose fractional remainder differs
             // from the recorder item the pad was rendered for.

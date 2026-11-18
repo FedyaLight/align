@@ -401,10 +401,14 @@ pub fn audio_manifest(
                 return Err(fail("Invalid AAF sample rate"));
             }
             // Stems that lead with silence start their clip that much earlier.
-            let (stems, lead) = if item.aaf_audio_urls.is_empty() {
-                (&item.precision_audio_urls, 0)
+            let (stems, lead, tail) = if item.aaf_audio_urls.is_empty() {
+                (&item.precision_audio_urls, 0, item.precision_tail_samples)
             } else {
-                (&item.aaf_audio_urls, item.aaf_lead_samples)
+                (
+                    &item.aaf_audio_urls,
+                    item.aaf_lead_samples,
+                    item.aaf_tail_samples,
+                )
             };
             if stems.len() != audio.channels || audio.channels == 0 {
                 return Err(fail("AAF requires prepared mono stems for every channel"));
@@ -421,7 +425,7 @@ pub fn audio_manifest(
                 .ok_or_else(|| fail("AAF audio lead precedes the timeline"))?;
             let length = samples(item.precision_source_duration())? + lead;
             let frames = length
-                .checked_add(item.precision_tail_samples)
+                .checked_add(tail)
                 .ok_or_else(|| fail("AAF length overflow"))?;
             if length == 0 || start.checked_add(length).is_none() {
                 return Err(fail("Invalid AAF clip length"));
@@ -926,7 +930,7 @@ mod tests {
         .unwrap();
         let mut item = ExportItem::new(clip, 1.0 + 200.0 / 48000.0, 1.0, vec![], 1.0);
         item.precision_audio_urls = vec!["/stems/plain.wav".into()];
-        let item = item.with_aaf_audio(vec!["/stems/lead.wav".into()], 200);
+        let item = item.with_aaf_audio(vec!["/stems/lead.wav".into()], 200, 0);
         let timeline = ExportTimeline::new(
             vec![ExportIsland {
                 id: 0,

@@ -93,13 +93,19 @@ def write_composition(container, document):
         timecode.segment = container.create.Timecode(fps=round(rate), drop=False,
             length=(frames.numerator + frames.denominator - 1) // frames.denominator)
         timecode.segment.start = 0
+    clock = None
     if picture_tracks:
         write_picture(container, composition, picture_tracks, rate)
+        # Premiere takes its sequence rate from the sound tracks too: at the
+        # sample rate it opens 23.976 and 59.94 as 29.97. So with picture,
+        # sound counts in composition frames, as Resolve writes it.
+        clock = rate
     for track in tracks:
         rate = integer(track['sample_rate'], 'sample_rate', 1)
-        slot = composition.create_sound_slot(edit_rate=rate)
+        slot = composition.create_sound_slot(edit_rate=rate if clock is None else clock)
         slot.name = track['name']
         cursor = 0
+        sound = []
         for clip in track['clips']:
             path = Path(clip['path']).resolve(strict=True)
             start = integer(clip['start'], 'start')
@@ -116,13 +122,41 @@ def write_composition(container, document):
                 'duration_ts': frames, 'channels': 1,
             }]}
             master, _, _ = container.content.create_ama_link(str(path), metadata)
-            if start > cursor:
-                gap = container.create.Filler(media_kind='sound', length=start-cursor)
-                slot.segment.components.append(gap)
-            slot.segment.components.append(master.create_source_clip(
-                slot_id=1, start=source_in, length=length, media_kind='sound'))
+            sound.append((master, start, source_in, length, frames))
             cursor = start + length
-        slot.segment.length = cursor
+        write_sound(container, slot, sound, rate, clock)
+
+
+def write_sound(container, slot, sound, rate, clock):
+    """Sound clips at sample positions, or counted in `clock` frames.
+
+    In frames a clip starts on the frame nearest its start, which Align puts
+    on a frame boundary, and ends on the frame that covers its last sample
+    while the file lasts.
+    """
+    def units(samples, rounding):
+        if clock is None:
+            return samples
+        exact = Fraction(samples) * clock / rate
+        if rounding == 'up':
+            return -(-exact.numerator // exact.denominator)
+        if rounding == 'down':
+            return exact.numerator // exact.denominator
+        return (2 * exact.numerator + exact.denominator) // (2 * exact.denominator)
+
+    cursor = 0
+    for master, start, source_in, length, frames in sound:
+        begin, first = units(start, 'nearest'), units(source_in, 'nearest')
+        end = min(units(start + length, 'up'), begin + units(frames, 'down') - first)
+        if begin < cursor or end <= begin:
+            raise ValueError('AAF sound clip does not fit its frames')
+        if begin > cursor:
+            slot.segment.components.append(
+                container.create.Filler(media_kind='sound', length=begin - cursor))
+        slot.segment.components.append(master.create_source_clip(
+            slot_id=1, start=first, length=end - begin, media_kind='sound'))
+        cursor = end
+    slot.segment.length = cursor
 
 
 def write_picture(container, composition, picture_tracks, rate):
