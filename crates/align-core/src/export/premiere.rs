@@ -380,7 +380,7 @@ impl Document {
                 .and_then(|next| transition_between(entry, next, media_type));
             let next_start = track
                 .get(index + 1)
-                .map(|next| self.start_frame(next, media_type).0);
+                .map(|next| self.start_frame(next, media_type));
             xml += &self.clip_item(
                 entry,
                 media_type,
@@ -766,28 +766,24 @@ fn tracks_for<'a>(entries: &[TrackEntry<'a>], media_type: MediaKind) -> Vec<Vec<
 }
 
 impl Document {
-    /// The sequence frame a clipitem starts on, and the fraction of a frame
-    /// its audio starts after it. Premiere and Resolve start XML sound only
-    /// on a frame, so it starts on the nearest one, like its picture.
-    fn start_frame(&self, entry: &TrackEntry, media_type: MediaKind) -> (i64, f64) {
+    /// The sequence frame a clipitem starts on. Premiere and Resolve start
+    /// XML sound only on a frame, so it starts on the nearest one, like its
+    /// picture.
+    fn start_frame(&self, entry: &TrackEntry, media_type: MediaKind) -> i64 {
         let (rate, item) = (self.rate, entry.item);
-        let stable_start = (item.timeline_start(media_type) * 100_000.0).round() / 100_000.0;
+        let start = stable_start(item, media_type);
         if media_type == MediaKind::Video {
-            return (rate.frames(stable_start, Rounding::Nearest), 0.0);
+            return rate.frames(start, Rounding::Nearest);
         }
         // Collapse sub-sample dust (float noise, µs solver jitter) to the
         // adjacent integer frame so near-exact starts encode exactly.
         let sample_rate = item.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);
-        let floor = rate.frames(stable_start, Rounding::Down);
+        let floor = rate.frames(start, Rounding::Down);
         let (adjustment, fraction) = super::model::snap_sub_sample_frac(
-            stable_start * rate.fps - floor as f64,
+            start * rate.fps - floor as f64,
             sample_rate / rate.fps,
         );
-        if fraction >= 0.5 {
-            (floor + adjustment + 1, 0.0)
-        } else {
-            (floor + adjustment, fraction)
-        }
+        floor + adjustment + i64::from(fraction >= 0.5)
     }
 
     /// One `<clipitem>`. FCP7 marks an edge shared with a transition as -1.
@@ -806,7 +802,7 @@ impl Document {
     ) -> String {
         let (rate, format) = (self.rate, self.format);
         let item = entry.item;
-        let (start, start_frac) = self.start_frame(entry, media_type);
+        let start = self.start_frame(entry, media_type);
         let media = self.media_use(item, media_type);
         let (source_rate, file_duration) = (media.rate, media.duration);
         let corrected = media.corrected;
@@ -828,6 +824,14 @@ impl Document {
             source_rate
         };
         let geometry = item.fcp7_retime_geometry(media_type);
+        // The source range moves with the start's rounding, so the sound
+        // stays within half a frame of its place; two separate roundings
+        // could add up to almost a frame.
+        let rounding = if retimed {
+            0.0
+        } else {
+            start as f64 / rate.fps - stable_start(item, media_type)
+        };
         let (computed_in, computed_out) = if retimed {
             let media_in = in_seconds * source_rate.fps;
             let media_out = out_seconds * source_rate.fps;
@@ -845,19 +849,26 @@ impl Document {
             (g_in, g_out)
         } else {
             (
-                item_rate.frames(in_seconds, Rounding::Nearest),
-                item_rate.frames(out_seconds, Rounding::Nearest),
+                shifted_frame(item_rate, in_seconds, rounding),
+                shifted_frame(item_rate, out_seconds, rounding),
             )
         };
-        // Resolve counts a WAV's in point from its broadcast start floored to
-        // a frame, so a WAV starting inside a frame played a frame late; one
-        // frame more in the Resolve XML lands on the selected frame.
+        // How far ahead of its place the sound plays, in sequence frames.
+        let ahead = if retimed {
+            0.0
+        } else {
+            (computed_in as f64 / item_rate.fps - in_seconds - rounding) * rate.fps
+        };
+        // Resolve counts a trimmed WAV's in point from its broadcast start
+        // rounded to a frame, halves down, so a WAV starting past the middle
+        // of a frame played a frame late; one frame more in the Resolve XML
+        // lands on the selected frame.
         let late = i64::from(
             format == TimelineExportFormat::ResolveXML
                 && media_type == MediaKind::Audio
                 && !retimed
                 && computed_in > 0
-                && starts_inside_a_frame(item, rate),
+                && starts_past_the_middle_of_a_frame(item, rate),
         );
         let source_in = geometry.map_or(computed_in, |g| g.0) + late;
         let mut source_out = geometry.map_or(computed_out, |g| g.1) + late;
@@ -878,7 +889,16 @@ impl Document {
         } else {
             item.selected_timeline_duration(media_type)
         };
-        let timeline_duration = rate.frames(selected_tl, Rounding::Nearest);
+        let mut timeline_duration = rate.frames(selected_tl, Rounding::Nearest);
+        if !retimed && geometry.is_none() && (item_rate.fps - rate.fps).abs() < 1e-9 {
+            // The source range spans the clip's frames, and the moved range
+            // ends with its file.
+            let past_end = source_in + timeline_duration - (clip_duration + late);
+            if past_end > 0 && past_end < timeline_duration {
+                timeline_duration -= past_end;
+            }
+            source_out = source_in + timeline_duration;
+        }
         let mut end = start + timeline_duration;
         // Seams of one source's clips share a track (see the allocator), and
         // rounding to frames can end a clip inside the next.
@@ -911,7 +931,7 @@ impl Document {
             if transition_after { -1 } else { end }
         );
         if media_type == MediaKind::Audio && format == TimelineExportFormat::PremiereXML {
-            let subframes = super::model::subframe_offset_80(start_frac);
+            let subframes = super::model::subframe_offset_80(ahead.max(0.0));
             if subframes != 0 {
                 xml += &format!("                <subframeoffset>{subframes}</subframeoffset>\n");
             }
@@ -1153,9 +1173,27 @@ impl MediaUse {
     }
 }
 
-/// An audio file whose own broadcast start falls inside a frame of the
-/// sequence, more than half a sample from its edges.
-fn starts_inside_a_frame(item: &ExportItem, rate: SequenceRate) -> bool {
+/// Where an item's side starts on the timeline, without float noise.
+fn stable_start(item: &ExportItem, media_type: MediaKind) -> f64 {
+    (item.timeline_start(media_type) * 100_000.0).round() / 100_000.0
+}
+
+/// The nearest frame of `seconds` moved by `shift`; halfway between two
+/// frames, the one nearer the unmoved time.
+fn shifted_frame(rate: SequenceRate, seconds: f64, shift: f64) -> i64 {
+    let frames = (seconds + shift) * rate.fps;
+    let halfway = (frames - frames.floor() - 0.5).abs() < 1e-6;
+    let frame = match (halfway, shift > 0.0) {
+        (true, true) => frames.floor(),
+        (true, false) => frames.ceil(),
+        (false, _) => frames.round(),
+    };
+    frame as i64
+}
+
+/// An audio file whose own broadcast start falls past the middle of a frame
+/// of the sequence, by more than half a sample, and short of its end.
+fn starts_past_the_middle_of_a_frame(item: &ExportItem, rate: SequenceRate) -> bool {
     let Some(audio) = item.clip.audio.first() else {
         return false;
     };
@@ -1165,7 +1203,7 @@ fn starts_inside_a_frame(item: &ExportItem, rate: SequenceRate) -> bool {
     let frames = timecode.as_seconds() * rate.fps;
     let half_sample = 0.5 * rate.fps / audio.sample_rate.max(1.0);
     let fraction = frames - frames.floor();
-    item.clip.video.is_none() && fraction > half_sample && 1.0 - fraction > half_sample
+    item.clip.video.is_none() && fraction - 0.5 > half_sample && 1.0 - fraction > half_sample
 }
 
 fn source_rate(item: &ExportItem, sequence: SequenceRate) -> SequenceRate {
@@ -1479,6 +1517,36 @@ mod tests {
         assert!(!resolve.contains("subframeoffset"));
     }
 
+    /// The source range moves with the start's rounding: a start 0.49 of a
+    /// frame past frame 25 with a source in 0.51 past frame 12 plays within
+    /// a fiftieth of a frame, where rounding each alone was a frame off.
+    #[test]
+    fn source_range_moves_with_the_start_rounding() {
+        for format in [
+            TimelineExportFormat::PremiereXML,
+            TimelineExportFormat::ResolveXML,
+        ] {
+            let mut timeline = fixture_timeline();
+            let rec = timeline.islands[0]
+                .clips
+                .iter_mut()
+                .find(|i| i.clip.id.0 == "rec")
+                .expect("recorder item");
+            rec.start = 25.49 / 25.0;
+            rec.source_in = 12.51 / 25.0;
+            rec.source_out = rec.source_in + 2.0;
+            rec.timeline_duration = 2.0;
+            let xml = write(&timeline, format, PremiereOptions::default());
+            let clip = &xml[xml.find("<name>rec.wav</name>").expect("recorder")..];
+            let clip = &clip[..clip.find("</clipitem>").unwrap()];
+            assert!(
+                clip.contains("<start>25</start>\n                <end>75</end>\n                <in>12</in>\n                <out>62</out>"),
+                "{format:?}: {clip}"
+            );
+            assert!(!clip.contains("subframeoffset"), "{clip}");
+        }
+    }
+
     #[test]
     fn near_integer_audio_start_snaps_instead_of_floor_plus_80() {
         // 9.28 s should encode as frame 232, not 231 + subframeoffset 80.
@@ -1498,11 +1566,11 @@ mod tests {
         assert!(xml.contains("<start>232</start>"));
     }
 
-    /// Resolve counts a trimmed WAV's in point from its broadcast start
-    /// floored to a frame: a WAV starting inside a frame is read one frame
-    /// further on in the Resolve XML. Premiere counts from the first sample.
+    /// Resolve reads a trimmed WAV whose broadcast start falls past the
+    /// middle of a frame a frame early, so its Resolve XML selects a frame
+    /// on; up to the middle, and in Premiere, it reads the selected frame.
     #[test]
-    fn resolve_reads_a_trimmed_wav_starting_inside_a_frame_a_frame_on() {
+    fn resolve_reads_a_trimmed_wav_starting_past_mid_frame_a_frame_on() {
         let xml = |format, reference: u64| {
             let mut timeline = fixture_timeline();
             let rec = timeline.islands[0]
@@ -1523,22 +1591,22 @@ mod tests {
             let clip = &xml[xml.find("<name>rec.wav</name>").expect("recorder")..];
             clip[..clip.find("</clipitem>").unwrap()].to_string()
         };
-        let inside = 48_000 * 10 + 200;
-        let resolve = xml(TimelineExportFormat::ResolveXML, inside);
-        assert!(
-            resolve.contains("<in>13</in>\n                <out>63</out>"),
-            "{resolve}"
-        );
-        let premiere = xml(TimelineExportFormat::PremiereXML, inside);
-        assert!(
-            premiere.contains("<in>12</in>\n                <out>62</out>"),
-            "{premiere}"
-        );
-        let on_frame = xml(TimelineExportFormat::ResolveXML, 48_000 * 10);
-        assert!(
-            on_frame.contains("<in>12</in>\n                <out>62</out>"),
-            "{on_frame}"
-        );
+        let selected = "<in>12</in>\n                <out>62</out>";
+        let frame_on = "<in>13</in>\n                <out>63</out>";
+        // Samples past a frame of 1920.
+        for (phase, resolve) in [
+            (0, selected),
+            (200, selected),
+            (960, selected),
+            (979, frame_on),
+            (1536, frame_on),
+        ] {
+            let reference = 48_000 * 10 + phase;
+            let xml_resolve = xml(TimelineExportFormat::ResolveXML, reference);
+            assert!(xml_resolve.contains(resolve), "{phase}: {xml_resolve}");
+            let premiere = xml(TimelineExportFormat::PremiereXML, reference);
+            assert!(premiere.contains(selected), "{phase}: {premiere}");
+        }
     }
 
     /// Takes of one recorder share a track across sub-second seams; when

@@ -346,8 +346,20 @@ class SourceValidation(unittest.TestCase):
             self.assertEqual(track['edit_rate'], rate)
             clip = track['clips'][0]
             self.assertEqual((clip['start'], clip['source_in'], clip['length']), (2, 0, 25))
-            # Without picture sound keeps its samples.
+            # Sound alone counts in composition frames too: at the sample
+            # rate Premiere opens it as 29.97.
             del document['picture_tracks']
+            write_audio(document, output)
+            with aaf2.open(str(output)) as container:
+                top = next(container.content.toplevel())
+                self.assertEqual([str(slot.edit_rate) for slot in top.slots],
+                    ['24000/1001', '24000/1001'])
+            # Read back on a 24000 tick clock: 2 and 25 frames of 1001 ticks.
+            track = read_timeline(output, audio_only=True)['sequences'][0]['tracks'][0]
+            clip = track['clips'][0]
+            self.assertEqual((track['sample_rate'], clip['start'], clip['length']),
+                (24000, 2002, 25025))
+            # Without a composition rate sound keeps its samples.
             del document['composition_edit_rate']
             write_audio(document, output)
             clip = read_timeline(output, audio_only=True)['sequences'][0]['tracks'][0]['clips'][0]

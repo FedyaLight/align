@@ -696,12 +696,11 @@ pub fn timeline_manifest_with_frame_rate(
             );
         }
     }
-    // Editors count picture in the composition's frames, so with picture
-    // the composition runs at the timeline's rate unless overridden.
+    // Editors count picture and sound in the composition's frames, so the
+    // composition runs at the timeline's rate unless overridden.
     let composition_edit_rate = composition_edit_rate.or_else(|| {
         let frame = timeline.frame_duration;
-        (!lanes.is_empty() && frame.value > 0)
-            .then(|| json!({"numerator":frame.timescale,"denominator":frame.value}))
+        (frame.value > 0).then(|| json!({"numerator":frame.timescale,"denominator":frame.value}))
     });
     Ok(
         json!({"version":2,"name":timeline.name,"tracks":tracks,"picture_tracks":lanes,

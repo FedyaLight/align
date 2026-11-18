@@ -84,6 +84,7 @@ def write_composition(container, document):
     clock = document.get('composition_edit_rate')
     if clock is None and picture_tracks:
         clock = picture_tracks[0]['edit_rate']
+    composition_rate = None
     if clock is not None:
         rate = Fraction(integer(clock['numerator'], 'numerator', 1),
             integer(clock['denominator'], 'denominator', 1))
@@ -101,13 +102,13 @@ def write_composition(container, document):
         timecode.segment = container.create.Timecode(fps=round(rate), drop=False,
             length=(frames.numerator + frames.denominator - 1) // frames.denominator)
         timecode.segment.start = 0
-    clock = None
+        composition_rate = rate
     if picture_tracks:
         write_picture(container, composition, picture_tracks, rate, link)
-        # Premiere takes its sequence rate from the sound tracks too: at the
-        # sample rate it opens 23.976 and 59.94 as 29.97. So with picture,
-        # sound counts in composition frames, as Resolve writes it.
-        clock = rate
+    # Premiere takes its sequence rate from the sound tracks too: at the
+    # sample rate it opens 23.976, 59.94 and sound alone at 25 as 29.97. So
+    # sound counts in composition frames, as Resolve writes it.
+    clock = composition_rate
     for track in tracks:
         rate = integer(track['sample_rate'], 'sample_rate', 1)
         slot = composition.create_sound_slot(edit_rate=rate if clock is None else clock)
