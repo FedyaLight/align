@@ -99,7 +99,8 @@ def write_composition(container, document):
         timecode = composition.create_timeline_slot(str(rate))
         timecode.name = 'Timecode'
         timecode['PhysicalTrackNumber'].value = 1
-        timecode.segment = container.create.Timecode(fps=round(rate), drop=False,
+        timecode.segment = container.create.Timecode(fps=round(rate),
+            drop=document.get('composition_drop_frame') is True,
             length=(frames.numerator + frames.denominator - 1) // frames.denominator)
         timecode.segment.start = 0
         composition_rate = rate

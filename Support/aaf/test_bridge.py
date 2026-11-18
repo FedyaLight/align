@@ -262,6 +262,16 @@ class SourceValidation(unittest.TestCase):
                 clip = picture.segment.components[-1]
                 self.assertEqual((clip.start, clip.length), (9, 84))
                 self.assertEqual(picture.segment.components[0].length, 6)
+                self.assertFalse(timecode.segment['Drop'].value)
+            # A drop-frame composition labels its timecode drop-frame.
+            dropped = copy.deepcopy(document)
+            dropped['composition_drop_frame'] = True
+            write_audio(dropped, override_output)
+            with aaf2.open(str(override_output)) as container:
+                top = next(container.content.toplevel())
+                timecode = next(slot for slot in top.slots if slot.media_kind == 'Timecode')
+                self.assertEqual(str(timecode.edit_rate), '30000/1001')
+                self.assertTrue(timecode.segment['Drop'].value)
             original = output.read_bytes()
             document['picture_tracks'][0]['clips'][0]['length'] = 121
             with self.assertRaises(ValueError):

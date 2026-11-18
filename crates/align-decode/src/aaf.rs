@@ -699,9 +699,19 @@ pub fn timeline_manifest_with_frame_rate(
         let frame = timeline.frame_duration;
         (frame.value > 0).then(|| json!({"numerator":frame.timescale,"denominator":frame.value}))
     });
+    // Its timecode counts drop frames, as the first source's does, where
+    // drop-frame labels exist: at 29.97 and 59.94.
+    let drop_frame = composition_edit_rate.as_ref().is_some_and(|rate| {
+        rate["denominator"] == 1001 && (rate["numerator"] == 30_000 || rate["numerator"] == 60_000)
+    }) && timeline
+        .islands
+        .iter()
+        .flat_map(|island| &island.clips)
+        .find_map(|item| item.clip.source_timecode())
+        .is_some_and(|timecode| timecode.drop_frame);
     Ok(
         json!({"version":2,"name":timeline.name,"tracks":tracks,"picture_tracks":lanes,
-        "composition_edit_rate":composition_edit_rate}),
+        "composition_edit_rate":composition_edit_rate,"composition_drop_frame":drop_frame}),
     )
 }
 
@@ -958,6 +968,26 @@ mod tests {
             overridden["composition_edit_rate"],
             serde_json::json!({"numerator":30000,"denominator":1001})
         );
+        assert_eq!(overridden["composition_drop_frame"], false);
+        // A drop-frame source labels a 29.97 composition drop-frame; 25 has
+        // no drop-frame labels.
+        let mut dropped = timeline.clone();
+        for item in &mut dropped.islands[0].clips {
+            item.clip.audio[0].source_timecode = align_core::model::SourceTimecode::from_samples(
+                48_000 * 60,
+                48_000.0,
+                MediaTime::new(1001, 30000),
+                true,
+            );
+        }
+        let manifest = |frame| {
+            timeline_manifest_with_frame_rate(&dropped, frame, &AtomicBool::new(false)).unwrap()
+        };
+        assert_eq!(
+            manifest(Some(MediaTime::new(1001, 30000)))["composition_drop_frame"],
+            true
+        );
+        assert_eq!(manifest(None)["composition_drop_frame"], false);
     }
     /// A camera's sound without stems links the camera file's channels.
     #[test]

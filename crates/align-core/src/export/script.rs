@@ -365,21 +365,22 @@ for track_index, track in enumerate(audio_tracks, 1):
     for entry, item in zip(track_entries, resolve_items):
         entry['item'] = item
 
-# Camera sound stays linked to its picture. A selected channel of a recording
-# keeps the clip the timeline import gave it, which plays that channel.
+# Camera sound stays linked to its picture; recordings are placed anew.
 for entry in entries:
-    if entry['linked'] or entry['align'].get('Selected Channel'):
+    if entry['linked']:
         apply_clip(entry['item'], entry['clip'])
-replaced = recordings([
-    entry for entry in entries
-    if not entry['linked'] and not entry['align'].get('Selected Channel')
-])
+        continue
+    # A deleted clip no longer knows its media.
+    entry['media'] = entry['item'].GetMediaPoolItem()
+    if not entry['media']:
+        raise RuntimeError(f"Resolve has no media for {entry['name']}")
+replaced = recordings([entry for entry in entries if not entry['linked']])
 replaced_items = [entry['item'] for recording in replaced for entry in recording['entries']]
 if replaced_items and not timeline.DeleteClips(replaced_items, False):
     raise RuntimeError('Resolve could not replace the frame-quantized recorder clips')
 original_tracks = timeline.GetTrackCount('audio')
 for recording in replaced:
-    place(recording, recording['item'].GetMediaPoolItem())
+    place(recording, recording['media'])
 remove_empty_tracks(original_tracks)
 
 organize_media()
