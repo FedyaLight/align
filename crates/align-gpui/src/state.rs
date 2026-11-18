@@ -339,6 +339,10 @@ pub struct AppData {
     pub ruler_timecode: Option<f64>,
     pub live_matches: HashMap<String, LiveMatch>,
     pub visible_matches: Vec<LiveMatch>,
+    /// Progress is applied in batches; the provisional layout follows once
+    /// a batch is in, rather than for each discovered clip or match.
+    layout_deferred: bool,
+    layout_stale: bool,
     pub warnings: Vec<String>,
     pub operation: Operation,
     pub progress: f32,
@@ -436,6 +440,8 @@ impl Default for AppData {
             ruler_timecode: None,
             live_matches: HashMap::new(),
             visible_matches: Vec::new(),
+            layout_deferred: false,
+            layout_stale: false,
             warnings: Vec::new(),
             operation: Operation::Idle,
             progress: 0.0,
@@ -1208,6 +1214,9 @@ impl AppData {
         if let Some(event) = preview {
             self.receive_preview(event);
         }
+        if !self.layout_deferred {
+            self.refresh_provisional();
+        }
         let (start, share) = match phase {
             "inspect" => (0.0, 0.05),
             "fingerprint" => (0.05, 0.60),
@@ -1261,7 +1270,23 @@ impl AppData {
         });
         self.clips
             .sort_by(|a, b| a.url.to_string_lossy().cmp(&b.url.to_string_lossy()));
-        self.rebuild_provisional();
+        self.layout_stale = true;
+    }
+
+    /// Defer the provisional layout while a batch of progress is applied;
+    /// ending the deferral lays out what the batch changed.
+    pub fn defer_layout(&mut self, deferred: bool) {
+        self.layout_deferred = deferred;
+        if !deferred {
+            self.refresh_provisional();
+        }
+    }
+
+    fn refresh_provisional(&mut self) {
+        if std::mem::take(&mut self.layout_stale) {
+            self.visible_matches = sorted_live_matches(&self.live_matches);
+            self.rebuild_provisional();
+        }
     }
 
     fn receive_preview(&mut self, event: &MatchPreview) {
@@ -1280,8 +1305,7 @@ impl AppData {
                 }
             }
         }
-        self.visible_matches = sorted_live_matches(&self.live_matches);
-        self.rebuild_provisional();
+        self.layout_stale = true;
     }
 
     fn rebuild_provisional(&mut self) {
@@ -2492,6 +2516,67 @@ mod tests {
     }
 
     /// Synthetic result fixture (no corpus, no pipeline): one island of
+    /// Progress applied as one batch lays out the timeline as applying its
+    /// events one at a time does.
+    #[test]
+    fn a_progress_batch_lays_out_as_its_events_one_by_one() {
+        use align_core::{MatchPreview, MatchPreviewStage, MediaTime};
+        let clip = |name: &str| Clip {
+            id: ClipId::new(name),
+            url: PathBuf::from(format!("/v/{name}")),
+            kind: MediaKind::Audio,
+            duration: MediaTime::seconds(30.0),
+            audio: vec![align_core::AudioSummary {
+                sample_rate: 48000.0,
+                channels: 1,
+                bit_depth: None,
+                is_float: None,
+                source_timecode: None,
+            }],
+            video: None,
+            recorded_at: None,
+            recorded_at_source: None,
+            source_identifier: None,
+            media_span: None,
+        };
+        let clips = [clip("a.wav"), clip("b.wav"), clip("c.wav")];
+        let preview = |left: &str, right: &str, offset: f64| MatchPreview {
+            left: ClipId::new(left),
+            right: ClipId::new(right),
+            rate: 1.0,
+            offset,
+            confidence: 0.9,
+            stage: MatchPreviewStage::Refined,
+        };
+        let previews = [
+            preview("a.wav", "b.wav", 2.0),
+            preview("b.wav", "c.wav", -1.0),
+        ];
+        let lay_out = |batched: bool| {
+            let mut data = AppData {
+                inputs: clips.iter().map(|clip| clip.url.clone()).collect(),
+                operation: Operation::Synchronizing,
+                ..AppData::default()
+            };
+            data.begin_sequence_progress();
+            data.defer_layout(batched);
+            for clip in &clips {
+                data.apply_progress("inspect", 0, 3, None, Some(clip), None);
+            }
+            for preview in &previews {
+                data.apply_progress("match", 0, 2, None, None, Some(preview));
+            }
+            data.defer_layout(false);
+            (
+                format!("{:?}", data.lanes),
+                format!("{:?}", data.visible_matches),
+            )
+        };
+        let batched = lay_out(true);
+        assert_eq!(batched, lay_out(false));
+        assert_ne!(batched.0, "[]");
+    }
+
     /// two clips plus one unmatched singleton. Guards the "all 25"
     /// regression where unmatched singletons leaked into `states` and rows
     /// read Synchronized instead of Unmatched.

@@ -848,11 +848,17 @@ impl AlignApp {
         });
         let view = cx.entity();
         cx.spawn(async move |_, cx| {
-            while let Some(msg) = rx.next().await {
-                let finished = matches!(msg, SyncMsg::Done(_));
+            while let Some(first) = rx.next().await {
+                // What arrived meanwhile applies with it, as one update:
+                // refinement reports hundreds of pairs.
+                let mut batch = vec![first];
+                while let Ok(msg) = rx.try_recv() {
+                    batch.push(msg);
+                }
+                let finished = batch.iter().any(|msg| matches!(msg, SyncMsg::Done(_)));
                 let _ = view.update(cx, |this, cx| {
                     if this.data.generation == generation {
-                        this.apply_sync_msg(msg);
+                        this.apply_sync_msgs(batch);
                         cx.notify();
                     }
                 });
@@ -929,12 +935,29 @@ impl AlignApp {
         result
     }
 
-    fn apply_sync_msg(&mut self, msg: SyncMsg) {
-        let changes_layout = match &msg {
+    /// Apply messages in order as one change: the timeline lays out, and
+    /// animates, once for all of them.
+    fn apply_sync_msgs(&mut self, msgs: Vec<SyncMsg>) {
+        let changes_layout = msgs.iter().any(|msg| match msg {
             SyncMsg::Progress(event) => event.discovered.is_some() || event.preview.is_some(),
             _ => true,
-        };
+        });
         let before = changes_layout.then(|| timeline_poses(&self.data));
+        self.data.defer_layout(true);
+        for msg in msgs {
+            if matches!(msg, SyncMsg::Done(_)) {
+                // The result replaces the provisional layout.
+                self.data.defer_layout(false);
+            }
+            self.apply_sync_msg(msg);
+        }
+        self.data.defer_layout(false);
+        if let Some(before) = before {
+            self.record_timeline_layout_change(before);
+        }
+    }
+
+    fn apply_sync_msg(&mut self, msg: SyncMsg) {
         match msg {
             SyncMsg::SequenceStart {
                 sequence_index,
@@ -996,9 +1019,6 @@ impl AlignApp {
                     }
                 }
             },
-        }
-        if let Some(before) = before {
-            self.record_timeline_layout_change(before);
         }
     }
 
