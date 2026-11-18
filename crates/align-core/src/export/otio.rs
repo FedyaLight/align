@@ -172,7 +172,21 @@ fn track_json(
             children.push(gap(item_start - cursor, rate));
         }
         let trim_start = before.map_or(0.0, |t| (t.end - t.start) / 2.0);
-        let trim_end = after.map_or(0.0, |t| (t.end - t.start) / 2.0);
+        // A clip runs into the next at a seam of one recording's parts; it
+        // ends where the next starts, or a track's clips play back to back
+        // and the next would start that much later.
+        let duration = timeline_duration(entry, kind);
+        let seam = entries
+            .get(index + 1)
+            .filter(|_| after.is_none())
+            .map_or(0.0, |next| {
+                item_start + duration - timeline_start(next, kind)
+            });
+        let trim_end = match after {
+            Some(t) => (t.end - t.start) / 2.0,
+            None if seam > TIME_TOLERANCE && seam < duration => seam,
+            None => 0.0,
+        };
         children.push(clip_json(
             entry,
             kind,
@@ -746,6 +760,48 @@ pub(crate) mod tests {
         assert_eq!(transitions("Video", "cam.mov"), 1);
         assert_eq!(transitions("Audio", "cam.mov"), 0);
         assert_eq!(transitions("Audio", "rec.wav"), 1);
+    }
+
+    /// Two parts of a recording that overlap at their seam share a track;
+    /// the first ends where the second starts, so the second plays at its
+    /// own place rather than after the whole first.
+    #[test]
+    fn a_seam_ends_the_first_part_where_the_second_starts() {
+        let mut timeline = fixture_timeline();
+        let clips = &mut timeline.islands[0].clips;
+        let rec = clips
+            .iter()
+            .position(|item| item.clip.video.is_none())
+            .unwrap();
+        let mut second = clips[rec].clone();
+        second.instance_id = "second part".into();
+        second.start = clips[rec].start + clips[rec].timeline_duration - 0.2;
+        clips.push(second.clone());
+        let v: Value = serde_json::from_slice(&data(&timeline, false).unwrap()).unwrap();
+        let track = v["tracks"]["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| {
+                t["kind"] == "Audio"
+                    && t["children"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|c| c["OTIO_SCHEMA"] == "Clip.2")
+                        .count()
+                        == 2
+            })
+            .expect("both parts on one track");
+        let mut cursor = 0.0;
+        let mut starts = Vec::new();
+        for child in track["children"].as_array().unwrap() {
+            if child["OTIO_SCHEMA"] == "Clip.2" {
+                starts.push(cursor);
+            }
+            cursor += child["source_range"]["duration"]["value"].as_f64().unwrap() / 25.0;
+        }
+        assert!((starts[1] - second.start).abs() < 1e-6, "{starts:?}");
     }
 
     #[test]

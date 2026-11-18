@@ -1121,8 +1121,15 @@ impl Document {
         }
         if retimed {
             xml += &match item.fcp7_time_remap_xml(media_type).filter(|_| preserved) {
-                Some(preserved) => format!("                {preserved}\n"),
+                Some(graph) if plays_backward => {
+                    format!(
+                        "                {}\n",
+                        reverse_out_at_speed(graph, graph_slope)
+                    )
+                }
+                Some(graph) => format!("                {graph}\n"),
                 None => TimeRemap {
+                    premiere: format == TimelineExportFormat::PremiereXML,
                     media_type,
                     graph_slope,
                     graph_in: source_in,
@@ -1195,6 +1202,8 @@ fn splice_pair(xml: &str, tag: &str, value: i64) -> Option<String> {
 /// A generated Time Remap filter: graph frames on the timeline against
 /// media frames of the source.
 struct TimeRemap {
+    /// Premiere reads a reverse graph's speed from its out point.
+    premiere: bool,
     media_type: MediaKind,
     graph_slope: f64,
     graph_in: i64,
@@ -1209,6 +1218,7 @@ struct TimeRemap {
 impl TimeRemap {
     fn xml(&self) -> String {
         let &Self {
+            premiere,
             media_type,
             graph_slope,
             graph_in,
@@ -1242,10 +1252,10 @@ impl TimeRemap {
         ));
         keyframes.push((
             graph_out,
-            if plays_backward {
-                media_in + 1.0
-            } else {
-                media_out
+            match (plays_backward, premiere) {
+                (true, true) => graph_out as f64 * graph_slope,
+                (true, false) => media_in + 1.0,
+                (false, _) => media_out,
             },
             "speedkfout",
         ));
@@ -1282,6 +1292,35 @@ impl TimeRemap {
         xml += "                    <interpolation><name>FCPCurve</name></interpolation>\n                  </parameter>\n                </effect></filter>\n";
         xml
     }
+}
+
+/// A reverse Time Remap graph whose out point Premiere reads its speed
+/// from: the out keyframe's value is its time at the clip's speed. With the
+/// value of the source frame there, Premiere played the clip as a still.
+fn reverse_out_at_speed(graph: &str, slope: f64) -> String {
+    let rewritten = (|| {
+        let flag = graph.find("<speedkfout>TRUE</speedkfout>")?;
+        let start = graph[..flag].rfind("<keyframe>")?;
+        let end = flag + graph[flag..].find("</keyframe>")?;
+        let keyframe = &graph[start..end];
+        let when: f64 = keyframe
+            .split_once("<when>")?
+            .1
+            .split_once("</when>")?
+            .0
+            .trim()
+            .parse()
+            .ok()?;
+        let value = keyframe.find("<value>")? + "<value>".len();
+        let value_end = value + keyframe[value..].find("</value>")?;
+        Some(format!(
+            "{}{}{}",
+            &graph[..start + value],
+            xml_number(when * slope),
+            &graph[start + value_end..]
+        ))
+    })();
+    rewritten.unwrap_or_else(|| graph.to_string())
 }
 
 fn xml_number(value: f64) -> String {
@@ -1706,6 +1745,38 @@ mod tests {
             );
             assert!(!clip.contains("subframeoffset"), "{clip}");
         }
+    }
+
+    /// Premiere reads a reverse clip's speed from the out keyframe's value
+    /// over its time and froze on the source frame stored there, even in a
+    /// graph it wrote itself; the value is the time at the clip's speed.
+    #[test]
+    fn premiere_reverse_graph_stores_its_speed_at_the_out_point() {
+        let graph = "<filter><parameter><keyframe><when>0</when><value>376</value><speedkfin>TRUE</speedkfin></keyframe>\n<keyframe><when>37</when><value>326</value><speedvirtualkf>TRUE</speedvirtualkf><speedkfout>TRUE</speedkfout></keyframe></parameter></filter>";
+        let rewritten = reverse_out_at_speed(graph, 2.0);
+        assert!(
+            rewritten.contains("<when>37</when><value>74</value><speedvirtualkf>"),
+            "{rewritten}"
+        );
+        assert!(rewritten.contains("<when>0</when><value>376</value>"));
+        assert_eq!(reverse_out_at_speed("<filter/>", 2.0), "<filter/>");
+        let remap = |premiere| {
+            TimeRemap {
+                premiere,
+                media_type: MediaKind::Video,
+                graph_slope: 1.0,
+                graph_in: 0,
+                graph_out: 400,
+                graph_duration: 400,
+                media_in: 0.0,
+                media_out: 400.0,
+                media_duration: 400.0,
+                plays_backward: true,
+            }
+            .xml()
+        };
+        assert!(remap(true).contains("<when>400</when><value>400</value>"));
+        assert!(remap(false).contains("<when>400</when><value>1</value>"));
     }
 
     #[test]

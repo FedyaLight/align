@@ -910,15 +910,35 @@ impl Library<'_> {
                 ),
             );
         }
+        let audio_lane = |id: &str| -((audio_assignments.get(id).copied().unwrap_or(0) + 1) as i64);
+        // Where each sound lane's clips start: a part that runs into the next
+        // at a seam of one recording ends where the next starts, as a lane
+        // plays its clips over each other.
+        let mut lane_starts: HashMap<i64, Vec<MediaTime>> = HashMap::new();
+        for (item, _, id) in &audio_entries {
+            lane_starts
+                .entry(audio_lane(id))
+                .or_default()
+                .push(sound_time(item.start, frame, &item.clip));
+        }
         for (item, channel, id) in audio_entries {
             let Some((media_url, asset_id, origin)) = self.asset(item, item.clip.video.is_none())
             else {
                 continue;
             };
-            let lane = -((audio_assignments.get(&id).copied().unwrap_or(0) + 1) as i64);
+            let lane = audio_lane(&id);
             let clip = &item.clip;
             let start = sound_time(item.start, frame, clip);
-            let duration = sound_time(audio_duration(item), frame, clip);
+            let mut duration = sound_time(audio_duration(item), frame, clip);
+            let next = lane_starts[&lane]
+                .iter()
+                .filter(|next| next.as_seconds() > start.as_seconds() + TIME_TOLERANCE)
+                .min_by(|a, b| a.as_seconds().total_cmp(&b.as_seconds()));
+            if let Some(&next) = next
+                && sum(start, duration).as_seconds() > next.as_seconds() + TIME_TOLERANCE
+            {
+                duration = difference(next, start);
+            }
             let source_in = sound_time(audio_source_in(item), frame, clip);
             let media_start = xml_text::fcpxml_time(sum(origin, source_in));
             let (source_start, source_duration) = (
@@ -1187,6 +1207,41 @@ mod tests {
             .unwrap();
         assert!(picture.contains("offset=\"20s\""), "{picture}");
         assert!(!xml.contains("duration=\"9/1000000s\""), "{xml}");
+    }
+
+    /// Two parts of a recording overlapping at their seam share a lane; the
+    /// first ends where the second starts, as Final Cut Pro would otherwise
+    /// play both over the overlap.
+    #[test]
+    fn a_seam_ends_the_first_part_where_the_second_starts() {
+        let mut timeline = fixture_timeline();
+        let clips = &mut timeline.islands[0].clips;
+        // Without the camera's sound, which shares the fixture's folder.
+        for camera in clips.iter_mut().filter(|i| i.clip.video.is_some()) {
+            camera.audio_enabled = Some(false);
+        }
+        let rec = clips.iter().position(|i| i.clip.video.is_none()).unwrap();
+        let mut second = clips[rec].clone();
+        second.instance_id = "second part".into();
+        second.start = clips[rec].start + clips[rec].timeline_duration - 0.2;
+        clips.push(second);
+        let xml = write(&timeline, FcpxmlOptions::TIMELINE);
+        let parts: Vec<&str> = xml
+            .lines()
+            .filter(|line| line.contains("<asset-clip lane=") && line.contains("rec.wav"))
+            .collect();
+        assert_eq!(parts.len(), 2, "{xml}");
+        // 0.5 s to 12.3 s, then from 12.3 s.
+        assert!(
+            parts[0].contains(" offset=\"1/2s\" duration=\"59/5s\""),
+            "{}",
+            parts[0]
+        );
+        assert!(
+            parts[1].contains(" offset=\"123/10s\" duration=\"12s\""),
+            "{}",
+            parts[1]
+        );
     }
 
     /// Sound off the frame grid sits on whole samples of its file, so two

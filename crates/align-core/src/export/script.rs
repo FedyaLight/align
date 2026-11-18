@@ -300,6 +300,15 @@ def place(recording, media):
     return item
 
 
+def track_clips(track_type, index):
+    """The clips of a track. Resolve lists a track's transitions among its
+    items too, as items without media."""
+    return [
+        item for item in (timeline.GetItemListInTrack(track_type, index) or [])
+        if item.GetMediaPoolItem()
+    ]
+
+
 def remove_empty_tracks(count):
     """Drop the first `count` audio tracks that the recordings left empty;
     the indices of the removed tracks."""
@@ -357,7 +366,7 @@ if not video_clips:
     imported_items = [
         item
         for track_index in range(1, timeline.GetTrackCount('audio') + 1)
-        for item in (timeline.GetItemListInTrack('audio', track_index) or [])
+        for item in track_clips('audio', track_index)
     ]
     unlock_audio_tracks()
     if imported_items and not timeline.DeleteClips(imported_items, False):
@@ -404,7 +413,7 @@ video_tracks = [track for track in document['tracks']['children'] if track['kind
 pictures = {}
 for track_index, track in enumerate(video_tracks, 1):
     clips = otio_clips(track)
-    resolve_items = timeline.GetItemListInTrack('video', track_index) or []
+    resolve_items = track_clips('video', track_index)
     if len(clips) != len(resolve_items):
         warnings.append(f'Video track {track_index} did not conform one-to-one; kept its clip names')
         continue
@@ -416,7 +425,7 @@ for track_index, track in enumerate(video_tracks, 1):
 
 entries = audio_entries()
 for track_index, track in enumerate(audio_tracks, 1):
-    resolve_items = timeline.GetItemListInTrack('audio', track_index) or []
+    resolve_items = track_clips('audio', track_index)
     track_entries = [entry for entry in entries if entry['track'] == track_index]
     if len(track_entries) != len(resolve_items):
         raise RuntimeError(f'Audio track {track_index} did not conform one-to-one')
