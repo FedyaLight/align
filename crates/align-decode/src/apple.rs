@@ -462,6 +462,66 @@ fn next_buffer(
     }
 }
 
+/// How long a window read through AVFoundation may take; reads normally
+/// take milliseconds.
+const WINDOW_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `work`'s result, or `None` once `limit` passes first; the work then goes
+/// on in its own thread, unattended.
+fn within<T: Send + 'static>(
+    limit: std::time::Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("align-avfoundation-window".into())
+        .spawn(move || {
+            let _ = sender.send(work());
+        })
+        .ok()?;
+    receiver.recv_timeout(limit).ok()
+}
+
+/// A window decoded to 16 kHz mono through AVFoundation.
+fn avfoundation_window(
+    path: &Path,
+    start_seconds: f64,
+    duration_seconds: f64,
+    source: AudioAnalysisSource,
+) -> Result<(f64, Vec<f32>), DecodeError> {
+    let (session, sample_rate) = open_reader(
+        path,
+        source.stream_index(),
+        Some((start_seconds, duration_seconds)),
+    )?;
+    let want = (duration_seconds * 16_000.0).ceil() as usize + 64;
+    let samples = std::cell::RefCell::new(Vec::with_capacity(want.min(16_000 * 12)));
+    let mut pipe = crate::mono::MonoPipe::new(
+        sample_rate,
+        16_000.0,
+        session.channels,
+        source.selected_channel(),
+        source.mixes_channels(),
+        |s: &[f32]| {
+            samples.borrow_mut().extend_from_slice(s);
+            Ok(())
+        },
+    )?;
+    // Read presentation timestamps from the sample buffers.
+    let mut actual_start = None::<f64>;
+    while samples.borrow().len() < want {
+        let Some(bytes) = next_buffer(&session.output, &mut actual_start)? else {
+            break;
+        };
+        pipe.push_interleaved(&bytes_to_f32(&bytes, session.channels)?)?;
+    }
+    check_completed(&session.reader, path)?;
+    pipe.finish()?;
+    let mut samples = samples.into_inner();
+    samples.truncate(want);
+    Ok((actual_start.unwrap_or(start_seconds.max(0.0)), samples))
+}
+
 // ------------------------------------------------------------ backend
 
 pub struct AppleNativeBackend;
@@ -596,37 +656,24 @@ impl MediaBackend for AppleNativeBackend {
         {
             return Ok(window);
         }
-        let (session, sample_rate) = open_reader(
-            path,
-            source.stream_index(),
-            Some((start_seconds, duration_seconds)),
-        )?;
-        let want = (duration_seconds * 16_000.0).ceil() as usize + 64;
-        let samples = std::cell::RefCell::new(Vec::with_capacity(want.min(16_000 * 12)));
-        let mut pipe = crate::mono::MonoPipe::new(
-            sample_rate,
-            16_000.0,
-            session.channels,
-            source.selected_channel(),
-            source.mixes_channels(),
-            |s: &[f32]| {
-                samples.borrow_mut().extend_from_slice(s);
-                Ok(())
-            },
-        )?;
-        // Read presentation timestamps from the sample buffers.
-        let mut actual_start = None::<f64>;
-        while samples.borrow().len() < want {
-            let Some(bytes) = next_buffer(&session.output, &mut actual_start)? else {
-                break;
-            };
-            pipe.push_interleaved(&bytes_to_f32(&bytes, session.channels)?)?;
-        }
-        check_completed(&session.reader, path)?;
-        pipe.finish()?;
-        let mut samples = samples.into_inner();
-        samples.truncate(want);
-        Ok((actual_start.unwrap_or(start_seconds.max(0.0)), samples))
+        // AVAssetReader has been seen to block for good inside startReading
+        // and copyNextSampleBuffer. A window it does not deliver in time is
+        // read by the portable engine, and the blocked reader is left behind.
+        let owned = path.to_path_buf();
+        let read = move || avfoundation_window(&owned, start_seconds, duration_seconds, source);
+        within(WINDOW_DEADLINE, read).unwrap_or_else(|| {
+            eprintln!(
+                "warning: AVFoundation did not read {} at {start_seconds:.3} s within {} s; reading it with the portable engine",
+                path.display(),
+                WINDOW_DEADLINE.as_secs()
+            );
+            crate::portable::PortableBackend.decode_window_16k(
+                path,
+                start_seconds,
+                duration_seconds,
+                source,
+            )
+        })
     }
 
     fn decode_native(
@@ -944,6 +991,21 @@ mod tests {
         assert_eq!(a.len(), p.len(), "lengths differ");
         assert_eq!(a, p, "streams differ");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Work that finishes in time gives its result; work that blocks past
+    /// the limit gives none, and the caller goes on without it.
+    #[test]
+    fn work_past_its_deadline_is_left_behind() {
+        let limit = std::time::Duration::from_millis(50);
+        assert_eq!(within(limit, || 7), Some(7));
+        let started = std::time::Instant::now();
+        let blocked = within(limit, || {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            7
+        });
+        assert_eq!(blocked, None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]
