@@ -90,9 +90,10 @@ fn with_gaps(
     indent: &str,
 ) -> String {
     clips.sort_by(|a, b| a.0.as_seconds().total_cmp(&b.0.as_seconds()));
+    // Shorter than half a sample, a gap is float dust.
     let gap = |from: MediaTime, to: MediaTime| {
         let space = difference(to, from);
-        if space.as_seconds() > TIME_TOLERANCE {
+        if space.as_seconds() > 0.5 / 48_000.0 {
             format!(
                 "{indent}<gap offset=\"{}\" duration=\"{}\"/>\n",
                 xml_text::fcpxml_time(from),
@@ -162,6 +163,15 @@ fn media_start(clip: &Clip) -> MediaTime {
                 tc.frame_duration.timescale,
             )
         })
+}
+
+/// A picture position on whole frames of the sequence: Resolve drops a
+/// picture that a storyline's microsecond gap moves off the frame grid.
+fn picture_time(seconds: f64, frame: MediaTime) -> MediaTime {
+    MediaTime::new(
+        (seconds / frame.as_seconds()).round() as i64 * frame.value,
+        frame.timescale,
+    )
 }
 
 /// A sound position on whole frames when it is on one, else on whole samples
@@ -644,8 +654,8 @@ impl Library<'_> {
                 let frame = self.frame;
                 let (start, duration, source) = match side {
                     MediaKind::Video => (
-                        grid_time(item.start, frame),
-                        grid_time(item.timeline_duration, frame),
+                        picture_time(item.start, frame),
+                        picture_time(item.timeline_duration, frame),
                         source_time(
                             origin,
                             picture_seconds(item.source_in, &item.clip),
@@ -794,15 +804,19 @@ impl Library<'_> {
             let media_start = source_time(origin, picture_in, &item.clip, frame);
             let source_duration =
                 picture_duration(picture_in, item.timeline_duration, &item.clip, frame);
+            let (start, duration) = (
+                picture_time(item.start, frame),
+                picture_time(item.timeline_duration, frame),
+            );
             place(
                 lane,
-                grid_time(item.start, frame),
-                grid_time(item.timeline_duration, frame),
+                start,
+                duration,
                 format!(
                     "              <clip{} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{}\" enabled=\"{}\"><video ref=\"{asset_id}\" offset=\"{source_start}\" start=\"{media_start}\" duration=\"{source_duration}\"/></clip>\n",
                     lane_attribute(lane),
-                    timeline_time(item.start, frame),
-                    timeline_time(item.timeline_duration, frame),
+                    xml_text::fcpxml_time(start),
+                    xml_text::fcpxml_time(duration),
                     timeline_time(item.source_in, frame),
                     clip_name(item, &media_url),
                     u8::from(item.is_enabled(MediaKind::Video)),
@@ -1038,6 +1052,27 @@ mod tests {
         assert!(angle.contains(" start=\"5/24s\""), "{angle}");
         // Its sound keeps the exact position.
         assert!(xml.contains("<audio ref=\"r_asset_1\" offset=\"1/5s\" start=\"1/5s\""));
+    }
+
+    /// A camera placed 9 µs past a frame sits on the frame: in a storyline
+    /// the 9 µs gap before it made Resolve drop the picture.
+    #[test]
+    fn pictures_sit_on_whole_frames_without_dust_gaps() {
+        let mut timeline = fixture_timeline();
+        timeline.islands[0].clips[0].start = 20.000_009;
+        let xml = write(
+            &timeline,
+            FcpxmlOptions {
+                group_storylines: true,
+                ..FcpxmlOptions::TIMELINE
+            },
+        );
+        let picture = xml
+            .lines()
+            .find(|line| line.contains("<video ref="))
+            .unwrap();
+        assert!(picture.contains("offset=\"20s\""), "{picture}");
+        assert!(!xml.contains("duration=\"9/1000000s\""), "{xml}");
     }
 
     /// Sound off the frame grid sits on whole samples of its file, so two

@@ -1021,7 +1021,7 @@ impl Document {
             xml += "</link>\n";
         }
         if self.defined_files.insert(media.resource_key.clone()) {
-            xml += &file_block(item, media_type, &media, self.format);
+            xml += &file_block(item, media_type, &media);
         } else {
             xml += &format!("                <file id=\"{file_id}\"/>\n");
         }
@@ -1420,7 +1420,7 @@ impl Document {
             );
             xml += &media.rate.xml("                    ");
             if index == 0 && self.defined_files.insert(media.resource_key.clone()) {
-                xml += &file_block(item, side, media, self.format);
+                xml += &file_block(item, side, media);
             } else {
                 xml += &format!("                <file id=\"{}\"/>\n", media.file_id());
             }
@@ -1448,12 +1448,7 @@ fn bin_open(name: &str) -> String {
     )
 }
 
-fn file_block(
-    item: &ExportItem,
-    media_type: MediaKind,
-    media: &MediaUse,
-    format: TimelineExportFormat,
-) -> String {
+fn file_block(item: &ExportItem, media_type: MediaKind, media: &MediaUse) -> String {
     let id = media.file_id();
     let (media_url, duration, rate) = (&media.url, media.duration, media.rate);
     let clip = &item.clip;
@@ -1527,11 +1522,12 @@ fn file_block(
             "<samplecharacteristics><depth>{depth}</depth><samplerate>{}</samplerate></samplecharacteristics>",
             audio.sample_rate.round() as i64,
         );
-        if format == TimelineExportFormat::PremiereXML && audio.channels > 1 {
+        if audio.channels > 1 {
             // Premiere plays a clip's `<sourcetrack>` channel only when the
             // file lists that channel as its own mono audio, as Premiere
             // writes multichannel files itself. A single multichannel
-            // description leaves every channel after the first silent.
+            // description leaves every channel after the first silent, also
+            // when Premiere opens the Resolve XML; Resolve reads either.
             for channel in 1..=audio.channels {
                 xml += &format!(
                     "<audio>{characteristics}<channelcount>1</channelcount><audiochannel><sourcechannel>{channel}</sourcechannel></audiochannel></audio>"
@@ -1844,9 +1840,10 @@ mod tests {
     }
 
     /// Premiere plays channels after the first only when the file lists
-    /// each channel as its own mono audio; Resolve reads one description.
+    /// each channel as its own mono audio, whichever XML it opens; Resolve
+    /// reads that as well.
     #[test]
-    fn premiere_lists_each_channel_of_a_file_as_mono_audio() {
+    fn both_xmls_list_each_channel_of_a_file_as_mono_audio() {
         let mut timeline = fixture_timeline();
         for item in &mut timeline.islands[0].clips {
             if item.clip.video.is_none() {
@@ -1858,18 +1855,20 @@ mod tests {
             let file = &xml[xml.find("<name>rec.wav</name>").expect("recorder file")..];
             file[file.find("<media>").unwrap()..file.find("</media>").unwrap()].to_string()
         };
-        let premiere = media(TimelineExportFormat::PremiereXML);
-        assert_eq!(premiere.matches("<audio>").count(), 4, "{premiere}");
-        assert_eq!(
-            premiere.matches("<channelcount>1</channelcount>").count(),
-            4
-        );
-        for channel in 1..=4 {
-            assert!(premiere.contains(&format!("<sourcechannel>{channel}</sourcechannel>")));
+        for format in [
+            TimelineExportFormat::PremiereXML,
+            TimelineExportFormat::ResolveXML,
+        ] {
+            let described = media(format);
+            assert_eq!(described.matches("<audio>").count(), 4, "{described}");
+            assert_eq!(
+                described.matches("<channelcount>1</channelcount>").count(),
+                4
+            );
+            for channel in 1..=4 {
+                assert!(described.contains(&format!("<sourcechannel>{channel}</sourcechannel>")));
+            }
         }
-        let resolve = media(TimelineExportFormat::ResolveXML);
-        assert_eq!(resolve.matches("<audio>").count(), 1, "{resolve}");
-        assert!(resolve.contains("<channelcount>4</channelcount>"));
     }
 
     #[test]
