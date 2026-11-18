@@ -67,19 +67,40 @@ fn difference(to: MediaTime, from: MediaTime) -> MediaTime {
     sum(to, MediaTime::new(-from.value, from.timescale))
 }
 
+/// A time on whole frames, rounded `up` or down.
+fn whole_frames(time: MediaTime, frame: MediaTime, up: bool) -> MediaTime {
+    let frames = time.as_seconds() / frame.as_seconds();
+    let frames = if up {
+        (frames - TIME_TOLERANCE).ceil()
+    } else {
+        (frames + TIME_TOLERANCE).floor()
+    };
+    MediaTime::new(frames as i64 * frame.value, frame.timescale)
+}
+
 /// Gaps between the clips of a storyline or multicam angle. Final Cut Pro
 /// places the clips at their offsets, but Resolve plays a storyline's clips
-/// back to back, so every space between them is an explicit gap.
-fn with_gaps(mut clips: Vec<(MediaTime, MediaTime, String)>, indent: &str) -> String {
+/// back to back, so the space between them is an explicit gap. Gaps span
+/// whole frames: Final Cut Pro moves a gap ending inside a frame, and with
+/// it the clip after, to a frame boundary.
+fn with_gaps(
+    mut clips: Vec<(MediaTime, MediaTime, String)>,
+    frame: MediaTime,
+    indent: &str,
+) -> String {
     clips.sort_by(|a, b| a.0.as_seconds().total_cmp(&b.0.as_seconds()));
     let mut xml = String::new();
     let mut cursor = MediaTime::new(0, 1);
     for (start, end, clip) in clips {
-        let space = difference(start, cursor);
+        let (from, to) = (
+            whole_frames(cursor, frame, true),
+            whole_frames(start, frame, false),
+        );
+        let space = difference(to, from);
         if space.as_seconds() > TIME_TOLERANCE {
             xml += &format!(
                 "{indent}<gap offset=\"{}\" duration=\"{}\"/>\n",
-                xml_text::fcpxml_time(cursor),
+                xml_text::fcpxml_time(from),
                 xml_text::fcpxml_time(space)
             );
         }
@@ -95,12 +116,29 @@ fn with_gaps(mut clips: Vec<(MediaTime, MediaTime, String)>, indent: &str) -> St
 /// picture's start to a frame of its file, flooring it; the nearest frame
 /// keeps the picture closer to its sound.
 fn picture_seconds(seconds: f64, clip: &Clip) -> f64 {
-    match clip.video.as_ref().and_then(|video| video.frame_duration) {
-        Some(frame) if frame.value > 0 => {
-            (seconds / frame.as_seconds()).round() * frame.as_seconds()
-        }
-        _ => seconds,
+    match picture_frame(clip) {
+        Some(frame) => (seconds / frame.as_seconds()).round() * frame.as_seconds(),
+        None => seconds,
     }
+}
+
+fn picture_frame(clip: &Clip) -> Option<MediaTime> {
+    clip.video
+        .as_ref()
+        .and_then(|video| video.frame_duration)
+        .filter(|frame| frame.value > 0)
+}
+
+/// How long a picture plays from its file: to the end of the file's frame
+/// that covers its last moment, as Final Cut Pro extends it.
+fn picture_duration(start: f64, duration: f64, clip: &Clip, frame: MediaTime) -> String {
+    let grid = picture_frame(clip).unwrap_or(frame);
+    let end = ((start + duration) / grid.as_seconds() - TIME_TOLERANCE).ceil();
+    let first = (start / grid.as_seconds()).round();
+    xml_text::fcpxml_time(MediaTime::new(
+        (end - first).max(0.0) as i64 * grid.value,
+        grid.timescale,
+    ))
 }
 
 /// Where Final Cut Pro starts a file: exactly at its own timecode, which FCP
@@ -284,45 +322,23 @@ fn frame_start(timecode: Option<&crate::model::SourceTimecode>, frame: MediaTime
     xml_text::fcpxml_time(MediaTime::new(frames, frame.timescale))
 }
 
-/// Prepared precision stems contain exactly the selected source range, so
-/// recorder items reference their stem from its start.
-fn with_precision_stems(island: &ExportIsland) -> ExportIsland {
-    let mut prepared = island.clone();
-    for item in &mut prepared.clips {
-        if item.clip.video.is_none()
-            && let Some(channel) = item.selected_audio_source_channel()
-            && let Some(path) = item.precision_audio_url(channel + 1).cloned()
-        {
-            let duration = item.corrected_selected_duration();
-            // A stem starts at its source's timecode plus the selected start,
-            // in whole samples, as its broadcast extension says.
-            let rate = item.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);
-            let start = MediaTime::new(
-                (item.precision_source_start() * rate).round() as i64,
-                rate.round() as i32,
-            );
-            let origin = sum(media_start(&item.clip), start);
-            for audio in &mut item.clip.audio {
-                if let Some(tc) = &mut audio.source_timecode
-                    && !tc.derived
-                {
-                    tc.frame_number = origin.value;
-                    tc.frame_duration = MediaTime::new(1, origin.timescale);
-                }
-            }
-            item.clip.url = path;
-            item.clip.duration = MediaTime::microseconds(duration);
-            for audio in &mut item.clip.audio {
-                audio.channels = 1;
-            }
-            item.corrected_audio_url = None;
-            item.source_in = 0.0;
-            item.source_out = duration;
-            item.audio_source_channel = Some(0);
-            item.precision_audio_urls.clear();
-        }
+/// Where an item's audio starts in the file it plays: its drift sidecar
+/// counts from the corrected start.
+fn audio_source_in(item: &ExportItem) -> f64 {
+    if item.corrected_audio_url.is_none() {
+        item.source_in
+    } else {
+        item.corrected_source_in()
     }
-    prepared
+}
+
+/// How long an item's audio plays from the file.
+fn audio_duration(item: &ExportItem) -> f64 {
+    if item.corrected_audio_url.is_none() {
+        item.timeline_duration
+    } else {
+        item.corrected_selected_duration()
+    }
 }
 
 fn write_island(
@@ -330,7 +346,8 @@ fn write_island(
     sources: &ExportIsland,
     options: FcpxmlOptions,
 ) -> String {
-    let island = &with_precision_stems(sources);
+    // Final Cut Pro picks channels and ranges of the original files itself.
+    let island = sources;
     let frame = timeline.frame_duration;
     let dimension = |side: fn(&crate::model::VideoSummary) -> u32, fallback: u32| {
         island
@@ -603,12 +620,15 @@ impl Library<'_> {
                 else {
                     continue;
                 };
-                let source_in = match side {
-                    MediaKind::Video => picture_seconds(item.source_in, &item.clip),
-                    MediaKind::Audio => item.source_in,
+                let (source_in, duration) = match side {
+                    MediaKind::Video => (
+                        picture_seconds(item.source_in, &item.clip),
+                        item.timeline_duration,
+                    ),
+                    MediaKind::Audio => (audio_source_in(item), audio_duration(item)),
                 };
                 let start = grid_time(item.start, self.frame);
-                let duration = grid_time(item.timeline_duration, self.frame);
+                let duration = grid_time(duration, self.frame);
                 clips.push((
                     start,
                     sum(start, duration),
@@ -624,7 +644,7 @@ impl Library<'_> {
                     ),
                 ));
             }
-            xml += &with_gaps(clips, "          ");
+            xml += &with_gaps(clips, self.frame, "          ");
             xml += "        </mc-angle>\n";
         }
         xml += "      </multicam>\n    </media>\n";
@@ -652,13 +672,27 @@ impl Library<'_> {
                 !i.clip.audio.is_empty() && !muted_camera_audio
             })
             .collect();
-        let audio_duration = |item: &ExportItem| {
-            if item.corrected_audio_url.is_none() {
-                item.timeline_duration
-            } else {
-                item.corrected_selected_duration()
-            }
-        };
+        // Final Cut Pro plays a file of more than two channels in a clip only
+        // through chosen channels, so each channel becomes its own clip.
+        let audio_entries: Vec<(&ExportItem, Option<usize>, String)> = audio_items
+            .iter()
+            .flat_map(|&item| {
+                let channels = item.clip.audio.first().map_or(0, |a| a.channels);
+                match item.selected_audio_source_channel() {
+                    Some(channel) => vec![(item, Some(channel), item.instance_id.clone())],
+                    None if channels > 2 => (0..channels)
+                        .map(|channel| {
+                            (
+                                item,
+                                Some(channel),
+                                format!("{}#{channel}", item.instance_id),
+                            )
+                        })
+                        .collect(),
+                    None => vec![(item, None, item.instance_id.clone())],
+                }
+            })
+            .collect();
         let video_assignments = allocate(
             &video_items
                 .iter()
@@ -675,11 +709,11 @@ impl Library<'_> {
                 .collect::<Vec<_>>(),
         );
         let audio_assignments = allocate(
-            &audio_items
+            &audio_entries
                 .iter()
-                .map(|item| {
+                .map(|(item, _, id)| {
                     TimelineTrackRequest::new(
-                        item.instance_id.clone(),
+                        id.clone(),
                         item.preferred_audio_source_key
                             .clone()
                             .or(item.preferred_source_key.clone())
@@ -722,13 +756,10 @@ impl Library<'_> {
             // video starts its file at that position past the file's start,
             // on a frame of the file.
             let source_start = timeline_time(item.source_in, frame);
-            let media_start = source_time(
-                origin,
-                picture_seconds(item.source_in, &item.clip),
-                &item.clip,
-                frame,
-            );
-            let source_duration = timeline_time(item.timeline_duration, frame);
+            let picture_in = picture_seconds(item.source_in, &item.clip);
+            let media_start = source_time(origin, picture_in, &item.clip, frame);
+            let source_duration =
+                picture_duration(picture_in, item.timeline_duration, &item.clip, frame);
             place(
                 lane,
                 item.start,
@@ -744,23 +775,19 @@ impl Library<'_> {
                 ),
             );
         }
-        for item in audio_items {
+        for (item, channel, id) in audio_entries {
             let Some((media_url, asset_id, origin)) = self.asset(item, item.clip.video.is_none())
             else {
                 continue;
             };
-            let lane = -((audio_assignments
-                .get(&item.instance_id)
-                .copied()
-                .unwrap_or(0)
-                + 1) as i64);
+            let lane = -((audio_assignments.get(&id).copied().unwrap_or(0) + 1) as i64);
             let duration = audio_duration(item);
-            let source_start = timeline_time(item.source_in, frame);
-            let media_start = source_time(origin, item.source_in, &item.clip, frame);
+            let source_in = audio_source_in(item);
+            let source_start = timeline_time(source_in, frame);
+            let media_start = source_time(origin, source_in, &item.clip, frame);
             let source_duration = timeline_time(duration, frame);
-            let channel_attribute = item
-                .selected_audio_source_channel()
-                .map_or_else(String::new, |channel| format!(" srcCh=\"{}\"", channel + 1));
+            let channel_attribute =
+                channel.map_or_else(String::new, |channel| format!(" srcCh=\"{}\"", channel + 1));
             place(
                 lane,
                 item.start,
@@ -770,7 +797,7 @@ impl Library<'_> {
                     lane_attribute(lane),
                     timeline_time(item.start, frame),
                     timeline_time(duration, frame),
-                    timeline_time(item.source_in, frame),
+                    source_start,
                     clip_name(item, &media_url),
                     u8::from(item.is_enabled(MediaKind::Audio)),
                     audio_role_attribute(item, "role"),
@@ -782,7 +809,7 @@ impl Library<'_> {
         for (lane, clips) in stories {
             spine += &format!(
                 "              <spine lane=\"{lane}\" offset=\"0s\">\n{}              </spine>\n",
-                with_gaps(clips, "              ")
+                with_gaps(clips, frame, "              ")
             );
         }
         spine
@@ -930,10 +957,10 @@ mod tests {
                 ..FcpxmlOptions::default()
             },
         );
-        // The recorder starts 0.5 s in, after a gap, in its storyline and
-        // in its angle.
+        // The recorder starts 12.5 frames in, after a gap of the 12 whole
+        // frames before it, in its storyline and in its angle.
         assert_eq!(
-            xml.matches("<gap offset=\"0s\" duration=\"1/2s\"/>")
+            xml.matches("<gap offset=\"0s\" duration=\"12/25s\"/>")
                 .count(),
             2,
             "{xml}"
@@ -949,9 +976,14 @@ mod tests {
         let camera = &mut timeline.islands[0].clips[0];
         camera.clip.video.as_mut().unwrap().frame_duration = Some(MediaTime::new(1, 24));
         camera.source_in = 0.2;
+        camera.timeline_duration = 9.8;
         let xml = write(&timeline, FcpxmlOptions::default());
+        // It plays to the end of the file's frame that covers its last
+        // moment: 9.8 s from frame 5 end inside frame 240, so frames 5–240.
         assert!(
-            xml.contains("<video ref=\"r_asset_1\" offset=\"1/5s\" start=\"5/24s\""),
+            xml.contains(
+                "<video ref=\"r_asset_1\" offset=\"1/5s\" start=\"5/24s\" duration=\"59/6s\""
+            ),
             "{xml}"
         );
         let angle = xml
@@ -961,6 +993,32 @@ mod tests {
         assert!(angle.contains(" start=\"5/24s\""), "{angle}");
         // Its sound keeps the exact position.
         assert!(xml.contains("<audio ref=\"r_asset_1\" offset=\"1/5s\" start=\"1/5s\""));
+    }
+
+    /// Final Cut Pro plays a clip's file of more than two channels only
+    /// through chosen channels: each channel is a clip of the original file
+    /// with its `srcCh`, without mono copies.
+    #[test]
+    fn multichannel_audio_plays_each_channel_of_the_original_file() {
+        let mut timeline = fixture_timeline();
+        let recorder = &mut timeline.islands[0].clips[1];
+        recorder.clip.audio[0].channels = 4;
+        recorder.precision_audio_urls = (1..=4)
+            .map(|channel| PathBuf::from(format!("/stems/rec-{channel}.wav")))
+            .collect();
+        let xml = write(&timeline, FcpxmlOptions::TIMELINE);
+        assert!(!xml.contains("/stems/"), "{xml}");
+        for channel in 1..=4 {
+            let audio = format!(
+                "<audio ref=\"r_asset_2\" offset=\"0s\" start=\"0s\" duration=\"12s\" srcCh=\"{channel}\""
+            );
+            assert!(xml.contains(&audio), "{xml}");
+        }
+        // A chosen channel is its own clip already.
+        timeline.islands[0].clips[1].audio_source_channel = Some(2);
+        let xml = write(&timeline, FcpxmlOptions::TIMELINE);
+        assert_eq!(xml.matches("srcCh=").count(), 1);
+        assert!(xml.contains("srcCh=\"3\""));
     }
 
     /// A drop-frame camera labels the sequence's timecode drop-frame, or

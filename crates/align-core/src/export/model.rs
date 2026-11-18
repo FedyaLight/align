@@ -1185,7 +1185,14 @@ impl ImportedAssembly<'_> {
             clip: {
                 let mut clip = base.clip.clone();
                 if edit.media_type == MediaKind::Audio {
-                    clip.video = None;
+                    // The file's start timecode is its sound's too: editors
+                    // count the sound's source times from it.
+                    let timecode = clip.video.take().and_then(|video| video.source_timecode);
+                    if let Some(audio) = clip.audio.first_mut()
+                        && audio.source_timecode.is_none()
+                    {
+                        audio.source_timecode = timecode;
+                    }
                     clip.kind = MediaKind::Audio;
                 }
                 clip

@@ -1379,3 +1379,39 @@ fn fcpxml_times_count_from_file_and_sequence_timecode() {
     let asset = edit("asset", DraftMediaKind::Video);
     assert!(near(asset.source_in, 3.0) && near(asset.timeline_start, 5.0));
 }
+
+/// Final Cut Pro writes a camera's sound as its own clip; a clip holding
+/// only the picture must not bring the camera's sound back.
+#[test]
+fn fcpxml_picture_clip_does_not_claim_the_camera_sound() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("muted.fcpxml");
+    std::fs::write(
+        &path,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<fcpxml version="1.14">
+<resources>
+<format id="r1" frameDuration="1/25s"/>
+<asset id="a1" start="0s" duration="16s" hasVideo="1" hasAudio="1"><media-rep src="file:///tmp/camera.mov"/></asset>
+</resources>
+<library><event><project name="P"><sequence format="r1" tcStart="0s">
+<spine><gap offset="0s" duration="16s">
+<clip lane="1" offset="4s" name="picture" duration="2s"><video ref="a1" offset="0s" start="4s" duration="16s"/></clip>
+<clip lane="-1" offset="0s" name="sound" duration="16s" enabled="0"><audio ref="a1" offset="0s" duration="16s"/></clip>
+<clip lane="2" offset="8s" name="both" duration="2s"><video ref="a1" offset="0s" start="8s" duration="2s"/><audio ref="a1" offset="0s" start="8s" duration="2s" lane="-1"/></clip>
+</gap></spine>
+</sequence></project></event></library>
+</fcpxml>"#,
+    )
+    .unwrap();
+    let draft = read_timeline(&path, None).unwrap();
+    let video = |name: &str| {
+        draft
+            .edits
+            .iter()
+            .find(|e| e.name.as_deref() == Some(name) && e.media_type == DraftMediaKind::Video)
+            .unwrap()
+    };
+    assert!(!video("picture").include_embedded_audio);
+    assert!(video("both").include_embedded_audio);
+}

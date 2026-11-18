@@ -525,7 +525,14 @@ pub(super) fn emit_fcpxml_std_clip(
             }
         }
     }
-    for (element, media_type) in media {
+    // A clip's picture carries the file's sound only when the clip holds that
+    // sound too; Final Cut Pro writes a muted camera's sound as its own clip.
+    let holds_sound = |reference: Option<&str>| {
+        media.iter().any(|&(element, kind)| {
+            kind == DraftMediaKind::Audio && refs.doc.attr(element, "ref") == reference
+        })
+    };
+    for &(element, media_type) in &media {
         let Some(asset) = refs
             .doc
             .attr(element, "ref")
@@ -580,7 +587,7 @@ pub(super) fn emit_fcpxml_std_clip(
             fcp7_retime_duration: None,
             fcp7_labels_xml: None,
             time_scale: 1_000_000,
-            include_embedded_audio: true,
+            include_embedded_audio: audio || holds_sound(refs.doc.attr(element, "ref")),
             audio_source_channel: if audio {
                 refs.doc
                     .attr(element, "srcCh")

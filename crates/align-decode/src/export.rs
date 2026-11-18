@@ -584,9 +584,8 @@ impl AudioPlan {
         cancel: &AtomicBool,
     ) -> Result<Self, ExportError> {
         let wants_aaf = options.wants(TimelineExportFormat::Aaf);
-        let wants_precision = wants_aaf
-            || options.wants(TimelineExportFormat::ResolveScript)
-            || options.wants(TimelineExportFormat::FinalCutProXML);
+        // Final Cut Pro picks channels and ranges of the original files.
+        let wants_precision = wants_aaf || options.wants(TimelineExportFormat::ResolveScript);
         // Placement pads are a PremiereXML-only concern: no other writer reads
         // them (OTIO/FCPXML place exactly already; the Resolve script locates
         // stems through its own fractional API, so its stems stay unpadded).
