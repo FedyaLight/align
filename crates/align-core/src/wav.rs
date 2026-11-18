@@ -30,6 +30,39 @@ pub enum WavError {
     Invalid(&'static str),
 }
 
+/// The speaker mask of a `WAVE_FORMAT_EXTENSIBLE` file, so audio rendered
+/// from it keeps its channel layout. `None` for other files.
+pub fn channel_mask(path: &Path) -> Option<u32> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let size = file.metadata().ok()?.len();
+    let mut header = [0u8; 12];
+    file.read_exact(&mut header).ok()?;
+    if !matches!(&header[0..4], b"RIFF" | b"RF64" | b"BW64") || &header[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut offset = 12u64;
+    while size.saturating_sub(offset) >= 8 {
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        let mut chunk = [0u8; 8];
+        file.read_exact(&mut chunk).ok()?;
+        let length = u64::from(u32::from_le_bytes(chunk[4..8].try_into().unwrap()));
+        if &chunk[0..4] == b"fmt " {
+            if length < 24 {
+                return None;
+            }
+            let mut format = [0u8; 24];
+            file.read_exact(&mut format).ok()?;
+            let tag = u16::from_le_bytes([format[0], format[1]]);
+            return (tag == 0xFFFE).then(|| u32::from_le_bytes(format[20..24].try_into().unwrap()));
+        }
+        if &chunk[0..4] == b"data" {
+            return None;
+        }
+        offset += 8 + length + (length & 1);
+    }
+    None
+}
+
 /// Copy `bext` from `source` into already-rendered `target`.
 pub fn preserve_broadcast_extension(
     source: &Path,

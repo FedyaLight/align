@@ -175,14 +175,20 @@ struct WavWriter {
     file: std::fs::File,
     frames_written: u64,
     bytes: Vec<u8>,
+    /// Where the audio starts, after the header.
+    data_offset: u64,
 }
 
 impl WavWriter {
+    /// More than two channels take `WAVE_FORMAT_EXTENSIBLE` with
+    /// `channel_mask`, as the format requires: Resolve plays only the first
+    /// channel of a plain multichannel float file.
     fn create(
         path: &Path,
         sample_rate: u32,
         channels: usize,
         int32: bool,
+        channel_mask: Option<u32>,
     ) -> Result<Self, RenderError> {
         let mut header = Vec::new();
         header.extend_from_slice(b"RIFF");
@@ -193,16 +199,26 @@ impl WavWriter {
         header.extend_from_slice(b"JUNK");
         header.extend_from_slice(&28u32.to_le_bytes());
         header.extend_from_slice(&[0u8; 28]);
+        // tag 3 = FLOAT, 1 = PCM, 0xFFFE = EXTENSIBLE.
+        let tag: u16 = if int32 { 1 } else { 3 };
+        let extensible = channels > 2;
         header.extend_from_slice(b"fmt ");
-        header.extend_from_slice(&16u32.to_le_bytes());
-        // tag 3 = FLOAT, 1 = PCM.
-        header.extend_from_slice(&(if int32 { 1u16 } else { 3u16 }).to_le_bytes());
+        header.extend_from_slice(&(if extensible { 40u32 } else { 16u32 }).to_le_bytes());
+        header.extend_from_slice(&(if extensible { 0xFFFE } else { tag }).to_le_bytes());
         header.extend_from_slice(&(channels as u16).to_le_bytes());
         header.extend_from_slice(&sample_rate.to_le_bytes());
         let block_align = (channels * 4) as u16;
         header.extend_from_slice(&(sample_rate * block_align as u32).to_le_bytes());
         header.extend_from_slice(&block_align.to_le_bytes());
         header.extend_from_slice(&32u16.to_le_bytes());
+        if extensible {
+            header.extend_from_slice(&22u16.to_le_bytes());
+            header.extend_from_slice(&32u16.to_le_bytes());
+            header.extend_from_slice(&channel_mask.unwrap_or(0).to_le_bytes());
+            // The subformat GUID 0000000t-0000-0010-8000-00AA00389B71.
+            header.extend_from_slice(&u32::from(tag).to_le_bytes());
+            header.extend_from_slice(&[0, 0, 0x10, 0, 0x80, 0, 0, 0xAA, 0, 0x38, 0x9B, 0x71]);
+        }
         header.extend_from_slice(b"data");
         header.extend_from_slice(&[0u8; 4]);
         let mut file = std::fs::File::create(path).map_err(RenderError::Write)?;
@@ -211,6 +227,7 @@ impl WavWriter {
             file,
             frames_written: 0,
             bytes: Vec::new(),
+            data_offset: header.len() as u64,
         })
     }
 
@@ -265,10 +282,10 @@ impl WavWriter {
 
     fn patch_header(&mut self) -> io::Result<()> {
         let len = self.file.stream_position()?;
-        // 12-byte RIFF header, 36-byte reserved ds64, 24-byte fmt,
-        // and 8-byte data header. Audio starts at byte 80.
+        // 12-byte RIFF header, 36-byte reserved ds64, 24- or 48-byte fmt,
+        // and 8-byte data header before the audio.
         let data_size = len
-            .checked_sub(80)
+            .checked_sub(self.data_offset)
             .ok_or_else(|| io::Error::other("WAV header is incomplete"))?;
         let riff_size = len - 8;
         let rf64 = riff_size >= u64::from(u32::MAX);
@@ -285,7 +302,7 @@ impl WavWriter {
             }
             // The reserved final u32 remains zero: no ds64 table entries.
         }
-        self.file.seek(SeekFrom::Start(76))?;
+        self.file.seek(SeekFrom::Start(self.data_offset - 4))?;
         self.file
             .write_all(&(if rf64 { u32::MAX } else { data_size as u32 }).to_le_bytes())?;
         self.file.flush()
@@ -474,7 +491,8 @@ pub fn render_drift_cancellable(
     let (probe, sample_rate, channels) = audio_format(backend, source)?;
 
     let staged = StagedFile::new(destination).map_err(RenderError::Write)?;
-    let mut writer = WavWriter::create(staged.path(), sample_rate as u32, channels, false)?;
+    let mask = align_core::wav::channel_mask(source);
+    let mut writer = WavWriter::create(staged.path(), sample_rate as u32, channels, false, mask)?;
     for &(source_start, source_duration, target_duration) in &segments {
         check_cancel(cancel)?;
         let mut segment = GuardedSegment::new(
@@ -664,7 +682,8 @@ pub fn render_pad_cancellable(
     )
     .map_err(|_| RenderError::InvalidRequest("the placement pad is out of range"))?;
     let staged = StagedFile::new(destination).map_err(RenderError::Write)?;
-    let mut writer = WavWriter::create(staged.path(), sample_rate as u32, channels, false)?;
+    let mask = align_core::wav::channel_mask(source);
+    let mut writer = WavWriter::create(staged.path(), sample_rate as u32, channels, false, mask)?;
     writer.write_silence(channels, pad_samples, cancel)?;
     let range = selection.map(|(start, end)| {
         (
@@ -776,7 +795,8 @@ pub fn render_channels_cancellable(
             .iter()
             .zip(&staged)
             .map(|((channel, _), staged)| {
-                let mut writer = WavWriter::create(staged.path(), sample_rate as u32, 1, int32)?;
+                let mut writer =
+                    WavWriter::create(staged.path(), sample_rate as u32, 1, int32, None)?;
                 writer.write_silence(1, stems.lead_samples, cancel)?;
                 Ok((*channel, writer))
             })
@@ -911,7 +931,7 @@ mod tests {
         let dir = tmp("pcm-bits");
         for int32 in [false, true] {
             let path = dir.join(if int32 { "int.wav" } else { "float.wav" });
-            let mut writer = WavWriter::create(&path, 48000, 2, int32).unwrap();
+            let mut writer = WavWriter::create(&path, 48000, 2, int32, None).unwrap();
             let expected = if int32 {
                 let left = [i32::MIN, 0, i32::MAX];
                 let right = [1, -1, 123456789];
@@ -959,7 +979,7 @@ mod tests {
         use std::io::Read;
         let dir = tmp("rf64-size");
         let path = dir.join("large.wav");
-        let mut writer = WavWriter::create(&path, 48000, 2, false).unwrap();
+        let mut writer = WavWriter::create(&path, 48000, 2, false, None).unwrap();
         // Sparse file crosses the actual RIFF boundary without allocating
         // 4 GiB of RAM or writing hours of silence during a unit test.
         let frames = (u64::from(u32::MAX) / 8) + 1;
@@ -1095,6 +1115,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Resolve plays only the first channel of a plain multichannel float
+    /// WAV, so a four-channel pad is `WAVE_FORMAT_EXTENSIBLE` with the
+    /// source's speaker mask, and every channel keeps its own audio.
+    #[test]
+    fn multichannel_pad_keeps_the_extensible_format_and_channels() {
+        let dir = tmp("pad-poly");
+        let src = dir.join("poly.wav");
+        let spec = hound::WavSpec {
+            channels: 4,
+            sample_rate: 48000,
+            bits_per_sample: 24,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(&src, spec).unwrap();
+        for i in 0..4800 {
+            for channel in 0..4 {
+                let click = i == 1000 + channel * 10;
+                w.write_sample(if click { 1 << 22 } else { 0i32 }).unwrap();
+            }
+        }
+        w.finalize().unwrap();
+        add_test_bext(&src, 48000);
+        let mask = align_core::wav::channel_mask(&src).expect("hound writes an extensible header");
+        let dst = dir.join("pad.wav");
+        render_pad(&crate::portable::PortableBackend, &src, &dst, 192, None).expect("pad");
+        assert_eq!(align_core::wav::channel_mask(&dst), Some(mask));
+        assert_eq!(
+            align_core::meta::read_bwf(&dst).unwrap().time_reference,
+            Some(48000 - 192)
+        );
+        let reader = hound::WavReader::open(&dst).unwrap();
+        assert_eq!(reader.spec().channels, 4);
+        assert_eq!(reader.spec().sample_format, hound::SampleFormat::Float);
+        let samples: Vec<f32> = reader.into_samples().map(Result::unwrap).collect();
+        assert_eq!(samples.len(), (4800 + 192) * 4);
+        for channel in 0..4 {
+            let loud: Vec<usize> = (0..4800 + 192)
+                .filter(|frame| samples[frame * 4 + channel] != 0.0)
+                .collect();
+            assert_eq!(loud, vec![192 + 1000 + channel * 10], "channel {channel}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn placement_pad_preserves_selected_head_and_tail_only() {
         let dir = tmp("pad-range");
@@ -1152,7 +1216,7 @@ mod tests {
         write_stereo_wav(&src, 48000, 1, 42);
         let mut probe = crate::portable::PortableBackend.inspect(&src).unwrap();
         let dst = dir.join("tail.wav");
-        let mut writer = WavWriter::create(&dst, 48000, 2, false).unwrap();
+        let mut writer = WavWriter::create(&dst, 48000, 2, false, None).unwrap();
         assert!(matches!(
             finish_tail(&mut writer, &probe, 1.0, 6, 48000.0, 2, cancel),
             Err(RenderError::Truncated)
