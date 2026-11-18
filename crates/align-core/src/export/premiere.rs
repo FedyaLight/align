@@ -1421,7 +1421,12 @@ impl Document {
         let mut prepared_keys = HashSet::new();
         for &(island, include_embedded_audio) in islands {
             for item in &island.clips {
-                sources.entry(&item.clip.id).or_insert(item);
+                // The source of a camera file is its item with picture, as
+                // its bin lists it.
+                let source = sources.entry(&item.clip.id).or_insert(item);
+                if source.clip.video.is_none() && item.clip.video.is_some() {
+                    *source = item;
+                }
                 let video = item.clip.video.is_some();
                 let audio = !item.clip.audio.is_empty()
                     && (include_embedded_audio || item.clip.kind == MediaKind::Audio);
@@ -2090,6 +2095,42 @@ mod tests {
             out += "\n";
         }
         out
+    }
+
+    /// A camera file's sound edited on its own, listed before the camera,
+    /// leaves the camera's master clip whole: picture, timecode, and sound.
+    /// With a sound-only master both editors refused the XML.
+    #[test]
+    fn media_bins_describe_a_camera_file_with_its_picture() {
+        let mut timeline = fixture_timeline();
+        let camera = timeline.islands[0]
+            .clips
+            .iter()
+            .find(|i| i.clip.video.is_some())
+            .expect("camera item")
+            .clone();
+        let mut sound = camera.clone();
+        sound.instance_id = "camera sound".into();
+        sound.clip.video = None;
+        timeline.islands[0].clips.insert(0, sound);
+        let xml = write(
+            &timeline,
+            TimelineExportFormat::PremiereXML,
+            PremiereOptions {
+                media_bins: true,
+                ..PremiereOptions::default()
+            },
+        );
+        let bin = &xml[..xml.find("<sequence").expect("sequence")];
+        let file = format!("<file id=\"file-{}\">", camera.clip.id.0);
+        let definition = &bin[bin.find(&file).expect("camera file in its bin")..];
+        let definition = &definition[..definition.find("</file>").unwrap()];
+        assert!(
+            definition.contains("<video><samplecharacteristics>"),
+            "{definition}"
+        );
+        assert!(definition.contains("<timecode>"), "{definition}");
+        assert!(bin.contains("-v\">"), "{bin}");
     }
 
     #[test]

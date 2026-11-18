@@ -47,15 +47,34 @@ pub struct MediaBins<'a> {
     by_clip: HashMap<&'a ClipId, usize>,
 }
 
+/// Each clip once, in the order first seen, as its fullest representation:
+/// a camera file's sound alone can also stand for the file, without its
+/// picture, and then the representation with picture wins.
+pub fn preferred_clips<'a>(clips: impl IntoIterator<Item = &'a Clip>) -> Vec<&'a Clip> {
+    let mut order: Vec<&'a Clip> = Vec::new();
+    let mut index: HashMap<&'a ClipId, usize> = HashMap::new();
+    for clip in clips {
+        match index.get(&clip.id) {
+            Some(&position) => {
+                if order[position].video.is_none() && clip.video.is_some() {
+                    order[position] = clip;
+                }
+            }
+            None => {
+                index.insert(&clip.id, order.len());
+                order.push(clip);
+            }
+        }
+    }
+    order
+}
+
 impl<'a> MediaBins<'a> {
     pub fn new(clips: impl IntoIterator<Item = &'a Clip>) -> Self {
-        let mut seen = HashSet::new();
         let mut by_folder: BTreeMap<PathBuf, Vec<&'a Clip>> = BTreeMap::new();
-        for clip in clips {
-            if seen.insert(&clip.id) {
-                let folder = clip.url.parent().unwrap_or(Path::new(""));
-                by_folder.entry(card_root(folder)).or_default().push(clip);
-            }
+        for clip in preferred_clips(clips) {
+            let folder = clip.url.parent().unwrap_or(Path::new(""));
+            by_folder.entry(card_root(folder)).or_default().push(clip);
         }
         let folders: Vec<&Path> = by_folder.keys().map(PathBuf::as_path).collect();
         let folder_names = folder_names(&folders);
