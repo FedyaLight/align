@@ -1291,3 +1291,34 @@ fn draft_to_otio_timeline(draft: &TimelineDraft) -> crate::export_model::ExportT
         &draft.name,
     )
 }
+
+/// Premiere writes its XML with a byte order mark. Verbatim payloads
+/// (time remaps, filters, labels) must still be cut at their own elements,
+/// or a round trip writes broken tags.
+#[test]
+fn byte_order_mark_keeps_verbatim_payloads_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().join("plain.xml");
+    let marked = dir.path().join("marked.xml");
+    std::fs::write(&plain, FCP7).unwrap();
+    std::fs::write(&marked, format!("\u{feff}{FCP7}")).unwrap();
+    let payloads = |path: &Path| {
+        read_timeline(path, None)
+            .unwrap()
+            .edits
+            .into_iter()
+            .map(|e| (e.id, e.fcp7_time_remap_xml, e.fcp7_labels_xml))
+            .collect::<Vec<_>>()
+    };
+    let marked_payloads = payloads(&marked);
+    assert_eq!(marked_payloads, payloads(&plain));
+    let remap = marked_payloads
+        .iter()
+        .find_map(|(_, remap, _)| remap.clone())
+        .expect("time remap");
+    assert!(
+        remap.starts_with("<filter>") && remap.ends_with("</filter>"),
+        "{remap}"
+    );
+}
+

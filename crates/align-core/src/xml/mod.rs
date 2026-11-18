@@ -53,6 +53,9 @@ pub struct XmlDoc {
 
 impl XmlDoc {
     pub fn parse(text: &str) -> Result<Self, ImportError> {
+        // Premiere writes its XML with a byte order mark. The reader skips it
+        // but counts positions after it, and verbatim spans index `text`.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let mut reader = Reader::from_str(text);
         reader.config_mut().trim_text(false);
         let mut doc = XmlDoc {
