@@ -1282,6 +1282,13 @@ impl AppData {
         }
     }
 
+    /// End a deferral without laying out what it changed: what comes next
+    /// replaces the provisional layout.
+    pub fn discard_deferred_layout(&mut self) {
+        self.layout_deferred = false;
+        self.layout_stale = false;
+    }
+
     fn refresh_provisional(&mut self) {
         if std::mem::take(&mut self.layout_stale) {
             self.visible_matches = sorted_live_matches(&self.live_matches);

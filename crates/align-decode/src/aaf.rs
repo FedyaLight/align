@@ -221,18 +221,26 @@ pub fn read_timeline(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, 
     if let Some(json) = cached
         && let Ok(result) = parse_timeline(&json)
         // Extracted sound lives on while the folder does; read again if not.
+        // Media the project only refers to may be missing, and is relinked
+        // later.
         && result
             .sequences
             .iter()
             .flat_map(|sequence| &sequence.tracks)
             .flat_map(|track| &track.clips)
+            .filter(|clip| clip.path.starts_with(&directory))
             .all(|clip| clip.path.exists())
     {
         return Ok(result);
     }
     let json = run_read_timeline(path, &directory, cancel)?;
     let result = parse_timeline(&json)?;
-    if let Some(key) = key {
+    // A project that changed while the module read it may have been read
+    // in either state; its response is not kept.
+    let unchanged = |key: &(PathBuf, String, PathBuf)| {
+        align_core::cache::media_revision(path).is_ok_and(|revision| revision == key.1)
+    };
+    if let Some(key) = key.filter(unchanged) {
         let mut read = lock();
         if read.len() >= READ_LIMIT {
             read.clear();

@@ -8,7 +8,7 @@
 //! returned Objective-C objects are retained before crossing the boundary.
 //! Decoder concurrency is bounded by the pipeline.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -466,6 +466,32 @@ fn next_buffer(
 /// take milliseconds.
 const WINDOW_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Files AVFoundation did not read a window of in time, and how many of its
+/// readers are left blocked. Later windows of such a file, and every window
+/// once several readers are blocked, go to the portable engine at once
+/// rather than each waiting out the deadline and leaving another thread.
+static STALLED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(Default::default);
+static BLOCKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Blocked readers after which AVFoundation reads no more windows.
+const BLOCKED_LIMIT: usize = 4;
+
+fn avfoundation_stalled(path: &Path) -> bool {
+    BLOCKED.load(std::sync::atomic::Ordering::Relaxed) >= BLOCKED_LIMIT
+        || STALLED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(path)
+}
+
+fn note_stall(path: &Path) {
+    BLOCKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    STALLED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf());
+}
+
 /// `work`'s result, or `None` once `limit` passes first; the work then goes
 /// on in its own thread, unattended.
 fn within<T: Send + 'static>(
@@ -659,20 +685,27 @@ impl MediaBackend for AppleNativeBackend {
         // AVAssetReader has been seen to block for good inside startReading
         // and copyNextSampleBuffer. A window it does not deliver in time is
         // read by the portable engine, and the blocked reader is left behind.
-        let owned = path.to_path_buf();
-        let read = move || avfoundation_window(&owned, start_seconds, duration_seconds, source);
-        within(WINDOW_DEADLINE, read).unwrap_or_else(|| {
-            eprintln!(
-                "warning: AVFoundation did not read {} at {start_seconds:.3} s within {} s; reading it with the portable engine",
-                path.display(),
-                WINDOW_DEADLINE.as_secs()
-            );
+        let portable = || {
             crate::portable::PortableBackend.decode_window_16k(
                 path,
                 start_seconds,
                 duration_seconds,
                 source,
             )
+        };
+        if avfoundation_stalled(path) {
+            return portable();
+        }
+        let owned = path.to_path_buf();
+        let read = move || avfoundation_window(&owned, start_seconds, duration_seconds, source);
+        within(WINDOW_DEADLINE, read).unwrap_or_else(|| {
+            note_stall(path);
+            eprintln!(
+                "warning: AVFoundation did not read {} at {start_seconds:.3} s within {} s; reading it with the portable engine",
+                path.display(),
+                WINDOW_DEADLINE.as_secs()
+            );
+            portable()
         })
     }
 

@@ -102,8 +102,25 @@ pub fn refine_forest(
             });
         }
     }
-    let completed = std::sync::atomic::AtomicUsize::new(0);
     let total = usable.len();
+    // Workers count and report under one lock, so the counts they report
+    // arrive in order.
+    let completed = std::sync::Mutex::new(0usize);
+    let report_done = |candidate: &PairwiseMatch, stage: RefineStage| {
+        if let Some(report) = &progress {
+            let mut done = completed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *done += 1;
+            report(RefineEvent {
+                completed: *done,
+                total,
+                left: candidate.left.clone(),
+                right: candidate.right.clone(),
+                stage,
+            });
+        }
+    };
     let clips: Vec<_> = durations.keys().cloned().collect();
     let mut components = FineDisjointSet::new(&clips);
     let mut accepted = Vec::new();
@@ -132,33 +149,16 @@ pub fn refine_forest(
                     sources,
                     provider,
                 );
-                if let Some(report) = &progress {
-                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    report(RefineEvent {
-                        completed: done,
-                        total,
-                        left: candidate.left.clone(),
-                        right: candidate.right.clone(),
-                        stage: if result.is_some() {
-                            RefineStage::Refined
-                        } else {
-                            RefineStage::Rejected
-                        },
-                    });
-                }
+                let stage = if result.is_some() {
+                    RefineStage::Refined
+                } else {
+                    RefineStage::Rejected
+                };
+                report_done(candidate, stage);
                 result
             });
-        if let Some(report) = &progress {
-            for &(candidate, _) in jobs.iter().filter(|(_, dropped)| *dropped) {
-                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                report(RefineEvent {
-                    completed: done,
-                    total,
-                    left: candidate.left.clone(),
-                    right: candidate.right.clone(),
-                    stage: RefineStage::Rejected,
-                });
-            }
+        for &(candidate, _) in jobs.iter().filter(|(_, dropped)| *dropped) {
+            report_done(candidate, RefineStage::Rejected);
         }
         for (&candidate, result) in batch.iter().zip(refined) {
             let closes_cycle = components.connected(&candidate.left, &candidate.right);

@@ -935,9 +935,26 @@ impl AlignApp {
         result
     }
 
-    /// Apply messages in order as one change: the timeline lays out, and
-    /// animates, once for all of them.
+    /// Apply messages in order. A sequence's start clears the timeline, so
+    /// it applies on its own; the messages between apply as one change, and
+    /// the timeline lays out, and animates, once for them.
     fn apply_sync_msgs(&mut self, msgs: Vec<SyncMsg>) {
+        let mut group = Vec::new();
+        for msg in msgs {
+            if matches!(msg, SyncMsg::SequenceStart { .. }) {
+                self.apply_sync_group(std::mem::take(&mut group));
+                self.apply_sync_group(vec![msg]);
+            } else {
+                group.push(msg);
+            }
+        }
+        self.apply_sync_group(group);
+    }
+
+    fn apply_sync_group(&mut self, msgs: Vec<SyncMsg>) {
+        if msgs.is_empty() {
+            return;
+        }
         let changes_layout = msgs.iter().any(|msg| match msg {
             SyncMsg::Progress(event) => event.discovered.is_some() || event.preview.is_some(),
             _ => true,
@@ -945,9 +962,13 @@ impl AlignApp {
         let before = changes_layout.then(|| timeline_poses(&self.data));
         self.data.defer_layout(true);
         for msg in msgs {
-            if matches!(msg, SyncMsg::Done(_)) {
-                // The result replaces the provisional layout.
-                self.data.defer_layout(false);
+            if let SyncMsg::Done(result) = &msg {
+                // A result, or a cancellation, replaces the provisional
+                // layout; after a failure it stays on screen.
+                match result.as_ref() {
+                    Err(error) if error != "Cancelled." => self.data.defer_layout(false),
+                    _ => self.data.discard_deferred_layout(),
+                }
             }
             self.apply_sync_msg(msg);
         }

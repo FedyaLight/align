@@ -115,7 +115,11 @@ fn probe_json(path: &Path) -> Result<Vec<u8>, DecodeError> {
         return Ok(json.clone());
     }
     let json = run_probe(path)?;
-    if let Some(revision) = revision {
+    // A file that changed while ffprobe read it may have been read in
+    // either state; its header is not kept.
+    if let Some(revision) =
+        revision.filter(|revision| media_revision(path).as_ref() == Some(revision))
+    {
         let mut probed = lock();
         if probed.len() >= PROBED_LIMIT {
             probed.clear();
