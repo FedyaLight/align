@@ -1,7 +1,7 @@
 //! Export preparation and format dispatch.
 //!
 //! An export first plans every audio file the timeline writers will reference
-//! (drift corrections, Premiere placement pads, Resolve precision stems) and
+//! (drift corrections and precision stems) and
 //! attaches their paths to the timeline. The plan is then rendered job by job
 //! with progress, and the timelines are written last. Prepared audio is
 //! reused when its file name, which encodes its full identity, already exists.
@@ -18,7 +18,7 @@ use align_core::drift::needs_correction_points;
 use align_core::export::fcpxml::FcpxmlOptions;
 use align_core::export::model::{
     ExportIsland, ExportItem, ExportTimeline, TimelineExportError, TimelineExportFormat,
-    aaf_lead_samples, placement_pad_samples, sequence_fps,
+    sequence_fps,
 };
 use align_core::export::premiere::PremiereOptions;
 use align_core::model::file_name;
@@ -29,7 +29,6 @@ use crate::backend::MediaBackend;
 use crate::process::WaitError;
 use crate::render::{
     ChannelStems, RenderError, render_channels_cancellable, render_drift_cancellable,
-    render_pad_cancellable,
 };
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -382,10 +381,8 @@ fn export_prepared_internal(
         ));
     }
     std::fs::create_dir_all(directory).map_err(ExportError::Write)?;
-    // Combine up front: the writer floors the combined island's starts, and
-    // placement pads depend on those absolute starts (chronology shifts are
-    // generally fractional). Planning on pre-combine starts would attach the
-    // wrong prepend whenever the island minimum is not frame-exact.
+    // Combine up front, so the plan sees the starts the writers round, and
+    // the final precision stem's tail fits the combined timeline's end.
     // Re-combining inside write_artifacts is a no-op shift afterwards.
     // Drift mappings are shift-invariant (relative source/island coords).
     let mut combined = timeline.combined();
@@ -520,7 +517,7 @@ fn extend_final_precision_tail(combined: &mut ExportTimeline, correct_drift: boo
 
 /// Version of the prepared-audio formats, part of every sidecar's identity:
 /// a change to how sidecars are rendered never reuses an older file.
-const AUDIO_SIDECAR_REVISION: u32 = 14;
+const AUDIO_SIDECAR_REVISION: u32 = 15;
 
 /// `"<media> – <label> – <identity hash>.wav"`. The readable part names the
 /// file in an editor's bin; the hash keeps every rendering input, so a file
@@ -558,12 +555,6 @@ enum AudioJobKind {
         destination: PathBuf,
         points: Vec<(f64, f64)>,
     },
-    Pad {
-        source: PathBuf,
-        destination: PathBuf,
-        samples: u64,
-        selection: (u64, u64),
-    },
     Stems {
         source: PathBuf,
         outputs: Vec<PathBuf>,
@@ -571,7 +562,6 @@ enum AudioJobKind {
         is_float: bool,
         source_start: f64,
         duration: f64,
-        lead_samples: u64,
         tail_samples: u64,
     },
 }
@@ -586,55 +576,18 @@ impl AudioPlan {
         let wants_aaf = options.wants(TimelineExportFormat::Aaf);
         // Final Cut Pro picks channels and ranges of the original files.
         let wants_precision = wants_aaf || options.wants(TimelineExportFormat::ResolveScript);
-        // Placement pads serve the FCP 7 XML writers: Premiere and Resolve
-        // place XML audio on whole frames. OTIO, FCPXML and the Resolve
-        // script place exactly already, so their files stay unpadded.
-        let wants_pad = options.wants(TimelineExportFormat::PremiereXML)
-            || options.wants(TimelineExportFormat::ResolveXML);
-        let fps = sequence_fps(combined.frame_duration);
-
         let needs_drift = |item: &ExportItem| {
             options.correct_drift
                 && item.clip.kind == MediaKind::Audio
                 && needs_correction_points(&item.mapping_points)
         };
-        // Only Resolve needs copies of trimmed WAVs starting inside a frame.
-        let trim_copies = options.wants(TimelineExportFormat::ResolveXML);
-        let pad = |item: &ExportItem| {
-            if wants_pad {
-                placement_pad(item, fps, trim_copies)
-            } else {
-                None
-            }
-        };
-        // AAF audio that does not start on a whole-sample composition frame
-        // plays stems that lead with silence instead of the plain ones. With
-        // picture the AAF counts audio in frames, as Premiere needs to take
-        // the picture's rate, so the stems also end with up to a frame of
-        // silence that the clip's last frame covers.
-        let aaf_frame = options
-            .aaf_frame_duration
-            .unwrap_or(combined.frame_duration);
-        let aaf_in_frames = wants_aaf
-            && combined
-                .islands
-                .iter()
-                .flat_map(|island| &island.clips)
-                .any(|item| item.clip.video.is_some());
         let aaf_item = |item: &ExportItem| {
             wants_aaf && !item.clip.audio.is_empty() && item.is_enabled(MediaKind::Audio)
         };
-        let aaf_lead = |item: &ExportItem| {
-            let rate = item.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);
-            aaf_lead_samples(item.timeline_start(MediaKind::Audio), aaf_frame, rate).unwrap_or(0)
-        };
-        // A camera starting and ending on whole-sample frames links its own
-        // QuickTime or MP4 file's channels, as Resolve's AAF does. Ending
-        // inside a frame, its clip would stop a frame short of the file's
-        // sound, so it keeps a stem ending in silence; other files, such as
+        // A camera links its own QuickTime or MP4 file's channels in AAF, as
+        // Resolve's AAF does, when its selection lies within the file's
+        // sound, which can end before its picture. Other files, such as
         // MXF, whose sound often lives in other files, keep their stems.
-        // The selection must also lie within the file's sound, which can
-        // end before its picture.
         let mut sound_lengths: HashMap<PathBuf, Option<u64>> = HashMap::new();
         if wants_aaf {
             for item in combined.islands.iter().flat_map(|island| &island.clips) {
@@ -652,7 +605,6 @@ impl AudioPlan {
         }
         let aaf_direct = |item: &ExportItem| {
             let rate = item.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);
-            let end = item.timeline_start(MediaKind::Audio) + item.precision_source_duration();
             let within = sound_lengths
                 .get(&item.clip.url)
                 .copied()
@@ -666,21 +618,6 @@ impl AudioPlan {
                 && item.clip.video.is_some()
                 && within
                 && !item.is_retimed(MediaKind::Audio)
-                && aaf_lead(item) == 0
-                && aaf_lead_samples(end, aaf_frame, rate).is_none()
-        };
-        let aaf_stems = |item: &ExportItem| {
-            let rate = item.clip.audio.first()?.sample_rate;
-            if !aaf_item(item) || item.is_retimed(MediaKind::Audio) || aaf_direct(item) {
-                return None;
-            }
-            let lead = aaf_lead(item);
-            let tail = if aaf_in_frames {
-                (rate * aaf_frame.as_seconds()).ceil() as u64 + 1
-            } else {
-                0
-            };
-            (lead > 0 || tail > 0).then_some((lead, tail))
         };
         let needs_precision = |item: &ExportItem| {
             let channels = item.clip.audio.first().map_or(0, |a| a.channels);
@@ -689,7 +626,7 @@ impl AudioPlan {
                 && (channels > 1
                     || !item.is_full_source_selection()
                     || item.precision_tail_samples > 0);
-            for_resolve_or_fcp || (aaf_item(item) && !aaf_direct(item) && aaf_stems(item).is_none())
+            for_resolve_or_fcp || (aaf_item(item) && !aaf_direct(item))
         };
 
         // Every item of a corrected clip plays its drift sidecar, and every
@@ -709,9 +646,7 @@ impl AudioPlan {
         let mut source_tags = HashMap::new();
         for item in items() {
             let needs_file = corrected_clips.contains(item.clip.id.0.as_str())
-                || pad(item).is_some()
-                || precision_assets.contains(&item.precision_asset_key())
-                || aaf_stems(item).is_some();
+                || precision_assets.contains(&item.precision_asset_key());
             if needs_file && !source_tags.contains_key(&item.clip.url) {
                 source_tags.insert(
                     item.clip.url.clone(),
@@ -723,7 +658,6 @@ impl AudioPlan {
         let audio_dir = directory.join("Corrected Audio");
         let precision_dir = directory.join("Resolve Precision Audio");
         let mut jobs = Vec::new();
-        let mut planned_pads = HashSet::new();
         let mut drift_files: HashMap<&str, PathBuf> = HashMap::new();
         let mut precision_files: HashMap<String, Vec<PathBuf>> = HashMap::new();
         let mut islands = Vec::with_capacity(combined.islands.len());
@@ -763,136 +697,60 @@ impl AudioPlan {
                     prepared = prepared.with_corrected_audio(destination.clone());
                 }
 
-                if let Some((samples, sample_rate)) = pad(item) {
-                    // Pad the drift sidecar when one exists, else the
-                    // original: precision stems keep using the unpadded
-                    // source, so the script workflow is unaffected.
-                    let corrected = prepared.corrected_audio_url.clone();
-                    let mapping = if corrected.is_some() {
-                        item.mapping_digest()
-                    } else {
-                        "direct".to_string()
-                    };
-                    let (start, end) = if corrected.is_some() {
-                        (item.corrected_source_in(), item.corrected_source_out())
-                    } else {
-                        (
-                            item.selected_source_in(MediaKind::Audio),
-                            item.selected_source_out(MediaKind::Audio),
-                        )
-                    };
-                    let destination = audio_dir.join(sidecar_name(
-                        media,
-                        &if samples == 0 {
-                            "trim".to_string()
-                        } else {
-                            format!("pad {samples}")
-                        },
-                        &[
-                            "pad",
-                            id,
-                            &mapping,
-                            &item
-                                .selected_source_in(MediaKind::Audio)
-                                .to_bits()
-                                .to_string(),
-                            &item
-                                .selected_source_out(MediaKind::Audio)
-                                .to_bits()
-                                .to_string(),
-                            &source_tags[media],
-                            &samples.to_string(),
-                        ],
-                    ));
-                    if planned_pads.insert(destination.clone()) {
-                        jobs.push(AudioJob {
-                            media: media.clone(),
-                            kind: AudioJobKind::Pad {
-                                source: corrected.unwrap_or_else(|| media.clone()),
-                                destination: destination.clone(),
-                                samples,
-                                selection: (
-                                    (start * sample_rate).round() as u64,
-                                    (end * sample_rate).round() as u64,
+                let key = item.precision_asset_key();
+                if precision_assets.contains(&key) {
+                    let outputs = match precision_files.get(&key) {
+                        Some(outputs) => outputs.clone(),
+                        None => {
+                            let corrected = prepared.corrected_audio_url.clone();
+                            let audio = item.clip.audio.first();
+                            // Drift sidecars are always 32-bit float.
+                            let (bit_depth, is_float) = match corrected {
+                                Some(_) => (Some(32), true),
+                                None => (
+                                    audio.and_then(|a| a.bit_depth),
+                                    audio.and_then(|a| a.is_float).unwrap_or(false),
                                 ),
-                            },
-                        });
-                    }
-                    prepared =
-                        prepared.with_placement_pad(destination, samples as f64 / sample_rate);
-                }
-
-                // Mono stems of every channel over the selected range, plain
-                // or for AAF between `lead` and `tail` samples of silence;
-                // one render per distinct range.
-                let mut stems = |prepared: &ExportItem, aaf: Option<(u64, u64)>| {
-                    let key = format!("{}-{aaf:?}", item.precision_asset_key());
-                    if let Some(outputs) = precision_files.get(&key) {
-                        return outputs.clone();
-                    }
-                    let corrected = prepared.corrected_audio_url.clone();
-                    let audio = item.clip.audio.first();
-                    // Drift sidecars are always 32-bit float.
-                    let (bit_depth, is_float) = match corrected {
-                        Some(_) => (Some(32), true),
-                        None => (
-                            audio.and_then(|a| a.bit_depth),
-                            audio.and_then(|a| a.is_float).unwrap_or(false),
-                        ),
-                    };
-                    let origin = if corrected.is_some() {
-                        "corrected"
-                    } else {
-                        "original"
-                    };
-                    let digest = prepared.precision_digest();
-                    let (lead, tail) = aaf.unwrap_or((0, prepared.precision_tail_samples));
-                    let (lead_tag, tail_tag) = (lead.to_string(), tail.to_string());
-                    let outputs: Vec<_> = (0..audio.map_or(0, |a| a.channels))
-                        .map(|channel| {
-                            let label = match (aaf, lead) {
-                                (None, _) => format!("channel {}", channel + 1),
-                                (Some(_), 0) => format!("channel {} – AAF", channel + 1),
-                                (Some(_), _) => format!("channel {} – pad {lead}", channel + 1),
                             };
-                            let channel = channel.to_string();
-                            let mut identity = vec![
-                                "channel",
-                                &channel,
-                                id,
-                                &digest,
-                                &source_tags[media],
-                                origin,
-                            ];
-                            if aaf.is_some() {
-                                identity.extend(["aaf", &lead_tag, &tail_tag]);
-                            }
-                            precision_dir.join(sidecar_name(media, &label, &identity))
-                        })
-                        .collect();
-                    jobs.push(AudioJob {
-                        media: media.clone(),
-                        kind: AudioJobKind::Stems {
-                            source: corrected.unwrap_or_else(|| media.clone()),
-                            outputs: outputs.clone(),
-                            bit_depth,
-                            is_float,
-                            source_start: prepared.precision_source_start(),
-                            duration: prepared.precision_source_duration(),
-                            lead_samples: lead,
-                            tail_samples: tail,
-                        },
-                    });
-                    precision_files.insert(key, outputs.clone());
-                    outputs
-                };
-                if precision_assets.contains(&item.precision_asset_key()) {
-                    let outputs = stems(&prepared, None);
+                            let origin = if corrected.is_some() {
+                                "corrected"
+                            } else {
+                                "original"
+                            };
+                            let digest = prepared.precision_digest();
+                            let outputs: Vec<_> = (0..audio.map_or(0, |a| a.channels))
+                                .map(|channel| {
+                                    precision_dir.join(sidecar_name(
+                                        media,
+                                        &format!("channel {}", channel + 1),
+                                        &[
+                                            "channel",
+                                            &channel.to_string(),
+                                            id,
+                                            &digest,
+                                            &source_tags[media],
+                                            origin,
+                                        ],
+                                    ))
+                                })
+                                .collect();
+                            jobs.push(AudioJob {
+                                media: media.clone(),
+                                kind: AudioJobKind::Stems {
+                                    source: corrected.unwrap_or_else(|| media.clone()),
+                                    outputs: outputs.clone(),
+                                    bit_depth,
+                                    is_float,
+                                    source_start: prepared.precision_source_start(),
+                                    duration: prepared.precision_source_duration(),
+                                    tail_samples: prepared.precision_tail_samples,
+                                },
+                            });
+                            precision_files.insert(key, outputs.clone());
+                            outputs
+                        }
+                    };
                     prepared = prepared.with_precision_audio(outputs);
-                }
-                if let Some((lead, tail)) = aaf_stems(item) {
-                    let outputs = stems(&prepared, Some((lead, tail)));
-                    prepared = prepared.with_aaf_audio(outputs, lead, tail);
                 }
                 clips.push(prepared);
             }
@@ -928,26 +786,6 @@ impl AudioJob {
                 render_drift_cancellable(backend, &self.media, destination, points, cancel)
                     .map_err(|e| ExportError::audio(&self.media, "drift-corrected", e))
             }
-            AudioJobKind::Pad {
-                source,
-                destination,
-                samples,
-                selection,
-            } => {
-                if destination.is_file() {
-                    return Ok(());
-                }
-                create_parent(destination)?;
-                render_pad_cancellable(
-                    backend,
-                    source,
-                    destination,
-                    *samples,
-                    Some(*selection),
-                    cancel,
-                )
-                .map_err(|e| ExportError::audio(&self.media, "sample-accurate Premiere", e))
-            }
             AudioJobKind::Stems {
                 source,
                 outputs,
@@ -955,7 +793,6 @@ impl AudioJob {
                 is_float,
                 source_start,
                 duration,
-                lead_samples,
                 tail_samples,
             } => {
                 let missing: Vec<_> = outputs
@@ -976,7 +813,6 @@ impl AudioJob {
                         is_float: *is_float,
                         source_start: *source_start,
                         duration: *duration,
-                        lead_samples: *lead_samples,
                         tail_samples: *tail_samples,
                     },
                     cancel,
@@ -985,54 +821,6 @@ impl AudioJob {
             }
         }
     }
-}
-
-/// Samples of silence (and their rate) that land a fractional audio start
-/// sample-accurately in Premiere, when one is needed.
-///
-/// Skipped for retimed audio (time-remap graphs own subframe truth there),
-/// items without audio, and non-positive sample rates. Only audio clipitems
-/// reference the padded file; video sides are untouched (frame-grid
-/// limitation).
-fn placement_pad(item: &ExportItem, sequence_fps: f64, trim_copies: bool) -> Option<(u64, f64)> {
-    let audio = item.clip.audio.first()?;
-    if audio.sample_rate <= 0.0 || audio.channels == 0 || item.is_retimed(MediaKind::Audio) {
-        return None;
-    }
-    match placement_pad_samples(
-        item.timeline_start(MediaKind::Audio),
-        sequence_fps,
-        audio.sample_rate,
-    ) {
-        Some(samples) => Some((samples, audio.sample_rate)),
-        // Resolve counts a trimmed WAV's in point from its broadcast start
-        // rounded to a frame, so a WAV starting inside a frame played a
-        // frame late. A copy of the selection, with no silence, starts at
-        // its own beginning instead. Premiere counts from the file's first
-        // sample, so its XML keeps the original.
-        None if trim_copies && trimmed_inside_a_frame(item, sequence_fps) => {
-            Some((0, audio.sample_rate))
-        }
-        None => None,
-    }
-}
-
-/// An audio file selected from past its start whose own start timecode
-/// falls inside a frame of the sequence.
-fn trimmed_inside_a_frame(item: &ExportItem, sequence_fps: f64) -> bool {
-    let Some(audio) = item.clip.audio.first() else {
-        return false;
-    };
-    let Some(timecode) = audio.source_timecode.as_ref().filter(|tc| !tc.derived) else {
-        return false;
-    };
-    let frames = timecode.as_seconds() * sequence_fps;
-    let fraction = frames - frames.floor();
-    let in_samples = item.selected_source_in(MediaKind::Audio) * audio.sample_rate;
-    item.clip.video.is_none()
-        && in_samples >= 0.5
-        && fraction * sequence_fps.recip() * audio.sample_rate >= 0.5
-        && (1.0 - fraction) * sequence_fps.recip() * audio.sample_rate >= 0.5
 }
 
 fn write_aaf_manifest(
@@ -1383,16 +1171,9 @@ mod tests {
     }
 
     #[test]
-    fn premiere_export_renders_placement_pads_for_fractional_starts() {
-        if crate::ff::test_ffmpeg().is_none() {
-            eprintln!("SKIP: ffmpeg is unavailable");
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("align-padprep-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // 4 s stereo source, real file the pad renderer can read.
-        let src = dir.join("take.wav");
+    fn premiere_export_plays_the_recordings_without_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("take.wav");
         let spec = hound::WavSpec {
             channels: 2,
             sample_rate: 48_000,
@@ -1400,19 +1181,14 @@ mod tests {
             sample_format: hound::SampleFormat::Int,
         };
         let mut w = hound::WavWriter::create(&src, spec).unwrap();
-        for i in 0..48_000 * 4 {
-            let v = if i == 4800 { 16000 } else { 0 };
-            w.write_sample(v as i16).unwrap();
+        for _ in 0..48_000 * 4 * 2 {
             w.write_sample(0i16).unwrap();
         }
         w.finalize().unwrap();
-
+        // 2.1 frames past the exact take, at 25 fps.
         let mut frac = item("frac", MediaKind::Audio, 5.084, 4.0);
         frac.clip.url = src.clone();
         frac.clip.duration = MediaTime::seconds(4.0);
-        // Island minimum normalizes to timeline zero at combine time, so the
-        // exact item anchors the island and the fractional offset survives
-        // the shift the writer also sees.
         let mut exact = item("exact", MediaKind::Audio, 5.0, 4.0);
         exact.clip.url = src.clone();
         exact.clip.duration = MediaTime::seconds(4.0);
@@ -1423,244 +1199,33 @@ mod tests {
                 duration: 10.0,
             }],
             MediaTime::new(1, 25),
-            "padtest",
+            "frames",
         );
-        let out = dir.join("out");
-        let run = || {
-            export_prepared(
-                ExportRequest {
-                    backend: &crate::portable::PortableBackend,
-                    timeline: &timeline,
-                    directory: &out,
-                    options: &ExportOptions {
-                        formats: vec![TimelineExportFormat::PremiereXML],
-                        correct_drift: false,
-                        ..ExportOptions::default()
-                    },
-                    cancel: &std::sync::atomic::AtomicBool::new(false),
+        let out = dir.path().join("out");
+        let artifacts = export_prepared(
+            ExportRequest {
+                backend: &crate::portable::PortableBackend,
+                timeline: &timeline,
+                directory: &out,
+                options: &ExportOptions {
+                    formats: vec![
+                        TimelineExportFormat::PremiereXML,
+                        TimelineExportFormat::ResolveXML,
+                    ],
+                    correct_drift: false,
+                    ..ExportOptions::default()
                 },
-                None,
-            )
-            .expect("export")
-        };
-        let first = run();
-        let xml_url = first
-            .iter()
-            .find(|a| a.format == ExportArtifactFormat::PremiereXML)
-            .expect("premiere artifact")
-            .url
-            .clone();
-        let pads: Vec<PathBuf> = std::fs::read_dir(out.join("Corrected Audio"))
-            .expect("pad dir")
-            .map(|e| e.unwrap().path())
-            .collect();
-        assert_eq!(pads.len(), 1, "only the fractional start needs a file");
-        assert!(
-            pads[0]
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .contains("pad 192"),
-            "unexpected pad name: {}",
-            pads[0].display()
-        );
-        let xml = std::fs::read_to_string(&xml_url).expect("read xml");
-        assert!(xml.contains("pad 192"), "xml must reference the sidecar");
-        assert!(
-            !xml.contains("subframeoffset"),
-            "padded export carries no subframeoffset"
-        );
-        // Re-export resolves the identical sidecar without re-rendering.
-        let mtime = std::fs::metadata(&pads[0]).unwrap().modified().unwrap();
-        let second = run();
-        assert_eq!(first.len(), second.len());
-        assert_eq!(
-            std::fs::metadata(&pads[0]).unwrap().modified().unwrap(),
-            mtime,
-            "existing sidecar must not be rewritten"
-        );
-        // Same-size replacement at the same URL must never reuse old essence.
-        let mut bytes = std::fs::read(&src).unwrap();
-        let marker = bytes.windows(4).position(|w| w == b"data").unwrap() + 8 + 4800 * 4;
-        bytes[marker..marker + 2].copy_from_slice(&8000i16.to_le_bytes());
-        std::fs::write(&src, bytes).unwrap();
-        run();
-        let fresh_xml = std::fs::read_to_string(&xml_url).unwrap();
-        assert_ne!(fresh_xml, xml);
-        let fresh_pad = std::fs::read_dir(out.join("Corrected Audio"))
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .find(|p| p != &pads[0])
-            .unwrap();
-        let samples: Vec<f32> = hound::WavReader::open(fresh_pad)
-            .unwrap()
-            .into_samples::<f32>()
-            .map(Result::unwrap)
-            .collect();
-        assert!((samples[(192 + 4800) * 2] - 8000.0 / 32768.0).abs() < 1e-6);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn premiere_export_keeps_a_camera_with_a_shorter_audio_track() {
-        let Some(ffmpeg) = crate::ff::test_ffmpeg() else {
-            return;
-        };
-        // 1.9 s of audio in a 2.04 s camera file, with clicks at 0.1 s and
-        // on the last audio sample.
-        const AUDIO_FRAMES: usize = 91_200;
-        const FIRST_CLICK: usize = 4_800;
-        const LAST_CLICK: usize = AUDIO_FRAMES - 1;
-        // The clip starts 0.05 s into the file, at 5.084 s on a 25 fps
-        // timeline: frame 127 (5.08 s) plus a 4 ms (192-sample) prepend.
-        const SOURCE_IN: usize = 2_400;
-        const PAD: usize = 192;
-        let dir = tempfile::tempdir().unwrap();
-        let audio = dir.path().join("source.wav");
-        let camera = dir.path().join("camera.mov");
-        let mut input = hound::WavWriter::create(
-            &audio,
-            hound::WavSpec {
-                channels: 2,
-                sample_rate: 48000,
-                bits_per_sample: 16,
-                sample_format: hound::SampleFormat::Int,
+                cancel: &std::sync::atomic::AtomicBool::new(false),
             },
+            None,
         )
-        .unwrap();
-        for frame in 0..AUDIO_FRAMES {
-            let value = if frame == FIRST_CLICK || frame == LAST_CLICK {
-                16000i16
-            } else {
-                0
-            };
-            input.write_sample(value).unwrap();
-            input.write_sample(-value).unwrap();
-        }
-        input.finalize().unwrap();
-        assert!(
-            std::process::Command::new(ffmpeg)
-                .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
-                .arg("color=c=black:s=160x90:r=25:d=2.04")
-                .arg("-i")
-                .arg(&audio)
-                .args([
-                    "-c:v",
-                    "mpeg4",
-                    "-c:a",
-                    "pcm_s16le",
-                    "-movflags",
-                    "+faststart"
-                ])
-                .arg(&camera)
-                .status()
-                .unwrap()
-                .success()
-        );
-        let original = std::fs::read(&camera).unwrap();
-        for kind in [
-            crate::backend::BackendKind::Portable,
-            #[cfg(target_os = "macos")]
-            crate::backend::BackendKind::AppleNative,
-        ] {
-            let backend = crate::backend::create(kind);
-            for end in [2.04, 2.0] {
-                let mut fractional = item("fractional", MediaKind::Video, 5.084, 2.04);
-                fractional.clip.url = camera.clone();
-                fractional.clip.audio[0].bit_depth = Some(16);
-                fractional.source_in = 0.05;
-                fractional.source_out = end;
-                fractional.timeline_duration = end - 0.05;
-                let mut anchor = item("anchor", MediaKind::Video, 5.0, 2.04);
-                anchor.clip.url = camera.clone();
-                let timeline = ExportTimeline::new(
-                    vec![ExportIsland {
-                        id: 0,
-                        clips: vec![anchor, fractional],
-                        duration: 2.2,
-                    }],
-                    MediaTime::new(1, 25),
-                    "camera tail",
-                );
-                let out = dir.path().join(format!("{kind:?}-{end}"));
-                let run = || {
-                    export_prepared(
-                        ExportRequest {
-                            backend: backend.as_ref(),
-                            timeline: &timeline,
-                            directory: &out,
-                            options: &ExportOptions {
-                                formats: vec![TimelineExportFormat::PremiereXML],
-                                correct_drift: false,
-                                ..ExportOptions::default()
-                            },
-                            cancel: &std::sync::atomic::AtomicBool::new(false),
-                        },
-                        None,
-                    )
-                };
-                let artifacts = run().expect("a valid camera audio extent must export");
-                let pads: Vec<_> = std::fs::read_dir(out.join("Corrected Audio"))
-                    .unwrap()
-                    .map(|entry| entry.unwrap().path())
-                    .collect();
-                assert_eq!(pads.len(), 1);
-                let reader = hound::WavReader::open(&pads[0]).unwrap();
-                assert_eq!(
-                    reader.duration(),
-                    (PAD + ((end - 0.05) * 48000.0).round() as usize) as u32
-                );
-                let samples: Vec<f32> = reader.into_samples().map(Result::unwrap).collect();
-                let first = PAD + FIRST_CLICK - SOURCE_IN;
-                let last = PAD + LAST_CLICK - SOURCE_IN;
-                assert_eq!(
-                    &samples[first * 2..first * 2 + 2],
-                    &[16000.0 / 32768.0, -16000.0 / 32768.0]
-                );
-                assert_eq!(
-                    &samples[last * 2..last * 2 + 2],
-                    &[16000.0 / 32768.0, -16000.0 / 32768.0]
-                );
-                assert!(samples[..PAD * 2].iter().all(|sample| *sample == 0.0));
-                assert!(
-                    samples[(last + 1) * 2..]
-                        .iter()
-                        .all(|sample| *sample == 0.0)
-                );
-                assert_eq!(std::fs::read(&camera).unwrap(), original);
-                let xml = &artifacts[0].url;
-                let previous_xml = std::fs::read(xml).unwrap();
-                let previous_pad = std::fs::read(&pads[0]).unwrap();
-                // The header precedes the media data (faststart): dropping the
-                // file's last 91,200 bytes removes audio the track declares.
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&camera)
-                    .unwrap()
-                    .set_len((original.len() - 91_200) as u64)
-                    .unwrap();
-                assert!(
-                    backend.inspect(&camera).is_ok(),
-                    "metadata remains readable"
-                );
-                let error =
-                    run().expect_err("missing media inside the declared audio track must fail");
-                assert!(error.to_string().contains("camera.mov"), "{error}");
-                assert!(
-                    error.to_string().contains("sample-accurate Premiere"),
-                    "{error}"
-                );
-                assert_eq!(std::fs::read(xml).unwrap(), previous_xml);
-                assert_eq!(std::fs::read(&pads[0]).unwrap(), previous_pad);
-                assert_eq!(
-                    std::fs::read_dir(out.join("Corrected Audio"))
-                        .unwrap()
-                        .count(),
-                    1
-                );
-                std::fs::write(&camera, &original).unwrap();
-            }
+        .expect("export");
+        // Sound starts on the nearest frame of the original recording.
+        assert!(!out.join("Corrected Audio").exists());
+        for artifact in &artifacts {
+            let xml = std::fs::read_to_string(&artifact.url).unwrap();
+            assert!(xml.contains("take.wav") && !xml.contains("pad "), "{xml}");
+            assert!(xml.contains("<start>2</start>"), "{xml}");
         }
     }
 
@@ -1727,191 +1292,6 @@ mod tests {
         assert!(dir.join("Sequence 01 – First_cut").is_dir());
         assert!(dir.join("Sequence 02 – Second cut").is_dir());
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// Resolve counts a trimmed WAV's in point from its broadcast start
-    /// rounded to a frame; a WAV starting inside a frame, trimmed and placed
-    /// on a frame, plays a copy of its selection for the XML instead.
-    #[test]
-    fn trimmed_wav_starting_inside_a_frame_plays_a_copy_of_its_selection() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("recorder.wav");
-        let mut writer = hound::WavWriter::create(
-            &source,
-            hound::WavSpec {
-                channels: 1,
-                sample_rate: 48000,
-                bits_per_sample: 24,
-                sample_format: hound::SampleFormat::Int,
-            },
-        )
-        .unwrap();
-        for i in 0..48000 * 2 {
-            writer.write_sample(i % 1000).unwrap();
-        }
-        writer.finalize().unwrap();
-        let mut recorder = item("rec", MediaKind::Audio, 1.0, 1.0);
-        recorder.clip.url = source;
-        recorder.clip.audio[0].channels = 1;
-        recorder.source_in = 0.5;
-        recorder.source_out = 1.5;
-        recorder.clip.audio[0].source_timecode = align_core::SourceTimecode::from_samples(
-            48_000 * 10 + 200,
-            48_000.0,
-            MediaTime::new(1, 25),
-            false,
-        );
-        let mut on_frame = recorder.clone();
-        on_frame.instance_id = "on frame".into();
-        on_frame.clip.id = align_core::ClipId::new("on frame");
-        on_frame.clip.audio[0].source_timecode = align_core::SourceTimecode::from_samples(
-            48_000 * 10,
-            48_000.0,
-            MediaTime::new(1, 25),
-            false,
-        );
-        let timeline = ExportTimeline::new(
-            vec![ExportIsland {
-                id: 0,
-                clips: vec![recorder, on_frame],
-                duration: 2.0,
-            }],
-            MediaTime::new(1, 25),
-            "Trim",
-        );
-        let options = ExportOptions {
-            formats: vec![TimelineExportFormat::ResolveXML],
-            correct_drift: false,
-            ..ExportOptions::default()
-        };
-        let plan = AudioPlan::new(
-            &timeline,
-            &options,
-            dir.path(),
-            &std::sync::atomic::AtomicBool::new(false),
-        )
-        .unwrap();
-        let items = &plan.timeline.islands[0].clips;
-        assert!(items[0].has_placement_pad(MediaKind::Audio));
-        assert_eq!(items[0].placement_pad_seconds, 0.0);
-        assert!(!items[1].has_placement_pad(MediaKind::Audio));
-        assert!(plan.jobs.iter().any(|job| matches!(
-            job.kind,
-            AudioJobKind::Pad {
-                samples: 0,
-                selection: (24000, 72000),
-                ..
-            }
-        )));
-        // Premiere counts from the file's first sample: no copy for it alone.
-        let premiere = ExportOptions {
-            formats: vec![TimelineExportFormat::PremiereXML],
-            ..options
-        };
-        let plan = AudioPlan::new(
-            &timeline,
-            &premiere,
-            dir.path(),
-            &std::sync::atomic::AtomicBool::new(false),
-        )
-        .unwrap();
-        assert!(!plan.timeline.islands[0].clips[0].has_placement_pad(MediaKind::Audio));
-        assert!(plan.jobs.is_empty());
-    }
-
-    /// Premiere starts AAF audio on a frame, so a recorder 200 samples past
-    /// one plays stems that lead with that much silence; Resolve's plain
-    /// stems are planned as before.
-    #[test]
-    fn aaf_audio_past_a_frame_plays_stems_that_lead_with_silence() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("recorder.wav");
-        let mut writer = hound::WavWriter::create(
-            &source,
-            hound::WavSpec {
-                channels: 2,
-                sample_rate: 48000,
-                bits_per_sample: 24,
-                sample_format: hound::SampleFormat::Int,
-            },
-        )
-        .unwrap();
-        for _ in 0..48000 * 2 {
-            writer.write_sample(0).unwrap();
-        }
-        writer.finalize().unwrap();
-        let mut recorder = item("rec", MediaKind::Audio, 200.0 / 48000.0, 1.0);
-        recorder.clip.url = source;
-        let mut aligned = recorder.clone();
-        aligned.instance_id = "aligned".into();
-        aligned.start = 0.04;
-        let timeline = ExportTimeline::new(
-            vec![ExportIsland {
-                id: 0,
-                clips: vec![recorder, aligned],
-                duration: 1.04,
-            }],
-            MediaTime::new(1, 25),
-            "AAF",
-        );
-        let options = ExportOptions {
-            formats: vec![
-                TimelineExportFormat::Aaf,
-                TimelineExportFormat::ResolveScript,
-            ],
-            correct_drift: false,
-            ..ExportOptions::default()
-        };
-        let plan = AudioPlan::new(
-            &timeline,
-            &options,
-            dir.path(),
-            &std::sync::atomic::AtomicBool::new(false),
-        )
-        .unwrap();
-        let items = &plan.timeline.islands[0].clips;
-        assert_eq!(items[0].aaf_lead_samples, 200);
-        assert_eq!(items[0].aaf_audio_urls.len(), 2);
-        assert_eq!(items[0].precision_audio_urls.len(), 2);
-        // Without picture the AAF keeps samples: no tail, and the aligned
-        // item plays the plain stems.
-        assert_eq!(items[0].aaf_tail_samples, 0);
-        assert!(items[1].aaf_audio_urls.is_empty());
-        let leads: Vec<u64> = plan
-            .jobs
-            .iter()
-            .filter_map(|job| match &job.kind {
-                AudioJobKind::Stems { lead_samples, .. } => Some(*lead_samples),
-                _ => None,
-            })
-            .collect();
-        // Both items select the same range, so they share the plain stems.
-        assert_eq!(leads, vec![0, 200]);
-
-        // Beside picture the AAF counts audio in frames: every AAF stem ends
-        // with a frame and a sample of silence for the clip's last frame.
-        let mut camera = item("cam", MediaKind::Video, 0.0, 1.0);
-        camera.clip.url = timeline.islands[0].clips[0].clip.url.clone();
-        camera.clip.audio.clear();
-        let mut with_picture = timeline.clone();
-        with_picture.islands[0].clips.push(camera);
-        let plan = AudioPlan::new(
-            &with_picture,
-            &options,
-            dir.path(),
-            &std::sync::atomic::AtomicBool::new(false),
-        )
-        .unwrap();
-        let items = &plan.timeline.islands[0].clips;
-        assert_eq!(
-            (items[0].aaf_lead_samples, items[0].aaf_tail_samples),
-            (200, 1921)
-        );
-        assert_eq!(
-            (items[1].aaf_lead_samples, items[1].aaf_tail_samples),
-            (0, 1921)
-        );
-        assert_eq!(items[1].aaf_audio_urls.len(), 2);
     }
 
     #[test]

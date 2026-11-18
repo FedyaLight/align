@@ -1,4 +1,4 @@
-//! Streaming drift correction, channel stems, and placement padding.
+//! Streaming drift correction and channel stems.
 //!
 //! The source is decoded once at native rate. Per-segment resampling maps
 //! source ranges to their validated timeline durations; adjacent segments
@@ -649,86 +649,6 @@ pub(crate) fn stream_at_rate(
     Ok(channels)
 }
 
-// ------------------------------------------------------------ placement pad
-
-/// Placement-pad sidecar render (32-bit float, native rate/channels).
-///
-/// Prepends exactly `pad_samples` silence samples through the native-rate
-/// streaming decoder and WAV writer, equally on every channel. No resampling
-/// or external FFmpeg process is needed when the backend decodes the source.
-/// An integer-frame FCP7 XML placement of this file lands fractional
-/// content sample-accurately in Premiere, whose importer floors audio
-/// `start`/`end` and ignores `<subframeoffset>`. BWF extension handling
-/// mirrors drift sidecars. `selection` is a native-sample half-open range;
-/// when present, only that range follows the prepend.
-pub fn render_pad_cancellable(
-    backend: &dyn MediaBackend,
-    source: &Path,
-    destination: &Path,
-    pad_samples: u64,
-    selection: Option<(u64, u64)>,
-    cancel: &AtomicBool,
-) -> Result<(), RenderError> {
-    check_cancel(cancel)?;
-    // Without silence a pad is a copy of its selection.
-    if pad_samples == 0 && selection.is_none() {
-        return Err(RenderError::InvalidRequest("a placement pad needs samples"));
-    }
-    let (probe, sample_rate, channels) = audio_format(backend, source)?;
-    if selection.is_some_and(|(start, end)| end <= start) {
-        return Err(RenderError::InvalidRequest("the selected range is empty"));
-    }
-    let reference_shift = i64::try_from(
-        i128::from(selection.map_or(0, |(start, _)| start)) - i128::from(pad_samples),
-    )
-    .map_err(|_| RenderError::InvalidRequest("the placement pad is out of range"))?;
-    let staged = StagedFile::new(destination).map_err(RenderError::Write)?;
-    let mask = align_core::wav::channel_mask(source);
-    let mut writer = WavWriter::create(staged.path(), sample_rate as u32, channels, false, mask)?;
-    writer.write_silence(channels, pad_samples, cancel)?;
-    let range = selection.map(|(start, end)| {
-        (
-            start as f64 / sample_rate,
-            Some((end - start) as f64 / sample_rate),
-        )
-    });
-    let mut remaining = selection.map(|(start, end)| end - start);
-    backend.decode_native(source, 0, range, &mut |block| {
-        check_cancel(cancel)?;
-        let available = block.frames.first().map_or(0, Vec::len);
-        let take = remaining.map_or(available, |n| n.min(available as u64) as usize);
-        let selected: Vec<&[f32]> = block.frames.iter().map(|ch| &ch[..take]).collect();
-        writer.write_pcm(channels, &selected, f32::to_le_bytes)?;
-        if let Some(ref mut n) = remaining {
-            *n -= take as u64;
-        }
-        Ok(())
-    })?;
-    if let (Some(n), Some((_, end))) = (remaining, selection) {
-        finish_tail(
-            &mut writer,
-            &probe,
-            end as f64 / sample_rate,
-            n,
-            sample_rate,
-            channels,
-            cancel,
-        )?;
-    }
-    check_cancel(cancel)?;
-    writer.finalize()?;
-    preserve_broadcast_extension(
-        source,
-        staged.path(),
-        sample_rate,
-        channels,
-        32,
-        "placement pad",
-        reference_shift,
-    )?;
-    staged.commit().map_err(RenderError::Write)
-}
-
 // ------------------------------------------------------------ channel stem
 
 /// Sample-exact mono stems of selected source channels over one range.
@@ -742,8 +662,6 @@ pub struct ChannelStems<'a> {
     /// Selected source range, in seconds.
     pub source_start: f64,
     pub duration: f64,
-    /// Silence before the selected range.
-    pub lead_samples: u64,
     /// Silence appended after the selected range.
     pub tail_samples: u64,
 }
@@ -796,12 +714,10 @@ pub fn render_channels_cancellable(
             .iter()
             .zip(&staged)
             .map(|((channel, _), staged)| {
-                let mut writer =
-                    WavWriter::create(staged.path(), sample_rate as u32, 1, int32, None)?;
-                writer.write_silence(1, stems.lead_samples, cancel)?;
-                Ok((*channel, writer))
+                WavWriter::create(staged.path(), sample_rate as u32, 1, int32, None)
+                    .map(|writer| (*channel, writer))
             })
-            .collect::<Result<Vec<_>, RenderError>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
         let mut remaining = take_frames;
         if int32 {
             backend.decode_native_i32(source, 0, range, &mut |block: NativeBlockI32| {
@@ -846,7 +762,7 @@ pub fn render_channels_cancellable(
                 1,
                 32,
                 &format!("channel {} extraction", channel + 1),
-                start_frame - stems.lead_samples as i64,
+                start_frame,
             )?;
         }
         for staged in staged {
@@ -882,23 +798,6 @@ fn write_channel_block<T: Copy>(
 mod tests {
     use super::*;
     use std::path::PathBuf;
-
-    fn render_pad(
-        backend: &dyn MediaBackend,
-        source: &Path,
-        destination: &Path,
-        pad_samples: u64,
-        selection: Option<(u64, u64)>,
-    ) -> Result<(), RenderError> {
-        render_pad_cancellable(
-            backend,
-            source,
-            destination,
-            pad_samples,
-            selection,
-            &NEVER_CANCELLED,
-        )
-    }
 
     fn write_stereo_wav(path: &Path, rate: u32, secs: u64, seed: u64) {
         let spec = hound::WavSpec {
@@ -1079,87 +978,11 @@ mod tests {
         std::fs::write(path, wav).unwrap();
     }
 
-    #[test]
-    fn placement_pad_prepends_exact_silence() {
-        let dir = tmp("pad");
-        let src = dir.join("src.wav");
-        // f32 stereo with a click at sample 1000 (both channels).
-        let spec = hound::WavSpec {
-            channels: 2,
-            sample_rate: 48000,
-            bits_per_sample: 32,
-            sample_format: hound::SampleFormat::Float,
-        };
-        let mut w = hound::WavWriter::create(&src, spec).unwrap();
-        for i in 0..4800 {
-            let v = if i == 1000 { 0.75 } else { 0.0 };
-            w.write_sample(v).unwrap();
-            w.write_sample(-v).unwrap();
-        }
-        w.finalize().unwrap();
-        add_test_bext(&src, 48000);
-        let dst = dir.join("pad.wav");
-        let backend = crate::portable::PortableBackend;
-        render_pad(&backend, &src, &dst, 192, None).expect("pad");
-        assert_eq!(
-            align_core::meta::read_bwf(&dst).unwrap().time_reference,
-            Some(48000 - 192)
-        );
-        let samples = read_pad_samples(&dst);
-        assert_eq!(samples.len(), (4800 + 192) * 2);
-        // Leading prepend is digital silence on both channels.
-        assert!(samples[..192 * 2].iter().all(|&v| v == 0.0));
-        // Body is the untouched source: click moved by exactly 192 samples.
-        assert_eq!(samples[192 * 2 + 1000 * 2], 0.75);
-        assert_eq!(samples[192 * 2 + 1000 * 2 + 1], -0.75);
-        assert!(samples[192 * 2 + 999 * 2] == 0.0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Without silence a pad copies its selection and starts its broadcast
-    /// time there.
-    #[test]
-    fn zero_pad_copies_its_selection() {
-        let dir = tmp("pad-zero");
-        let src = dir.join("src.wav");
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: 48000,
-            bits_per_sample: 32,
-            sample_format: hound::SampleFormat::Float,
-        };
-        let mut w = hound::WavWriter::create(&src, spec).unwrap();
-        for i in 0..4800 {
-            w.write_sample(if i == 1000 { 0.75f32 } else { 0.0 })
-                .unwrap();
-        }
-        w.finalize().unwrap();
-        add_test_bext(&src, 48000);
-        let dst = dir.join("trim.wav");
-        render_pad(
-            &crate::portable::PortableBackend,
-            &src,
-            &dst,
-            0,
-            Some((900, 1900)),
-        )
-        .unwrap();
-        let samples = read_pad_samples(&dst);
-        assert_eq!(samples.len(), 1000);
-        assert_eq!(samples[100], 0.75);
-        assert_eq!(
-            align_core::meta::read_bwf(&dst).unwrap().time_reference,
-            Some(48900)
-        );
-        assert!(render_pad(&crate::portable::PortableBackend, &src, &dst, 0, None).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// Resolve plays only the first channel of a plain multichannel float
-    /// WAV, so a four-channel pad is `WAVE_FORMAT_EXTENSIBLE` with the
-    /// source's speaker mask, and every channel keeps its own audio.
+    /// WAV, so a four-channel drift correction is `WAVE_FORMAT_EXTENSIBLE`
+    /// with the source's speaker mask, and every channel keeps its own audio.
     #[test]
-    fn multichannel_pad_keeps_the_extensible_format_and_channels() {
+    fn multichannel_drift_keeps_the_extensible_format_and_channels() {
         let dir = tmp("pad-poly");
         let src = dir.join("poly.wav");
         let spec = hound::WavSpec {
@@ -1178,74 +1001,38 @@ mod tests {
         w.finalize().unwrap();
         add_test_bext(&src, 48000);
         let mask = align_core::wav::channel_mask(&src).expect("hound writes an extensible header");
-        let dst = dir.join("pad.wav");
-        render_pad(&crate::portable::PortableBackend, &src, &dst, 192, None).expect("pad");
-        assert_eq!(align_core::wav::channel_mask(&dst), Some(mask));
-        assert_eq!(
-            align_core::meta::read_bwf(&dst).unwrap().time_reference,
-            Some(48000 - 192)
-        );
-        let reader = hound::WavReader::open(&dst).unwrap();
-        assert_eq!(reader.spec().channels, 4);
-        assert_eq!(reader.spec().sample_format, hound::SampleFormat::Float);
-        let samples: Vec<f32> = reader.into_samples().map(Result::unwrap).collect();
-        assert_eq!(samples.len(), (4800 + 192) * 4);
-        for channel in 0..4 {
-            let loud: Vec<usize> = (0..4800 + 192)
-                .filter(|frame| samples[frame * 4 + channel] != 0.0)
-                .collect();
-            assert_eq!(loud, vec![192 + 1000 + channel * 10], "channel {channel}");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn placement_pad_preserves_selected_head_and_tail_only() {
-        let dir = tmp("pad-range");
-        let src = dir.join("src.wav");
-        let mut w = hound::WavWriter::create(
-            &src,
-            hound::WavSpec {
-                channels: 2,
-                sample_rate: 48000,
-                bits_per_sample: 32,
-                sample_format: hound::SampleFormat::Float,
-            },
-        )
-        .unwrap();
-        for i in 0..9600 {
-            let v = match i {
-                100 => 0.9,
-                2400 => 0.6,
-                7199 => 0.7,
-                8000 => 0.8,
-                _ => 0.0,
-            };
-            w.write_sample(v).unwrap();
-            w.write_sample(-v).unwrap();
-        }
-        w.finalize().unwrap();
-        add_test_bext(&src, 48000);
-        let dst = dir.join("selected.wav");
-        render_pad(
+        let dst = dir.join("drift.wav");
+        render_drift(
             &crate::portable::PortableBackend,
             &src,
             &dst,
-            192,
-            Some((2400, 7200)),
+            &[(0.0, 0.0), (0.1, 0.1)],
         )
-        .unwrap();
-        let samples = read_pad_samples(&dst);
-        assert_eq!(samples.len(), 4992 * 2);
+        .expect("drift");
+        assert_eq!(align_core::wav::channel_mask(&dst), Some(mask));
         assert_eq!(
             align_core::meta::read_bwf(&dst).unwrap().time_reference,
-            Some(48000 + 2400 - 192)
+            Some(48000)
         );
-        assert!(samples[..384].iter().all(|v| *v == 0.0));
-        assert_eq!(&samples[384..386], &[0.6, -0.6]);
-        assert_eq!(&samples[samples.len() - 2..], &[0.7, -0.7]);
-        assert_eq!(samples.iter().filter(|v| **v != 0.0).count(), 4);
-        std::fs::remove_dir_all(dir).unwrap();
+        let mut planes: Vec<Vec<f32>> = Vec::new();
+        crate::portable::PortableBackend
+            .decode_native(&dst, 0, None, &mut |block| {
+                planes.resize(block.frames.len(), Vec::new());
+                for (plane, frames) in planes.iter_mut().zip(&block.frames) {
+                    plane.extend_from_slice(frames);
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(planes.len(), 4);
+        for (channel, plane) in planes.iter().enumerate() {
+            assert_eq!(plane.len(), 4800);
+            let loudest = (0..plane.len())
+                .max_by(|a, b| plane[*a].abs().total_cmp(&plane[*b].abs()))
+                .unwrap();
+            assert_eq!(loudest, 1000 + channel * 10, "channel {channel}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1315,7 +1102,6 @@ mod tests {
                 is_float: false,
                 source_start: 0.0,
                 duration: probe.duration_seconds,
-                lead_samples: 0,
                 tail_samples: 0,
             },
             &NEVER_CANCELLED,
@@ -1327,24 +1113,6 @@ mod tests {
             (probe.duration_seconds * 48_000.0).round() as usize
         );
         assert!(crate::ff::click_at(&samples).abs_diff(24_000) <= 2);
-    }
-
-    #[test]
-    fn placement_pad_invalid_clock_preserves_existing_destination() {
-        let dir = tmp("pad-clock-underflow");
-        let src = dir.join("src.wav");
-        write_stereo_wav(&src, 48000, 1, 42);
-        add_test_bext(&src, 100);
-        let dst = dir.join("existing.wav");
-        std::fs::write(&dst, b"existing output").unwrap();
-        assert!(render_pad(&crate::portable::PortableBackend, &src, &dst, 192, None).is_err());
-        assert_eq!(std::fs::read(&dst).unwrap(), b"existing output");
-        assert_eq!(
-            std::fs::read_dir(&dir).unwrap().count(),
-            2,
-            "no staged file remains"
-        );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     struct CancelOnDecode<'a>(&'a AtomicBool);
@@ -1424,7 +1192,6 @@ mod tests {
                         is_float: false,
                         source_start: 0.0,
                         duration: 1.0,
-                        lead_samples: 0,
                         tail_samples: 0,
                     },
                     &cancel,
@@ -1432,11 +1199,6 @@ mod tests {
                 Err(RenderError::Cancelled)
             ));
         }
-        cancel.store(false, Ordering::Relaxed);
-        assert!(matches!(
-            render_pad_cancellable(&backend, &src, &dst, 192, None, &cancel),
-            Err(RenderError::Cancelled)
-        ));
         assert_eq!(std::fs::read(&dst).unwrap(), b"existing output");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
         std::fs::remove_dir_all(dir).unwrap();
@@ -1450,10 +1212,6 @@ mod tests {
         let backend = crate::portable::PortableBackend;
         let cancel = AtomicBool::new(true);
         let source = dir.join("missing.wav");
-        assert!(matches!(
-            render_pad_cancellable(&backend, &source, &dst, 192, None, &cancel),
-            Err(RenderError::Cancelled)
-        ));
         assert!(matches!(
             render_drift_cancellable(
                 &backend,
@@ -1474,7 +1232,6 @@ mod tests {
                     is_float: false,
                     source_start: 0.0,
                     duration: 1.0,
-                    lead_samples: 0,
                     tail_samples: 0,
                 },
                 &cancel,
@@ -1522,15 +1279,6 @@ mod tests {
             assert!(start.elapsed() < std::time::Duration::from_secs(3));
         });
         assert!(child.try_wait().unwrap().is_some());
-    }
-
-    #[test]
-    fn placement_pad_rejects_empty_prepend() {
-        let backend = crate::portable::PortableBackend;
-        let dir = tmp("pad-empty");
-        let dst = dir.join("pad.wav");
-        assert!(render_pad(&backend, Path::new("/nonexistent.wav"), &dst, 0, None).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1594,7 +1342,6 @@ mod tests {
                         is_float: format == hound::SampleFormat::Float,
                         source_start: 137.0 / 48000.0,
                         duration: 701.0 / 48000.0,
-                        lead_samples: 5,
                         tail_samples: 17,
                     },
                     &NEVER_CANCELLED,
@@ -1605,22 +1352,24 @@ mod tests {
                     assert_eq!(reader.spec().channels, 1);
                     assert_eq!(reader.spec().sample_rate, 48000);
                     assert_eq!(reader.spec().bits_per_sample, 32);
-                    assert_eq!(reader.duration(), 5 + 701 + 17);
+                    assert_eq!(reader.duration(), 701 + 17);
                     if bits == 32 && format == hound::SampleFormat::Int {
                         assert_eq!(reader.spec().sample_format, hound::SampleFormat::Int);
                         let samples: Vec<i32> = reader.into_samples().map(Result::unwrap).collect();
-                        let expected: Vec<_> = std::iter::repeat_n(0, 5)
-                            .chain(frames[137..838].iter().map(|frame| frame[channel]))
+                        let expected: Vec<_> = frames[137..838]
+                            .iter()
+                            .map(|frame| frame[channel])
                             .chain(std::iter::repeat_n(0, 17))
                             .collect();
                         assert_eq!(samples, expected, "{kind:?}, channel {channel}");
                     } else {
                         assert_eq!(reader.spec().sample_format, hound::SampleFormat::Float);
                         let samples: Vec<f32> = reader.into_samples().map(Result::unwrap).collect();
-                        let expected: Vec<_> = std::iter::repeat_n(0.0, 5)
-                            .chain(frames[137..838].iter().map(|frame| {
+                        let expected: Vec<_> = frames[137..838]
+                            .iter()
+                            .map(|frame| {
                                 (frame[channel] >> (32 - bits)) as f32 / (1u64 << (bits - 1)) as f32
-                            }))
+                            })
                             .chain(std::iter::repeat_n(0.0, 17))
                             .collect();
                         assert_eq!(
@@ -1628,10 +1377,9 @@ mod tests {
                             "{kind:?}, {bits}, {format:?}, channel {channel}"
                         );
                     }
-                    // The stem starts at its lead silence.
                     assert_eq!(
                         align_core::meta::read_bwf(path).unwrap().time_reference,
-                        Some(48132)
+                        Some(48137)
                     );
                     let wav = std::fs::read(path).unwrap();
                     let history = format!("T=Align channel {} extraction", channel + 1);
@@ -1660,7 +1408,6 @@ mod tests {
                 is_float: false,
                 source_start: 0.4004,
                 duration: (80080.0 - 0.00001) / 48000.0,
-                lead_samples: 0,
                 tail_samples: 0,
             },
             &NEVER_CANCELLED,

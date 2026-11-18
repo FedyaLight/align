@@ -72,9 +72,9 @@ into one folder form one.
 
 Source clips keep their original audio; use the exported timeline for
 synchronized playback. `Align generated audio` holds the files Align rendered
-for the timelines: drift corrections, and copies with leading silence that
-place audio on the exact sample. The timelines play these files, so keep them
-with the export.
+for the timelines: drift corrections of recorders whose clock drifts, and
+mono copies of each channel for the Resolve import script and AAF. The
+timelines play these files, so keep them with the export.
 
 Organizing never renames or moves files on disk. Each run of the Resolve import
 script creates its own folder, because Resolve imports a timeline's media again

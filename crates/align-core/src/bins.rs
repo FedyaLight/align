@@ -16,7 +16,7 @@ use std::path::{Component, Path, PathBuf};
 use crate::model::{Clip, ClipId};
 
 /// The bin holding audio that Align rendered for the timelines: drift
-/// corrections, placement pads, and precision stems.
+/// corrections and precision stems.
 pub const GENERATED_AUDIO: &str = "Align generated audio";
 
 /// Joins a folder name to the parent folders that tell it apart. Bins are

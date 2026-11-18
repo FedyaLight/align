@@ -37,14 +37,6 @@ pub fn sequence_fps(frame_duration: MediaTime) -> f64 {
     frame_duration.as_seconds().recip().max(1.0)
 }
 
-/// Integer-frame floor plus fractional remainder (in frames) of a timeline
-/// start, mirroring the writer's stable-start quantization exactly.
-pub fn placement_floor_and_frac(timeline_start_s: f64, fps: f64) -> (i64, f64) {
-    let stable = (timeline_start_s * 100_000.0).round() / 100_000.0;
-    let floor = (stable * fps).floor() as i64;
-    (floor, stable * fps - floor as f64)
-}
-
 /// Collapse a sub-sample fractional remainder (float dust, solver noise)
 /// to the adjacent integer frame. Returns `(floor_adjustment,
 /// effective_frac)`: `(0, 0.0)` just below an integer, `(1, 0.0)` just
@@ -64,83 +56,10 @@ pub fn snap_sub_sample_frac(frac_frames: f64, samples_per_frame: f64) -> (i64, f
     }
 }
 
-/// Historical 1/80-frame `<subframeoffset>` value for a fractional remainder.
-/// Premiere ignores it on import (proven by live readback); kept for
-/// unpadded/plain exports so their encoding stays byte-stable.
+/// The 1/80-frame `<subframeoffset>` of a fractional remainder. Premiere
+/// and Resolve ignore it on import; other FCP 7 XML readers may not.
 pub fn subframe_offset_80(frac_frames: f64) -> i64 {
     (frac_frames * 80.0).round() as i64
-}
-
-/// Leading silence that starts AAF audio placed at `timeline_start_s` on a
-/// composition frame whose boundary is a whole sample, so editors that
-/// start AAF audio on frames (Premiere) and editors that keep samples
-/// (Resolve) both play it at the same sample. `None` when the start already
-/// is such a boundary. Where those boundaries are more than five frames
-/// apart (44.1 kHz at NTSC rates) the clip starts at the first whole sample
-/// of the preceding frame instead, within a sample in either editor.
-pub fn aaf_lead_samples(timeline_start_s: f64, frame: MediaTime, sample_rate: f64) -> Option<u64> {
-    if !timeline_start_s.is_finite()
-        || timeline_start_s < 0.0
-        || frame.value <= 0
-        || sample_rate.fract() != 0.0
-        || sample_rate < 1.0
-    {
-        return None;
-    }
-    // Frame k starts at k·rate·value/timescale samples, a whole sample every
-    // `step` frames.
-    let samples_per_frame = (sample_rate as i64 * frame.value, i64::from(frame.timescale));
-    let (mut a, mut b) = samples_per_frame;
-    while b != 0 {
-        (a, b) = (b, a % b);
-    }
-    let step = samples_per_frame.1 / a;
-    let start = i128::from((timeline_start_s * sample_rate).round() as i64);
-    let (per, frames) = (
-        i128::from(samples_per_frame.0),
-        i128::from(samples_per_frame.1),
-    );
-    let lead = if step <= 5 {
-        start.rem_euclid(i128::from(step) * per / frames)
-    } else {
-        let first_sample = |frame: i128| (frame * per + frames - 1) / frames;
-        let mut frame = start * frames / per;
-        if first_sample(frame) > start {
-            frame -= 1;
-        }
-        start - first_sample(frame)
-    };
-    (lead > 0).then_some(lead as u64)
-}
-
-/// Whole-sample silence prepend that makes an integer-frame placement
-/// sample-accurate: `Some(pad)` means a sidecar with `pad` leading silence
-/// samples carries the content to its exact position. `None` when the start
-/// is already frame-exact (or the input is unusable): no sidecar needed.
-///
-/// Premiere's FCP7 importer floors audio `start`/`end` to integer frames and
-/// ignores every tested subframe encoding, so the fractional remainder is
-/// baked into the essence instead. Residual error is the sample rounding of
-/// the prepend plus Premiere’s truncation of the frame anchor to a sample.
-pub fn placement_pad_samples(timeline_start_s: f64, fps: f64, sample_rate: f64) -> Option<u64> {
-    if !timeline_start_s.is_finite() || fps <= 0.0 || sample_rate <= 0.0 {
-        return None;
-    }
-    let (frame, frac) = placement_floor_and_frac(timeline_start_s, fps);
-    let (_, effective) = snap_sub_sample_frac(frac, sample_rate / fps);
-    if effective == 0.0 {
-        return None;
-    }
-    // Premiere renders the integer-frame anchor at the preceding sample.
-    // Round the absolute target, not just its fractional-frame remainder.
-    let anchor = frame as f64 / fps * sample_rate;
-    let anchor_sample = (anchor + 1e-7).floor();
-    let pad = ((anchor + effective / fps * sample_rate).round() - anchor_sample) as u64;
-    let spf = (sample_rate / fps).round() as u64;
-    if pad == 0 || pad > spf {
-        return None;
-    }
-    Some(pad)
 }
 
 impl ExportTransitionKind {
@@ -233,22 +152,6 @@ pub struct ExportItem {
     pub precision_audio_urls: Vec<PathBuf>,
     /// Trailing silence in precision stems to retain a final partial frame in Resolve.
     pub precision_tail_samples: u64,
-    /// AAF stems of every channel that lead the selected range with
-    /// `aaf_lead_samples` of silence. Premiere starts AAF audio on a frame,
-    /// so the clip starts on one and the silence carries the remainder.
-    /// `aaf_tail_samples` of silence follow, so an AAF counting audio in
-    /// frames can end it on the next frame.
-    pub aaf_audio_urls: Vec<PathBuf>,
-    pub aaf_lead_samples: u64,
-    pub aaf_tail_samples: u64,
-    /// Sample-accurate placement sidecar for Premiere: this file prepends
-    /// `placement_pad_seconds` of silence to the (possibly drift-corrected)
-    /// source so the integer-frame XML placement lands the content exactly.
-    /// `None` unless `export_prepared` rendered one (PremiereXML only).
-    /// The replacement (`– replaced`) sequence never uses pads: its items
-    /// start at video-overlap positions the pad planner cannot pre-render.
-    pub placement_pad_url: Option<PathBuf>,
-    pub placement_pad_seconds: f64,
     pub enabled: bool,
     pub track_enabled: bool,
     pub track_locked: bool,
@@ -311,11 +214,6 @@ impl ExportItem {
             corrected_audio_url: None,
             precision_audio_urls: Vec::new(),
             precision_tail_samples: 0,
-            aaf_audio_urls: Vec::new(),
-            aaf_lead_samples: 0,
-            aaf_tail_samples: 0,
-            placement_pad_url: None,
-            placement_pad_seconds: 0.0,
             enabled: true,
             track_enabled: true,
             track_locked: false,
@@ -432,27 +330,6 @@ impl ExportItem {
     pub fn with_corrected_audio(&self, url: PathBuf) -> Self {
         let mut out = self.clone();
         out.corrected_audio_url = Some(url);
-        out
-    }
-    pub fn with_placement_pad(&self, url: PathBuf, pad_seconds: f64) -> Self {
-        let mut out = self.clone();
-        out.placement_pad_url = Some(url);
-        out.placement_pad_seconds = pad_seconds;
-        out
-    }
-    /// True when the writer must reference the padded sidecar instead of the
-    /// drift/original file (audio side only; never for retimed items, which
-    /// the pad planner skips).
-    /// Whether the audio side plays a placement sidecar: leading silence and
-    /// the selection, or the selection alone.
-    pub fn has_placement_pad(&self, media: MediaKind) -> bool {
-        media == MediaKind::Audio && self.placement_pad_url.is_some()
-    }
-    pub fn with_aaf_audio(&self, urls: Vec<PathBuf>, lead_samples: u64, tail_samples: u64) -> Self {
-        let mut out = self.clone();
-        out.aaf_audio_urls = urls;
-        out.aaf_lead_samples = lead_samples;
-        out.aaf_tail_samples = tail_samples;
         out
     }
     pub fn with_precision_audio(&self, urls: Vec<PathBuf>) -> Self {
@@ -1237,11 +1114,6 @@ impl ImportedAssembly<'_> {
             corrected_audio_url: None,
             precision_audio_urls: Vec::new(),
             precision_tail_samples: 0,
-            aaf_audio_urls: Vec::new(),
-            aaf_lead_samples: 0,
-            aaf_tail_samples: 0,
-            placement_pad_url: None,
-            placement_pad_seconds: 0.0,
             linked_audio_edit: linked,
         };
         if is_unmatched {
@@ -1867,31 +1739,6 @@ pub mod xml_text {
 mod tests {
     use super::*;
 
-    /// AAF audio starts on a frame whose boundary is a whole sample; the
-    /// remainder becomes leading silence.
-    #[test]
-    fn aaf_lead_reaches_back_to_a_whole_sample_frame() {
-        let at = |samples: f64, frame: MediaTime, rate: f64| {
-            aaf_lead_samples(samples / rate, frame, rate)
-        };
-        assert_eq!(at(200.0, MediaTime::new(1, 25), 48_000.0), Some(200));
-        assert_eq!(at(1920.0, MediaTime::new(1, 25), 48_000.0), None);
-        // At 29.97 every fifth frame starts on a sample (8008 samples).
-        let ntsc = MediaTime::new(1001, 30_000);
-        assert_eq!(at(8008.0 + 1601.0, ntsc, 48_000.0), Some(1601));
-        assert_eq!(at(16_016.0, ntsc, 48_000.0), None);
-        // At 23.976 every frame does (2002 samples).
-        assert_eq!(
-            at(2002.0 + 7.0, MediaTime::new(1001, 24_000), 48_000.0),
-            Some(7)
-        );
-        // 44.1 kHz at 29.97 reaches a sample only every 100 frames, so the
-        // clip starts at the first whole sample of its frame: frame 1 starts
-        // at 1471.47, so sample 1472.
-        assert_eq!(at(200.0, ntsc, 44_100.0), Some(200));
-        assert_eq!(at(1500.0, ntsc, 44_100.0), Some(28));
-        assert_eq!(at(1472.0, ntsc, 44_100.0), None);
-    }
     use crate::model::{
         AudioSummary, Clip, ClipId, MediaKind, RecordingTimestampSource, SourceTimecode,
         TemporalMode,
@@ -1921,56 +1768,16 @@ mod tests {
     }
 
     #[test]
-    fn placement_pad_matches_writer_floor_at_25fps() {
-        // 2.1 frames at 25 fps: floor 2, 0.1 frame = 192 samples of pad.
-        assert_eq!(sequence_fps(MediaTime::new(1, 25)), 25.0);
-        let (floor, frac) = placement_floor_and_frac(0.084, 25.0);
-        assert_eq!(floor, 2);
-        assert!((frac - 0.1).abs() < 1e-9, "frac={frac}");
-        assert_eq!(placement_pad_samples(0.084, 25.0, 48_000.0), Some(192));
-        assert_eq!(subframe_offset_80(0.1), 8);
-        // Whole-frame control needs no sidecar.
-        assert_eq!(placement_pad_samples(0.48, 25.0, 48_000.0), None);
-        assert_eq!(placement_pad_samples(0.0, 25.0, 48_000.0), None);
-    }
-
-    #[test]
-    fn placement_pad_rounds_to_nearest_sample_at_ntsc() {
-        let fps = sequence_fps(MediaTime::new(1001, 30_000));
-        assert!((fps - 30_000.0 / 1001.0).abs() < 1e-9);
-        // 0.1 NTSC frame = 160.16 samples -> 160.
-        let start = 2.1 / fps;
-        assert_eq!(placement_pad_samples(start, fps, 48_000.0), Some(160));
-        // Mid-frame 0.5 -> 801 samples (800.8 rounded).
-        let mid = 80.5 / fps;
-        assert_eq!(placement_pad_samples(mid, fps, 48_000.0), Some(801));
-        // Real Premiere render: frame 156 anchors at sample 249849,
-        // so target 251291.04 needs 1442 samples, not round(1441.44).
-        assert_eq!(
-            placement_pad_samples(156.9 / fps, fps, 48_000.0),
-            Some(1442)
-        );
-    }
-
-    #[test]
-    fn placement_pad_rejects_degenerate_inputs() {
-        assert_eq!(placement_pad_samples(f64::NAN, 25.0, 48_000.0), None);
-        assert_eq!(placement_pad_samples(0.084, 0.0, 48_000.0), None);
-        assert_eq!(placement_pad_samples(0.084, 25.0, 0.0), None);
-        assert_eq!(placement_pad_samples(-1.0, 25.0, 48_000.0), None);
-    }
-
-    #[test]
     fn sub_sample_dust_snaps_to_integer() {
         // 9.28 s is not binary-exact: 9.28 * 25 floors to 231 with a
         // 231.9999... remainder. Snapping encodes frame 232, not 231 + 80.
-        let (floor, frac) = placement_floor_and_frac(9.28, 25.0);
-        assert_eq!(floor, 231);
+        let frames: f64 = 9.28 * 25.0;
+        assert_eq!(frames.floor(), 231.0);
+        let frac = frames - frames.floor();
         assert_eq!(snap_sub_sample_frac(frac, 48_000.0 / 25.0), (1, 0.0));
-        assert_eq!(placement_pad_samples(9.28, 25.0, 48_000.0), None);
         // Genuine single-sample offsets never snap.
-        let one_sample = 1.0 / 48_000.0;
-        let (_, frac) = placement_floor_and_frac(2.0 / 25.0 + one_sample, 25.0);
+        let frames: f64 = (2.0 / 25.0 + 1.0 / 48_000.0) * 25.0;
+        let frac = frames - frames.floor();
         assert_eq!(snap_sub_sample_frac(frac, 48_000.0 / 25.0), (0, frac));
         assert!(frac > 0.0);
     }

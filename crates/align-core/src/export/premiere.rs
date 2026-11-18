@@ -6,14 +6,10 @@
 //! preserved XML exists. Frame math mirrors `SequenceRate` exactly
 //! (down/nearest/up roundings, subframe offsets, NTSC timebases).
 //!
-//! Sample-accurate audio placement: Premiere floors imported audio
-//! `start`/`end` to integer frames and ignores `<subframeoffset>`, and
-//! Resolve places them on whole frames too, so `export_prepared` renders
-//! placement-pad sidecars (leading silence) for fractional audio starts and
-//! records them on the item. Padded items keep the floored integer placement
-//! with no `<subframeoffset>`; the content lands exactly in both editors.
-//! Unpadded items (plain `export`, retimed audio, the `– replaced` sequence)
-//! keep the historical `<subframeoffset>` encoding.
+//! Audio placement: Premiere and Resolve start imported sound only on a
+//! frame and ignore `<subframeoffset>`, so sound starts on the nearest frame,
+//! within half a frame, like other sync tools. The Premiere XML keeps the
+//! remainder after a frame below as `<subframeoffset>` for other readers.
 //!
 //! Media bins: a Premiere project can open with one bin of master clips per
 //! camera and recorder, plus a bin of the audio Align prepared. Master clips
@@ -336,8 +332,8 @@ impl Document {
                 })
             })
             .collect();
-        let video_tracks = tracks_for(&video_entries, MediaKind::Video, rate);
-        let audio_tracks = tracks_for(&audio_entries, MediaKind::Audio, rate);
+        let video_tracks = tracks_for(&video_entries, MediaKind::Video);
+        let audio_tracks = tracks_for(&audio_entries, MediaKind::Audio);
         let mut ids = identifiers(&video_tracks, MediaKind::Video, 1, clip_id_prefix);
         ids.extend(identifiers(
             &audio_tracks,
@@ -352,11 +348,7 @@ impl Document {
         for track in &video_tracks {
             xml += &self.track(track, MediaKind::Video, &layout);
         }
-        let audio_depth = if island
-            .clips
-            .iter()
-            .any(|i| i.corrected_audio_url.is_some() || i.placement_pad_url.is_some())
-        {
+        let audio_depth = if island.clips.iter().any(|i| i.corrected_audio_url.is_some()) {
             32
         } else {
             island
@@ -533,14 +525,6 @@ fn replaced_island(island: &ExportIsland) -> Option<ExportIsland> {
             corrected_audio_url: recorder.corrected_audio_url.clone(),
             precision_audio_urls: Vec::new(),
             precision_tail_samples: 0,
-            aaf_audio_urls: Vec::new(),
-            aaf_lead_samples: 0,
-            aaf_tail_samples: 0,
-            // Deliberately not copied: replacement items start at
-            // video-overlap positions whose fractional remainder differs
-            // from the recorder item the pad was rendered for.
-            placement_pad_url: None,
-            placement_pad_seconds: 0.0,
             enabled: recorder.enabled,
             track_enabled: recorder.track_enabled,
             track_locked: recorder.track_locked,
@@ -670,11 +654,7 @@ fn links(
     ]
 }
 
-fn tracks_for<'a>(
-    entries: &[TrackEntry<'a>],
-    media_type: MediaKind,
-    rate: SequenceRate,
-) -> Vec<Vec<TrackEntry<'a>>> {
+fn tracks_for<'a>(entries: &[TrackEntry<'a>], media_type: MediaKind) -> Vec<Vec<TrackEntry<'a>>> {
     let source_key = |entry: &TrackEntry<'a>| -> String {
         let item = entry.item;
         let base = item
@@ -722,9 +702,7 @@ fn tracks_for<'a>(
             allocatable.extend(group);
         }
     }
-    // Where an entry's sound plays, and the frames its clipitem spans: a
-    // padded clip starts on the frame before its sound and ends on the frame
-    // after it.
+    // Where an entry plays on the timeline.
     let content = |entry: &TrackEntry<'a>| {
         let item = entry.item;
         let duration = if media_type == MediaKind::Audio
@@ -737,23 +715,12 @@ fn tracks_for<'a>(
         };
         (item.timeline_start(media_type), duration)
     };
-    let span = |entry: &TrackEntry<'a>| {
-        let item = entry.item;
-        let (start, duration) = content(entry);
-        if item.has_placement_pad(media_type) {
-            let first = rate.frames(start, Rounding::Down) as f64 / rate.fps;
-            let length =
-                rate.frames(duration + item.placement_pad_seconds, Rounding::Up) as f64 / rate.fps;
-            (first, length)
-        } else {
-            (start, duration)
-        }
-    };
+
     let requests: Vec<TimelineTrackRequest> = allocatable
         .iter()
         .map(|entry| {
             let item = entry.item;
-            let (start, duration) = span(entry);
+            let (start, duration) = content(entry);
             TimelineTrackRequest::new(
                 format!("{}#{media_type}#{}", item.instance_id, entry.source_channel),
                 source_key(entry),
@@ -794,83 +761,33 @@ fn tracks_for<'a>(
             track
         })
         .collect();
-    // Clips whose sounds abut can still share frames: a padded clip's end
-    // rounds up into the frame where the next starts. Both play whole only
-    // on separate tracks, so the later one moves to another track. Clips
-    // whose sounds overlap stay, and the earlier ends where the later starts.
-    let mut moved = Vec::new();
-    for track in &mut allocated {
-        let mut kept: Vec<TrackEntry<'a>> = Vec::new();
-        for entry in track.drain(..) {
-            if let Some(previous) = kept.last() {
-                let (start, length) = span(previous);
-                let (sound_start, sound_length) = content(previous);
-                let shares_frames = start + length > span(&entry).0 + 1e-9;
-                let sounds_overlap = sound_start + sound_length > content(&entry).0 + 1e-6;
-                if shares_frames && !sounds_overlap {
-                    moved.push(entry);
-                    continue;
-                }
-            }
-            kept.push(entry);
-        }
-        *track = kept;
-    }
-    moved.sort_by(|a, b| span(a).0.total_cmp(&span(b).0));
-    let mut extra: Vec<Vec<TrackEntry<'a>>> = Vec::new();
-    for entry in moved {
-        let start = span(&entry).0;
-        match extra.iter_mut().find(|track| {
-            track.last().is_none_or(|last| {
-                let (first, length) = span(last);
-                first + length <= start + 1e-9
-            })
-        }) {
-            Some(track) => track.push(entry),
-            None => extra.push(vec![entry]),
-        }
-    }
     forced.append(&mut allocated);
-    forced.append(&mut extra);
     forced
 }
 
 impl Document {
     /// The sequence frame a clipitem starts on, and the fraction of a frame
-    /// its audio starts later.
+    /// its audio starts after it. Premiere and Resolve start XML sound only
+    /// on a frame, so it starts on the nearest one, like its picture.
     fn start_frame(&self, entry: &TrackEntry, media_type: MediaKind) -> (i64, f64) {
         let (rate, item) = (self.rate, entry.item);
-        // A padded sidecar's silence lands its audio after the frame before
-        // it, in Premiere and Resolve alike.
-        let floored = media_type == MediaKind::Audio
-            && (self.format == TimelineExportFormat::PremiereXML
-                || item.has_placement_pad(media_type));
         let stable_start = (item.timeline_start(media_type) * 100_000.0).round() / 100_000.0;
-        // Resolve drops `<subframeoffset>` and places clips on whole frames, so
-        // a floored unpadded audio start lands up to a frame early there
-        // (camera audio a frame ahead of its picture). Round it like video
-        // and like the OTIO writer instead.
-        let mut start = rate.frames(
-            stable_start,
-            if floored {
-                Rounding::Down
-            } else {
-                Rounding::Nearest
-            },
-        );
-        // Collapse sub-sample dust (float noise, µs solver jitter) to the
-        // adjacent integer frame so near-exact starts encode exactly instead of
-        // as floor + a full-frame subframeoffset Premiere would drop.
-        let mut start_frac = 0.0;
-        if floored {
-            let sample_rate = item.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);
-            let raw_frac = stable_start * rate.fps - start as f64;
-            let (adjustment, effective) =
-                super::model::snap_sub_sample_frac(raw_frac, sample_rate / rate.fps);
-            start += adjustment;
-            start_frac = effective;
+        if media_type == MediaKind::Video {
+            return (rate.frames(stable_start, Rounding::Nearest), 0.0);
         }
-        (start, start_frac)
+        // Collapse sub-sample dust (float noise, µs solver jitter) to the
+        // adjacent integer frame so near-exact starts encode exactly.
+        let sample_rate = item.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);
+        let floor = rate.frames(stable_start, Rounding::Down);
+        let (adjustment, fraction) = super::model::snap_sub_sample_frac(
+            stable_start * rate.fps - floor as f64,
+            sample_rate / rate.fps,
+        );
+        if fraction >= 0.5 {
+            (floor + adjustment + 1, 0.0)
+        } else {
+            (floor + adjustment, fraction)
+        }
     }
 
     /// One `<clipitem>`. FCP7 marks an edge shared with a transition as -1.
@@ -892,7 +809,7 @@ impl Document {
         let (start, start_frac) = self.start_frame(entry, media_type);
         let media = self.media_use(item, media_type);
         let (source_rate, file_duration) = (media.rate, media.duration);
-        let (corrected, padded) = (media.corrected, media.padded);
+        let corrected = media.corrected;
         let (in_seconds, out_seconds) = (media.in_seconds, media.out_seconds);
         let playback_rate = item.playback_rate(media_type);
         let plays_backward = item.plays_backward(media_type);
@@ -932,16 +849,18 @@ impl Document {
                 item_rate.frames(out_seconds, Rounding::Nearest),
             )
         };
-        let source_in = if padded {
-            0
-        } else {
-            geometry.map_or(computed_in, |g| g.0)
-        };
-        let mut source_out = if padded {
-            file_duration
-        } else {
-            geometry.map_or(computed_out, |g| g.1)
-        };
+        // Resolve counts a WAV's in point from its broadcast start floored to
+        // a frame, so a WAV starting inside a frame played a frame late; one
+        // frame more in the Resolve XML lands on the selected frame.
+        let late = i64::from(
+            format == TimelineExportFormat::ResolveXML
+                && media_type == MediaKind::Audio
+                && !retimed
+                && computed_in > 0
+                && starts_inside_a_frame(item, rate),
+        );
+        let source_in = geometry.map_or(computed_in, |g| g.0) + late;
+        let mut source_out = geometry.map_or(computed_out, |g| g.1) + late;
         let clip_duration = geometry.map_or_else(
             || {
                 if retimed {
@@ -959,14 +878,10 @@ impl Document {
         } else {
             item.selected_timeline_duration(media_type)
         };
-        let timeline_duration = if padded {
-            file_duration
-        } else {
-            rate.frames(selected_tl, Rounding::Nearest)
-        };
+        let timeline_duration = rate.frames(selected_tl, Rounding::Nearest);
         let mut end = start + timeline_duration;
         // Seams of one source's clips share a track (see the allocator), and
-        // a padded clip's end rounds up into the next frame.
+        // rounding to frames can end a clip inside the next.
         let overlap = next_start
             .filter(|_| !transition_after && !retimed)
             .map_or(0, |next| end - next);
@@ -995,7 +910,7 @@ impl Document {
             if transition_before { -1 } else { start },
             if transition_after { -1 } else { end }
         );
-        if media_type == MediaKind::Audio && !padded {
+        if media_type == MediaKind::Audio && format == TimelineExportFormat::PremiereXML {
             let subframes = super::model::subframe_offset_80(start_frac);
             if subframes != 0 {
                 xml += &format!("                <subframeoffset>{subframes}</subframeoffset>\n");
@@ -1211,11 +1126,10 @@ fn xml_number(value: f64) -> String {
     s
 }
 
-/// The file one side of an item plays: its source, its drift sidecar, or a
-/// Premiere placement pad, with the `<file>` description it is written with
-/// once per document.
+/// The file one side of an item plays: its source or its drift sidecar, with
+/// the `<file>` description it is written with once per document.
 struct MediaUse {
-    /// One per source, drift sidecar, and pad offset.
+    /// One per source and drift sidecar.
     resource_key: String,
     url: PathBuf,
     /// The file's own rate, which `duration` counts in.
@@ -1223,10 +1137,7 @@ struct MediaUse {
     duration: i64,
     /// A drift-corrected sidecar.
     corrected: bool,
-    /// A placement-padded sidecar.
-    padded: bool,
-    /// The selected range in the file's seconds; a padded sidecar holds
-    /// exactly this range after its leading silence.
+    /// The selected range in the file's seconds.
     in_seconds: f64,
     out_seconds: f64,
 }
@@ -1238,8 +1149,23 @@ impl MediaUse {
 
     /// Sidecars Align renders are 32-bit float.
     fn is_prepared(&self) -> bool {
-        self.corrected || self.padded
+        self.corrected
     }
+}
+
+/// An audio file whose own broadcast start falls inside a frame of the
+/// sequence, more than half a sample from its edges.
+fn starts_inside_a_frame(item: &ExportItem, rate: SequenceRate) -> bool {
+    let Some(audio) = item.clip.audio.first() else {
+        return false;
+    };
+    let Some(timecode) = audio.source_timecode.as_ref().filter(|tc| !tc.derived) else {
+        return false;
+    };
+    let frames = timecode.as_seconds() * rate.fps;
+    let half_sample = 0.5 * rate.fps / audio.sample_rate.max(1.0);
+    let fraction = frames - frames.floor();
+    item.clip.video.is_none() && fraction > half_sample && 1.0 - fraction > half_sample
 }
 
 fn source_rate(item: &ExportItem, sequence: SequenceRate) -> SequenceRate {
@@ -1254,13 +1180,6 @@ fn source_rate(item: &ExportItem, sequence: SequenceRate) -> SequenceRate {
 impl Document {
     fn media_use(&self, item: &ExportItem, media_type: MediaKind) -> MediaUse {
         let corrected = media_type == MediaKind::Audio && item.corrected_audio_url.is_some();
-        // Premiere and Resolve both place XML audio on whole frames; a padded
-        // sidecar carries the remainder to the exact sample in either. A copy
-        // without silence serves only Resolve, which counts a trimmed WAV's in
-        // point from its broadcast start; Premiere plays the original.
-        let padded = item.has_placement_pad(media_type)
-            && (self.format == TimelineExportFormat::ResolveXML
-                || item.placement_pad_seconds > 0.0);
         let (in_seconds, out_seconds) = if corrected {
             (item.corrected_source_in(), item.corrected_source_out())
         } else {
@@ -1269,47 +1188,25 @@ impl Document {
                 item.selected_source_out(media_type),
             )
         };
-        let (rate, duration) = if padded {
-            let duration = out_seconds - in_seconds + item.placement_pad_seconds;
-            (self.rate, self.rate.frames(duration, Rounding::Up))
+        let rate = source_rate(item, self.rate);
+        let seconds = if corrected {
+            item.mapped_duration()
         } else {
-            let rate = source_rate(item, self.rate);
-            let seconds = if corrected {
-                item.mapped_duration()
-            } else {
-                item.source_duration()
-            };
-            (rate, rate.frames(seconds, Rounding::Nearest))
+            item.source_duration()
         };
         let url = match media_type {
-            MediaKind::Audio => padded
-                .then(|| item.placement_pad_url.clone())
-                .flatten()
-                .or_else(|| item.corrected_audio_url.clone())
+            MediaKind::Audio => item
+                .corrected_audio_url
+                .clone()
                 .unwrap_or_else(|| item.clip.url.clone()),
             MediaKind::Video => item.clip.url.clone(),
         };
-        let resource_key = if padded {
-            // Padded sidecars differ per prepend length: items sharing a source
-            // at different fractional offsets must not share a file block.
-            let sample_rate = item.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);
-            let pad_samples = (item.placement_pad_seconds * sample_rate).round() as u64;
-            format!(
-                "{}-placement-pad-{pad_samples}-{}-{}",
-                base_resource_key(item),
-                in_seconds.to_bits(),
-                out_seconds.to_bits()
-            )
-        } else {
-            base_resource_key(item)
-        };
         MediaUse {
-            resource_key,
+            resource_key: base_resource_key(item),
             url,
             rate,
-            duration,
+            duration: rate.frames(seconds, Rounding::Nearest),
             corrected,
-            padded,
             in_seconds,
             out_seconds,
         }
@@ -1325,7 +1222,6 @@ impl Document {
             rate,
             duration: rate.frames(item.source_duration(), Rounding::Nearest),
             corrected: false,
-            padded: false,
             in_seconds: 0.0,
             out_seconds: item.source_duration(),
         }
@@ -1553,17 +1449,34 @@ mod tests {
     use super::super::otio::tests::fixture_timeline;
     use super::*;
 
+    /// Premiere and Resolve start XML sound on a frame: the nearest one.
+    /// Premiere XML keeps the remainder after a frame below as
+    /// `<subframeoffset>` for other readers.
     #[test]
-    fn unpadded_fractional_audio_keeps_subframeoffset() {
-        // Historical encoding, preserved for plain `export` (no sidecars):
-        // fixture recorder at 0.5 s = 12.5 frames at 25 fps.
-        let timeline = fixture_timeline();
-        let xml = write(
-            &timeline,
-            TimelineExportFormat::PremiereXML,
-            PremiereOptions::default(),
-        );
-        assert!(xml.contains("<subframeoffset>40</subframeoffset>"));
+    fn audio_starts_on_the_nearest_frame() {
+        let at = |start: f64, format| {
+            let mut timeline = fixture_timeline();
+            let rec = timeline.islands[0]
+                .clips
+                .iter_mut()
+                .find(|i| i.clip.id.0 == "rec")
+                .expect("recorder item");
+            rec.start = start;
+            let xml = write(&timeline, format, PremiereOptions::default());
+            let clip = &xml[xml.find("<name>rec.wav</name>").expect("recorder")..];
+            clip[..clip.find("</clipitem>").unwrap()].to_string()
+        };
+        // 12.5 frames at 25 fps starts on frame 13.
+        let premiere = at(0.5, TimelineExportFormat::PremiereXML);
+        assert!(premiere.contains("<start>13</start>"), "{premiere}");
+        assert!(!premiere.contains("subframeoffset"));
+        // 2.1 frames starts on frame 2, a tenth of a frame later.
+        let premiere = at(0.084, TimelineExportFormat::PremiereXML);
+        assert!(premiere.contains("<start>2</start>"), "{premiere}");
+        assert!(premiere.contains("<subframeoffset>8</subframeoffset>"));
+        let resolve = at(0.084, TimelineExportFormat::ResolveXML);
+        assert!(resolve.contains("<start>2</start>"), "{resolve}");
+        assert!(!resolve.contains("subframeoffset"));
     }
 
     #[test]
@@ -1585,166 +1498,84 @@ mod tests {
         assert!(xml.contains("<start>232</start>"));
     }
 
+    /// Resolve counts a trimmed WAV's in point from its broadcast start
+    /// floored to a frame: a WAV starting inside a frame is read one frame
+    /// further on in the Resolve XML. Premiere counts from the first sample.
     #[test]
-    fn padded_audio_omits_subframeoffset_and_references_sidecar() {
-        let mut timeline = fixture_timeline();
-        let rec = timeline.islands[0]
-            .clips
-            .iter_mut()
-            .find(|i| i.clip.id.0 == "rec")
-            .expect("recorder item");
-        // 2.9 frames at 25 fps: floored start 2, 1728-sample prepend.
-        rec.start = 2.9 / 25.0;
-        let pad = rec
-            .clip
-            .audio
-            .first()
-            .and_then(|a| {
-                super::super::model::placement_pad_samples(
-                    rec.timeline_start(MediaKind::Audio),
-                    super::super::model::sequence_fps(timeline.frame_duration),
-                    a.sample_rate,
-                )
-            })
-            .expect("pad");
-        assert_eq!(pad, 1728);
-        let padded = rec
-            .clone()
-            .with_placement_pad(PathBuf::from("/pad/rec-pad.wav"), pad as f64 / 48_000.0);
-        *rec = padded;
-        let xml = write(
-            &timeline,
-            TimelineExportFormat::PremiereXML,
-            PremiereOptions::default(),
-        );
-        assert!(
-            !xml.contains("subframeoffset"),
-            "padded items carry no subframeoffset"
-        );
-        assert!(xml.contains("rec-pad.wav"));
-        assert!(xml.contains("<start>2</start>\n                <end>303</end>"));
-        // File grows by the 0.036 s prepend: 12 s -> 301 frames.
-        assert!(xml.matches("<duration>301</duration>").count() >= 2);
-        // The padded selection includes the full source tail.
-        assert!(xml.contains("<in>0</in>"));
-        assert!(xml.contains("<out>301</out>"));
-    }
-
-    /// Two takes of one recorder whose sounds abut: the first padded take's
-    /// end rounds up into the frame where the second starts. On one track
-    /// Resolve moved the second a frame later, and ending the first there cut
-    /// its last 200 samples, so the second plays on a track of its own.
-    /// Takes whose sounds overlap stay on one track, the first ending where
-    /// the second starts.
-    #[test]
-    fn takes_sharing_a_frame_play_on_separate_tracks() {
-        let pad = 200.0 / 48_000.0;
-        let takes = |second_start: f64| {
+    fn resolve_reads_a_trimmed_wav_starting_inside_a_frame_a_frame_on() {
+        let xml = |format, reference: u64| {
             let mut timeline = fixture_timeline();
             let rec = timeline.islands[0]
                 .clips
                 .iter_mut()
                 .find(|i| i.clip.id.0 == "rec")
                 .expect("recorder item");
-            rec.start = pad;
-            rec.source_out = 2.0;
+            rec.source_in = 0.48;
+            rec.source_out = 2.48;
             rec.timeline_duration = 2.0;
-            *rec = rec.with_placement_pad(PathBuf::from("/pad/first.wav"), pad);
-            let mut second = rec.with_placement_pad(PathBuf::from("/pad/second.wav"), pad);
-            second.instance_id = "second take".into();
-            second.start = second_start;
-            timeline.islands[0].clips.push(second);
-            write(
-                &timeline,
-                TimelineExportFormat::PremiereXML,
-                PremiereOptions::default(),
-            )
+            rec.clip.audio[0].source_timecode = crate::model::SourceTimecode::from_samples(
+                reference,
+                48_000.0,
+                crate::model::MediaTime::new(1, 25),
+                false,
+            );
+            let xml = write(&timeline, format, PremiereOptions::default());
+            let clip = &xml[xml.find("<name>rec.wav</name>").expect("recorder")..];
+            clip[..clip.find("</clipitem>").unwrap()].to_string()
         };
-        let tracks = |xml: &str| -> Vec<String> {
-            let audio = &xml[xml.find("<audio>").unwrap()..];
-            audio.split("<track>").skip(1).map(str::to_string).collect()
-        };
-        let abutting = takes(2.0 + pad);
-        let first = &abutting[abutting.find("<name>first.wav</name>").expect("first take")..];
+        let inside = 48_000 * 10 + 200;
+        let resolve = xml(TimelineExportFormat::ResolveXML, inside);
         assert!(
-            first.contains("<start>0</start>\n                <end>51</end>"),
-            "{first}"
+            resolve.contains("<in>13</in>\n                <out>63</out>"),
+            "{resolve}"
         );
+        let premiere = xml(TimelineExportFormat::PremiereXML, inside);
         assert!(
-            !tracks(&abutting)
-                .iter()
-                .any(|track| track.contains("first.wav") && track.contains("second.wav")),
-            "{abutting}"
+            premiere.contains("<in>12</in>\n                <out>62</out>"),
+            "{premiere}"
         );
-        assert!(abutting.contains("<start>50</start>\n                <end>101</end>"));
-        // The second take's sound starts 10 ms before the first's ends, in
-        // frame 49: the first ends there.
-        let overlapping = takes(2.0 + pad - 0.01);
-        let first = &overlapping[overlapping
-            .find("<name>first.wav</name>")
-            .expect("first take")..];
+        let on_frame = xml(TimelineExportFormat::ResolveXML, 48_000 * 10);
         assert!(
-            first.contains("<start>0</start>\n                <end>49</end>"),
-            "{first}"
-        );
-        assert!(
-            tracks(&overlapping)
-                .iter()
-                .any(|track| track.contains("first.wav") && track.contains("second.wav"))
+            on_frame.contains("<in>12</in>\n                <out>62</out>"),
+            "{on_frame}"
         );
     }
 
-    /// A copy of a trimmed WAV without silence serves only Resolve; the
-    /// Premiere XML plays the original from the file's first sample.
+    /// Takes of one recorder share a track across sub-second seams; when
+    /// rounding to frames ends the first inside the next, it ends where the
+    /// next starts, or Resolve moves the next a frame later.
     #[test]
-    fn only_the_resolve_xml_plays_a_trim_copy() {
+    fn a_clip_ends_where_the_next_on_its_track_starts() {
         let mut timeline = fixture_timeline();
         let rec = timeline.islands[0]
             .clips
             .iter_mut()
             .find(|i| i.clip.id.0 == "rec")
             .expect("recorder item");
-        rec.start = 1.0;
-        rec.source_in = 0.5;
-        *rec = rec.with_placement_pad(PathBuf::from("/pad/rec-trim.wav"), 0.0);
-        let xml = |format| write(&timeline, format, PremiereOptions::default());
-        let resolve = xml(TimelineExportFormat::ResolveXML);
-        assert!(resolve.contains("<pathurl>file:///pad/rec-trim.wav</pathurl>"));
-        let premiere = xml(TimelineExportFormat::PremiereXML);
-        assert!(!premiere.contains("rec-trim.wav"));
-        assert!(premiere.contains("<pathurl>file:///v/rec.wav</pathurl>"));
-    }
-
-    #[test]
-    fn resolve_xml_plays_pads_like_premiere() {
-        // Resolve places XML audio on whole frames too: 0.5 s = 12.5 frames
-        // at 25 fps starts on frame 12, and the sidecar's half frame of
-        // silence lands the sound on its sample. Without a pad Resolve keeps
-        // the nearest frame, 13.
-        let mut timeline = fixture_timeline();
-        let rec = timeline.islands[0]
-            .clips
-            .iter_mut()
-            .find(|i| i.clip.id.0 == "rec")
-            .expect("recorder item");
-        *rec = rec
-            .clone()
-            .with_placement_pad(PathBuf::from("/pad/rec-pad.wav"), 960.0 / 48_000.0);
+        rec.start = 0.0;
+        rec.source_out = 2.0;
+        rec.timeline_duration = 2.0;
+        let mut second = rec.clone();
+        second.instance_id = "second take".into();
+        // 49.5 frames: the second starts on frame 50 and the first, 50
+        // frames long, would end there anyway; 49.4 starts on frame 49.
+        second.start = 49.4 / 25.0;
+        timeline.islands[0].clips.push(second);
         let xml = write(
             &timeline,
             TimelineExportFormat::ResolveXML,
             PremiereOptions::default(),
         );
-        assert!(xml.contains("<pathurl>file:///pad/rec-pad.wav</pathurl>"));
-        assert!(!xml.contains("subframeoffset"));
-        assert!(xml.contains("<start>12</start>"));
-        let plain = write(
-            &fixture_timeline(),
-            TimelineExportFormat::ResolveXML,
-            PremiereOptions::default(),
+        let first = &xml[xml.find("<name>rec.wav</name>").expect("first take")..];
+        assert!(
+            first.contains("<start>0</start>\n                <end>49</end>"),
+            "{first}"
         );
-        assert!(plain.contains("<start>13</start>"));
-        assert!(plain.contains("<pathurl>file:///v/rec.wav</pathurl>"));
+        assert!(first.contains("<out>49</out>"), "{first}");
+        assert!(
+            xml.contains("<start>49</start>\n                <end>99</end>"),
+            "{xml}"
+        );
     }
 
     #[test]
@@ -1814,35 +1645,6 @@ mod tests {
         );
         assert!(!premiere.contains("01:26:57:00"));
         assert!(premiere.contains("<timecode><string>"));
-    }
-
-    #[test]
-    fn pads_do_not_share_file_blocks_across_offsets() {
-        // Same source at two fractional offsets needs two sidecars: the
-        // resource key carries the prepend length.
-        let mut timeline = fixture_timeline();
-        let mut second = timeline.islands[0]
-            .clips
-            .iter()
-            .find(|i| i.clip.id.0 == "rec")
-            .expect("recorder item")
-            .clone();
-        second.instance_id = "rec-second".into();
-        second.start = 0.084;
-        second.placement_pad_url = Some(PathBuf::from("/pad/rec-pad-192.wav"));
-        second.placement_pad_seconds = 192.0 / 48_000.0;
-        timeline.islands[0].clips.push(second);
-        let xml = write(
-            &timeline,
-            TimelineExportFormat::PremiereXML,
-            PremiereOptions::default(),
-        );
-        assert!(xml.contains("file-rec\""), "plain file block keeps its id");
-        assert!(
-            xml.contains("file-rec-placement-pad-192-"),
-            "padded file block gets its own id"
-        );
-        assert!(xml.contains("/pad/rec-pad-192.wav"));
     }
 
     #[test]
@@ -2008,9 +1810,7 @@ mod tests {
             .find(|i| i.clip.id.0 == "rec")
             .expect("recorder item");
         rec.start = 2.9 / 25.0;
-        *rec = rec
-            .clone()
-            .with_placement_pad(PathBuf::from("/pad/rec-pad.wav"), 1728.0 / 48_000.0);
+        *rec = rec.with_corrected_audio(PathBuf::from("/fix/rec-drift.wav"));
         let options = PremiereOptions {
             replaced_sequence: true,
             media_bins: true,
@@ -2023,9 +1823,9 @@ mod tests {
             .map(|bin| &bin[..bin.find('<').expect("name")])
             .collect();
         // One folder holding a camera and a recorder: a bin each, then the
-        // pad the synchronized sequence plays.
+        // drift correction the synchronized sequence plays.
         assert_eq!(bins, ["v – Video", "v – Audio", "Align generated audio"]);
-        for path in ["/v/cam.mov", "/v/rec.wav", "/pad/rec-pad.wav"] {
+        for path in ["/v/cam.mov", "/v/rec.wav", "/fix/rec-drift.wav"] {
             let pathurl = format!("<pathurl>file://{path}</pathurl>");
             assert_eq!(xml.matches(&pathurl).count(), 1, "{path}");
             assert!(xml.find(&pathurl).expect("defined") < sequences, "{path}");

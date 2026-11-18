@@ -416,16 +416,7 @@ fn audio_manifest_linking(
             if !rate.is_finite() || rate < 1.0 || rate > u32::MAX as f64 || rate.fract() != 0.0 {
                 return Err(fail("Invalid AAF sample rate"));
             }
-            // Stems that lead with silence start their clip that much earlier.
-            let (stems, lead, tail) = if item.aaf_audio_urls.is_empty() {
-                (&item.precision_audio_urls, 0, item.precision_tail_samples)
-            } else {
-                (
-                    &item.aaf_audio_urls,
-                    item.aaf_lead_samples,
-                    item.aaf_tail_samples,
-                )
-            };
+            let (stems, tail) = (&item.precision_audio_urls, item.precision_tail_samples);
             let direct = stems.is_empty() && cameras.contains(&item.clip.url);
             if !direct && (stems.len() != audio.channels || audio.channels == 0) {
                 return Err(fail("AAF requires prepared mono stems for every channel"));
@@ -437,10 +428,8 @@ fn audio_manifest_linking(
                 }
                 Ok(value.round() as u64)
             };
-            let start = samples(item.timeline_start(align_core::MediaKind::Audio))?
-                .checked_sub(lead)
-                .ok_or_else(|| fail("AAF audio lead precedes the timeline"))?;
-            let length = samples(item.precision_source_duration())? + lead;
+            let start = samples(item.timeline_start(align_core::MediaKind::Audio))?;
+            let length = samples(item.precision_source_duration())?;
             let (source_in, frames) = if direct {
                 (
                     samples(item.precision_source_start())?,
@@ -576,11 +565,7 @@ pub fn timeline_manifest_with_frame_rate(
         .islands
         .iter()
         .flat_map(|island| &island.clips)
-        .filter(|item| {
-            item.clip.video.is_some()
-                && item.precision_audio_urls.is_empty()
-                && item.aaf_audio_urls.is_empty()
-        })
+        .filter(|item| item.clip.video.is_some() && item.precision_audio_urls.is_empty())
         .map(|item| item.clip.url.clone())
         .collect();
     let mut audio = timeline.clone();
@@ -977,36 +962,6 @@ mod tests {
             overridden["composition_edit_rate"],
             serde_json::json!({"numerator":30000,"denominator":1001})
         );
-    }
-    /// Premiere starts AAF audio on a frame: a clip whose stems lead with
-    /// silence starts that much earlier, on the frame, and lasts that much
-    /// longer, so the content keeps its sample.
-    #[test]
-    fn leading_silence_moves_the_clip_start_onto_a_frame() {
-        use align_core::export::{ExportIsland, ExportItem, ExportTimeline};
-        use align_core::{Clip, MediaTime};
-        let clip: Clip = serde_json::from_value(serde_json::json!({
-            "id":"a", "url":"/recordings/a.wav", "kind":"audio",
-            "duration":{"value":1,"timescale":1},
-            "audio":[{"sampleRate":48000.0,"channels":1,"bitDepth":24}]
-        }))
-        .unwrap();
-        let mut item = ExportItem::new(clip, 1.0 + 200.0 / 48000.0, 1.0, vec![], 1.0);
-        item.precision_audio_urls = vec!["/stems/plain.wav".into()];
-        let item = item.with_aaf_audio(vec!["/stems/lead.wav".into()], 200, 0);
-        let timeline = ExportTimeline::new(
-            vec![ExportIsland {
-                id: 0,
-                clips: vec![item],
-                duration: 2.0,
-            }],
-            MediaTime::new(1, 25),
-            "Test",
-        );
-        let clip = &audio_manifest(&timeline).unwrap().tracks[0].clips[0];
-        assert_eq!(clip.path, PathBuf::from("/stems/lead.wav"));
-        assert_eq!((clip.start, clip.length), (48000, 48200));
-        assert_eq!(clip.source_frames, 48200);
     }
     /// A camera's sound without stems links the camera file's channels.
     #[test]
