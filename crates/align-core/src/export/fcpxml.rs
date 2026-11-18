@@ -80,33 +80,42 @@ fn whole_frames(time: MediaTime, frame: MediaTime, up: bool) -> MediaTime {
 
 /// Gaps between the clips of a storyline or multicam angle. Final Cut Pro
 /// places the clips at their offsets, but Resolve plays a storyline's clips
-/// back to back, so the space between them is an explicit gap. Gaps span
-/// whole frames: Final Cut Pro moves a gap ending inside a frame, and with
-/// it the clip after, to a frame boundary.
+/// back to back, so the space between them is an explicit gap. Final Cut Pro
+/// rounds the leading gap to whole frames, taking the clip after it along,
+/// but keeps later gaps as they are; so the leading space is whole frames
+/// followed by a gap of the remainder.
 fn with_gaps(
     mut clips: Vec<(MediaTime, MediaTime, String)>,
     frame: MediaTime,
     indent: &str,
 ) -> String {
     clips.sort_by(|a, b| a.0.as_seconds().total_cmp(&b.0.as_seconds()));
-    let mut xml = String::new();
-    let mut cursor = MediaTime::new(0, 1);
-    for (start, end, clip) in clips {
-        let (from, to) = (
-            whole_frames(cursor, frame, true),
-            whole_frames(start, frame, false),
-        );
+    let gap = |from: MediaTime, to: MediaTime| {
         let space = difference(to, from);
         if space.as_seconds() > TIME_TOLERANCE {
-            xml += &format!(
+            format!(
                 "{indent}<gap offset=\"{}\" duration=\"{}\"/>\n",
                 xml_text::fcpxml_time(from),
                 xml_text::fcpxml_time(space)
-            );
+            )
+        } else {
+            String::new()
+        }
+    };
+    let mut xml = String::new();
+    let mut cursor: Option<MediaTime> = None;
+    for (start, end, clip) in clips {
+        match cursor {
+            None => {
+                let frames = whole_frames(start, frame, false);
+                xml += &gap(MediaTime::new(0, 1), frames);
+                xml += &gap(frames, start);
+            }
+            Some(cursor) => xml += &gap(cursor, start),
         }
         xml += &clip;
-        if end.as_seconds() > cursor.as_seconds() {
-            cursor = end;
+        if cursor.is_none_or(|cursor| end.as_seconds() > cursor.as_seconds()) {
+            cursor = Some(end);
         }
     }
     xml
@@ -153,6 +162,18 @@ fn media_start(clip: &Clip) -> MediaTime {
                 tc.frame_duration.timescale,
             )
         })
+}
+
+/// A sound position on whole frames when it is on one, else on whole samples
+/// of its file: cuts between samples written in microseconds left a sample
+/// of silence at Final Cut Pro's edits.
+fn sound_time(seconds: f64, frame: MediaTime, clip: &Clip) -> MediaTime {
+    let on_frames = grid_time(seconds, frame);
+    let rate = clip.audio.first().map_or(0.0, |audio| audio.sample_rate);
+    if on_frames.timescale == frame.timescale || rate < 1.0 || rate.fract() != 0.0 {
+        return on_frames;
+    }
+    MediaTime::new((seconds * rate).round() as i64, rate as i32)
 }
 
 /// A source position `seconds` into a file starting at `origin`. FCPXML
@@ -620,15 +641,27 @@ impl Library<'_> {
                 else {
                     continue;
                 };
-                let (source_in, duration) = match side {
+                let frame = self.frame;
+                let (start, duration, source) = match side {
                     MediaKind::Video => (
-                        picture_seconds(item.source_in, &item.clip),
-                        item.timeline_duration,
+                        grid_time(item.start, frame),
+                        grid_time(item.timeline_duration, frame),
+                        source_time(
+                            origin,
+                            picture_seconds(item.source_in, &item.clip),
+                            &item.clip,
+                            frame,
+                        ),
                     ),
-                    MediaKind::Audio => (audio_source_in(item), audio_duration(item)),
+                    MediaKind::Audio => (
+                        sound_time(item.start, frame, &item.clip),
+                        sound_time(audio_duration(item), frame, &item.clip),
+                        xml_text::fcpxml_time(sum(
+                            origin,
+                            sound_time(audio_source_in(item), frame, &item.clip),
+                        )),
+                    ),
                 };
-                let start = grid_time(item.start, self.frame);
-                let duration = grid_time(duration, self.frame);
                 clips.push((
                     start,
                     sum(start, duration),
@@ -637,7 +670,7 @@ impl Library<'_> {
                         clip_name(item, &media_url),
                         xml_text::fcpxml_time(start),
                         xml_text::fcpxml_time(duration),
-                        source_time(origin, source_in, &item.clip, self.frame),
+                        source,
                         u8::from(item.is_enabled(side)),
                         audio_role_attribute(item, "audioRole"),
                         audio_channel_end(item),
@@ -734,11 +767,12 @@ impl Library<'_> {
                 format!(" lane=\"{lane}\"")
             }
         };
-        let mut place = |lane: i64, start: f64, duration: f64, clip: String| {
+        let mut place = |lane: i64, start: MediaTime, duration: MediaTime, clip: String| {
             if group_storylines {
-                let start = grid_time(start, frame);
-                let end = sum(start, grid_time(duration, frame));
-                stories.entry(lane).or_default().push((start, end, clip));
+                stories
+                    .entry(lane)
+                    .or_default()
+                    .push((start, sum(start, duration), clip));
             } else {
                 spine += &clip;
             }
@@ -762,8 +796,8 @@ impl Library<'_> {
                 picture_duration(picture_in, item.timeline_duration, &item.clip, frame);
             place(
                 lane,
-                item.start,
-                item.timeline_duration,
+                grid_time(item.start, frame),
+                grid_time(item.timeline_duration, frame),
                 format!(
                     "              <clip{} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{}\" enabled=\"{}\"><video ref=\"{asset_id}\" offset=\"{source_start}\" start=\"{media_start}\" duration=\"{source_duration}\"/></clip>\n",
                     lane_attribute(lane),
@@ -781,22 +815,26 @@ impl Library<'_> {
                 continue;
             };
             let lane = -((audio_assignments.get(&id).copied().unwrap_or(0) + 1) as i64);
-            let duration = audio_duration(item);
-            let source_in = audio_source_in(item);
-            let source_start = timeline_time(source_in, frame);
-            let media_start = source_time(origin, source_in, &item.clip, frame);
-            let source_duration = timeline_time(duration, frame);
+            let clip = &item.clip;
+            let start = sound_time(item.start, frame, clip);
+            let duration = sound_time(audio_duration(item), frame, clip);
+            let source_in = sound_time(audio_source_in(item), frame, clip);
+            let media_start = xml_text::fcpxml_time(sum(origin, source_in));
+            let (source_start, source_duration) = (
+                xml_text::fcpxml_time(source_in),
+                xml_text::fcpxml_time(duration),
+            );
             let channel_attribute =
                 channel.map_or_else(String::new, |channel| format!(" srcCh=\"{}\"", channel + 1));
             place(
                 lane,
-                item.start,
+                start,
                 duration,
                 format!(
                     "              <clip{} offset=\"{}\" duration=\"{}\" start=\"{}\" name=\"{}\" enabled=\"{}\"><audio ref=\"{asset_id}\" offset=\"{source_start}\" start=\"{media_start}\" duration=\"{source_duration}\"{channel_attribute}{}/></clip>\n",
                     lane_attribute(lane),
-                    timeline_time(item.start, frame),
-                    timeline_time(duration, frame),
+                    xml_text::fcpxml_time(start),
+                    source_duration,
                     source_start,
                     clip_name(item, &media_url),
                     u8::from(item.is_enabled(MediaKind::Audio)),
@@ -957,10 +995,17 @@ mod tests {
                 ..FcpxmlOptions::default()
             },
         );
-        // The recorder starts 12.5 frames in, after a gap of the 12 whole
-        // frames before it, in its storyline and in its angle.
+        // The recorder starts 12.5 frames in: a gap of the 12 whole frames
+        // before it, then one of the remaining half frame, in its storyline
+        // and in its angle.
         assert_eq!(
             xml.matches("<gap offset=\"0s\" duration=\"12/25s\"/>")
+                .count(),
+            2,
+            "{xml}"
+        );
+        assert_eq!(
+            xml.matches("<gap offset=\"12/25s\" duration=\"1/50s\"/>")
                 .count(),
             2,
             "{xml}"
@@ -993,6 +1038,25 @@ mod tests {
         assert!(angle.contains(" start=\"5/24s\""), "{angle}");
         // Its sound keeps the exact position.
         assert!(xml.contains("<audio ref=\"r_asset_1\" offset=\"1/5s\" start=\"1/5s\""));
+    }
+
+    /// Sound off the frame grid sits on whole samples of its file, so two
+    /// clips cut between samples meet without a sample of silence.
+    #[test]
+    fn sound_positions_count_whole_samples() {
+        let mut timeline = fixture_timeline();
+        timeline.islands[0].clips[1].start = 0.5 + 1.0 / 48_000.0;
+        let xml = write(&timeline, FcpxmlOptions::default());
+        let recorder = xml
+            .lines()
+            .find(|line| line.contains("<clip") && line.contains("rec.wav"))
+            .unwrap();
+        assert!(recorder.contains("offset=\"24001/48000s\""), "{recorder}");
+        let angle = xml
+            .lines()
+            .find(|line| line.contains("<asset-clip ") && line.contains("rec.wav"))
+            .unwrap();
+        assert!(angle.contains("offset=\"24001/48000s\""), "{angle}");
     }
 
     /// Final Cut Pro plays a clip's file of more than two channels only
