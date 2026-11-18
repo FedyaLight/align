@@ -626,20 +626,46 @@ impl AudioPlan {
             let rate = item.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);
             aaf_lead_samples(item.timeline_start(MediaKind::Audio), aaf_frame, rate).unwrap_or(0)
         };
-        // A camera starting on a whole-sample frame links its own file's
-        // channels, as Resolve's AAF does; MXF keeps its stems, since its
-        // sound often lives in other files.
+        // A camera starting and ending on whole-sample frames links its own
+        // QuickTime or MP4 file's channels, as Resolve's AAF does. Ending
+        // inside a frame, its clip would stop a frame short of the file's
+        // sound, so it keeps a stem ending in silence; other files, such as
+        // MXF, whose sound often lives in other files, keep their stems.
+        // The selection must also lie within the file's sound, which can
+        // end before its picture.
+        let mut sound_lengths: HashMap<PathBuf, Option<u64>> = HashMap::new();
+        if wants_aaf {
+            for item in combined.islands.iter().flat_map(|island| &island.clips) {
+                if item.clip.video.is_some() && !sound_lengths.contains_key(&item.clip.url) {
+                    let length = crate::isobmff::ama_metadata(&item.clip.url).and_then(|meta| {
+                        meta["streams"]
+                            .as_array()?
+                            .iter()
+                            .find(|stream| stream["codec_type"] == "audio")?["duration_ts"]
+                            .as_u64()
+                    });
+                    sound_lengths.insert(item.clip.url.clone(), length);
+                }
+            }
+        }
         let aaf_direct = |item: &ExportItem| {
-            let mxf = item
-                .clip
-                .url
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("mxf"));
+            let rate = item.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);
+            let end = item.timeline_start(MediaKind::Audio) + item.precision_source_duration();
+            let within = sound_lengths
+                .get(&item.clip.url)
+                .copied()
+                .flatten()
+                .is_some_and(|length| {
+                    ((item.precision_source_start() + item.precision_source_duration()) * rate)
+                        .round() as u64
+                        <= length
+                });
             aaf_item(item)
                 && item.clip.video.is_some()
-                && !mxf
+                && within
                 && !item.is_retimed(MediaKind::Audio)
                 && aaf_lead(item) == 0
+                && aaf_lead_samples(end, aaf_frame, rate).is_none()
         };
         let aaf_stems = |item: &ExportItem| {
             let rate = item.clip.audio.first()?.sample_rate;
