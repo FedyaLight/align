@@ -385,6 +385,9 @@ impl Document {
             let after = track
                 .get(index + 1)
                 .and_then(|next| transition_between(entry, next, media_type));
+            let next_start = track
+                .get(index + 1)
+                .map(|next| self.start_frame(next, media_type).0);
             xml += &self.clip_item(
                 entry,
                 media_type,
@@ -392,6 +395,7 @@ impl Document {
                 &links(entry, media_type, self.format, layout),
                 before.is_some(),
                 after.is_some(),
+                next_start,
             );
             if let Some(t) = after {
                 xml += &transition_item(t, self.rate);
@@ -787,19 +791,11 @@ fn tracks_for<'a>(
 }
 
 impl Document {
-    /// One `<clipitem>`. FCP7 marks an edge shared with a transition as -1.
-    fn clip_item(
-        &mut self,
-        entry: &TrackEntry,
-        media_type: MediaKind,
-        id: &str,
-        links: &[LinkReference],
-        transition_before: bool,
-        transition_after: bool,
-    ) -> String {
-        let (rate, format) = (self.rate, self.format);
-        let item = entry.item;
-        let resolve = format == TimelineExportFormat::ResolveXML;
+    /// The sequence frame a clipitem starts on, and the fraction of a frame
+    /// its audio starts later.
+    fn start_frame(&self, entry: &TrackEntry, media_type: MediaKind) -> (i64, f64) {
+        let (rate, item) = (self.rate, entry.item);
+        let resolve = self.format == TimelineExportFormat::ResolveXML;
         let stable_start = (item.timeline_start(media_type) * 100_000.0).round() / 100_000.0;
         // Resolve drops `<subframeoffset>` and places clips on whole frames, so
         // a floored audio start lands up to a frame early there (camera audio a
@@ -825,6 +821,26 @@ impl Document {
             start += adjustment;
             start_frac = effective;
         }
+        (start, start_frac)
+    }
+
+    /// One `<clipitem>`. FCP7 marks an edge shared with a transition as -1.
+    /// A clip ending after `next_start`, where the next clip of its track
+    /// starts, ends there: Resolve moves the next clip past it instead.
+    #[allow(clippy::too_many_arguments)]
+    fn clip_item(
+        &mut self,
+        entry: &TrackEntry,
+        media_type: MediaKind,
+        id: &str,
+        links: &[LinkReference],
+        transition_before: bool,
+        transition_after: bool,
+        next_start: Option<i64>,
+    ) -> String {
+        let (rate, format) = (self.rate, self.format);
+        let item = entry.item;
+        let (start, start_frac) = self.start_frame(entry, media_type);
         let media = self.media_use(item, media_type);
         let (source_rate, file_duration) = (media.rate, media.duration);
         let (corrected, padded) = (media.corrected, media.padded);
@@ -872,7 +888,7 @@ impl Document {
         } else {
             geometry.map_or(computed_in, |g| g.0)
         };
-        let source_out = if padded {
+        let mut source_out = if padded {
             file_duration
         } else {
             geometry.map_or(computed_out, |g| g.1)
@@ -899,7 +915,16 @@ impl Document {
         } else {
             rate.frames(selected_tl, Rounding::Nearest)
         };
-        let end = start + timeline_duration;
+        let mut end = start + timeline_duration;
+        // Seams of one source's clips share a track (see the allocator), and
+        // a padded clip's end rounds up into the next frame.
+        let overlap = next_start
+            .filter(|_| !transition_after && !retimed)
+            .map_or(0, |next| end - next);
+        if overlap > 0 && overlap < timeline_duration {
+            end -= overlap;
+            source_out -= (overlap as f64 * item_rate.fps / rate.fps).round() as i64;
+        }
         let name = xml_text::escape(
             &item
                 .display_name
@@ -1556,6 +1581,43 @@ mod tests {
         // The padded selection includes the full source tail.
         assert!(xml.contains("<in>0</in>"));
         assert!(xml.contains("<out>301</out>"));
+    }
+
+    /// Two takes of one recorder share a track; the first padded take's end
+    /// rounds up into the frame where the second starts. Resolve then moved
+    /// the second a frame later, so the first ends where the second starts.
+    #[test]
+    fn a_clip_ends_where_the_next_on_its_track_starts() {
+        let mut timeline = fixture_timeline();
+        let pad = 200.0 / 48_000.0;
+        let rec = timeline.islands[0]
+            .clips
+            .iter_mut()
+            .find(|i| i.clip.id.0 == "rec")
+            .expect("recorder item");
+        rec.start = pad;
+        rec.source_out = 2.0;
+        rec.timeline_duration = 2.0;
+        *rec = rec.with_placement_pad(PathBuf::from("/pad/first.wav"), pad);
+        let mut second = rec.with_placement_pad(PathBuf::from("/pad/second.wav"), pad);
+        second.instance_id = "second take".into();
+        second.start = 2.0 + pad;
+        timeline.islands[0].clips.push(second);
+        let xml = write(
+            &timeline,
+            TimelineExportFormat::PremiereXML,
+            PremiereOptions::default(),
+        );
+        let first = &xml[xml.find("<name>first.wav</name>").expect("first take")..];
+        assert!(
+            first.contains("<start>0</start>\n                <end>50</end>"),
+            "{first}"
+        );
+        assert!(first.contains("<out>50</out>"), "{first}");
+        assert!(
+            xml.contains("<start>50</start>\n                <end>101</end>"),
+            "{xml}"
+        );
     }
 
     #[test]
