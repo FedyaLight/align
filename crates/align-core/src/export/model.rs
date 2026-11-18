@@ -2468,7 +2468,10 @@ mod tests {
         let fcpxml =
             super::super::fcpxml::write(&timeline, super::super::fcpxml::FcpxmlOptions::TIMELINE);
         assert!(fcpxml.contains("name=\"recorder.wav ✓\""));
-        assert!(fcpxml.contains("<audio ref=") && fcpxml.contains(" role=\"dialogue.interview\""));
+        assert!(
+            fcpxml.contains(" audioRole=\"dialogue.interview\""),
+            "{fcpxml}"
+        );
         // Resolve imports neither, so the OTIO carries the name and the
         // nearest Resolve color for the import script to apply.
         let otio: serde_json::Value =
@@ -2570,6 +2573,6 @@ mod tests {
         single.islands = vec![timeline.combined_island(1.0)];
         let xml =
             super::super::fcpxml::write(&single, super::super::fcpxml::FcpxmlOptions::TIMELINE);
-        assert_eq!(xml.matches(" role=\"effects\"").count(), 2);
+        assert_eq!(xml.matches(" audioRole=\"effects\"").count(), 2, "{xml}");
     }
 }

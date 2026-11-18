@@ -224,7 +224,15 @@ pub(super) fn read_fcpxml(
                             AssetInfo {
                                 url: fcpxml_url(src, base),
                                 start: fcpxml_time(doc.attr(c, "start")),
-                                has_video: doc.attr(c, "hasVideo") != Some("0"),
+                                // Final Cut Pro leaves `hasVideo` out of a
+                                // sound file's asset; picture has a format.
+                                has_video: match doc.attr(c, "hasVideo") {
+                                    Some(value) => value != "0",
+                                    None => {
+                                        doc.attr(c, "format").is_some()
+                                            || doc.attr(c, "hasAudio").is_none()
+                                    }
+                                },
                                 has_audio: doc.attr(c, "hasAudio") != Some("0"),
                             },
                         );

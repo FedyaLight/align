@@ -925,19 +925,23 @@ impl Library<'_> {
                 xml_text::fcpxml_time(source_in),
                 xml_text::fcpxml_time(duration),
             );
-            if plays_each_channel(item) {
+            // A recording is an asset clip from its file's own start: Final
+            // Cut Pro moved the source of a clip's nested audio from a file
+            // starting inside a frame.
+            if item.clip.video.is_none() {
                 place(
                     lane,
                     start,
                     duration,
                     dust(item, MediaKind::Audio),
                     format!(
-                        "              <asset-clip{} ref=\"{asset_id}\" offset=\"{}\" duration=\"{source_duration}\" start=\"{media_start}\" name=\"{}\" enabled=\"{}\"{}\n",
+                        "              <asset-clip{} ref=\"{asset_id}\" offset=\"{}\" duration=\"{source_duration}\" start=\"{media_start}\" name=\"{}\" enabled=\"{}\"{}{}\n",
                         lane_attribute(lane),
                         xml_text::fcpxml_time(start),
                         clip_name(item, &media_url),
                         u8::from(item.is_enabled(MediaKind::Audio)),
-                        channel_sources(item) + "</asset-clip>",
+                        audio_role_attribute(item, "audioRole"),
+                        audio_channel_end(item),
                     ),
                 );
                 continue;
@@ -1058,7 +1062,7 @@ mod tests {
         assert!(asset("rec.wav").contains(&format!(" start=\"{recorder_start}\"")));
         assert!(xml.contains("<video ref=\"r_asset_1\" offset=\"0s\" start=\"41217s\""));
         assert!(xml.contains(&format!(
-            "<audio ref=\"r_asset_2\" offset=\"0s\" start=\"{recorder_start}\""
+            " ref=\"r_asset_2\" offset=\"1/2s\" duration=\"12s\" start=\"{recorder_start}\""
         )));
         assert!(xml.contains("<gap offset=\"41217s\""));
         assert!(xml.contains("offset=\"41217s\" duration=\"313/25s\"/>"));
@@ -1099,7 +1103,10 @@ mod tests {
             .find(|line| line.contains("<asset ") && line.contains("rec.wav"))
             .unwrap();
         assert!(asset.contains(" start=\"0s\""), "{asset}");
-        assert!(xml.contains("<audio ref=\"r_asset_2\" offset=\"0s\" start=\"0s\""));
+        assert!(
+            xml.contains(" ref=\"r_asset_2\" offset=\"1/2s\" duration=\"12s\" start=\"0s\""),
+            "{xml}"
+        );
     }
 
     /// Resolve plays a storyline's clips back to back, so the space before
@@ -1189,16 +1196,15 @@ mod tests {
         let mut timeline = fixture_timeline();
         timeline.islands[0].clips[1].start = 0.5 + 1.0 / 48_000.0;
         let xml = write(&timeline, FcpxmlOptions::default());
-        let recorder = xml
+        let clips: Vec<&str> = xml
             .lines()
-            .find(|line| line.contains("<clip") && line.contains("rec.wav"))
-            .unwrap();
-        assert!(recorder.contains("offset=\"24001/48000s\""), "{recorder}");
-        let angle = xml
-            .lines()
-            .find(|line| line.contains("<asset-clip ") && line.contains("rec.wav"))
-            .unwrap();
-        assert!(angle.contains("offset=\"24001/48000s\""), "{angle}");
+            .filter(|line| line.contains("<asset-clip ") && line.contains("rec.wav"))
+            .collect();
+        // In the synced project and in the recorder's angle.
+        assert_eq!(clips.len(), 2, "{xml}");
+        for clip in clips {
+            assert!(clip.contains("offset=\"24001/48000s\""), "{clip}");
+        }
     }
 
     /// A recording of more than two channels is one clip of the original
@@ -1488,7 +1494,9 @@ mod tests {
         }
         let xml = write(&timeline, FcpxmlOptions::TIMELINE);
         assert_eq!(xml.matches("<video ref=").count(), 1);
-        assert_eq!(xml.matches("<audio ref=").count(), 1);
+        // The recorder alone, as an asset clip; no camera sound.
+        assert_eq!(xml.matches("<audio ref=").count(), 0, "{xml}");
+        assert_eq!(xml.matches("<asset-clip lane=").count(), 1, "{xml}");
         timeline.islands[0].clips[0].enabled = false;
         let xml = write(&timeline, FcpxmlOptions::TIMELINE);
         assert!(xml.contains("enabled=\"0\""));
@@ -1663,8 +1671,9 @@ mod tests {
         let timeline = ExportTimeline::from_result_with_options(&result, Default::default())
             .expect("timeline");
         let xml = write(&timeline, FcpxmlOptions::TIMELINE);
+        // The camera's sound in a clip's audio, the recording as an asset clip.
         assert!(xml.contains(" role=\"dialogue\""));
-        assert!(xml.contains(" role=\"effects\""));
+        assert!(xml.contains(" audioRole=\"effects\""), "{xml}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
