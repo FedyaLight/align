@@ -722,28 +722,38 @@ fn tracks_for<'a>(
             allocatable.extend(group);
         }
     }
+    // Where an entry's sound plays, and the frames its clipitem spans: a
+    // padded clip starts on the frame before its sound and ends on the frame
+    // after it.
+    let content = |entry: &TrackEntry<'a>| {
+        let item = entry.item;
+        let duration = if media_type == MediaKind::Audio
+            && item.corrected_audio_url.is_some()
+            && !item.is_retimed(media_type)
+        {
+            item.corrected_selected_duration()
+        } else {
+            item.selected_timeline_duration(media_type)
+        };
+        (item.timeline_start(media_type), duration)
+    };
+    let span = |entry: &TrackEntry<'a>| {
+        let item = entry.item;
+        let (start, duration) = content(entry);
+        if item.has_placement_pad(media_type) {
+            let first = rate.frames(start, Rounding::Down) as f64 / rate.fps;
+            let length =
+                rate.frames(duration + item.placement_pad_seconds, Rounding::Up) as f64 / rate.fps;
+            (first, length)
+        } else {
+            (start, duration)
+        }
+    };
     let requests: Vec<TimelineTrackRequest> = allocatable
         .iter()
         .map(|entry| {
             let item = entry.item;
-            let duration = if media_type == MediaKind::Audio
-                && item.corrected_audio_url.is_some()
-                && !item.is_retimed(media_type)
-            {
-                item.corrected_selected_duration()
-            } else {
-                item.selected_timeline_duration(media_type)
-            };
-            let (start, duration) = if item.has_placement_pad(media_type) {
-                let start =
-                    rate.frames(item.timeline_start(media_type), Rounding::Down) as f64 / rate.fps;
-                let duration = rate.frames(duration + item.placement_pad_seconds, Rounding::Up)
-                    as f64
-                    / rate.fps;
-                (start, duration)
-            } else {
-                (item.timeline_start(media_type), duration)
-            };
+            let (start, duration) = span(entry);
             TimelineTrackRequest::new(
                 format!("{}#{media_type}#{}", item.instance_id, entry.source_channel),
                 source_key(entry),
@@ -784,7 +794,44 @@ fn tracks_for<'a>(
             track
         })
         .collect();
+    // Clips whose sounds abut can still share frames: a padded clip's end
+    // rounds up into the frame where the next starts. Both play whole only
+    // on separate tracks, so the later one moves to another track. Clips
+    // whose sounds overlap stay, and the earlier ends where the later starts.
+    let mut moved = Vec::new();
+    for track in &mut allocated {
+        let mut kept: Vec<TrackEntry<'a>> = Vec::new();
+        for entry in track.drain(..) {
+            if let Some(previous) = kept.last() {
+                let (start, length) = span(previous);
+                let (sound_start, sound_length) = content(previous);
+                let shares_frames = start + length > span(&entry).0 + 1e-9;
+                let sounds_overlap = sound_start + sound_length > content(&entry).0 + 1e-6;
+                if shares_frames && !sounds_overlap {
+                    moved.push(entry);
+                    continue;
+                }
+            }
+            kept.push(entry);
+        }
+        *track = kept;
+    }
+    moved.sort_by(|a, b| span(a).0.total_cmp(&span(b).0));
+    let mut extra: Vec<Vec<TrackEntry<'a>>> = Vec::new();
+    for entry in moved {
+        let start = span(&entry).0;
+        match extra.iter_mut().find(|track| {
+            track.last().is_none_or(|last| {
+                let (first, length) = span(last);
+                first + length <= start + 1e-9
+            })
+        }) {
+            Some(track) => track.push(entry),
+            None => extra.push(vec![entry]),
+        }
+    }
     forced.append(&mut allocated);
+    forced.append(&mut extra);
     forced
 }
 
@@ -1583,40 +1630,67 @@ mod tests {
         assert!(xml.contains("<out>301</out>"));
     }
 
-    /// Two takes of one recorder share a track; the first padded take's end
-    /// rounds up into the frame where the second starts. Resolve then moved
-    /// the second a frame later, so the first ends where the second starts.
+    /// Two takes of one recorder whose sounds abut: the first padded take's
+    /// end rounds up into the frame where the second starts. On one track
+    /// Resolve moved the second a frame later, and ending the first there cut
+    /// its last 200 samples, so the second plays on a track of its own.
+    /// Takes whose sounds overlap stay on one track, the first ending where
+    /// the second starts.
     #[test]
-    fn a_clip_ends_where_the_next_on_its_track_starts() {
-        let mut timeline = fixture_timeline();
+    fn takes_sharing_a_frame_play_on_separate_tracks() {
         let pad = 200.0 / 48_000.0;
-        let rec = timeline.islands[0]
-            .clips
-            .iter_mut()
-            .find(|i| i.clip.id.0 == "rec")
-            .expect("recorder item");
-        rec.start = pad;
-        rec.source_out = 2.0;
-        rec.timeline_duration = 2.0;
-        *rec = rec.with_placement_pad(PathBuf::from("/pad/first.wav"), pad);
-        let mut second = rec.with_placement_pad(PathBuf::from("/pad/second.wav"), pad);
-        second.instance_id = "second take".into();
-        second.start = 2.0 + pad;
-        timeline.islands[0].clips.push(second);
-        let xml = write(
-            &timeline,
-            TimelineExportFormat::PremiereXML,
-            PremiereOptions::default(),
-        );
-        let first = &xml[xml.find("<name>first.wav</name>").expect("first take")..];
+        let takes = |second_start: f64| {
+            let mut timeline = fixture_timeline();
+            let rec = timeline.islands[0]
+                .clips
+                .iter_mut()
+                .find(|i| i.clip.id.0 == "rec")
+                .expect("recorder item");
+            rec.start = pad;
+            rec.source_out = 2.0;
+            rec.timeline_duration = 2.0;
+            *rec = rec.with_placement_pad(PathBuf::from("/pad/first.wav"), pad);
+            let mut second = rec.with_placement_pad(PathBuf::from("/pad/second.wav"), pad);
+            second.instance_id = "second take".into();
+            second.start = second_start;
+            timeline.islands[0].clips.push(second);
+            write(
+                &timeline,
+                TimelineExportFormat::PremiereXML,
+                PremiereOptions::default(),
+            )
+        };
+        let tracks = |xml: &str| -> Vec<String> {
+            let audio = &xml[xml.find("<audio>").unwrap()..];
+            audio.split("<track>").skip(1).map(str::to_string).collect()
+        };
+        let abutting = takes(2.0 + pad);
+        let first = &abutting[abutting.find("<name>first.wav</name>").expect("first take")..];
         assert!(
-            first.contains("<start>0</start>\n                <end>50</end>"),
+            first.contains("<start>0</start>\n                <end>51</end>"),
             "{first}"
         );
-        assert!(first.contains("<out>50</out>"), "{first}");
         assert!(
-            xml.contains("<start>50</start>\n                <end>101</end>"),
-            "{xml}"
+            !tracks(&abutting)
+                .iter()
+                .any(|track| track.contains("first.wav") && track.contains("second.wav")),
+            "{abutting}"
+        );
+        assert!(abutting.contains("<start>50</start>\n                <end>101</end>"));
+        // The second take's sound starts 10 ms before the first's ends, in
+        // frame 49: the first ends there.
+        let overlapping = takes(2.0 + pad - 0.01);
+        let first = &overlapping[overlapping
+            .find("<name>first.wav</name>")
+            .expect("first take")..];
+        assert!(
+            first.contains("<start>0</start>\n                <end>49</end>"),
+            "{first}"
+        );
+        assert!(
+            tracks(&overlapping)
+                .iter()
+                .any(|track| track.contains("first.wav") && track.contains("second.wav"))
         );
     }
 
