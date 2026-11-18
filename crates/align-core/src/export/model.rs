@@ -443,10 +443,10 @@ impl ExportItem {
     /// True when the writer must reference the padded sidecar instead of the
     /// drift/original file (audio side only; never for retimed items, which
     /// the pad planner skips).
+    /// Whether the audio side plays a placement sidecar: leading silence and
+    /// the selection, or the selection alone.
     pub fn has_placement_pad(&self, media: MediaKind) -> bool {
-        media == MediaKind::Audio
-            && self.placement_pad_url.is_some()
-            && self.placement_pad_seconds > 0.0
+        media == MediaKind::Audio && self.placement_pad_url.is_some()
     }
     pub fn with_aaf_audio(&self, urls: Vec<PathBuf>, lead_samples: u64, tail_samples: u64) -> Self {
         let mut out = self.clone();

@@ -670,7 +670,8 @@ pub fn render_pad_cancellable(
     cancel: &AtomicBool,
 ) -> Result<(), RenderError> {
     check_cancel(cancel)?;
-    if pad_samples == 0 {
+    // Without silence a pad is a copy of its selection.
+    if pad_samples == 0 && selection.is_none() {
         return Err(RenderError::InvalidRequest("a placement pad needs samples"));
     }
     let (probe, sample_rate, channels) = audio_format(backend, source)?;
@@ -1112,6 +1113,45 @@ mod tests {
         assert_eq!(samples[192 * 2 + 1000 * 2], 0.75);
         assert_eq!(samples[192 * 2 + 1000 * 2 + 1], -0.75);
         assert!(samples[192 * 2 + 999 * 2] == 0.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without silence a pad copies its selection and starts its broadcast
+    /// time there.
+    #[test]
+    fn zero_pad_copies_its_selection() {
+        let dir = tmp("pad-zero");
+        let src = dir.join("src.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = hound::WavWriter::create(&src, spec).unwrap();
+        for i in 0..4800 {
+            w.write_sample(if i == 1000 { 0.75f32 } else { 0.0 })
+                .unwrap();
+        }
+        w.finalize().unwrap();
+        add_test_bext(&src, 48000);
+        let dst = dir.join("trim.wav");
+        render_pad(
+            &crate::portable::PortableBackend,
+            &src,
+            &dst,
+            0,
+            Some((900, 1900)),
+        )
+        .unwrap();
+        let samples = read_pad_samples(&dst);
+        assert_eq!(samples.len(), 1000);
+        assert_eq!(samples[100], 0.75);
+        assert_eq!(
+            align_core::meta::read_bwf(&dst).unwrap().time_reference,
+            Some(48900)
+        );
+        assert!(render_pad(&crate::portable::PortableBackend, &src, &dst, 0, None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

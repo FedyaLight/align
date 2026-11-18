@@ -781,7 +781,11 @@ impl AudioPlan {
                     };
                     let destination = audio_dir.join(sidecar_name(
                         media,
-                        &format!("pad {samples}"),
+                        &if samples == 0 {
+                            "trim".to_string()
+                        } else {
+                            format!("pad {samples}")
+                        },
                         &[
                             "pad",
                             id,
@@ -993,12 +997,37 @@ fn placement_pad(item: &ExportItem, sequence_fps: f64) -> Option<(u64, f64)> {
     if audio.sample_rate <= 0.0 || audio.channels == 0 || item.is_retimed(MediaKind::Audio) {
         return None;
     }
-    let samples = placement_pad_samples(
+    match placement_pad_samples(
         item.timeline_start(MediaKind::Audio),
         sequence_fps,
         audio.sample_rate,
-    )?;
-    Some((samples, audio.sample_rate))
+    ) {
+        Some(samples) => Some((samples, audio.sample_rate)),
+        // Resolve counts a trimmed WAV's in point from its broadcast start
+        // rounded to a frame, so a WAV starting inside a frame played a
+        // frame late. A copy of the selection, with no silence, starts at
+        // its own beginning instead.
+        None if trimmed_inside_a_frame(item, sequence_fps) => Some((0, audio.sample_rate)),
+        None => None,
+    }
+}
+
+/// An audio file selected from past its start whose own start timecode
+/// falls inside a frame of the sequence.
+fn trimmed_inside_a_frame(item: &ExportItem, sequence_fps: f64) -> bool {
+    let Some(audio) = item.clip.audio.first() else {
+        return false;
+    };
+    let Some(timecode) = audio.source_timecode.as_ref().filter(|tc| !tc.derived) else {
+        return false;
+    };
+    let frames = timecode.as_seconds() * sequence_fps;
+    let fraction = frames - frames.floor();
+    let in_samples = item.selected_source_in(MediaKind::Audio) * audio.sample_rate;
+    item.clip.video.is_none()
+        && in_samples >= 0.5
+        && fraction * sequence_fps.recip() * audio.sample_rate >= 0.5
+        && (1.0 - fraction) * sequence_fps.recip() * audio.sample_rate >= 0.5
 }
 
 fn write_aaf_manifest(
@@ -1693,6 +1722,82 @@ mod tests {
         assert!(dir.join("Sequence 01 – First_cut").is_dir());
         assert!(dir.join("Sequence 02 – Second cut").is_dir());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Resolve counts a trimmed WAV's in point from its broadcast start
+    /// rounded to a frame; a WAV starting inside a frame, trimmed and placed
+    /// on a frame, plays a copy of its selection for the XML instead.
+    #[test]
+    fn trimmed_wav_starting_inside_a_frame_plays_a_copy_of_its_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("recorder.wav");
+        let mut writer = hound::WavWriter::create(
+            &source,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 48000,
+                bits_per_sample: 24,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for i in 0..48000 * 2 {
+            writer.write_sample(i % 1000).unwrap();
+        }
+        writer.finalize().unwrap();
+        let mut recorder = item("rec", MediaKind::Audio, 1.0, 1.0);
+        recorder.clip.url = source;
+        recorder.clip.audio[0].channels = 1;
+        recorder.source_in = 0.5;
+        recorder.source_out = 1.5;
+        recorder.clip.audio[0].source_timecode = align_core::SourceTimecode::from_samples(
+            48_000 * 10 + 200,
+            48_000.0,
+            MediaTime::new(1, 25),
+            false,
+        );
+        let mut on_frame = recorder.clone();
+        on_frame.instance_id = "on frame".into();
+        on_frame.clip.id = align_core::ClipId::new("on frame");
+        on_frame.clip.audio[0].source_timecode = align_core::SourceTimecode::from_samples(
+            48_000 * 10,
+            48_000.0,
+            MediaTime::new(1, 25),
+            false,
+        );
+        let timeline = ExportTimeline::new(
+            vec![ExportIsland {
+                id: 0,
+                clips: vec![recorder, on_frame],
+                duration: 2.0,
+            }],
+            MediaTime::new(1, 25),
+            "Trim",
+        );
+        let options = ExportOptions {
+            formats: vec![TimelineExportFormat::ResolveXML],
+            correct_drift: false,
+            ..ExportOptions::default()
+        };
+        let plan = AudioPlan::new(
+            &timeline,
+            &options,
+            dir.path(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        let items = &plan.timeline.islands[0].clips;
+        assert!(items[0].has_placement_pad(MediaKind::Audio));
+        assert_eq!(items[0].placement_pad_seconds, 0.0);
+        assert!(!items[1].has_placement_pad(MediaKind::Audio));
+        assert!(plan.jobs.iter().any(|job| matches!(
+            job.kind,
+            AudioJobKind::Pad {
+                samples: 0,
+                selection: (24000, 72000),
+                ..
+            }
+        )));
     }
 
     /// Premiere starts AAF audio on a frame, so a recorder 200 samples past
