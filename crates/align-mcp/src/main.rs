@@ -205,17 +205,18 @@ fn call_tool(params: &Value) -> Result<Value, (i64, String)> {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let args = match name {
-        "align_inspect" => media_paths(&arguments),
-        "align_sync" => sync_args(&arguments, false),
-        "align_export" => sync_args(&arguments, true),
+    // What a tool's list result is called in its structured content.
+    let (args, list) = match name {
+        "align_inspect" => (media_paths(&arguments), "media"),
+        "align_sync" => (sync_args(&arguments, false), "results"),
+        "align_export" => (sync_args(&arguments, true), "artifacts"),
         _ => return Err((-32602, format!("Unknown tool: {name}"))),
     };
     let args = match args {
         Ok(args) => args,
         Err(message) => return Ok(tool_error(message)),
     };
-    Ok(run_cli(args))
+    Ok(run_cli(args, list))
 }
 
 fn sync_args(arguments: &Map<String, Value>, export: bool) -> Result<Vec<String>, String> {
@@ -349,7 +350,17 @@ fn cli_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
-fn run_cli(args: Vec<String>) -> Value {
+/// A tool's structured content is a JSON object; a list the CLI prints is
+/// one under `list`.
+fn structured(data: Value, list: &str) -> Value {
+    if data.is_object() {
+        data
+    } else {
+        json!({ list: data })
+    }
+}
+
+fn run_cli(args: Vec<String>, list: &str) -> Value {
     let output = match Command::new(cli_path()).args(&args).output() {
         Ok(output) => output,
         Err(error) => return tool_error(format!("Could not start align-cli: {error}")),
@@ -367,7 +378,7 @@ fn run_cli(args: Vec<String>) -> Value {
     match serde_json::from_str::<Value>(&stdout) {
         Ok(data) => json!({
             "content": [{ "type": "text", "text": serde_json::to_string_pretty(&data).unwrap_or_default() }],
-            "structuredContent": data,
+            "structuredContent": structured(data, list),
             "isError": false
         }),
         Err(error) => tool_error(format!("align-cli returned invalid JSON: {error}")),
@@ -423,6 +434,19 @@ mod tests {
                 "/media/b.wav"
             ]
         );
+    }
+
+    /// MCP requires structured content to be an object: the artifacts an
+    /// export lists go under a name, and objects stay as they are.
+    #[test]
+    fn structured_content_is_an_object() {
+        let artifacts = json!([{ "format": "aaf", "url": "/out/Align.aaf" }]);
+        assert_eq!(
+            structured(artifacts.clone(), "artifacts"),
+            json!({ "artifacts": artifacts })
+        );
+        let result = json!({ "islands": [] });
+        assert_eq!(structured(result.clone(), "results"), result);
     }
 
     #[test]

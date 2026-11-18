@@ -235,7 +235,9 @@ Do not delete it while those results are needed. See
 
 `align-mcp` is a stdio server. Keep `align-cli` beside it. The server exposes
 `align_inspect`, `align_sync`, and `align_export`; it invokes the adjacent CLI and
-returns its result. Use absolute media and output paths.
+returns its result. The structured result is an object: a list the CLI prints
+appears under `media`, `results`, or `artifacts` respectively. Use absolute
+media and output paths.
 
 For clients that accept an `mcpServers` configuration:
 

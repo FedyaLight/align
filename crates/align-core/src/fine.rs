@@ -68,12 +68,18 @@ pub struct RefineEvent {
     pub stage: RefineStage,
 }
 
+/// A refined pair that closes a cycle below this confidence is dropped.
+const WEAK_CYCLE_CONFIDENCE: f64 = 0.85;
+/// Candidates refined together before acceptance looks again; a weak pair
+/// whose clips earlier batches joined is skipped.
+const REFINE_BATCH: usize = 16;
+
 /// Refine all candidates; `clips` are all known ids (disjoint-set universe).
 /// Progress reports unusable candidates first, then one event per candidate.
-/// Up to four workers refine candidates; indexed results keep input order, so
-/// outcomes are identical to sequential execution. Progress events carry a
-/// monotonic completion count; disjoint-set acceptance stays sequential
-/// and deterministic.
+/// Up to four workers refine each batch of candidates; indexed results keep
+/// input order, so outcomes are identical to sequential execution. Progress
+/// events carry a monotonic completion count; disjoint-set acceptance stays
+/// sequential and deterministic.
 pub fn refine_forest(
     durations: &HashMap<ClipId, f64>,
     candidates: &[PairwiseMatch],
@@ -98,47 +104,73 @@ pub fn refine_forest(
     }
     let completed = std::sync::atomic::AtomicUsize::new(0);
     let total = usable.len();
-    let refined: Vec<Option<PairwiseMatch>> = crate::parallel::par_map(&usable, 4, |candidate| {
-        if cancel.load(Ordering::Relaxed) {
-            return None;
-        }
-        let result = refine(
-            candidate,
-            match_policy.minimum_confidence(&candidate.left, &candidate.right),
-            durations,
-            sources,
-            provider,
-        );
-        if let Some(report) = &progress {
-            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            report(RefineEvent {
-                completed: done,
-                total,
-                left: candidate.left.clone(),
-                right: candidate.right.clone(),
-                stage: if result.is_some() {
-                    RefineStage::Refined
-                } else {
-                    RefineStage::Rejected
-                },
-            });
-        }
-        result
-    });
-
     let clips: Vec<_> = durations.keys().cloned().collect();
     let mut components = FineDisjointSet::new(&clips);
     let mut accepted = Vec::new();
-    for (candidate, result) in usable.iter().zip(refined) {
-        let closes_cycle = components.connected(&candidate.left, &candidate.right);
-        let Some(result) = result else { continue };
-        if closes_cycle && candidate.confidence < 0.85 {
-            continue;
+    // Candidates refine in batches, so a weak pair between clips that the
+    // pairs accepted before its batch already join is skipped rather than
+    // decoded and correlated: acceptance would drop it anyway, as joined
+    // clips stay joined.
+    for batch in usable.chunks(REFINE_BATCH) {
+        let jobs: Vec<(&PairwiseMatch, bool)> = batch
+            .iter()
+            .map(|&candidate| {
+                let dropped = candidate.confidence < WEAK_CYCLE_CONFIDENCE
+                    && components.connected(&candidate.left, &candidate.right);
+                (candidate, dropped)
+            })
+            .collect();
+        let refined: Vec<Option<PairwiseMatch>> =
+            crate::parallel::par_map(&jobs, 4, |&(candidate, dropped)| {
+                if dropped || cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let result = refine(
+                    candidate,
+                    match_policy.minimum_confidence(&candidate.left, &candidate.right),
+                    durations,
+                    sources,
+                    provider,
+                );
+                if let Some(report) = &progress {
+                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    report(RefineEvent {
+                        completed: done,
+                        total,
+                        left: candidate.left.clone(),
+                        right: candidate.right.clone(),
+                        stage: if result.is_some() {
+                            RefineStage::Refined
+                        } else {
+                            RefineStage::Rejected
+                        },
+                    });
+                }
+                result
+            });
+        if let Some(report) = &progress {
+            for &(candidate, _) in jobs.iter().filter(|(_, dropped)| *dropped) {
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                report(RefineEvent {
+                    completed: done,
+                    total,
+                    left: candidate.left.clone(),
+                    right: candidate.right.clone(),
+                    stage: RefineStage::Rejected,
+                });
+            }
         }
-        if !closes_cycle {
-            components.union(&candidate.left, &candidate.right);
+        for (&candidate, result) in batch.iter().zip(refined) {
+            let closes_cycle = components.connected(&candidate.left, &candidate.right);
+            let Some(result) = result else { continue };
+            if closes_cycle && candidate.confidence < WEAK_CYCLE_CONFIDENCE {
+                continue;
+            }
+            if !closes_cycle {
+                components.union(&candidate.left, &candidate.right);
+            }
+            accepted.push(result);
         }
-        accepted.push(result);
     }
     accepted
 }
@@ -701,6 +733,84 @@ mod tests {
         let m = coarse("a", "b", 800.0 / FINE_SAMPLE_RATE, 0.5);
         assert!(refine(&m, 0.55, &durations, &HashMap::new(), &provider).is_some());
         assert!(refine(&m, 0.70, &durations, &HashMap::new(), &provider).is_none());
+    }
+
+    /// A weak pair between clips that the batches before it joined is
+    /// reported rejected without reading a window: acceptance would drop it.
+    #[test]
+    fn forest_skips_refining_a_weak_pair_earlier_batches_joined() {
+        struct Counting(SynthProvider, std::sync::atomic::AtomicUsize);
+        impl WindowProvider for Counting {
+            fn window(
+                &self,
+                clip: &ClipId,
+                start: f64,
+                duration: f64,
+                source: AudioAnalysisSource,
+            ) -> Option<AudioWindow> {
+                self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.0.window(clip, start, duration, source)
+            }
+        }
+        let sr = FINE_SAMPLE_RATE as usize;
+        let a = noise(130 * sr, 11);
+        let mut b = vec![0.0; a.len()];
+        b[800..].copy_from_slice(&a[..a.len() - 800]);
+        let mut c = vec![0.0; a.len()];
+        c[1600..].copy_from_slice(&a[..a.len() - 1600]);
+        let provider = Counting(
+            SynthProvider {
+                clips: [(id("a"), a), (id("b"), b), (id("c"), c)]
+                    .into_iter()
+                    .collect(),
+                sample_rate: FINE_SAMPLE_RATE,
+            },
+            std::sync::atomic::AtomicUsize::new(0),
+        );
+        let mut durations: HashMap<ClipId, f64> = HashMap::new();
+        // The joining pairs, then pairs without audio to fill their batch.
+        let mut candidates = vec![
+            coarse("a", "b", 800.0 / FINE_SAMPLE_RATE, 0.9),
+            coarse("b", "c", 800.0 / FINE_SAMPLE_RATE, 0.9),
+        ];
+        for index in 0..REFINE_BATCH - 2 {
+            candidates.push(coarse(&format!("x{index}"), &format!("y{index}"), 0.0, 0.9));
+        }
+        for m in &candidates {
+            durations.insert(m.left.clone(), 130.0);
+            durations.insert(m.right.clone(), 130.0);
+        }
+        let run = |candidates: &[PairwiseMatch]| {
+            let stages = std::sync::Mutex::new(Vec::new());
+            let report = |e: RefineEvent| {
+                stages
+                    .lock()
+                    .expect("test lock")
+                    .push((e.left, e.right, e.stage));
+            };
+            provider.1.store(0, std::sync::atomic::Ordering::Relaxed);
+            let accepted = refine_forest(
+                &durations,
+                candidates,
+                &MatchPolicy::default(),
+                &HashMap::new(),
+                &provider,
+                &std::sync::atomic::AtomicBool::new(false),
+                Some(&report),
+            );
+            let reads = provider.1.load(std::sync::atomic::Ordering::Relaxed);
+            (
+                accepted.len(),
+                reads,
+                stages.into_inner().expect("test lock"),
+            )
+        };
+        let (accepted, reads, _) = run(&candidates);
+        candidates.push(coarse("a", "c", 1600.0 / FINE_SAMPLE_RATE, 0.5));
+        let (with_weak, reads_with_weak, stages) = run(&candidates);
+        assert_eq!((accepted, with_weak), (2, 2));
+        assert_eq!(reads, reads_with_weak);
+        assert!(stages.contains(&(id("a"), id("c"), RefineStage::Rejected)));
     }
 
     #[test]

@@ -73,6 +73,16 @@ pub fn analyze_timecodes(
             {
                 continue;
             }
+            // A rejected alignment rules out this partner, not the clip:
+            // the next best partner may still be allowed.
+            if SyncConstraint::rejects_alignment(
+                constraints,
+                &target.id,
+                &candidate.id,
+                target_start - candidate_start,
+            ) {
+                continue;
+            }
             let target_end = target_start + target.duration.as_seconds();
             let overlap =
                 overlap_start_end(candidate_start, candidate_end, target_start, target_end);
@@ -106,9 +116,6 @@ pub fn analyze_timecodes(
             (candidate, candidate_tc, target, target_tc)
         };
         let offset = left_tc - right_tc;
-        if SyncConstraint::rejects_alignment(constraints, &left.id, &right.id, offset) {
-            continue;
-        }
         new_matches.push(PairwiseMatch {
             left: left.id.clone(),
             right: right.id.clone(),
@@ -209,6 +216,30 @@ mod tests {
         assert_eq!(rescued.len(), 1);
         assert_eq!(rescued[0].left, ClipId::new("c"));
         assert_eq!(rescued[0].right, ClipId::new("d"));
+    }
+
+    /// A rejected alignment with the best-overlapping partner leaves the
+    /// clip to the next one it may join.
+    #[test]
+    fn a_rejected_alignment_falls_back_to_the_next_partner() {
+        // A[100..160] and B[150..210] are matched; C[130..170] overlaps A by
+        // 30 s and B by 20 s, and its alignment with A is rejected.
+        let clips = vec![
+            clip("a", Some(100.0), 60.0, None),
+            clip("b", Some(150.0), 60.0, None),
+            clip("c", Some(130.0), 40.0, None),
+        ];
+        let existing = analyze_timecodes(&clips[..2], &[], &[], &TemporalPolicy::default());
+        let rejected = [SyncConstraint::rejecting_alignment(
+            ClipId::new("a"),
+            ClipId::new("c"),
+            -30.0,
+        )];
+        let rescued = analyze_timecodes(&clips, &existing, &rejected, &TemporalPolicy::default());
+        assert_eq!(rescued.len(), 1, "{rescued:?}");
+        assert_eq!(rescued[0].left, ClipId::new("b"));
+        assert_eq!(rescued[0].right, ClipId::new("c"));
+        assert!((rescued[0].offset - 20.0).abs() < 1e-9);
     }
 
     #[test]
