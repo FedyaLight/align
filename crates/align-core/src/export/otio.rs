@@ -158,12 +158,12 @@ fn track_json(
     let mut children = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         let before = if index > 0 {
-            transition_between(&entries[index - 1], entry)
+            transition_between(&entries[index - 1], entry, kind)
         } else {
             None
         };
         let after = if index + 1 < entries.len() {
-            transition_between(entry, &entries[index + 1])
+            transition_between(entry, &entries[index + 1], kind)
         } else {
             None
         };
@@ -365,10 +365,14 @@ fn gap(duration: f64, rate: f64) -> Value {
     })
 }
 
-/// Portable dissolve between consecutive entries (video `transitionAfter`
-/// field).
-fn transition_between<'a>(left: &'a Entry, right: &'a Entry) -> Option<&'a ExportTransition> {
-    let t = left.item.transition_after.as_ref()?;
+/// Portable dissolve or crossfade between consecutive entries of a track
+/// of `kind`.
+fn transition_between<'a>(
+    left: &'a Entry,
+    right: &'a Entry,
+    kind: MediaKind,
+) -> Option<&'a ExportTransition> {
+    let t = left.item.transition_for(kind)?;
     if t.is_otio_portable && t.right_instance_id == right.item.instance_id {
         Some(t)
     } else {
@@ -442,49 +446,65 @@ fn media_start(item: &ExportItem, kind: MediaKind) -> f64 {
 }
 
 fn tracks<'a>(entries: Vec<Entry<'a>>, kind: MediaKind) -> Vec<Vec<Entry<'a>>> {
-    // Keep a source's video dissolve on one track.
-    let mut forced: Vec<Vec<Entry>> = Vec::new();
-    let mut allocatable: Vec<Entry> = Vec::new();
-    if kind == MediaKind::Video {
-        let mut groups: HashMap<String, Vec<Entry>> = HashMap::new();
-        for entry in entries {
-            let key = entry
+    // Clips joined by portable dissolves or crossfades, channel by channel,
+    // stay on one track as a chain; the others are packed.
+    let position: HashMap<(&str, usize), usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            (
+                (entry.item.instance_id.as_str(), entry.source_channel),
+                index,
+            )
+        })
+        .collect();
+    let next: Vec<Option<usize>> = entries
+        .iter()
+        .map(|entry| {
+            let t = entry
                 .item
-                .preferred_source_key(MediaKind::Video)
-                .map(str::to_string)
-                .unwrap_or_else(|| source_key_for_url(&entry.item.clip.url));
-            groups.entry(key).or_default().push(entry);
+                .transition_for(kind)
+                .filter(|t| t.is_otio_portable)?;
+            position
+                .get(&(t.right_instance_id.as_str(), entry.source_channel))
+                .copied()
+        })
+        .collect();
+    let mut chained = vec![false; entries.len()];
+    let mut chains: Vec<Vec<usize>> = Vec::new();
+    let heads: Vec<usize> = (0..entries.len())
+        .filter(|&index| next[index].is_some() && !next.contains(&Some(index)))
+        .collect();
+    for head in heads {
+        let mut chain = vec![head];
+        let mut current = head;
+        while let Some(following) = next[current].filter(|following| !chain.contains(following)) {
+            chain.push(following);
+            current = following;
         }
-        let mut forced_keys: Vec<String> = groups
-            .iter()
-            .filter(|(_, v)| {
-                let ts: Vec<_> = v
-                    .iter()
-                    .filter_map(|e| e.item.transition_for(MediaKind::Video))
-                    .collect();
-                !ts.is_empty() && ts.iter().all(|t| t.is_otio_portable)
-            })
-            .map(|(k, _)| k.clone())
-            .collect();
-        forced_keys.sort();
-        let mut keys: Vec<String> = groups.keys().cloned().collect();
-        keys.sort();
-        for key in keys {
-            let mut group = groups.remove(&key).unwrap_or_default();
-            group.sort_by(|a, b| {
-                timeline_start(a, kind)
-                    .total_cmp(&timeline_start(b, kind))
-                    .then_with(|| a.item.instance_id.cmp(&b.item.instance_id))
-            });
-            if forced_keys.contains(&key) {
-                forced.push(group);
-            } else {
-                allocatable.extend(group);
-            }
+        for &index in &chain {
+            chained[index] = true;
         }
-    } else {
-        allocatable = entries;
+        chains.push(chain);
     }
+    let mut slots: Vec<Option<Entry<'a>>> = entries.into_iter().map(Some).collect();
+    let mut forced: Vec<Vec<Entry>> = chains
+        .iter()
+        .map(|chain| {
+            chain
+                .iter()
+                .filter_map(|&index| slots[index].take())
+                .collect()
+        })
+        .collect();
+    forced.sort_by(|a: &Vec<Entry>, b: &Vec<Entry>| {
+        timeline_start(&a[0], kind).total_cmp(&timeline_start(&b[0], kind))
+    });
+    let allocatable: Vec<Entry> = slots
+        .into_iter()
+        .zip(chained)
+        .filter_map(|(slot, chained)| slot.filter(|_| !chained))
+        .collect();
     let requests: Vec<TimelineTrackRequest> = allocatable
         .iter()
         .map(|entry| {
@@ -664,6 +684,68 @@ pub(crate) mod tests {
             })
             .collect();
         assert_eq!(channels, vec![0, 1]);
+    }
+
+    /// A camera's dissolve stays on its picture, and a recorder's crossfade
+    /// is written on its sound: each track takes the transitions of its own
+    /// kind. Resolve's import script stopped at a dissolve on camera sound.
+    #[test]
+    fn each_track_takes_the_transitions_of_its_kind() {
+        use crate::export::model::{ExportTransition, ExportTransitionKind};
+        let mut timeline = fixture_timeline();
+        let clips = &mut timeline.islands[0].clips;
+        let transition = |kind, right: &str, start: f64| ExportTransition {
+            kind,
+            right_instance_id: right.to_string(),
+            start,
+            end: start + 0.32,
+            alignment: "center".into(),
+            fcp7_effect_xml: String::new(),
+            fcp7_transition_xml: None,
+            is_otio_portable: true,
+        };
+        for index in 0..2 {
+            let mut second = clips[index].clone();
+            second.instance_id = format!("{} second", clips[index].instance_id);
+            second.start += 4.0;
+            second.source_in += 4.0;
+            second.source_out = second.source_out.max(second.source_in + 1.0);
+            let kind = if second.clip.video.is_some() {
+                ExportTransitionKind::CrossDissolve
+            } else {
+                ExportTransitionKind::AudioTransition
+            };
+            let after = transition(kind, &second.instance_id, second.start - 0.16);
+            if second.clip.video.is_some() {
+                clips[index].transition_after = Some(after);
+            } else {
+                clips[index].audio_transition_after = Some(after);
+            }
+            clips[index].timeline_duration = 4.0;
+            clips[index].source_out = clips[index].source_in + 4.0;
+            clips.push(second);
+        }
+        let v: Value = serde_json::from_slice(&data(&timeline, false).unwrap()).unwrap();
+        let transitions = |kind: &str, file: &str| {
+            v["tracks"]["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|t| t["kind"] == kind)
+                .filter(|t| {
+                    t["children"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|c| c["media_references"]["DEFAULT_MEDIA"]["name"] == file)
+                })
+                .flat_map(|t| t["children"].as_array().unwrap())
+                .filter(|c| c["OTIO_SCHEMA"] == "Transition.1")
+                .count()
+        };
+        assert_eq!(transitions("Video", "cam.mov"), 1);
+        assert_eq!(transitions("Audio", "cam.mov"), 0);
+        assert_eq!(transitions("Audio", "rec.wav"), 1);
     }
 
     #[test]

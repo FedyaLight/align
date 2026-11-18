@@ -802,41 +802,50 @@ fn lanes_for<'a>(entries: &[TrackEntry<'a>], media_type: MediaKind) -> Vec<Vec<T
             base
         }
     };
-    let mut grouped: HashMap<String, Vec<TrackEntry<'a>>> = HashMap::new();
-    for entry in entries {
-        grouped.entry(source_key(entry)).or_default().push(*entry);
-    }
-    let forced_keys: Vec<String> = grouped
+    // Clips joined by transitions, channel by channel, stay on one track as
+    // a chain; the others are packed.
+    let position: HashMap<(&str, usize), usize> = entries
         .iter()
-        .filter(|(_, v)| {
-            v.iter().any(|e| {
-                if media_type == MediaKind::Audio {
-                    e.item.transition_for(MediaKind::Audio).is_some()
-                } else {
-                    e.item.transition_for(MediaKind::Video).is_some()
-                }
-            })
+        .enumerate()
+        .map(|(index, entry)| {
+            (
+                (entry.item.instance_id.as_str(), entry.source_channel),
+                index,
+            )
         })
-        .map(|(k, _)| k.clone())
         .collect();
+    let next: Vec<Option<usize>> = entries
+        .iter()
+        .map(|entry| {
+            let t = entry.item.transition_for(media_type)?;
+            position
+                .get(&(t.right_instance_id.as_str(), entry.source_channel))
+                .copied()
+        })
+        .collect();
+    let mut chained = vec![false; entries.len()];
     let mut forced: Vec<Vec<TrackEntry<'a>>> = Vec::new();
-    let mut allocatable: Vec<TrackEntry<'a>> = Vec::new();
-    let mut keys: Vec<String> = grouped.keys().cloned().collect();
-    keys.sort();
-    for key in keys {
-        let mut group = grouped.remove(&key).unwrap_or_default();
-        group.sort_by(|a, b| {
-            a.item
-                .timeline_start(media_type)
-                .total_cmp(&b.item.timeline_start(media_type))
-                .then_with(|| a.item.instance_id.cmp(&b.item.instance_id))
-        });
-        if forced_keys.contains(&key) {
-            forced.push(group);
-        } else {
-            allocatable.extend(group);
+    for head in (0..entries.len()).filter(|&i| next[i].is_some() && !next.contains(&Some(i))) {
+        let mut chain = vec![head];
+        while let Some(following) = next[*chain.last().unwrap()].filter(|f| !chain.contains(f)) {
+            chain.push(following);
         }
+        for &index in &chain {
+            chained[index] = true;
+        }
+        forced.push(chain.into_iter().map(|index| entries[index]).collect());
     }
+    forced.sort_by(|a, b| {
+        a[0].item
+            .timeline_start(media_type)
+            .total_cmp(&b[0].item.timeline_start(media_type))
+    });
+    let allocatable: Vec<TrackEntry<'a>> = entries
+        .iter()
+        .zip(&chained)
+        .filter(|(_, chained)| !**chained)
+        .map(|(entry, _)| *entry)
+        .collect();
     // Where an entry plays on the timeline.
     let content = |entry: &TrackEntry<'a>| {
         let item = entry.item;

@@ -168,9 +168,14 @@ def audio_entries():
     entries = []
     for track_index, track in enumerate(audio_tracks, 1):
         cursor = 0.0
-        for child in track['children']:
+        children = track['children']
+        for position, child in enumerate(children):
+            # A transition overlaps its neighbours and takes no time of its own.
+            if child['OTIO_SCHEMA'].startswith('Transition'):
+                continue
             duration = seconds(child['source_range']['duration'])
             if child['OTIO_SCHEMA'] == 'Clip.2':
+                beside = [children[i] for i in (position - 1, position + 1) if 0 <= i < len(children)]
                 reference = child['media_references'][child['active_media_reference_key']]
                 source_in = seconds(child['source_range']['start_time']) - seconds(
                     reference['available_range']['start_time']
@@ -189,6 +194,7 @@ def audio_entries():
                     'duration': duration,
                     'full_source': abs(source_in) < 0.000001 and abs(duration - available_duration) < 0.00001,
                     'name': child['name'],
+                    'transition': any(other['OTIO_SCHEMA'].startswith('Transition') for other in beside),
                 })
             cursor += duration
     return entries
@@ -279,17 +285,60 @@ def place(recording, media):
         }}}
         if not item.SetSourceAudioChannelMapping(json.dumps(mapping)):
             raise RuntimeError(f"Resolve could not play channel {recording['channel']} of {recording['name']}")
+    elif recording['format'] != 'mono':
+        # Resolve gives a clip of a camera file's separate sound streams only
+        # the first one; every channel is mapped in order.
+        channels = len(recording['entries'])
+        mapping = {'track_mapping': {'1': {
+            'channel_idx': list(range(1, channels + 1)),
+            'mute': False,
+            'type': 'stereo' if channels == 2 else f'adaptive_{channels}',
+        }}}
+        if not item.SetSourceAudioChannelMapping(json.dumps(mapping)):
+            warnings.append(f"Could not map every channel of {recording['name']}")
     apply_clip(item, recording['clip'])
     return item
 
 
 def remove_empty_tracks(count):
-    """Drop the first `count` audio tracks that the recordings left empty."""
+    """Drop the first `count` audio tracks that the recordings left empty;
+    the indices of the removed tracks."""
+    removed = []
     for index in range(count, 0, -1):
         if timeline.GetItemListInTrack('audio', index) or timeline.GetTrackCount('audio') <= 1:
             continue
-        if not timeline.DeleteTrack('audio', index):
+        if timeline.DeleteTrack('audio', index):
+            removed.append(index)
+        else:
             warnings.append(f'Could not remove empty audio track {index}')
+    return removed
+
+
+# Audio tracks the timeline keeps locked, as the OTIO lists them.
+locked_tracks = {
+    index
+    for index, track in enumerate(audio_tracks, 1)
+    if ((track.get('metadata') or {}).get('Resolve_OTIO') or {}).get('Locked')
+}
+
+
+def unlock_audio_tracks():
+    """Unlock every audio track, so its clips can be replaced."""
+    for index in range(1, timeline.GetTrackCount('audio') + 1):
+        if timeline.GetIsTrackLocked('audio', index) and not timeline.SetTrackLock('audio', index, False):
+            raise RuntimeError(f'Resolve could not unlock audio track {index}')
+
+
+def lock_audio_tracks(removed):
+    """Lock again the tracks that were locked and the tracks made of them,
+    where they are once the empty tracks are removed."""
+    def now(index):
+        return index - sum(1 for gone in removed if gone < index)
+    indices = [index for index in locked_tracks if index not in removed]
+    indices += [index for (track, _), index in typed_tracks.items() if track in locked_tracks]
+    for index in indices:
+        if not timeline.SetTrackLock('audio', now(index), True):
+            warnings.append(f'Could not lock audio track {now(index)}')
 
 
 if not video_clips:
@@ -310,6 +359,7 @@ if not video_clips:
         for track_index in range(1, timeline.GetTrackCount('audio') + 1)
         for item in (timeline.GetItemListInTrack('audio', track_index) or [])
     ]
+    unlock_audio_tracks()
     if imported_items and not timeline.DeleteClips(imported_items, False):
         raise RuntimeError('Resolve could not clear the XML bootstrap clips')
     while timeline.GetTrackCount('audio') < len(audio_tracks):
@@ -332,7 +382,7 @@ if not video_clips:
     placed = recordings(entries)
     for recording in placed:
         place(recording, media_by_path[os.path.realpath(recording['path'])])
-    remove_empty_tracks(original_tracks)
+    lock_audio_tracks(remove_empty_tracks(original_tracks))
     organize_media()
     project.SetCurrentTimeline(timeline)
     print(f'Created {timeline.GetName()} with {len(placed)} sample-accurate audio clips')
@@ -380,7 +430,11 @@ cameras = {}
 for entry in entries:
     if entry['linked']:
         cameras.setdefault(entry['align'].get('Item') or id(entry['clip']), []).append(entry)
-replaced_entries = [entry for entry in entries if not entry['linked']]
+# A clip beside a transition keeps the clip and transition the import made.
+for entry in entries:
+    if not entry['linked'] and entry['transition']:
+        apply_clip(entry['item'], entry['clip'])
+replaced_entries = [entry for entry in entries if not entry['linked'] and not entry['transition']]
 for group in cameras.values():
     first = group[0]
     channels = int(first['align'].get('Channels', 1))
@@ -389,7 +443,7 @@ for group in cameras.values():
         and len(group) == channels
         and not first['align'].get('Selected Channel')
         and first['group'] in pictures
-        and not any(entry['clip'].get('effects') for entry in group)
+        and not any(entry['clip'].get('effects') or entry['transition'] for entry in group)
     ):
         replaced_entries.extend(group)
         continue
@@ -404,6 +458,7 @@ replaced = recordings(replaced_entries)
 # Camera sound first, so its tracks come before the recorders'.
 replaced.sort(key=lambda recording: not recording['linked'])
 replaced_items = [entry['item'] for recording in replaced for entry in recording['entries']]
+unlock_audio_tracks()
 if replaced_items and not timeline.DeleteClips(replaced_items, False):
     raise RuntimeError('Resolve could not replace the frame-quantized sound clips')
 original_tracks = timeline.GetTrackCount('audio')
@@ -411,7 +466,7 @@ for recording in replaced:
     item = place(recording, recording['media'])
     if recording['linked'] and not timeline.SetClipsLinked([pictures[recording['group']], item], True):
         warnings.append(f"Could not link {recording['name']} to its picture")
-remove_empty_tracks(original_tracks)
+lock_audio_tracks(remove_empty_tracks(original_tracks))
 
 organize_media()
 project.SetCurrentTimeline(timeline)
