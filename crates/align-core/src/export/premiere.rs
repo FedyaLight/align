@@ -7,12 +7,13 @@
 //! (down/nearest/up roundings, subframe offsets, NTSC timebases).
 //!
 //! Sample-accurate audio placement: Premiere floors imported audio
-//! `start`/`end` to integer frames and ignores `<subframeoffset>`, so
-//! `export_prepared` renders placement-pad sidecars (leading silence) for
-//! fractional audio starts and records them on the item. Padded items keep
-//! the floored integer placement with no `<subframeoffset>`; the content
-//! lands exactly. Unpadded items (plain `export`, retimed audio, the
-//! `– replaced` sequence) keep the historical `<subframeoffset>` encoding.
+//! `start`/`end` to integer frames and ignores `<subframeoffset>`, and
+//! Resolve places them on whole frames too, so `export_prepared` renders
+//! placement-pad sidecars (leading silence) for fractional audio starts and
+//! records them on the item. Padded items keep the floored integer placement
+//! with no `<subframeoffset>`; the content lands exactly in both editors.
+//! Unpadded items (plain `export`, retimed audio, the `– replaced` sequence)
+//! keep the historical `<subframeoffset>` encoding.
 //!
 //! Media bins: a Premiere project can open with one bin of master clips per
 //! camera and recorder, plus a bin of the audio Align prepared. Master clips
@@ -282,7 +283,7 @@ impl Document {
         clip_id_prefix: &str,
         include_embedded_audio: bool,
     ) -> String {
-        let (rate, format) = (self.rate, self.format);
+        let rate = self.rate;
         let duration = rate.frames(island.duration, Rounding::Up);
         let mut xml = format!("      <sequence id=\"{id}\">\n");
         xml += &format!("        <name>{}</name>\n", xml_text::escape(&name));
@@ -335,8 +336,8 @@ impl Document {
                 })
             })
             .collect();
-        let video_tracks = tracks_for(&video_entries, MediaKind::Video, format, rate);
-        let audio_tracks = tracks_for(&audio_entries, MediaKind::Audio, format, rate);
+        let video_tracks = tracks_for(&video_entries, MediaKind::Video, rate);
+        let audio_tracks = tracks_for(&audio_entries, MediaKind::Audio, rate);
         let mut ids = identifiers(&video_tracks, MediaKind::Video, 1, clip_id_prefix);
         ids.extend(identifiers(
             &audio_tracks,
@@ -351,20 +352,20 @@ impl Document {
         for track in &video_tracks {
             xml += &self.track(track, MediaKind::Video, &layout);
         }
-        let use_pads = format == TimelineExportFormat::PremiereXML;
-        let audio_depth =
-            if island.clips.iter().any(|i| {
-                i.corrected_audio_url.is_some() || (use_pads && i.placement_pad_url.is_some())
-            }) {
-                32
-            } else {
-                island
-                    .clips
-                    .iter()
-                    .filter_map(|i| i.clip.audio.first()?.bit_depth)
-                    .next()
-                    .unwrap_or(24)
-            };
+        let audio_depth = if island
+            .clips
+            .iter()
+            .any(|i| i.corrected_audio_url.is_some() || i.placement_pad_url.is_some())
+        {
+            32
+        } else {
+            island
+                .clips
+                .iter()
+                .filter_map(|i| i.clip.audio.first()?.bit_depth)
+                .next()
+                .unwrap_or(24)
+        };
         xml += &format!(
             "          </video>\n          <audio>\n            <format><samplecharacteristics><depth>{audio_depth}</depth><samplerate>48000</samplerate></samplecharacteristics></format>\n"
         );
@@ -672,7 +673,6 @@ fn links(
 fn tracks_for<'a>(
     entries: &[TrackEntry<'a>],
     media_type: MediaKind,
-    format: TimelineExportFormat,
     rate: SequenceRate,
 ) -> Vec<Vec<TrackEntry<'a>>> {
     let source_key = |entry: &TrackEntry<'a>| -> String {
@@ -734,9 +734,7 @@ fn tracks_for<'a>(
             } else {
                 item.selected_timeline_duration(media_type)
             };
-            let (start, duration) = if format == TimelineExportFormat::PremiereXML
-                && item.has_placement_pad(media_type)
-            {
+            let (start, duration) = if item.has_placement_pad(media_type) {
                 let start =
                     rate.frames(item.timeline_start(media_type), Rounding::Down) as f64 / rate.fps;
                 let duration = rate.frames(duration + item.placement_pad_seconds, Rounding::Up)
@@ -795,25 +793,29 @@ impl Document {
     /// its audio starts later.
     fn start_frame(&self, entry: &TrackEntry, media_type: MediaKind) -> (i64, f64) {
         let (rate, item) = (self.rate, entry.item);
-        let resolve = self.format == TimelineExportFormat::ResolveXML;
+        // A padded sidecar's silence lands its audio after the frame before
+        // it, in Premiere and Resolve alike.
+        let floored = media_type == MediaKind::Audio
+            && (self.format == TimelineExportFormat::PremiereXML
+                || item.has_placement_pad(media_type));
         let stable_start = (item.timeline_start(media_type) * 100_000.0).round() / 100_000.0;
         // Resolve drops `<subframeoffset>` and places clips on whole frames, so
-        // a floored audio start lands up to a frame early there (camera audio a
-        // frame ahead of its picture). Round audio like video and like the OTIO
-        // writer instead; the precision script restores sample placement.
+        // a floored unpadded audio start lands up to a frame early there
+        // (camera audio a frame ahead of its picture). Round it like video
+        // and like the OTIO writer instead.
         let mut start = rate.frames(
             stable_start,
-            if media_type == MediaKind::Video || resolve {
-                Rounding::Nearest
-            } else {
+            if floored {
                 Rounding::Down
+            } else {
+                Rounding::Nearest
             },
         );
         // Collapse sub-sample dust (float noise, µs solver jitter) to the
         // adjacent integer frame so near-exact starts encode exactly instead of
         // as floor + a full-frame subframeoffset Premiere would drop.
         let mut start_frac = 0.0;
-        if media_type == MediaKind::Audio && !resolve {
+        if floored {
             let sample_rate = item.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);
             let raw_frac = stable_start * rate.fps - start as f64;
             let (adjustment, effective) =
@@ -1205,11 +1207,9 @@ fn source_rate(item: &ExportItem, sequence: SequenceRate) -> SequenceRate {
 impl Document {
     fn media_use(&self, item: &ExportItem, media_type: MediaKind) -> MediaUse {
         let corrected = media_type == MediaKind::Audio && item.corrected_audio_url.is_some();
-        // Pads are a PremiereXML-only essence swap: the Resolve bootstrap keeps
-        // referencing drift/original files with the historical subframeoffset
-        // encoding, byte-identical to before.
-        let padded =
-            item.has_placement_pad(media_type) && self.format == TimelineExportFormat::PremiereXML;
+        // Premiere and Resolve both place XML audio on whole frames; a padded
+        // sidecar carries the remainder to the exact sample in either.
+        let padded = item.has_placement_pad(media_type);
         let (in_seconds, out_seconds) = if corrected {
             (item.corrected_source_in(), item.corrected_source_out())
         } else {
@@ -1621,10 +1621,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_bootstrap_ignores_pads() {
-        // Pads are a PremiereXML-only essence swap; Resolve keeps the
-        // original file at the nearest whole frame (it ignores
-        // subframeoffset): 0.5 s = 12.5 frames at 25 fps rounds to 13.
+    fn resolve_xml_plays_pads_like_premiere() {
+        // Resolve places XML audio on whole frames too: 0.5 s = 12.5 frames
+        // at 25 fps starts on frame 12, and the sidecar's half frame of
+        // silence lands the sound on its sample. Without a pad Resolve keeps
+        // the nearest frame, 13.
         let mut timeline = fixture_timeline();
         let rec = timeline.islands[0]
             .clips
@@ -1639,11 +1640,16 @@ mod tests {
             TimelineExportFormat::ResolveXML,
             PremiereOptions::default(),
         );
-        assert!(!xml.contains("rec-pad.wav"));
+        assert!(xml.contains("<pathurl>file:///pad/rec-pad.wav</pathurl>"));
         assert!(!xml.contains("subframeoffset"));
-        assert!(xml.contains("<name>rec.wav</name>"));
-        assert!(xml.contains("<start>13</start>"));
-        assert!(xml.contains("<pathurl>file:///v/rec.wav</pathurl>"));
+        assert!(xml.contains("<start>12</start>"));
+        let plain = write(
+            &fixture_timeline(),
+            TimelineExportFormat::ResolveXML,
+            PremiereOptions::default(),
+        );
+        assert!(plain.contains("<start>13</start>"));
+        assert!(plain.contains("<pathurl>file:///v/rec.wav</pathurl>"));
     }
 
     #[test]

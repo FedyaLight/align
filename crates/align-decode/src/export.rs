@@ -586,10 +586,11 @@ impl AudioPlan {
         let wants_aaf = options.wants(TimelineExportFormat::Aaf);
         // Final Cut Pro picks channels and ranges of the original files.
         let wants_precision = wants_aaf || options.wants(TimelineExportFormat::ResolveScript);
-        // Placement pads are a PremiereXML-only concern: no other writer reads
-        // them (OTIO/FCPXML place exactly already; the Resolve script locates
-        // stems through its own fractional API, so its stems stay unpadded).
-        let wants_pad = options.wants(TimelineExportFormat::PremiereXML);
+        // Placement pads serve the FCP 7 XML writers: Premiere and Resolve
+        // place XML audio on whole frames. OTIO, FCPXML and the Resolve
+        // script place exactly already, so their files stay unpadded.
+        let wants_pad = options.wants(TimelineExportFormat::PremiereXML)
+            || options.wants(TimelineExportFormat::ResolveXML);
         let fps = sequence_fps(combined.frame_duration);
 
         let needs_drift = |item: &ExportItem| {
