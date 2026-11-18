@@ -196,10 +196,71 @@ impl ImportedAudio {
 /// Protocol version of the bridge's `read-timeline` response.
 const READ_TIMELINE_VERSION: u32 = 3;
 
+/// AAF responses already read, by file, revision, and extraction folder:
+/// listing a project's sequences and reading each of them parsed the whole
+/// project, and extracted its embedded sound, every time.
+static READ: std::sync::LazyLock<std::sync::Mutex<ReadTimelines>> =
+    std::sync::LazyLock::new(Default::default);
+type ReadTimelines = std::collections::HashMap<(PathBuf, String, PathBuf), Vec<u8>>;
+/// Responses kept at most; a long session starts over past it.
+const READ_LIMIT: usize = 64;
+
 pub fn read_timeline(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, AafError> {
     if cancel.load(Ordering::Relaxed) {
         return Err(AafError::Cancelled);
     }
+    let directory = crate::media_assets::extraction_directory()?;
+    let key = align_core::cache::media_revision(path)
+        .ok()
+        .map(|revision| (path.to_path_buf(), revision, directory.clone()));
+    let lock = || {
+        READ.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    let cached = key.as_ref().and_then(|key| lock().get(key).cloned());
+    if let Some(json) = cached
+        && let Ok(result) = parse_timeline(&json)
+        // Extracted sound lives on while the folder does; read again if not.
+        && result
+            .sequences
+            .iter()
+            .flat_map(|sequence| &sequence.tracks)
+            .flat_map(|track| &track.clips)
+            .all(|clip| clip.path.exists())
+    {
+        return Ok(result);
+    }
+    let json = run_read_timeline(path, &directory, cancel)?;
+    let result = parse_timeline(&json)?;
+    if let Some(key) = key {
+        let mut read = lock();
+        if read.len() >= READ_LIMIT {
+            read.clear();
+        }
+        read.insert(key, json);
+    }
+    Ok(result)
+}
+
+fn parse_timeline(json: &[u8]) -> Result<ImportedAudio, AafError> {
+    let result: ImportedAudio =
+        serde_json::from_slice(json).map_err(|e| AafError::Writer(e.to_string()))?;
+    if result.version != READ_TIMELINE_VERSION {
+        return Err(AafError::Writer(
+            "AAF module protocol version mismatch".into(),
+        ));
+    }
+    validate_import(&result)?;
+    Ok(result)
+}
+
+/// The bridge's `read-timeline` response for `path`, extracting embedded
+/// sound into `directory`.
+fn run_read_timeline(
+    path: &Path,
+    directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, AafError> {
     let executable = crate::ff::resolve_bin("ALIGN_AAF", "align-aaf").ok_or(AafError::Missing)?;
     // A file avoids stdout pipe deadlocks on large compositions while retaining
     // cancellable process supervision and automatic temporary-file cleanup.
@@ -207,7 +268,7 @@ pub fn read_timeline(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, 
     let mut child = crate::process::command(executable)
         .arg("read-timeline")
         .arg(path)
-        .arg(crate::media_assets::extraction_directory()?)
+        .arg(directory)
         .stdin(Stdio::null())
         .stdout(Stdio::from(output.try_clone()?))
         .stderr(Stdio::inherit())
@@ -216,17 +277,11 @@ pub fn read_timeline(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, 
     if !status.success() {
         return Err(AafError::Writer(status.to_string()));
     }
-    use std::io::{Seek, SeekFrom};
+    use std::io::{Read, Seek, SeekFrom};
     output.seek(SeekFrom::Start(0))?;
-    let result: ImportedAudio =
-        serde_json::from_reader(output).map_err(|e| AafError::Writer(e.to_string()))?;
-    if result.version != READ_TIMELINE_VERSION {
-        return Err(AafError::Writer(
-            "AAF module protocol version mismatch".into(),
-        ));
-    }
-    validate_import(&result)?;
-    Ok(result)
+    let mut json = Vec::new();
+    output.read_to_end(&mut json)?;
+    Ok(json)
 }
 
 fn validate_import(result: &ImportedAudio) -> Result<(), AafError> {
