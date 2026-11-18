@@ -176,10 +176,12 @@ def audio_entries():
                     reference['available_range']['start_time']
                 )
                 available_duration = seconds(reference['available_range']['duration'])
+                group = (child.get('metadata') or {}).get('Resolve_OTIO', {}).get('Link Group ID')
                 entries.append({
                     'clip': child,
                     'align': (child.get('metadata') or {}).get('Align') or {},
-                    'linked': (child.get('metadata') or {}).get('Resolve_OTIO', {}).get('Link Group ID') is not None,
+                    'group': group,
+                    'linked': group is not None,
                     'track': track_index,
                     'cursor': cursor,
                     'path': reference['target_url'],
@@ -278,6 +280,7 @@ def place(recording, media):
         if not item.SetSourceAudioChannelMapping(json.dumps(mapping)):
             raise RuntimeError(f"Resolve could not play channel {recording['channel']} of {recording['name']}")
     apply_clip(item, recording['clip'])
+    return item
 
 
 def remove_empty_tracks(count):
@@ -347,6 +350,8 @@ if not timeline:
 timeline_start = float(timeline.GetStartFrame())
 
 video_tracks = [track for track in document['tracks']['children'] if track['kind'] == 'Video']
+# Each camera's picture by its link group, which its sound shares.
+pictures = {}
 for track_index, track in enumerate(video_tracks, 1):
     clips = otio_clips(track)
     resolve_items = timeline.GetItemListInTrack('video', track_index) or []
@@ -355,6 +360,9 @@ for track_index, track in enumerate(video_tracks, 1):
         continue
     for clip, item in zip(clips, resolve_items):
         apply_clip(item, clip)
+        group = (clip.get('metadata') or {}).get('Resolve_OTIO', {}).get('Link Group ID')
+        if group is not None:
+            pictures[group] = item
 
 entries = audio_entries()
 for track_index, track in enumerate(audio_tracks, 1):
@@ -365,27 +373,49 @@ for track_index, track in enumerate(audio_tracks, 1):
     for entry, item in zip(track_entries, resolve_items):
         entry['item'] = item
 
-# Camera sound stays linked to its picture; recordings are placed anew.
+# Recordings are placed anew. So is a camera's sound that plays all its
+# channels, as one clip linked to its picture; a camera's single channel and
+# retimed sound keep the clips the timeline import linked.
+cameras = {}
 for entry in entries:
     if entry['linked']:
-        apply_clip(entry['item'], entry['clip'])
+        cameras.setdefault(entry['align'].get('Item') or id(entry['clip']), []).append(entry)
+replaced_entries = [entry for entry in entries if not entry['linked']]
+for group in cameras.values():
+    first = group[0]
+    channels = int(first['align'].get('Channels', 1))
+    if (
+        channels > 1
+        and len(group) == channels
+        and not first['align'].get('Selected Channel')
+        and first['group'] in pictures
+        and not any(entry['clip'].get('effects') for entry in group)
+    ):
+        replaced_entries.extend(group)
         continue
+    for entry in group:
+        apply_clip(entry['item'], entry['clip'])
+for entry in replaced_entries:
     # A deleted clip no longer knows its media.
     entry['media'] = entry['item'].GetMediaPoolItem()
     if not entry['media']:
         raise RuntimeError(f"Resolve has no media for {entry['name']}")
-replaced = recordings([entry for entry in entries if not entry['linked']])
+replaced = recordings(replaced_entries)
+# Camera sound first, so its tracks come before the recorders'.
+replaced.sort(key=lambda recording: not recording['linked'])
 replaced_items = [entry['item'] for recording in replaced for entry in recording['entries']]
 if replaced_items and not timeline.DeleteClips(replaced_items, False):
-    raise RuntimeError('Resolve could not replace the frame-quantized recorder clips')
+    raise RuntimeError('Resolve could not replace the frame-quantized sound clips')
 original_tracks = timeline.GetTrackCount('audio')
 for recording in replaced:
-    place(recording, recording['media'])
+    item = place(recording, recording['media'])
+    if recording['linked'] and not timeline.SetClipsLinked([pictures[recording['group']], item], True):
+        warnings.append(f"Could not link {recording['name']} to its picture")
 remove_empty_tracks(original_tracks)
 
 organize_media()
 project.SetCurrentTimeline(timeline)
-print(f'Created {timeline.GetName()} with {len(replaced)} sample-accurate recorder clips')
+print(f'Created {timeline.GetName()} with {len(replaced)} sample-accurate sound clips')
 for warning in warnings:
     print('Warning:', warning, file=sys.stderr)
 "#

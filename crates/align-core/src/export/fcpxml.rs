@@ -1673,7 +1673,8 @@ mod tests {
         let script = super::super::script::write();
         assert!(script.starts_with("#!/usr/bin/env python3"));
         assert!(script.contains("AppendToTimeline"));
-        assert!(script.contains("sample-accurate recorder clips"));
+        assert!(script.contains("sample-accurate sound clips"));
+        assert!(script.contains("SetClipsLinked"));
         assert!(script.contains("mediaBins") && script.contains("generatedAudio"));
     }
 }
