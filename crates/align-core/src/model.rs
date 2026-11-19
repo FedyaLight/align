@@ -994,6 +994,7 @@ fn strip_verbatim(path: &Path) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::review::{ManualPlacementOverride, ReviewSession, ReviewValidationReason};
 
     #[test]
     fn file_urls_follow_the_editor_form_on_every_platform() {
@@ -1008,6 +1009,103 @@ mod tests {
         assert_eq!(
             file_url(Path::new("/tmp/Café.mov")),
             "file:///tmp/Caf%C3%A9.mov"
+        );
+    }
+
+    fn review_test_clip(id: &str, url: &str) -> Clip {
+        Clip {
+            id: ClipId::new(id),
+            url: PathBuf::from(url),
+            kind: MediaKind::Audio,
+            duration: MediaTime::new(120, 1),
+            audio: Vec::new(),
+            video: None,
+            recorded_at: None,
+            recorded_at_source: None,
+            source_identifier: Some("source-1".into()),
+            media_span: None,
+        }
+    }
+
+    #[test]
+    fn review_override_round_trips_and_overrides_only_the_effective_start() {
+        let clip = review_test_clip("clip-a", "/media/a.wav");
+        let mut session = ReviewSession::default();
+        session.selected_clip = Some(clip.id.clone());
+        session.playhead = 12.25;
+        session.zoom = 2.5;
+        session.horizontal_scroll = 4.0;
+        session.overrides.insert(
+            clip.id.clone(),
+            ManualPlacementOverride::for_clip(&clip, 42.5),
+        );
+
+        let json = serde_json::to_string(&session).expect("serialize review session");
+        let restored: ReviewSession =
+            serde_json::from_str(&json).expect("deserialize review session");
+
+        assert_eq!(restored, session);
+        assert_eq!(restored.effective_start(&clip, 10.0), Ok(42.5));
+        assert_eq!(restored.overrides[&clip.id].timeline_start, 42.5);
+    }
+
+    #[test]
+    fn review_session_defaults_missing_state_and_ignores_unknown_fields() {
+        let restored: ReviewSession =
+            serde_json::from_str(r#"{"overrides":{},"futureField":{"ignored":true}}"#)
+                .expect("deserialize forward-compatible review session");
+
+        assert_eq!(restored, ReviewSession::default());
+        let empty: ReviewSession = serde_json::from_str("{}").expect("deserialize defaults");
+        assert_eq!(empty, ReviewSession::default());
+    }
+
+    #[test]
+    fn review_override_accepts_matching_clip_identity_and_rejects_stale_source() {
+        let clip = review_test_clip("clip-a", "/media/a.wav");
+        let mut session = ReviewSession::default();
+        session.overrides.insert(
+            clip.id.clone(),
+            ManualPlacementOverride::for_clip(&clip, 42.5),
+        );
+
+        assert!(session.validate(&[clip.clone()]).is_empty());
+        let changed_source = review_test_clip("clip-a", "/media/replaced.wav");
+        let issues = session.validate(&[changed_source.clone()]);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].clip_id, Some(clip.id));
+        assert_eq!(
+            session.effective_start(&changed_source, 10.0),
+            Err(ReviewValidationReason::StaleClipIdentity)
+        );
+    }
+
+    #[test]
+    fn review_session_rejects_missing_clip_and_non_finite_positions() {
+        let clip = review_test_clip("clip-a", "/media/a.wav");
+        let mut session = ReviewSession::default();
+        session.overrides.insert(
+            clip.id.clone(),
+            ManualPlacementOverride::for_clip(&clip, f64::NAN),
+        );
+        session.playhead = f64::INFINITY;
+        session.zoom = f64::NAN;
+
+        let issues = session.validate(&[]);
+        assert!(issues.iter().any(|issue| {
+            issue.clip_id.as_ref() == Some(&clip.id)
+                && issue.reason == ReviewValidationReason::MissingClip
+        }));
+        assert!(issues.iter().any(|issue| {
+            issue.clip_id.as_ref() == Some(&clip.id)
+                && issue.reason == ReviewValidationReason::InvalidPosition
+        }));
+        assert!(issues.iter().any(|issue| {
+            issue.clip_id.is_none() && issue.reason == ReviewValidationReason::InvalidPosition
+        }));
+        assert_eq!(
+            session.effective_start(&clip, 10.0),
+            Err(ReviewValidationReason::InvalidPosition)
         );
     }
 
