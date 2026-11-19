@@ -34,6 +34,16 @@ For an existing edit, enable Preserve basic editing on the tracks that should
 remain fixed. This preserves their trims, duplicates, positions, and gaps while
 other tracks align to them. See [format limits](formats.md) for unsupported edits.
 
+### Session restoration and review workspace
+
+Align automatically persists the current session on exit and whenever a
+synchronization completes. On launch, unless media paths are passed as command-line
+arguments, Align restores your selected inputs, latest synchronization results,
+timeline view, and any manual review placement overrides. Restored sessions always
+open paused. Missing media files and stale placement overrides remain visible as
+actionable warnings rather than discarding your project. Clearing the session removes
+the saved state.
+
 ### Keyboard shortcuts
 
 | Action | macOS | Windows and Linux |

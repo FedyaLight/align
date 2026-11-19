@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
 
 use align_core::{
     AudioAnalysisSource, Clip, ClipId, ClipOrder, MatchEvidence, MatchPreview, MatchThreshold,
@@ -155,6 +156,59 @@ pub struct ExportLabels {
     pub unmatched_symbol: String,
     pub unmatched_color: String,
     pub unmatched_role: String,
+}
+
+/// Versioned on-disk session representation for the review workspace.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSession {
+    #[serde(default = "default_session_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub inputs: Vec<PathBuf>,
+    #[serde(default)]
+    pub timeline_inputs: HashSet<PathBuf>,
+    #[serde(default)]
+    pub selection: HashSet<PathBuf>,
+    #[serde(default)]
+    pub result: Option<SyncResult>,
+    #[serde(default)]
+    pub sequence_results: Vec<SyncResult>,
+    #[serde(default)]
+    pub active_sequence_result: usize,
+    #[serde(default)]
+    pub review_session: align_core::ReviewSession,
+    #[serde(default)]
+    pub timeline_choices: HashMap<PathBuf, Vec<usize>>,
+    #[serde(default)]
+    pub manual_relinks: Vec<(String, PathBuf)>,
+    #[serde(default)]
+    pub omit_extensions: Vec<String>,
+    #[serde(default)]
+    pub prefer_proxies: bool,
+}
+
+fn default_session_version() -> u32 {
+    1
+}
+
+impl Default for ProjectSession {
+    fn default() -> Self {
+        Self {
+            version: default_session_version(),
+            inputs: Vec::new(),
+            timeline_inputs: HashSet::new(),
+            selection: HashSet::new(),
+            result: None,
+            sequence_results: Vec::new(),
+            active_sequence_result: 0,
+            review_session: align_core::ReviewSession::default(),
+            timeline_choices: HashMap::new(),
+            manual_relinks: Vec::new(),
+            omit_extensions: Vec::new(),
+            prefer_proxies: false,
+        }
+    }
 }
 
 impl Default for ExportSettings {
@@ -937,6 +991,7 @@ impl AppData {
             ..Default::default()
         };
         self.apply_export_settings(&self.export_baseline());
+        let _ = std::fs::remove_file(Self::default_session_path());
     }
 
     /// The export options in the sheet; `labels` come from its text fields.
@@ -1386,6 +1441,7 @@ impl AppData {
         self.quality_only_dirty = false;
         self.incremental_quality_run = false;
         self.report_sync_duration();
+        let _ = self.save_session();
     }
 
     /// "Synchronized all 8 clips." → "Synchronized all 8 clips in 0.4 s."
@@ -1432,6 +1488,7 @@ impl AppData {
                 active + 1
             );
         }
+        let _ = self.save_session();
     }
 
     pub fn select_sequence_result(&mut self, index: usize) -> bool {
@@ -1576,6 +1633,185 @@ impl AppData {
         } else {
             format!("Synchronized {} of {total} clips.", total - unmatched)
         };
+    }
+
+    /// Rebuild lanes and review validation issues from the current visible
+    /// result without resetting multi-sequence results or status.
+    pub fn refresh_review_view(&mut self) {
+        let Some(result) = self.result.as_ref() else {
+            let view = self.review_session.validate(&[]);
+            self.review_issues = view;
+            return;
+        };
+        let view = align_core::export_model::EffectivePlacementView::from_result(
+            result,
+            &self.review_session,
+        );
+        self.review_issues = view.issues;
+        let (bars, states, ruler) = if result.project.imported_timeline.is_some() {
+            imported_preview(result, &self.review_session)
+        } else {
+            let final_timeline = lane::final_bars_with_review(result, &self.review_session);
+            (
+                final_timeline.bars,
+                final_timeline.states,
+                final_timeline.ruler_timecode,
+            )
+        };
+        self.ruler_timecode = ruler;
+        let states: HashMap<&ClipId, (f64, MatchEvidence)> =
+            states.iter().map(|(id, c, e)| (id, (*c, *e))).collect();
+        let unmatched: HashSet<&ClipId> = result.unmatched.iter().collect();
+        let warned_urls: HashSet<&PathBuf> =
+            result.project.warnings.iter().map(|w| &w.url).collect();
+        for clip_row in &mut self.clips {
+            if let Some(id) = &clip_row.clip_id {
+                if let Some((confidence, evidence)) = states.get(id) {
+                    let island = result
+                        .islands
+                        .iter()
+                        .position(|i| i.placements.iter().any(|p| &p.clip_id == id))
+                        .unwrap_or(0);
+                    clip_row.state = ClipState::Synchronized {
+                        island,
+                        confidence: *confidence,
+                        drift_ppm: drift_of_placement(result, id),
+                        evidence: *evidence,
+                    };
+                } else if unmatched.contains(id) {
+                    clip_row.state = ClipState::Unmatched;
+                } else if warned_urls.contains(&clip_row.url) {
+                    clip_row.state = ClipState::Warning;
+                } else {
+                    clip_row.state = ClipState::Unmatched;
+                }
+            }
+        }
+        self.lanes = lane::layout_bars(bars, &self.audio_stream_channels);
+    }
+
+    // ---------------- session persistence
+
+    pub fn default_session_path() -> PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("Align")
+            .join("session.json")
+    }
+
+    pub fn save_session(&self) -> std::io::Result<()> {
+        self.save_session_to(&Self::default_session_path())
+    }
+
+    pub fn save_session_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let session = ProjectSession {
+            version: 1,
+            inputs: self.inputs.clone(),
+            timeline_inputs: self.timeline_inputs.clone(),
+            selection: self.selection.clone(),
+            result: self.result.clone(),
+            sequence_results: self.sequence_results.clone(),
+            active_sequence_result: self.active_sequence_result,
+            review_session: self.review_session.clone(),
+            timeline_choices: self.timeline_choices.clone(),
+            manual_relinks: self.manual_relinks.clone(),
+            omit_extensions: self.omit_extensions.clone(),
+            prefer_proxies: self.prefer_proxies,
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = serde_json::to_vec_pretty(&session)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        align_core::staged::write(path, &bytes)
+    }
+
+    pub fn restore_session(&mut self) -> std::io::Result<bool> {
+        self.restore_session_from(&Self::default_session_path())
+    }
+
+    pub fn restore_session_from(&mut self, path: &std::path::Path) -> std::io::Result<bool> {
+        if !path.is_file() {
+            return Ok(false);
+        }
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) => return Err(err),
+        };
+        let session: ProjectSession = serde_json::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        self.inputs = session.inputs;
+        self.timeline_inputs = session.timeline_inputs;
+        self.selection = session.selection;
+        self.timeline_choices = session.timeline_choices;
+        self.manual_relinks = session.manual_relinks;
+        self.omit_extensions = session.omit_extensions;
+        self.prefer_proxies = session.prefer_proxies;
+        self.review_session = session.review_session;
+
+        let mut missing_inputs = Vec::new();
+        for input in &self.inputs {
+            if !input.exists() {
+                missing_inputs.push(input.clone());
+            }
+        }
+
+        if let Some(result) = session.result {
+            if session.sequence_results.is_empty() {
+                self.sequence_results = vec![result.clone()];
+                self.active_sequence_result = 0;
+            } else {
+                self.sequence_results = session.sequence_results;
+                self.active_sequence_result = session.active_sequence_result.min(self.sequence_results.len().saturating_sub(1));
+            }
+            self.apply_visible_result(result);
+        } else if !self.inputs.is_empty() {
+            self.clips = self.inputs
+                .iter()
+                .map(|path| ClipRow {
+                    clip_id: None,
+                    url: path.clone(),
+                    name: file_name(path),
+                    kind: None,
+                    duration: None,
+                    timecode: None,
+                    state: ClipState::Queued,
+                })
+                .collect();
+            self.clips.sort_by(|a, b| a.url.to_string_lossy().cmp(&b.url.to_string_lossy()));
+        }
+
+        // Check for missing media across inputs and result clips
+        for missing in missing_inputs {
+            let name = file_name(&missing);
+            self.warnings.push(format!("{name}: Media file was not found at {}.", missing.display()));
+            if let Some(clip_row) = self.clips.iter_mut().find(|c| c.url == missing) {
+                clip_row.state = ClipState::Warning;
+            } else {
+                self.clips.push(ClipRow {
+                    clip_id: None,
+                    url: missing.clone(),
+                    name,
+                    kind: None,
+                    duration: None,
+                    timecode: None,
+                    state: ClipState::Warning,
+                });
+            }
+        }
+        self.clips.sort_by(|a, b| a.url.to_string_lossy().cmp(&b.url.to_string_lossy()));
+
+        // Revalidate review session overrides and flag stale / missing references
+        let project_clips = self.result.as_ref().map(|r| r.project.clips.as_slice()).unwrap_or(&[]);
+        self.review_issues = self.review_session.validate(project_clips);
+
+        self.operation = Operation::Idle;
+        self.sync_dirty = false;
+        self.quality_only_dirty = false;
+        self.incremental_quality_run = false;
+
+        Ok(true)
     }
 
     // ---------------- corrections
@@ -3565,5 +3801,148 @@ mod tests {
         let text = serde_json::to_string(&ExportSettings::default()).unwrap();
         assert!(text.contains(r#""targets":["resolveOtio"]"#), "{text}");
         assert!(text.contains(r#""unmatched":"byOrderAndTime""#), "{text}");
+    }
+
+    #[test]
+    fn session_round_trips_inputs_result_and_review_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_file = directory.path().join("session.json");
+
+        let media_file = directory.path().join("camera.mov");
+        std::fs::write(&media_file, b"video-content").unwrap();
+
+        let mut data = AppData::default();
+        data.inputs = vec![media_file.clone()];
+        data.selection.insert(media_file.clone());
+
+        let clip = Clip {
+            id: ClipId::new("cam-1"),
+            url: media_file.clone(),
+            kind: MediaKind::Video,
+            duration: align_core::MediaTime::seconds(10.0),
+            audio: Vec::new(),
+            video: None,
+            recorded_at: None,
+            recorded_at_source: None,
+            source_identifier: None,
+            media_span: None,
+        };
+        let result = SyncResult {
+            search_overrides: HashMap::new(),
+            stopped: false,
+            stages: Vec::new(),
+            selected_stage: None,
+            search_accuracy: align_core::SearchAccuracy::Balanced,
+            preserve_editing_tracks: std::collections::BTreeSet::new(),
+            project: align_core::SyncProject {
+                clips: vec![clip.clone()],
+                warnings: Vec::new(),
+                imported_timeline: None,
+            },
+            islands: vec![align_core::model::SyncIsland {
+                id: 0,
+                placements: vec![align_core::model::ClipPlacement {
+                    clip_id: clip.id.clone(),
+                    mapping: align_core::model::TimeMap {
+                        points: vec![align_core::model::MappingPoint {
+                            source: align_core::MediaTime::seconds(0.0),
+                            island: align_core::MediaTime::seconds(0.0),
+                        }],
+                    },
+                    confidence: 1.0,
+                }],
+            }],
+            unmatched: Vec::new(),
+            matches: Vec::new(),
+            temporal_policy: Default::default(),
+        };
+        data.apply_result(result);
+        data.review_session.overrides.insert(
+            clip.id.clone(),
+            align_core::ManualPlacementOverride::for_clip(&clip, 15.0),
+        );
+        data.review_session.playhead = 8.5;
+        data.review_session.zoom = 2.0;
+        data.review_session.horizontal_scroll = 120.0;
+        data.review_session.selected_clip = Some(clip.id.clone());
+
+        data.save_session_to(&session_file).expect("save session");
+        assert!(session_file.is_file());
+
+        let mut restored = AppData::default();
+        restored.restore_session_from(&session_file).expect("restore session");
+
+        assert_eq!(restored.inputs, vec![media_file]);
+        assert_eq!(restored.review_session.playhead, 8.5);
+        assert_eq!(restored.review_session.zoom, 2.0);
+        assert_eq!(restored.review_session.horizontal_scroll, 120.0);
+        assert_eq!(restored.review_session.selected_clip, Some(ClipId::new("cam-1")));
+        assert_eq!(restored.lanes[0].clips[0].start, 15.0);
+        assert!(restored.review_issues.is_empty());
+    }
+
+    #[test]
+    fn session_restores_missing_media_and_stale_overrides_as_warnings() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_file = directory.path().join("session.json");
+
+        let missing_media = directory.path().join("deleted.wav");
+        let clip = Clip {
+            id: ClipId::new("audio-1"),
+            url: missing_media.clone(),
+            kind: MediaKind::Audio,
+            duration: align_core::MediaTime::seconds(5.0),
+            audio: Vec::new(),
+            video: None,
+            recorded_at: None,
+            recorded_at_source: None,
+            source_identifier: None,
+            media_span: None,
+        };
+        let session_json = serde_json::json!({
+            "version": 1,
+            "inputs": [missing_media],
+            "reviewSession": {
+                "overrides": {
+                    "audio-1": {
+                        "timelineStart": 10.0,
+                        "sourceIdentity": align_core::ReviewClipIdentity::from(&clip)
+                    }
+                }
+            }
+        });
+        std::fs::write(&session_file, serde_json::to_vec_pretty(&session_json).unwrap()).unwrap();
+
+        let mut restored = AppData::default();
+        restored.restore_session_from(&session_file).expect("restore session with missing media");
+
+        assert_eq!(restored.inputs.len(), 1);
+        assert_eq!(restored.clips.len(), 1);
+        assert_eq!(restored.clips[0].state, ClipState::Warning);
+        assert!(restored.warnings.iter().any(|w| w.contains("deleted.wav") && w.contains("not found")));
+        assert!(restored.review_issues.iter().any(|issue| {
+            issue.clip_id == Some(ClipId::new("audio-1"))
+                && issue.reason == align_core::ReviewValidationReason::MissingClip
+        }));
+    }
+
+    #[test]
+    fn session_restore_never_starts_playback() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_file = directory.path().join("session.json");
+
+        let session_json = serde_json::json!({
+            "version": 1,
+            "inputs": [],
+            "reviewSession": {
+                "playhead": 5.0
+            }
+        });
+        std::fs::write(&session_file, serde_json::to_vec_pretty(&session_json).unwrap()).unwrap();
+
+        let mut restored = AppData::default();
+        restored.restore_session_from(&session_file).expect("restore");
+        assert_eq!(restored.operation, Operation::Idle);
+        assert_eq!(restored.review_session.playhead, 5.0);
     }
 }

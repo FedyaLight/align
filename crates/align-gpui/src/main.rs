@@ -342,6 +342,9 @@ fn main() {
             // Generated icon assets are disposable. Fingerprints are an
             // OS-managed performance cache and must outlive the session.
             cx.on_action(|_: &QuitApp, cx| {
+                update_view(cx, |this, _| {
+                    let _ = this.data.save_session();
+                });
                 icons::cleanup();
                 cx.quit();
             });
@@ -371,7 +374,11 @@ fn main() {
             let bounds = Bounds::centered(None, size(px(1120.), px(700.)), cx);
             let view = cx.new(move |cx| {
                 let mut app = views::AlignApp::new(cx);
-                app.data.add_paths(initial_paths);
+                if initial_paths.is_empty() {
+                    let _ = app.data.restore_session();
+                } else {
+                    app.data.add_paths(initial_paths);
+                }
                 app.check_for_updates_on_launch(cx);
                 app
             });
