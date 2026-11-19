@@ -572,7 +572,14 @@ fn replaced_island(island: &ExportIsland) -> Option<ExportIsland> {
         .inverted();
         replacements.push(ExportItem {
             instance_id: video.instance_id.clone(),
-            display_name: recorder.display_name.clone(),
+            display_name: if video.estimated || recorder.estimated {
+                Some(format!(
+                    "[ESTIMATED] {}",
+                    recorder.display_name.as_deref().unwrap_or("External audio")
+                ))
+            } else {
+                recorder.display_name.clone()
+            },
             clip: recorder.clip.clone(),
             start: overlap_start,
             source_in: recorder.source_in.max(inverse.value_at(overlap_start)),
@@ -593,6 +600,7 @@ fn replaced_island(island: &ExportIsland) -> Option<ExportIsland> {
             mapping_rate: recorder.mapping_rate,
             mapping_points: recorder.mapping_points.clone(),
             confidence: video.confidence.min(recorder.confidence),
+            estimated: video.estimated || recorder.estimated,
             corrected_audio_url: recorder.corrected_audio_url.clone(),
             precision_audio_urls: Vec::new(),
             enabled: recorder.enabled,
@@ -2407,6 +2415,7 @@ mod tests {
                 }],
             }],
             unmatched: Vec::new(),
+            estimated_placements: Vec::new(),
             matches: Vec::new(),
             temporal_policy: crate::model::TemporalPolicy::default(),
         };
@@ -2565,6 +2574,7 @@ mod tests {
                 }],
             }],
             unmatched: Vec::new(),
+            estimated_placements: Vec::new(),
             matches: Vec::new(),
             temporal_policy: crate::model::TemporalPolicy::default(),
         };

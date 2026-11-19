@@ -15,6 +15,7 @@ use align_core::{
 pub enum BarMatchState {
     Pending,
     Matched,
+    Estimated,
     Unmatched,
 }
 
@@ -209,6 +210,8 @@ pub fn final_bars(result: &align_core::SyncResult) -> FinalTimeline {
             confidence: item.confidence,
             match_state: if item.matched {
                 BarMatchState::Matched
+            } else if item.estimated {
+                BarMatchState::Estimated
             } else {
                 BarMatchState::Unmatched
             },
@@ -661,6 +664,7 @@ mod tests {
             },
             islands: vec![island(0, "a"), island(1, "b")],
             unmatched: vec![ClipId::new("c")],
+            estimated_placements: Vec::new(),
             matches: Vec::new(),
             temporal_policy: TemporalPolicy::default(),
         };

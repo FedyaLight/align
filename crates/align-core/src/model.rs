@@ -387,6 +387,18 @@ pub struct Clip {
     pub media_span: Option<MediaSpan>,
 }
 
+/// A best-effort timeline position inferred from another clip recorded by
+/// the same device. This is deliberately separate from solved placements:
+/// estimates are never waveform matches and remain explicitly unconfirmed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EstimatedPlacement {
+    pub clip_id: ClipId,
+    pub anchor_clip_id: ClipId,
+    pub timeline_start: MediaTime,
+    pub timestamp_delta: MediaTime,
+}
+
 impl Clip {
     pub fn source_timecode(&self) -> Option<&SourceTimecode> {
         self.video
@@ -535,6 +547,7 @@ pub struct TimelinePreviewItem {
     pub duration: f64,
     pub confidence: f64,
     pub matched: bool,
+    pub estimated: bool,
 }
 
 /// Live match preview for progress callbacks.
@@ -579,6 +592,9 @@ pub struct SyncResult {
     pub project: SyncProject,
     pub islands: Vec<SyncIsland>,
     pub unmatched: Vec<ClipId>,
+    /// Unconfirmed same-device recording-time estimates for unmatched clips.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub estimated_placements: Vec<EstimatedPlacement>,
     pub matches: Vec<MatchSummary>,
     /// Temporal evidence policy used for this solve. Old serializations
     /// without the field load with the current Automatic policy.
@@ -635,6 +651,8 @@ impl SyncResult {
         };
         self.islands = stage.islands.clone();
         self.unmatched = stage.unmatched.clone();
+        self.estimated_placements
+            .retain(|placement| self.unmatched.contains(&placement.clip_id));
         self.matches = stage.matches.clone();
         self.selected_stage = Some(index);
         true

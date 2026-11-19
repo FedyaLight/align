@@ -348,6 +348,7 @@ pub(super) fn clip_color(state: crate::lane::BarMatchState) -> u32 {
     match state {
         BarMatchState::Pending => 0x007AFF,
         BarMatchState::Matched => 0x34C759,
+        BarMatchState::Estimated => 0xAF52DE,
         BarMatchState::Unmatched => 0xFF9500,
     }
 }
