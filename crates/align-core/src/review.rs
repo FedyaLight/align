@@ -180,6 +180,7 @@ pub enum ReviewValidationReason {
     MissingClip,
     StaleClipIdentity,
     InvalidPosition,
+    ConflictingPlacement,
 }
 
 #[cfg(test)]

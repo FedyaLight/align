@@ -1582,6 +1582,7 @@ impl AlignApp {
         let mut timelines = Vec::with_capacity(result_count);
         for (index, result) in results.iter().enumerate() {
             let options = ExportAssemblyOptions {
+                review_session: self.data.review_session.clone(),
                 unmatched: self.data.export_unmatched,
                 prevent_group_overlaps: self.data.export_prevent_overlaps,
                 disable_unmatched: self.data.export_disable_unmatched,

@@ -352,6 +352,10 @@ pub struct AppData {
     pub error: Option<String>,
     pub exported_files: Vec<PathBuf>,
     pub result: Option<SyncResult>,
+    /// Manual placements persist across sync runs and are validated against
+    /// whichever result is currently visible.
+    pub review_session: align_core::ReviewSession,
+    pub review_issues: Vec<align_core::ReviewValidationIssue>,
     /// Independently solved imported sequences. `result` is the currently
     /// visible member so existing timeline/correction code stays single-view.
     pub sequence_results: Vec<SyncResult>,
@@ -450,6 +454,8 @@ impl Default for AppData {
             error: None,
             exported_files: Vec::new(),
             result: None,
+            review_session: Default::default(),
+            review_issues: Vec::new(),
             sequence_results: Vec::new(),
             active_sequence_result: 0,
             sequence_constraints: HashMap::new(),
@@ -1471,10 +1477,15 @@ impl AppData {
 
         // Final bars (sync-graph branch) or export-model preview when an
         // imported timeline reshaped the sequence.
+        let view = align_core::export_model::EffectivePlacementView::from_result(
+            &result,
+            &self.review_session,
+        );
+        self.review_issues = view.issues;
         let (bars, states, ruler) = if result.project.imported_timeline.is_some() {
-            imported_preview(&result)
+            imported_preview(&result, &self.review_session)
         } else {
-            let final_timeline = lane::final_bars(&result);
+            let final_timeline = lane::final_bars_with_review(&result, &self.review_session);
             (
                 final_timeline.bars,
                 final_timeline.states,
@@ -2287,10 +2298,20 @@ type ImportedPreview = (
     Option<f64>,
 );
 
-fn imported_preview(result: &SyncResult) -> ImportedPreview {
+fn imported_preview(
+    result: &SyncResult,
+    review_session: &align_core::ReviewSession,
+) -> ImportedPreview {
     use align_core::export_model::ExportTimeline;
-    let Ok(timeline) = ExportTimeline::from_result(result, true) else {
-        let fallback = lane::final_bars(result);
+    let Ok(timeline) = ExportTimeline::from_result_with_options(
+        result,
+        align_core::export_model::ExportAssemblyOptions {
+            review_session: review_session.clone(),
+            unmatched: align_core::export_model::UnmatchedPlacement::ByOrderAndTime,
+            ..Default::default()
+        },
+    ) else {
+        let fallback = lane::final_bars_with_review(result, review_session);
         return (fallback.bars, fallback.states, fallback.ruler_timecode);
     };
     let unmatched: HashSet<ClipId> = result.unmatched.iter().cloned().collect();
@@ -2407,6 +2428,78 @@ mod tests {
             matches: Vec::new(),
             temporal_policy: Default::default(),
         }
+    }
+
+    #[test]
+    fn sync_replacement_retains_manual_overrides_and_flags_changed_clip_identity() {
+        let clip = |url: &str| align_core::Clip {
+            id: ClipId::new("camera"),
+            url: PathBuf::from(url),
+            kind: MediaKind::Video,
+            duration: align_core::MediaTime::seconds(10.0),
+            audio: Vec::new(),
+            video: None,
+            recorded_at: None,
+            recorded_at_source: None,
+            source_identifier: None,
+            media_span: None,
+        };
+        let result = |clip: align_core::Clip| SyncResult {
+            search_overrides: Default::default(),
+            stopped: false,
+            stages: Vec::new(),
+            selected_stage: None,
+            search_accuracy: Default::default(),
+            preserve_editing_tracks: Default::default(),
+            project: align_core::SyncProject {
+                clips: vec![clip.clone()],
+                warnings: Vec::new(),
+                imported_timeline: None,
+            },
+            islands: vec![align_core::SyncIsland {
+                id: 0,
+                placements: vec![align_core::ClipPlacement {
+                    clip_id: clip.id,
+                    mapping: align_core::TimeMap {
+                        points: vec![
+                            align_core::MappingPoint {
+                                source: align_core::MediaTime::seconds(0.0),
+                                island: align_core::MediaTime::seconds(5.0),
+                            },
+                            align_core::MappingPoint {
+                                source: clip.duration,
+                                island: align_core::MediaTime::seconds(15.0),
+                            },
+                        ],
+                    },
+                    confidence: 0.9,
+                }],
+            }],
+            unmatched: Vec::new(),
+            matches: Vec::new(),
+            temporal_policy: Default::default(),
+        };
+
+        let source = clip("/media/camera.mov");
+        let mut data = AppData::default();
+        data.apply_result(result(source.clone()));
+        data.review_session.overrides.insert(
+            source.id.clone(),
+            align_core::ManualPlacementOverride::for_clip(&source, 30.0),
+        );
+
+        data.apply_result(result(source));
+        assert_eq!(data.review_session.overrides.len(), 1);
+        assert!(data.review_issues.is_empty());
+        assert_eq!(data.lanes[0].clips[0].start, 30.0);
+
+        data.apply_result(result(clip("/media/replaced-camera.mov")));
+        assert_eq!(data.review_session.overrides.len(), 1);
+        assert_eq!(data.lanes[0].clips[0].start, 0.0);
+        assert!(data.review_issues.iter().any(|issue| {
+            issue.clip_id == Some(ClipId::new("camera"))
+                && issue.reason == align_core::ReviewValidationReason::StaleClipIdentity
+        }));
     }
 
     #[test]

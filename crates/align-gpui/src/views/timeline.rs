@@ -13,6 +13,29 @@ pub(super) fn timeline_preview(
     active: bool,
 ) -> impl IntoElement {
     let mut root = div().flex().flex_col().bg(rgb(theme.bg)).overflow_hidden();
+    if !data.review_issues.is_empty() {
+        let details = data
+            .review_issues
+            .iter()
+            .map(|issue| {
+                let clip = issue
+                    .clip_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "review session".to_string());
+                format!("{clip}: {:?}", issue.reason)
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        root = root.child(
+            div()
+                .px_3()
+                .py_1()
+                .text_xs()
+                .text_color(rgb(theme.warning))
+                .child(format!("Review placement needs attention: {details}")),
+        );
+    }
     // Lanes (the header row with zoom controls lives in the unified
     // toolbar now).
     root = root.child(timeline_lanes(

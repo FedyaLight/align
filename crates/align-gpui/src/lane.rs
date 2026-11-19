@@ -185,8 +185,22 @@ pub fn provisional_bars(
 /// This keeps timestamp/timecode placement, gaps and overlaps identical in
 /// the UI and the NLE output.
 pub fn final_bars(result: &align_core::SyncResult) -> FinalTimeline {
+    final_bars_with_review(result, &align_core::ReviewSession::default())
+}
+
+pub fn final_bars_with_review(
+    result: &align_core::SyncResult,
+    review_session: &align_core::ReviewSession,
+) -> FinalTimeline {
     let unmatched: HashSet<ClipId> = result.unmatched.iter().cloned().collect();
-    let Ok(timeline) = ExportTimeline::from_result(result, true) else {
+    let Ok(timeline) = ExportTimeline::from_result_with_options(
+        result,
+        align_core::export_model::ExportAssemblyOptions {
+            review_session: review_session.clone(),
+            unmatched: align_core::export_model::UnmatchedPlacement::ByOrderAndTime,
+            ..Default::default()
+        },
+    ) else {
         return FinalTimeline {
             bars: Vec::new(),
             states: Vec::new(),
