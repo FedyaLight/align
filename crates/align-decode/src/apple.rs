@@ -480,6 +480,39 @@ static WINDOW_READERS: std::sync::LazyLock<WindowReaders> =
     std::sync::LazyLock::new(Default::default);
 const WINDOW_LIMIT: usize = 4;
 
+// A refine worker requests one window at a time. Reuse its native reader
+// thread for the next request, and close the channel when that caller exits.
+// After a timeout the caller drops its sender rather than queuing work behind
+// a stalled AVAssetReader. The global reservation still bounds late readers.
+type WindowTask = Box<dyn FnOnce() + Send>;
+thread_local! {
+    static WINDOW_WORKER: std::cell::RefCell<Option<mpsc::Sender<WindowTask>>> = const { std::cell::RefCell::new(None) };
+}
+fn submit_window(task: WindowTask) -> Option<()> {
+    WINDOW_WORKER.with_borrow_mut(|worker| {
+        let task = if let Some(sender) = worker {
+            match sender.send(task) {
+                Ok(()) => return Some(()),
+                Err(error) => error.0,
+            }
+        } else {
+            task
+        };
+        let (send, receive) = mpsc::channel::<WindowTask>();
+        std::thread::Builder::new()
+            .name("align-avfoundation-window".into())
+            .spawn(move || {
+                for task in receive {
+                    objc2::rc::autoreleasepool(|_| task());
+                }
+            })
+            .ok()?;
+        send.send(task).ok()?;
+        *worker = Some(send);
+        Some(())
+    })
+}
+
 impl WindowReaders {
     fn within<T: Send + 'static>(
         &self,
@@ -511,17 +544,15 @@ impl WindowReaders {
         };
         let worker = read.clone();
         let (tx, rx) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("align-avfoundation-window".into())
-            .spawn(move || {
-                let result = work();
-                drop(worker);
-                let _ = tx.send(result);
-            })
-            .ok()?;
+        submit_window(Box::new(move || {
+            let result = work();
+            drop(worker);
+            let _ = tx.send(result);
+        }))?;
         match rx.recv_timeout(limit) {
             Ok(result) => Some(result),
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                WINDOW_WORKER.with_borrow_mut(Option::take);
                 read.timed_out.store(true, Ordering::Relaxed);
                 eprintln!(
                     "warning: AVFoundation timed out reading {}; using portable decoding",

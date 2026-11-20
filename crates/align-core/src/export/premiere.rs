@@ -17,6 +17,7 @@
 //! reference them by `masterclipid` and file id.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 use std::path::PathBuf;
 
 use super::model::{
@@ -226,10 +227,8 @@ pub fn combine_project_documents(
             .ok_or("Premiere document has unterminated project children")?;
         let children = prefix_document_ids(&document[start..end], &format!("s{}-", index + 1));
         if media_bins {
-            xml += &format!(
-                "      <bin>\n        <name>{}</name>\n        <children>\n{children}        </children>\n      </bin>\n",
-                xml_text::escape(name)
-            );
+            writeln!(xml, "      <bin>\n        <name>{}</name>\n        <children>\n{children}        </children>\n      </bin>",
+                xml_text::escape(name)).unwrap();
         } else {
             xml += &children;
         }
@@ -328,16 +327,16 @@ impl Document {
             ""
         };
         let mut xml = format!("      <sequence id=\"{id}\"{exploded}>\n");
-        xml += &format!("        <name>{}</name>\n", xml_text::escape(&name));
-        xml += &format!(
+        writeln!(xml, "        <name>{}</name>", xml_text::escape(&name)).unwrap();
+        write!(
+            xml,
             "        <duration>{duration}</duration>\n{}",
             rate.xml("        ")
-        );
-        xml += &format!(
-            "        <timecode>\n          <string>01:00:00:00</string>\n          <frame>{}</frame>\n          <displayformat>NDF</displayformat>\n{}        </timecode>\n",
+        )
+        .unwrap();
+        writeln!(xml, "        <timecode>\n          <string>01:00:00:00</string>\n          <frame>{}</frame>\n          <displayformat>NDF</displayformat>\n{}        </timecode>",
             rate.timebase * 3_600,
-            rate.xml("          ")
-        );
+            rate.xml("          ")).unwrap();
         let width = island
             .clips
             .iter()
@@ -350,10 +349,8 @@ impl Document {
             .filter_map(|i| i.clip.video.as_ref().map(|v| v.height))
             .next()
             .unwrap_or(1080);
-        xml += &format!(
-            "        <media>\n          <video>\n            <format><samplecharacteristics>\n{}              <width>{width}</width>\n              <height>{height}</height>\n              <pixelaspectratio>square</pixelaspectratio>\n              <fielddominance>none</fielddominance>\n            </samplecharacteristics></format>\n",
-            rate.xml("              ")
-        );
+        writeln!(xml, "        <media>\n          <video>\n            <format><samplecharacteristics>\n{}              <width>{width}</width>\n              <height>{height}</height>\n              <pixelaspectratio>square</pixelaspectratio>\n              <fielddominance>none</fielddominance>\n            </samplecharacteristics></format>",
+            rate.xml("              ")).unwrap();
 
         let video_tracks = tracks_for(&video_entries, MediaKind::Video);
         let audio_tracks = tracks_for(&audio_entries, MediaKind::Audio);
@@ -381,15 +378,11 @@ impl Document {
                 .next()
                 .unwrap_or(24)
         };
-        xml += &format!(
-            "          </video>\n          <audio>\n            <format><samplecharacteristics><depth>{audio_depth}</depth><samplerate>48000</samplerate></samplecharacteristics></format>\n"
-        );
+        writeln!(xml, "          </video>\n          <audio>\n            <format><samplecharacteristics><depth>{audio_depth}</depth><samplerate>48000</samplerate></samplecharacteristics></format>").unwrap();
         if stereo {
             xml += "            <numOutputChannels>2</numOutputChannels>\n            <outputs>\n";
             for channel in 1..=2 {
-                xml += &format!(
-                    "              <group><index>{channel}</index><numchannels>1</numchannels><downmix>0</downmix><channel><index>{channel}</index></channel></group>\n"
-                );
+                writeln!(xml, "              <group><index>{channel}</index><numchannels>1</numchannels><downmix>0</downmix><channel><index>{channel}</index></channel></group>").unwrap();
             }
             xml += "            </outputs>\n";
         }
@@ -442,13 +435,19 @@ impl Document {
         let locked = track
             .first()
             .is_some_and(|e| e.item.is_track_locked(media_type));
-        xml += &format!(
-            "              <enabled>{}</enabled><locked>{}</locked>\n",
+        writeln!(
+            xml,
+            "              <enabled>{}</enabled><locked>{}</locked>",
             tf(enabled),
             tf(locked)
-        );
+        )
+        .unwrap();
         if let Some(channel) = stereo {
-            xml += &format!("              <outputchannelindex>{channel}</outputchannelindex>\n");
+            writeln!(
+                xml,
+                "              <outputchannelindex>{channel}</outputchannelindex>"
+            )
+            .unwrap();
         }
         xml += "            </track>\n";
         xml
@@ -794,50 +793,6 @@ fn lanes_for<'a>(entries: &[TrackEntry<'a>], media_type: MediaKind) -> Vec<Vec<T
             base
         }
     };
-    // Clips joined by transitions, channel by channel, stay on one track as
-    // a chain; the others are packed.
-    let position: HashMap<(&str, usize), usize> = entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            (
-                (entry.item.instance_id.as_str(), entry.source_channel),
-                index,
-            )
-        })
-        .collect();
-    let next: Vec<Option<usize>> = entries
-        .iter()
-        .map(|entry| {
-            let t = entry.item.transition_for(media_type)?;
-            position
-                .get(&(t.right_instance_id.as_str(), entry.source_channel))
-                .copied()
-        })
-        .collect();
-    let mut chained = vec![false; entries.len()];
-    let mut forced: Vec<Vec<TrackEntry<'a>>> = Vec::new();
-    for head in (0..entries.len()).filter(|&i| next[i].is_some() && !next.contains(&Some(i))) {
-        let mut chain = vec![head];
-        while let Some(following) = next[*chain.last().unwrap()].filter(|f| !chain.contains(f)) {
-            chain.push(following);
-        }
-        for &index in &chain {
-            chained[index] = true;
-        }
-        forced.push(chain.into_iter().map(|index| entries[index]).collect());
-    }
-    forced.sort_by(|a, b| {
-        a[0].item
-            .timeline_start(media_type)
-            .total_cmp(&b[0].item.timeline_start(media_type))
-    });
-    let allocatable: Vec<TrackEntry<'a>> = entries
-        .iter()
-        .zip(&chained)
-        .filter(|(_, chained)| !**chained)
-        .map(|(entry, _)| *entry)
-        .collect();
     // Where an entry plays on the timeline.
     let content = |entry: &TrackEntry<'a>| {
         let item = entry.item;
@@ -852,9 +807,12 @@ fn lanes_for<'a>(entries: &[TrackEntry<'a>], media_type: MediaKind) -> Vec<Vec<T
         (item.timeline_start(media_type), duration)
     };
 
-    let requests: Vec<TimelineTrackRequest> = allocatable
-        .iter()
-        .map(|entry| {
+    super::lanes::allocate_entries(
+        entries,
+        media_type,
+        super::lanes::Format::Premiere,
+        |entry| (entry.item, entry.source_channel),
+        |entry| {
             let item = entry.item;
             let (start, duration) = content(entry);
             TimelineTrackRequest::new(
@@ -863,42 +821,8 @@ fn lanes_for<'a>(entries: &[TrackEntry<'a>], media_type: MediaKind) -> Vec<Vec<T
                 start,
                 duration,
             )
-        })
-        .collect();
-    let assignments = allocate(&requests);
-    let mut by_lane: HashMap<usize, Vec<TrackEntry<'a>>> = HashMap::new();
-    for entry in allocatable {
-        let id = format!(
-            "{}#{media_type}#{}",
-            entry.item.instance_id, entry.source_channel
-        );
-        by_lane
-            .entry(assignments.get(&id).copied().unwrap_or(0))
-            .or_default()
-            .push(entry);
-    }
-    let mut lanes: Vec<usize> = by_lane.keys().copied().collect();
-    lanes.sort_unstable();
-    let mut allocated: Vec<Vec<TrackEntry<'a>>> = lanes
-        .into_iter()
-        .map(|lane| {
-            let mut track = by_lane.remove(&lane).unwrap_or_default();
-            track.sort_by(|a, b| {
-                a.item
-                    .timeline_start(media_type)
-                    .total_cmp(&b.item.timeline_start(media_type))
-                    .then_with(|| {
-                        let fa = a.item.clip.url.file_name();
-                        let fb = b.item.clip.url.file_name();
-                        fa.cmp(&fb)
-                    })
-                    .then_with(|| a.source_channel.cmp(&b.source_channel))
-            });
-            track
-        })
-        .collect();
-    forced.append(&mut allocated);
-    forced
+        },
+    )
 }
 
 impl Document {
@@ -1062,40 +986,42 @@ impl Document {
         };
         let mut xml = format!("              <clipitem id=\"{id}\"{channel_type}>\n");
         if let Some(master) = self.master_clips.get(&media.resource_key) {
-            xml += &format!("                <masterclipid>{master}</masterclipid>\n");
+            writeln!(xml, "                <masterclipid>{master}</masterclipid>").unwrap();
         }
-        xml += &format!(
-            "                <name>{name}</name>\n                <enabled>{}</enabled>\n                <duration>{clip_duration}</duration>\n",
-            tf(item.is_enabled(media_type))
-        );
+        writeln!(xml, "                <name>{name}</name>\n                <enabled>{}</enabled>\n                <duration>{clip_duration}</duration>",
+            tf(item.is_enabled(media_type))).unwrap();
         xml += &item_rate.xml("                ");
-        xml += &format!(
-            "                <start>{}</start>\n                <end>{}</end>\n                <in>{source_in}</in>\n                <out>{source_out}</out>\n",
+        writeln!(xml, "                <start>{}</start>\n                <end>{}</end>\n                <in>{source_in}</in>\n                <out>{source_out}</out>",
             if transition_before { -1 } else { start },
-            if transition_after { -1 } else { end }
-        );
+            if transition_after { -1 } else { end }).unwrap();
         if media_type == MediaKind::Audio && format == TimelineExportFormat::PremiereXML {
             let subframes = super::model::subframe_offset_80(ahead.max(0.0));
             if subframes != 0 {
-                xml += &format!("                <subframeoffset>{subframes}</subframeoffset>\n");
+                writeln!(
+                    xml,
+                    "                <subframeoffset>{subframes}</subframeoffset>"
+                )
+                .unwrap();
             }
         }
         for link in links {
-            xml += &format!(
+            write!(
+                xml,
                 "                <link><linkclipref>{}</linkclipref>",
                 link.clip_item_id
-            );
+            )
+            .unwrap();
             if let Some(mt) = link.media_type {
-                xml += &format!("<mediatype>{mt}</mediatype>");
+                write!(xml, "<mediatype>{mt}</mediatype>").unwrap();
             }
             if let Some(t) = link.track_index {
-                xml += &format!("<trackindex>{t}</trackindex>");
+                write!(xml, "<trackindex>{t}</trackindex>").unwrap();
             }
             if let Some(c) = link.clip_index {
-                xml += &format!("<clipindex>{c}</clipindex>");
+                write!(xml, "<clipindex>{c}</clipindex>").unwrap();
             }
             if let Some(g) = link.group_index {
-                xml += &format!("<groupindex>{g}</groupindex>");
+                write!(xml, "<groupindex>{g}</groupindex>").unwrap();
             }
             xml += "</link>\n";
         }
@@ -1103,13 +1029,11 @@ impl Document {
             let stereo = self.stereo_files.contains(&media.resource_key);
             xml += &file_block(item, media_type, &media, stereo);
         } else {
-            xml += &format!("                <file id=\"{file_id}\"/>\n");
+            writeln!(xml, "                <file id=\"{file_id}\"/>").unwrap();
         }
         if media_type == MediaKind::Audio {
-            xml += &format!(
-                "                <sourcetrack><mediatype>audio</mediatype><trackindex>{}</trackindex></sourcetrack>\n",
-                entry.source_channel
-            );
+            writeln!(xml, "                <sourcetrack><mediatype>audio</mediatype><trackindex>{}</trackindex></sourcetrack>",
+                entry.source_channel).unwrap();
         }
         if retimed {
             xml += &match item.fcp7_time_remap_xml(media_type).filter(|_| preserved) {
@@ -1136,10 +1060,10 @@ impl Document {
             };
         }
         if let Some(labels) = item.fcp7_labels_xml(media_type) {
-            xml += &format!("                {labels}\n");
+            writeln!(xml, "                {labels}").unwrap();
         }
         for filter in item.fcp7_filter_xmls(media_type) {
-            xml += &format!("                {filter}\n");
+            writeln!(xml, "                {filter}").unwrap();
         }
         xml += "              </clipitem>\n";
         xml
@@ -1172,12 +1096,14 @@ fn transition_item(t: &ExportTransition, rate: SequenceRate) -> String {
         }
     }
     let mut xml = "              <transitionitem>\n".to_string();
-    xml += &format!(
-        "                <start>{start}</start><end>{end}</end><alignment>{}</alignment>\n",
+    writeln!(
+        xml,
+        "                <start>{start}</start><end>{end}</end><alignment>{}</alignment>",
         xml_text::escape(&t.alignment)
-    );
+    )
+    .unwrap();
     xml += &rate.xml("                ");
-    xml += &format!("                {}\n", t.fcp7_effect_xml);
+    writeln!(xml, "                {}", t.fcp7_effect_xml).unwrap();
     xml += "              </transitionitem>\n";
     xml
 }
@@ -1260,26 +1186,18 @@ impl TimeRemap {
         }
         let mut xml = "                <filter><effect>\n".to_string();
         xml += "                  <name>Time Remap</name><effectid>timeremap</effectid><effectcategory>motion</effectcategory><effecttype>motion</effecttype>";
-        xml += &format!("<mediatype>{media_type}</mediatype>\n");
+        writeln!(xml, "<mediatype>{media_type}</mediatype>").unwrap();
         xml += "                  <parameter><parameterid>variablespeed</parameterid><name>variablespeed</name><valuemin>0</valuemin><valuemax>1</valuemax><value>0</value></parameter>\n";
-        xml += &format!(
-            "                  <parameter><parameterid>speed</parameterid><name>speed</name><valuemin>-100000</valuemin><valuemax>100000</valuemax><value>{}</value></parameter>\n",
-            xml_text::number(graph_slope * 100.0)
-        );
-        xml += &format!(
-            "                  <parameter><parameterid>reverse</parameterid><name>reverse</name><value>{}</value></parameter>\n",
-            if plays_backward { "TRUE" } else { "FALSE" }
-        );
+        writeln!(xml, "                  <parameter><parameterid>speed</parameterid><name>speed</name><valuemin>-100000</valuemin><valuemax>100000</valuemax><value>{}</value></parameter>",
+            xml_text::number(graph_slope * 100.0)).unwrap();
+        writeln!(xml, "                  <parameter><parameterid>reverse</parameterid><name>reverse</name><value>{}</value></parameter>",
+            if plays_backward { "TRUE" } else { "FALSE" }).unwrap();
         xml += "                  <parameter><parameterid>frameblending</parameterid><name>frameblending</name><value>FALSE</value></parameter>\n";
-        xml += &format!(
-            "                  <parameter><parameterid>graphdict</parameterid><name>graphdict</name><valuemin>0</valuemin><valuemax>{}</valuemax><value>0</value>\n",
-            xml_text::number(media_duration)
-        );
+        writeln!(xml, "                  <parameter><parameterid>graphdict</parameterid><name>graphdict</name><valuemin>0</valuemin><valuemax>{}</valuemax><value>0</value>",
+            xml_text::number(media_duration)).unwrap();
         for (when, value, flag) in keyframes {
-            xml += &format!(
-                "                    <keyframe><when>{when}</when><value>{}</value><speedvirtualkf>TRUE</speedvirtualkf><{flag}>TRUE</{flag}></keyframe>\n",
-                xml_text::number(value)
-            );
+            writeln!(xml, "                    <keyframe><when>{when}</when><value>{}</value><speedvirtualkf>TRUE</speedvirtualkf><{flag}>TRUE</{flag}></keyframe>",
+                xml_text::number(value)).unwrap();
         }
         xml += "                    <interpolation><name>FCPCurve</name></interpolation>\n                  </parameter>\n                </effect></filter>\n";
         xml
@@ -1518,34 +1436,30 @@ impl Document {
         for (index, (kind, channel)) in tracks.into_iter().enumerate() {
             if current != Some(kind) {
                 if let Some(previous) = current {
-                    xml += &format!("              </{previous}>\n");
+                    writeln!(xml, "              </{previous}>").unwrap();
                 }
-                xml += &format!("              <{kind}>\n");
+                writeln!(xml, "              <{kind}>").unwrap();
                 current = Some(kind);
             }
             let suffix = match kind {
                 MediaKind::Video => "v".to_string(),
                 MediaKind::Audio => format!("a{channel}"),
             };
-            xml += &format!(
-                "                <track>\n                  <clipitem id=\"{id}-{suffix}\">\n                    <masterclipid>{id}</masterclipid>\n                    <name>{name}</name>\n"
-            );
+            writeln!(xml, "                <track>\n                  <clipitem id=\"{id}-{suffix}\">\n                    <masterclipid>{id}</masterclipid>\n                    <name>{name}</name>").unwrap();
             xml += &media.rate.xml("                    ");
             if index == 0 && self.defined_files.insert(media.resource_key.clone()) {
                 let stereo = self.stereo_files.contains(&media.resource_key);
                 xml += &file_block(item, side, media, stereo);
             } else {
-                xml += &format!("                <file id=\"{}\"/>\n", media.file_id());
+                writeln!(xml, "                <file id=\"{}\"/>", media.file_id()).unwrap();
             }
             if kind == MediaKind::Audio {
-                xml += &format!(
-                    "                    <sourcetrack><mediatype>audio</mediatype><trackindex>{channel}</trackindex></sourcetrack>\n"
-                );
+                writeln!(xml, "                    <sourcetrack><mediatype>audio</mediatype><trackindex>{channel}</trackindex></sourcetrack>").unwrap();
             }
             xml += "                  </clipitem>\n                </track>\n";
         }
         if let Some(kind) = current {
-            xml += &format!("              </{kind}>\n");
+            writeln!(xml, "              </{kind}>").unwrap();
         }
         xml += "            </media>\n          </clip>\n";
         xml
@@ -1591,11 +1505,13 @@ fn file_block(item: &ExportItem, media_type: MediaKind, media: &MediaUse, stereo
     };
     if let Some(tc) = timecode {
         let source_rate = SequenceRate::new(tc.frame_duration);
-        xml += &format!(
-            "                  <timecode><string>{}</string><displayformat>{}</displayformat>\n",
+        writeln!(
+            xml,
+            "                  <timecode><string>{}</string><displayformat>{}</displayformat>",
             tc.text,
             if tc.drop_frame { "DF" } else { "NDF" }
-        );
+        )
+        .unwrap();
         xml += &source_rate.xml("                    ");
         xml += "                  </timecode>\n";
     } else if media_type == MediaKind::Video
@@ -1611,10 +1527,12 @@ fn file_block(item: &ExportItem, media_type: MediaKind, media: &MediaUse, stereo
             derived: false,
         };
         let source_rate = SequenceRate::new(fallback.frame_duration);
-        xml += &format!(
-            "                  <timecode><string>{}</string><displayformat>NDF</displayformat>\n",
+        writeln!(
+            xml,
+            "                  <timecode><string>{}</string><displayformat>NDF</displayformat>",
             fallback.text
-        );
+        )
+        .unwrap();
         xml += &source_rate.xml("                    ");
         xml += "                  </timecode>\n";
     }
@@ -1622,10 +1540,8 @@ fn file_block(item: &ExportItem, media_type: MediaKind, media: &MediaUse, stereo
     if media_type == MediaKind::Video
         && let Some(video) = &clip.video
     {
-        xml += &format!(
-            "<video><samplecharacteristics><width>{}</width><height>{}</height></samplecharacteristics></video>",
-            video.width, video.height
-        );
+        write!(xml, "<video><samplecharacteristics><width>{}</width><height>{}</height></samplecharacteristics></video>",
+            video.width, video.height).unwrap();
     }
     if let Some(audio) = clip.audio.first() {
         let depth = if media.is_prepared() {
@@ -1644,15 +1560,15 @@ fn file_block(item: &ExportItem, media_type: MediaKind, media: &MediaUse, stereo
             // description leaves every channel after the first silent, also
             // when Premiere opens the Resolve XML; Resolve reads either.
             for channel in 1..=audio.channels {
-                xml += &format!(
-                    "<audio>{characteristics}<channelcount>1</channelcount><audiochannel><sourcechannel>{channel}</sourcechannel></audiochannel></audio>"
-                );
+                write!(xml, "<audio>{characteristics}<channelcount>1</channelcount><audiochannel><sourcechannel>{channel}</sourcechannel></audiochannel></audio>").unwrap();
             }
         } else {
-            xml += &format!(
+            write!(
+                xml,
                 "<audio>{characteristics}<channelcount>{}</channelcount></audio>",
                 audio.channels
-            );
+            )
+            .unwrap();
         }
     }
     xml += "</media>\n                </file>\n";
