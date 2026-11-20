@@ -95,6 +95,15 @@ case "$(uname -s)" in
       patchelf --set-rpath '$ORIGIN' "$OUT_DIR/$soname"
     done
     for tool in ffmpeg ffprobe; do patchelf --set-rpath '$ORIGIN' "$OUT_DIR/$tool"; done
+    for binary in "$OUT_DIR/ffmpeg" "$OUT_DIR/ffprobe" "$OUT_DIR"/*.so.*; do
+      [[ "$(patchelf --print-rpath "$binary")" == '$ORIGIN' ]]
+      while read -r needed; do
+        case "$needed" in
+          libav*.so.*|libsw*.so.*) test -f "$OUT_DIR/$needed" ;;
+          */*) echo "Unexpected dependency path: $needed" >&2; exit 1 ;;
+        esac
+      done < <(patchelf --print-needed "$binary")
+    done
     ;;
 esac
 cp COPYING.LGPLv2.1 "$OUT_DIR/FFMPEG-LICENSE.txt"

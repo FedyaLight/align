@@ -140,10 +140,12 @@ def main():
             sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean',
             '--name', 'align-aaf',
             '--workpath', str(Path(temporary) / 'work'), '--specpath', temporary,
-            '--collect-all', 'aaf2',
-            # The bridge processes local files and hashes embedded essence with
-            # SHA-256. CPython supplies SHA-256 without its OpenSSL accelerator.
-            '--exclude-module', 'ssl', '--exclude-module', '_hashlib',
+            # aaf2 registers classes on import. Its model tables are modules,
+            # so shipping another set of their .py files as data is redundant.
+            '--collect-submodules', 'aaf2',
+            # Local AAF file operations use neither TLS nor shutil's optional
+            # archive formats. Keep _hashlib for accelerated essence hashing.
+            '--exclude-module', 'ssl', '--exclude-module', 'bz2', '--exclude-module', 'lzma',
         ]
         if windows:
             # A one-file build unpacks a Python runtime to %TEMP% and runs it
