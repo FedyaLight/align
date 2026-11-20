@@ -286,6 +286,7 @@ impl Track {
 
 #[derive(Clone, Debug)]
 pub struct Movie {
+    header_bytes: usize,
     pub timescale: u32,
     pub duration: u64,
     pub tracks: Vec<Track>,
@@ -294,6 +295,9 @@ pub struct Movie {
 }
 
 impl Movie {
+    pub(crate) fn small_header(&self) -> bool {
+        self.header_bytes <= 4 * 1024 * 1024
+    }
     pub fn duration_seconds(&self) -> f64 {
         if self.timescale == 0 {
             return 0.0;
@@ -464,7 +468,7 @@ pub(crate) fn shared_movie(path: &Path) -> Option<std::sync::Arc<Movie>> {
     let mut file = File::open(path).ok()?;
     let moov = read_moov(&mut file)?;
     let movie = Arc::new(read_movie(&mut file, &moov)?);
-    if moov.len() <= 4 * 1024 * 1024
+    if movie.small_header()
         && let Some(revision) = revision
         && align_core::cache::media_revision(path).ok().as_ref() == Some(&revision)
     {
@@ -800,6 +804,7 @@ pub(crate) fn parse_moov(moov: &[u8]) -> Option<Movie> {
         .map(|trak| parse_trak(trak.body))
         .collect::<Option<Vec<_>>>()?;
     Some(Movie {
+        header_bytes: moov.len(),
         timescale,
         duration,
         tracks,

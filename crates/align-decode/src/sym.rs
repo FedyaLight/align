@@ -213,6 +213,7 @@ pub fn inspect(path: &Path) -> Result<SymphoniaProbe, DecodeError> {
 }
 
 struct Stream {
+    cacheable: bool,
     pending_steps: std::collections::VecDeque<Step>,
     format: Box<dyn FormatReader>,
     track_id: u32,
@@ -362,6 +363,7 @@ fn open_stream(path: &Path, stream_index: usize) -> Result<Stream, DecodeError> 
         return Err(DecodeError::Symphonia("unknown audio format".into()));
     }
     Ok(Stream {
+        cacheable: movie.as_ref().is_some_and(|m| m.small_header()),
         pending_steps: Default::default(),
         format,
         track_id: track.id,
@@ -378,6 +380,22 @@ fn open_stream(path: &Path, stream_index: usize) -> Result<Stream, DecodeError> 
         last_frames: 0,
         last_channels: 0,
     })
+}
+
+/// Preserve opening silence and the first good packet for reads from the head.
+fn validate_opening(stream: &mut Stream) -> Result<(), DecodeError> {
+    for _ in 0..16 {
+        let step = read_packet(stream)?;
+        let decoded = matches!(step, Step::Decoded);
+        if matches!(step, Step::End) {
+            break;
+        }
+        stream.pending_steps.push_back(step);
+        if decoded {
+            return Ok(());
+        }
+    }
+    Err(DecodeError::Symphonia("no decodable opening packet".into()))
 }
 
 /// Can Symphonia decode this stream? Used to pick the decode tier *before*
@@ -416,20 +434,7 @@ impl AudioReader {
     pub(crate) fn validated(path: &Path, stream_index: usize) -> Result<Self, DecodeError> {
         let mut reader = Self::open(path, stream_index)?;
         if let Reader::Codec(stream) = &mut reader.0 {
-            // Keep initial damaged packet durations and the first good packet
-            // in decoder.last_decoded(). Replay them if reading from the head.
-            for _ in 0..16 {
-                let step = read_packet(stream)?;
-                let decoded = matches!(step, Step::Decoded);
-                if matches!(step, Step::End) {
-                    break;
-                }
-                stream.pending_steps.push_back(step);
-                if decoded {
-                    return Ok(reader);
-                }
-            }
-            return Err(DecodeError::Symphonia("no decodable opening packet".into()));
+            validate_opening(stream)?;
         }
         Ok(reader)
     }
@@ -504,7 +509,75 @@ pub fn decode_window(
     duration: f64,
     source: AudioAnalysisSource,
 ) -> Result<(f64, Vec<f32>), DecodeError> {
-    AudioReader::open(path, source.stream_index())?.decode_window(start, duration, source)
+    // Cache only seekable, non-fragmented ISO audio. A checked-out reader
+    // belongs to this call exclusively. Reopen at the head, where a seek can
+    // discard encoder priming or an opening damaged packet.
+    if !is_iso_media(path) || start < 1.0 {
+        return AudioReader::open(path, source.stream_index())?
+            .decode_window(start, duration, source);
+    }
+    if let Some(reader) = AudioReader::pcm(path, source.stream_index()) {
+        return reader.decode_window(start, duration, source);
+    }
+    struct Cached {
+        path: std::path::PathBuf,
+        revision: String,
+        index: usize,
+        stream: Box<Stream>,
+    }
+    static IDLE: std::sync::Mutex<std::collections::VecDeque<Cached>> =
+        std::sync::Mutex::new(std::collections::VecDeque::new());
+    let index = source.stream_index();
+    let revision = align_core::cache::media_revision(path).ok();
+    let cached = revision.as_ref().and_then(|rev| {
+        let mut idle = IDLE.lock().unwrap();
+        let pos = idle
+            .iter()
+            .position(|c| c.path == path && c.index == index && c.revision == *rev)?;
+        idle.remove(pos)
+    });
+    let mut stream = match cached {
+        Some(cached) => cached.stream,
+        None => Box::new(open_stream(path, index)?),
+    };
+    if stream.decoder.codec_params().codec != symphonia::core::codecs::CODEC_TYPE_AAC
+        || !stream.cacheable
+    {
+        return AudioReader(Reader::Codec(stream)).decode_window(start, duration, source);
+    }
+    // Use the opening packet, even when the requested window starts much
+    // later: a decoded AAC core may silently omit HE-AAC extension samples.
+    if !stream.timing_checked {
+        validate_opening(&mut stream)?;
+    }
+    // Decoder reset does not initialize all AAC state (e.g. its noise
+    // generator). Keep the expensive container tables; start a fresh codec.
+    stream.decoder = symphonia::default::get_codecs()
+        .make(stream.decoder.codec_params(), &Default::default())
+        .map_err(symphonia_error)?;
+    let actual_start = start.max(0.0);
+    if (actual_start * stream.sample_rate as f64).round() as u64
+        <= stream.preroll.saturating_sub(stream.lead)
+    {
+        return AudioReader::open(path, index)?.decode_window(start, duration, source);
+    }
+    let result = codec_window(&mut stream, actual_start, duration, source)?;
+    if let Some(revision) = revision
+        && stream.timing_checked
+        && align_core::cache::media_revision(path).ok().as_ref() == Some(&revision)
+    {
+        let mut idle = IDLE.lock().unwrap();
+        if idle.len() == 4 {
+            idle.pop_front();
+        }
+        idle.push_back(Cached {
+            path: path.to_owned(),
+            revision,
+            index,
+            stream,
+        });
+    }
+    Ok(result)
 }
 
 impl AudioReader {
@@ -541,41 +614,51 @@ impl AudioReader {
             }
             Reader::Codec(stream) => stream,
         };
-        let mut skip = position(&mut stream, actual_start)?;
-        let explicit = source.selected_channel();
-        // Shared collection: the closure owns the mutable borrow for the pipe's
-        // lifetime, so length checks go through the cell (windows are small).
-        let samples = std::cell::RefCell::new(Vec::with_capacity(want.min(16_000 * 12)));
-        let mut pipe = crate::mono::MonoPipe::new(
-            stream.sample_rate as f64,
-            16_000.0,
-            stream.channels,
-            explicit,
-            source.mixes_channels(),
-            |s: &[f32]| {
-                samples.borrow_mut().extend_from_slice(s);
-                Ok(())
-            },
-        )?;
-        // Pre-roll and seek-packet lead are discarded: the window starts at the
-        // requested sample.
-        loop {
-            if samples.borrow().len() >= want {
-                break;
-            }
-            match decode_packet_planes(&mut stream)? {
-                None => break,
-                Some(mut planes) => {
-                    trim_native_packet(&mut planes, &mut skip, None);
-                    pipe.push_owned(&planes)?;
-                }
+        codec_window(&mut stream, actual_start, duration, source)
+    }
+}
+
+fn codec_window(
+    stream: &mut Stream,
+    actual_start: f64,
+    duration: f64,
+    source: AudioAnalysisSource,
+) -> Result<(f64, Vec<f32>), DecodeError> {
+    let want = (duration * 16_000.0).ceil() as usize + 64;
+    let mut skip = position(stream, actual_start)?;
+    let explicit = source.selected_channel();
+    // Shared collection: the closure owns the mutable borrow for the pipe's
+    // lifetime, so length checks go through the cell (windows are small).
+    let samples = std::cell::RefCell::new(Vec::with_capacity(want.min(16_000 * 12)));
+    let mut pipe = crate::mono::MonoPipe::new(
+        stream.sample_rate as f64,
+        16_000.0,
+        stream.channels,
+        explicit,
+        source.mixes_channels(),
+        |s: &[f32]| {
+            samples.borrow_mut().extend_from_slice(s);
+            Ok(())
+        },
+    )?;
+    // Pre-roll and seek-packet lead are discarded: the window starts at the
+    // requested sample.
+    loop {
+        if samples.borrow().len() >= want {
+            break;
+        }
+        match decode_packet_planes(stream)? {
+            None => break,
+            Some(mut planes) => {
+                trim_native_packet(&mut planes, &mut skip, None);
+                pipe.push_owned(&planes)?;
             }
         }
-        pipe.finish()?;
-        let mut samples = samples.into_inner();
-        samples.truncate(want);
-        Ok((actual_start, samples))
     }
+    pipe.finish()?;
+    let mut samples = samples.into_inner();
+    samples.truncate(want);
+    Ok((actual_start, samples))
 }
 
 /// Decode one packet into owned planar f32 channels. Owned (not borrowed)
@@ -1149,6 +1232,8 @@ mod damaged_packet_tests {
             return;
         };
         assert!(can_decode(&clip, 0));
+        // A successful later window can leave an idle demuxer for this path.
+        decode_window(&clip, 1.0, 0.5, AudioAnalysisSource::default()).unwrap();
         double_packet_durations(&clip);
         assert!(!can_decode(&clip, 0), "FFmpeg decodes it");
         let error = decode_window(&clip, 1.0, 1.0, AudioAnalysisSource::default()).unwrap_err();
