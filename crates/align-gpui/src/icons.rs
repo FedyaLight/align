@@ -5,18 +5,11 @@
 //! silhouettes. They paint as monochrome sprites tinted through
 //! `text_color`, so one asset serves both system appearances.
 //!
-//! Assets are written to the OS temp dir on first use (keyed by content):
-//! no packaging layout to keep in sync, works from `cargo run` and from
-//! the bundled `.app` alike.
-
 use std::borrow::Cow;
-use std::sync::OnceLock;
 
 use gpui::{
     AssetSource, IntoElement, ParentElement, Result, SharedString, Styled, div, px, rgb, svg,
 };
-
-const ICON_VERSION: &str = "v2";
 
 /// Film strip (video clips).
 const FILM: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path fill="white" fill-rule="evenodd" d="M1 2h14v12H1V2zM2.5 4h2v2h-2V4zm0 3h2v2h-2V7zm0 3h2v2h-2v-2zm9 0h2v2h-2v-2zm0-3h2v2h-2V7zm0-3h2v2h-2V4z"/></svg>"#;
@@ -69,131 +62,39 @@ const FOLDER: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 
 /// Heart used for the support (donation) action.
 const HEART: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M8 13.4S2.2 10.1 2.2 5.8A2.9 2.9 0 0 1 8 5.2a2.9 2.9 0 0 1 5.8.6C13.8 10.1 8 13.4 8 13.4z" fill="none" stroke="white" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
 
-pub struct IconPaths {
-    pub app: String,
-    pub film: String,
-    pub waveform: String,
-    pub plus: String,
-    pub check: String,
-    pub warn: String,
-    pub fit: String,
-    pub zoom_in: String,
-    pub zoom_out: String,
-    pub chevron_down: String,
-    pub chevron_right: String,
-    pub close: String,
-    pub reset: String,
-    pub trash: String,
-    pub drop: String,
-    pub github: String,
-    pub folder: String,
-    pub heart: String,
-}
+pub struct EmbeddedAssets;
 
-static CACHE: OnceLock<IconPaths> = OnceLock::new();
+pub const APP_ICON: &str = "icons/app-icon.png";
 
-/// Filesystem asset source: GPUI's default source loads nothing, so SVG
-/// icons need this registered via `Application::with_assets`, otherwise
-/// every `svg()` element paints empty (no error surfaced in the UI).
-pub struct FileAssets;
-
-impl AssetSource for FileAssets {
+impl AssetSource for EmbeddedAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        match std::fs::read(path) {
-            Ok(bytes) => Ok(Some(Cow::Owned(bytes))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
-        }
+        let bytes: &[u8] = match path {
+            APP_ICON => include_bytes!("app-icon.png"),
+            "icons/film.svg" => FILM.as_bytes(),
+            "icons/waveform.svg" => WAVEFORM.as_bytes(),
+            "icons/plus.svg" => PLUS.as_bytes(),
+            "icons/check.svg" => CHECK.as_bytes(),
+            "icons/warn.svg" => WARN.as_bytes(),
+            "icons/fit.svg" => FIT.as_bytes(),
+            "icons/zoom-in.svg" => ZOOM_IN.as_bytes(),
+            "icons/zoom-out.svg" => ZOOM_OUT.as_bytes(),
+            "icons/chevron-down.svg" => CHEVRON_DOWN.as_bytes(),
+            "icons/chevron-right.svg" => CHEVRON_RIGHT.as_bytes(),
+            "icons/close.svg" => CLOSE.as_bytes(),
+            "icons/reset.svg" => RESET.as_bytes(),
+            "icons/trash.svg" => TRASH.as_bytes(),
+            "icons/drop.svg" => DROP.as_bytes(),
+            "icons/github.svg" => GITHUB.as_bytes(),
+            "icons/folder.svg" => FOLDER.as_bytes(),
+            "icons/heart.svg" => HEART.as_bytes(),
+            _ => return Ok(None),
+        };
+        Ok(Some(Cow::Borrowed(bytes)))
     }
 
     fn list(&self, _path: &str) -> Result<Vec<SharedString>> {
         Ok(Vec::new())
     }
-}
-
-/// Absolute asset paths, materialized once per process.
-pub fn icons() -> &'static IconPaths {
-    let paths = CACHE.get_or_init(|| {
-        let dir = asset_dir();
-        write_all(&dir);
-        paths_for(&dir)
-    });
-    // Self-heal after external deletion: quit-time cleanup (possibly from
-    // another process run) shares the same versioned dir. One stat call
-    // in the common case.
-    if !asset_dir().is_dir() {
-        let dir = asset_dir();
-        write_all(&dir);
-    }
-    paths
-}
-
-fn asset_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("align-icons-{ICON_VERSION}"))
-}
-
-fn paths_for(dir: &std::path::Path) -> IconPaths {
-    let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
-    IconPaths {
-        app: path("app-icon.png"),
-        film: path("film.svg"),
-        waveform: path("waveform.svg"),
-        plus: path("plus.svg"),
-        check: path("check.svg"),
-        warn: path("warn.svg"),
-        fit: path("fit.svg"),
-        zoom_in: path("zoom-in.svg"),
-        zoom_out: path("zoom-out.svg"),
-        chevron_down: path("chevron-down.svg"),
-        chevron_right: path("chevron-right.svg"),
-        close: path("close.svg"),
-        reset: path("reset.svg"),
-        trash: path("trash.svg"),
-        drop: path("drop.svg"),
-        github: path("github.svg"),
-        folder: path("folder.svg"),
-        heart: path("heart.svg"),
-    }
-}
-
-fn write_all(dir: &std::path::Path) {
-    let _ = std::fs::create_dir_all(dir);
-    let app_icon = include_bytes!("../../../Support/AppIcon.png");
-    let app_icon_path = dir.join("app-icon.png");
-    if !std::fs::read(&app_icon_path).is_ok_and(|current| current == app_icon) {
-        let _ = std::fs::write(app_icon_path, app_icon);
-    }
-    let write = |name: &str, svg: &str| {
-        let path = dir.join(name);
-        let current = std::fs::read_to_string(&path).unwrap_or_default();
-        if current != svg {
-            let _ = std::fs::write(&path, svg);
-        }
-    };
-    write("film.svg", FILM);
-    write("waveform.svg", WAVEFORM);
-    write("plus.svg", PLUS);
-    write("check.svg", CHECK);
-    write("warn.svg", WARN);
-    write("fit.svg", FIT);
-    write("zoom-in.svg", ZOOM_IN);
-    write("zoom-out.svg", ZOOM_OUT);
-    write("chevron-down.svg", CHEVRON_DOWN);
-    write("chevron-right.svg", CHEVRON_RIGHT);
-    write("close.svg", CLOSE);
-    write("reset.svg", RESET);
-    write("trash.svg", TRASH);
-    write("drop.svg", DROP);
-    write("github.svg", GITHUB);
-    write("folder.svg", FOLDER);
-    write("heart.svg", HEART);
-}
-
-/// Remove the materialized icon assets (quit-time cleanup: no traces).
-pub fn cleanup() {
-    let _ = std::fs::remove_dir_all(asset_dir());
-    // Remove the only legacy bundle used before quit cleanup was added.
-    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("align-icons-v1"));
 }
 
 /// A tinted monochrome icon. The tint is set on the `svg` element
@@ -210,9 +111,9 @@ pub fn svg_icon(path: impl Into<SharedString>, size_px: f32, color: u32) -> impl
 /// Icon + optional label badge for media kinds (source rows, bars).
 pub fn kind_badge(video: bool, color: u32, with_label: Option<&str>) -> impl IntoElement {
     let path = if video {
-        icons().film.clone()
+        "icons/film.svg"
     } else {
-        icons().waveform.clone()
+        "icons/waveform.svg"
     };
     let mut row = div().flex().flex_row().items_center().gap_1();
     row = row.child(div().child(svg_icon(path, 13.0, color)));
@@ -225,69 +126,28 @@ pub fn kind_badge(video: bool, color: u32, with_label: Option<&str>) -> impl Int
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// The cleanup test deletes the shared asset dir; serialize the
-    /// icons tests so no reader races it.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    struct TestCleanup;
-
-    impl Drop for TestCleanup {
-        fn drop(&mut self) {
-            cleanup();
-        }
-    }
-
-    #[test]
-    fn cleanup_removes_materialized_assets() {
-        let _guard = TEST_LOCK.lock().unwrap();
-        let _cleanup = TestCleanup;
-        let dir = asset_dir();
-        let _ = icons();
-        assert!(dir.is_dir());
-        cleanup();
-        assert!(!dir.exists());
-        let _ = icons();
-        assert!(dir.is_dir());
-    }
-
-    #[test]
-    fn file_assets_serve_written_icons() {
-        let _guard = TEST_LOCK.lock().unwrap();
-        let _cleanup = TestCleanup;
-        let body = FileAssets
-            .load(&icons().plus)
-            .expect("readable")
-            .expect("present");
-        assert!(body.starts_with(b"<svg"));
-    }
-
     #[test]
     fn icons_parse_with_the_renderer_and_stay_monochrome() {
-        let _guard = TEST_LOCK.lock().unwrap();
-        let _cleanup = TestCleanup;
         // `SvgRenderer::render_pixmap` calls `Tree::from_data` with default
         // options; anything failing here would paint empty in the UI.
-        let _ = icons();
         let options = usvg::Options::default();
         for path in [
-            &icons().film,
-            &icons().waveform,
-            &icons().plus,
-            &icons().check,
-            &icons().warn,
-            &icons().fit,
-            &icons().zoom_in,
-            &icons().zoom_out,
-            &icons().chevron_down,
-            &icons().chevron_right,
-            &icons().close,
-            &icons().reset,
-            &icons().trash,
-            &icons().drop,
+            "icons/film.svg",
+            "icons/waveform.svg",
+            "icons/plus.svg",
+            "icons/check.svg",
+            "icons/warn.svg",
+            "icons/fit.svg",
+            "icons/zoom-in.svg",
+            "icons/zoom-out.svg",
+            "icons/chevron-down.svg",
+            "icons/chevron-right.svg",
+            "icons/close.svg",
+            "icons/reset.svg",
+            "icons/trash.svg",
+            "icons/drop.svg",
         ] {
-            let bytes = std::fs::read(path).expect("icon asset written");
+            let bytes = EmbeddedAssets.load(path).unwrap().expect("embedded icon");
             let tree = usvg::Tree::from_data(&bytes, &options)
                 .unwrap_or_else(|error| panic!("{path} rejected by usvg: {error}"));
             assert!(

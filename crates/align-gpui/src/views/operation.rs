@@ -18,7 +18,7 @@ pub(super) fn warning_banner(
         .px_5()
         .py_1()
         .bg(rgba((theme.warning << 8) | 0x14))
-        .child(svg_icon(icons().warn.clone(), 14.0, theme.orange))
+        .child(svg_icon("icons/warn.svg", 14.0, theme.orange))
         .child(format!(
             "{} media warning{}",
             n,
@@ -77,10 +77,11 @@ pub(super) fn operation_bar(
     active: bool,
 ) -> Div {
     use crate::state::Operation;
-    let busy = matches!(
-        data.operation,
-        Operation::Synchronizing | Operation::Exporting | Operation::Repairing
-    );
+    let busy = data.importing()
+        || matches!(
+            data.operation,
+            Operation::Synchronizing | Operation::Exporting | Operation::Repairing
+        );
     let mut bar = div()
         .flex()
         .flex_row()
@@ -96,9 +97,9 @@ pub(super) fn operation_bar(
     if matches!(data.operation, Operation::Ready) && data.has_result() && !data.is_stale() {
         // A check only for complete success; partial results get a warning.
         bar = bar.child(if data.unmatched_count() == 0 {
-            svg_icon(icons().check.clone(), 14.0, theme.green)
+            svg_icon("icons/check.svg", 14.0, theme.green)
         } else {
-            svg_icon(icons().warn.clone(), 14.0, theme.orange)
+            svg_icon("icons/warn.svg", 14.0, theme.orange)
         });
     }
     // Status + progress.
@@ -110,7 +111,11 @@ pub(super) fn operation_bar(
             .text_size(px(12.))
             .gap_1();
         if !(data.show_export && matches!(data.operation, Operation::Exported)) {
-            status = status.child(data.status.clone());
+            status = status.child(if data.importing() {
+                "Reading inputs…".to_owned()
+            } else {
+                data.status.clone()
+            });
         }
         if busy {
             let fill = div().h_full().rounded_full().bg(rgb(theme.accent));
@@ -142,7 +147,7 @@ pub(super) fn operation_bar(
             cx,
             theme,
             "btn-cancel",
-            icons().close.clone(),
+            "icons/close.svg",
             "Cancel",
             true,
             |this, _, _, cx| this.cancel_current(cx),

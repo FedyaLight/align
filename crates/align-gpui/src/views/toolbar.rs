@@ -18,7 +18,7 @@ pub(super) fn app_menu_button(
             .items_center()
             .gap_1()
             .child("Menu")
-            .child(svg_icon(icons().chevron_down.clone(), 12., theme.icon)),
+            .child(svg_icon("icons/chevron-down.svg", 12., theme.icon)),
         active,
         |this, event, window, cx| {
             this.data.menu = None;
@@ -141,7 +141,7 @@ pub(super) fn toolbar(
         cx,
         theme,
         "btn-add",
-        icons().plus.clone(),
+        "icons/plus.svg",
         "Add Media",
         true,
         |this, _, _, cx| this.add_media(cx),
@@ -155,7 +155,7 @@ pub(super) fn toolbar(
         cx,
         theme,
         "btn-clear",
-        icons().trash.clone(),
+        "icons/trash.svg",
         trash_tip,
         !data.clips.is_empty(),
         |this, _, _, cx| this.delete_or_clear(cx),
@@ -251,7 +251,7 @@ pub(super) fn timeline_zoom_controls(
             cx,
             theme,
             "zoom-fit",
-            icons().fit.clone(),
+            "icons/fit.svg",
             "Zoom to fit",
             active && data.zoom_level > 0.001,
             |this, _, _, cx| {
@@ -264,7 +264,7 @@ pub(super) fn timeline_zoom_controls(
             cx,
             theme,
             "zoom-out",
-            icons().zoom_out.clone(),
+            "icons/zoom-out.svg",
             "Zoom out",
             active && data.zoom_level > 0.0,
             |this, _, _, cx| {
@@ -280,7 +280,7 @@ pub(super) fn timeline_zoom_controls(
             cx,
             theme,
             "zoom-in",
-            icons().zoom_in.clone(),
+            "icons/zoom-in.svg",
             "Zoom in",
             active && data.zoom_level < 1.0,
             |this, _, _, cx| {

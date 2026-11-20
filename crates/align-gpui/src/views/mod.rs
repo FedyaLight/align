@@ -20,7 +20,7 @@ use gpui::{
     rgb, rgba,
 };
 
-use crate::icons::{icons, kind_badge, svg_icon};
+use crate::icons::{kind_badge, svg_icon};
 use crate::lane::CorrectionOption;
 use crate::state::{
     AppData, ClipState, ExportTarget, MenuTarget, Operation, SequenceDefaults, SequencePicker,
@@ -598,6 +598,31 @@ impl AlignApp {
         cx.notify();
     }
 
+    pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let paths = self.data.begin_import(paths);
+        if paths.is_empty() {
+            return;
+        }
+        let token = self.data.import_cancel.clone();
+        let cancel = token.clone();
+        let task = cx.background_executor().spawn(async move {
+            paths
+                .into_iter()
+                .take_while(|_| !cancel.load(std::sync::atomic::Ordering::Relaxed))
+                .map(|path| crate::state::InputPath::inspect(path, &cancel))
+                .collect()
+        });
+        cx.spawn(async move |view, cx| {
+            let inputs = task.await;
+            let _ = view.update(cx, |this, cx| {
+                this.data.finish_import(&token, inputs);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     pub(crate) fn add_media(&mut self, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -611,7 +636,7 @@ impl AlignApp {
                 return;
             };
             let _ = view.update(cx, |this, cx| {
-                this.data.add_paths(paths);
+                this.add_paths(paths, cx);
                 cx.notify();
             });
         })
@@ -723,7 +748,6 @@ impl AlignApp {
         match prepared {
             #[cfg(windows)]
             updater::Prepared::Velopack { manager, asset } => {
-                crate::icons::cleanup();
                 align_decode::media_assets::cleanup();
                 if let Err(error) = manager.apply_updates_and_restart(&asset) {
                     eprintln!("Could not install the Align update: {error}");
@@ -750,7 +774,6 @@ impl AlignApp {
                     let result = rx.await.unwrap_or_else(|_| Err("cancelled".into()));
                     let _ = view.update(cx, |this, cx| match result {
                         Ok(()) => {
-                            crate::icons::cleanup();
                             align_decode::media_assets::cleanup();
                             cx.quit();
                         }
@@ -1732,6 +1755,11 @@ impl AlignApp {
     }
 
     fn cancel_current(&mut self, cx: &mut Context<Self>) {
+        if self.data.importing() {
+            self.data.cancel_import();
+            cx.notify();
+            return;
+        }
         self.data
             .cancel
             .store(true, std::sync::atomic::Ordering::Relaxed);

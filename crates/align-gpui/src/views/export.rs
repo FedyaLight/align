@@ -52,7 +52,7 @@ pub(super) fn check_row(
             .border_1()
             .border_color(rgb(if checked { theme.accent } else { theme.border }))
             .bg(rgb(if checked { theme.accent } else { theme.bg }))
-            .child(svg_icon(icons().check.clone(), 10.0, tick)),
+            .child(svg_icon("icons/check.svg", 10.0, tick)),
     )
     .child(
         div()
@@ -97,7 +97,7 @@ pub(super) fn export_select_option(
                 .items_center()
                 .justify_center()
                 .when(selected, |slot| {
-                    slot.child(svg_icon(icons().check.clone(), 12., theme.accent))
+                    slot.child(svg_icon("icons/check.svg", 12., theme.accent))
                 }),
         )
 }
@@ -139,7 +139,7 @@ pub(super) fn export_select_row(
         .text_size(px(12.))
         .child(div().min_w(px(0.)).truncate().child(value))
         .child(div().w(px(12.)).h(px(12.)).flex_shrink_0().child(svg_icon(
-            icons().chevron_down.clone(),
+            "icons/chevron-down.svg",
             12.,
             theme.icon,
         )));
@@ -726,7 +726,7 @@ pub(super) fn export_sidebar(
                     } else {
                         close = close.opacity(0.32);
                     }
-                    close.child(svg_icon(icons().chevron_right.clone(), 12., theme.icon))
+                    close.child(svg_icon("icons/chevron-right.svg", 12., theme.icon))
                 })
                 .child(div().flex_1()),
         )
@@ -889,7 +889,7 @@ pub(super) fn export_support_button(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     id: &'static str,
-    icon: String,
+    icon: &'static str,
     label: &'static str,
     action: impl Fn(&mut AlignApp, &ClickEvent, &mut Window, &mut Context<AlignApp>) + 'static,
 ) -> impl IntoElement {
@@ -984,7 +984,7 @@ pub(super) fn export_success_sheet(
                 .justify_center()
                 .rounded_full()
                 .bg(rgba((theme.green << 8) | 0x26))
-                .child(svg_icon(icons().check.clone(), 23., theme.green)),
+                .child(svg_icon("icons/check.svg", 23., theme.green)),
         )
         .child(
             div()
@@ -1018,7 +1018,7 @@ pub(super) fn export_success_sheet(
                 .justify_center()
                 .rounded_lg()
                 .bg(rgba((theme.accent << 8) | 0x1E))
-                .child(svg_icon(icons().folder.clone(), 18., theme.accent)),
+                .child(svg_icon("icons/folder.svg", 18., theme.accent)),
         )
         .child(
             div()
@@ -1108,7 +1108,7 @@ pub(super) fn export_success_sheet(
                     cx,
                     theme,
                     "export-success-star",
-                    icons().github.clone(),
+                    "icons/github.svg",
                     "Star on GitHub",
                     |_, _, _, cx| cx.open_url(updater::REPOSITORY_URL),
                 ))
@@ -1116,7 +1116,7 @@ pub(super) fn export_success_sheet(
                     cx,
                     theme,
                     "export-success-support",
-                    icons().heart.clone(),
+                    "icons/heart.svg",
                     "Support Align",
                     |_, _, _, cx| cx.open_url(updater::DONATION_URL),
                 )),

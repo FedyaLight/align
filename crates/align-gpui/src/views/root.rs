@@ -16,7 +16,7 @@ impl Render for AlignApp {
             && self.data.menu.is_none()
             && !self.data.show_path_fixer
             && self.data.error.is_none()
-            && self.data.sequence_picker.is_none()
+            && self.data.sequence_pickers.is_empty()
             && !self.data.show_about
             && !self.data.show_agent_setup
             && !self.data.show_search_quality
@@ -138,7 +138,7 @@ impl Render for AlignApp {
                 cx.notify();
             }))
             .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
-                this.data.add_paths(paths.paths().to_vec());
+                this.add_paths(paths.paths().to_vec(), cx);
                 cx.notify();
             }));
         let mut content = div()
@@ -178,7 +178,7 @@ impl Render for AlignApp {
             }
         }
         // No bottom bar over the empty drop zone either.
-        if !self.data.clips.is_empty() {
+        if !self.data.clips.is_empty() || self.data.importing() {
             self.progress_motion
                 .track(self.data.progress, Instant::now());
             content = content.child(toolbar_entrance(
@@ -245,7 +245,7 @@ impl Render for AlignApp {
         // The problem report temporarily replaces the open modal, keeping a
         // single dim layer; that modal returns when the report closes.
         let modals_visible = !self.show_problem_report;
-        if let (true, Some(picker)) = (modals_visible, self.data.sequence_picker.as_ref()) {
+        if let (true, Some(picker)) = (modals_visible, self.data.sequence_pickers.front()) {
             root = root.child(overlay(
                 &theme,
                 "overlay-seq",

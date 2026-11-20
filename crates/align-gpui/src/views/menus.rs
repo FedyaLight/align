@@ -29,7 +29,7 @@ pub(super) fn sequence_picker_panel(
             "Choose a sequence",
             "seq-cancel",
             |this, _, _, cx| {
-                this.data.sequence_picker = None;
+                this.data.sequence_pickers.pop_front();
                 cx.notify();
             },
         ))

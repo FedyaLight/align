@@ -98,6 +98,30 @@ pub struct MenuTarget {
     pub position: (f32, f32),
 }
 
+pub struct InputPath {
+    path: PathBuf,
+    is_dir: bool,
+    timeline: bool,
+    sequences: Vec<TimelineSequenceSummary>,
+}
+
+impl InputPath {
+    pub fn inspect(path: PathBuf, cancel: &std::sync::atomic::AtomicBool) -> Self {
+        let timeline = align_decode::timeline::is_supported(&path);
+        let sequences = if timeline {
+            align_decode::timeline::sequences(&path, cancel).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Self {
+            is_dir: path.is_dir(),
+            path,
+            timeline,
+            sequences,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SequencePicker {
     pub path: PathBuf,
@@ -363,7 +387,10 @@ pub struct AppData {
     pub waveform_previews: HashMap<ClipId, Vec<f32>>,
     pub pending_count: usize,
     pub menu: Option<MenuTarget>,
-    pub sequence_picker: Option<SequencePicker>,
+    pub sequence_pickers: std::collections::VecDeque<SequencePicker>,
+    pending_inputs: HashSet<PathBuf>,
+    pub import_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub folder_inputs: HashSet<PathBuf>,
     pub timeline_choices: HashMap<PathBuf, Vec<usize>>,
     /// Path Fixer state. Saved prefix redirections load once when the app
     /// starts; exact file choices are session-local and survive re-syncs.
@@ -457,7 +484,10 @@ impl Default for AppData {
             waveform_previews: HashMap::new(),
             pending_count: 0,
             menu: None,
-            sequence_picker: None,
+            sequence_pickers: Default::default(),
+            pending_inputs: Default::default(),
+            import_cancel: Default::default(),
+            folder_inputs: HashSet::new(),
             timeline_choices: HashMap::new(),
             redirects: Vec::new(),
             manual_relinks: Vec::new(),
@@ -672,7 +702,9 @@ impl AppData {
     }
 
     fn can_run_sync(&self) -> bool {
-        !self.clips.is_empty()
+        !self.importing()
+            && self.sequence_pickers.is_empty()
+            && !self.clips.is_empty()
             && !matches!(
                 self.operation,
                 Operation::Synchronizing | Operation::Exporting | Operation::Repairing
@@ -703,7 +735,9 @@ impl AppData {
     }
 
     pub fn can_export(&self) -> bool {
-        self.has_result()
+        !self.importing()
+            && self.sequence_pickers.is_empty()
+            && self.has_result()
             && !self.is_stale()
             && !matches!(
                 self.operation,
@@ -802,29 +836,62 @@ impl AppData {
 
     // ---------------- session edits
 
+    pub fn importing(&self) -> bool {
+        !self.pending_inputs.is_empty()
+    }
+
+    pub fn begin_import(&mut self, paths: Vec<PathBuf>) -> Vec<PathBuf> {
+        if matches!(
+            self.operation,
+            Operation::Synchronizing | Operation::Exporting | Operation::Repairing
+        ) {
+            return Vec::new();
+        }
+        let existing: HashSet<_> = self
+            .inputs
+            .iter()
+            .chain(self.clips.iter().map(|r| &r.url))
+            .chain(self.sequence_pickers.iter().map(|p| &p.path))
+            .collect();
+        paths
+            .into_iter()
+            .filter(|p| !existing.contains(p) && self.pending_inputs.insert(p.clone()))
+            .collect()
+    }
+
+    pub fn cancel_import(&mut self) {
+        self.import_cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.import_cancel = Default::default();
+        self.pending_inputs.clear();
+    }
+
     /// Add media/tagged timeline paths; marks the session stale when a
     /// result exists, otherwise resets the preview. Multi-sequence
     /// timelines open the picker instead of joining the inputs.
-    pub fn add_paths(&mut self, paths: Vec<PathBuf>) {
-        let existing: HashSet<PathBuf> = self.clips.iter().map(|c| c.url.clone()).collect();
+    pub fn finish_import(&mut self, token: &std::sync::atomic::AtomicBool, paths: Vec<InputPath>) {
+        if token.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let mut additions = Vec::new();
         let mut timelines = Vec::new();
-        for path in paths.iter().cloned() {
-            if existing.contains(&path) || additions.iter().any(|r: &ClipRow| r.url == path) {
+        for InputPath {
+            path,
+            is_dir,
+            timeline,
+            sequences,
+        } in paths
+        {
+            if !self.pending_inputs.remove(&path) {
                 continue;
             }
-            let timeline = is_timeline(&path);
-            if timeline
-                && !self.timeline_choices.contains_key(&path)
-                && let Ok(summaries) = align_decode::timeline::sequences(
-                    &path,
-                    &std::sync::atomic::AtomicBool::new(false),
-                )
-                && summaries.len() > 1
-            {
-                self.sequence_picker = Some(SequencePicker {
+            if is_dir {
+                self.folder_inputs.insert(path.clone());
+            }
+            if sequences.len() > 1 && !self.timeline_choices.contains_key(&path) {
+                self.sequence_pickers.push_back(SequencePicker {
                     path,
-                    options: summaries,
+                    options: sequences,
                 });
                 continue;
             }
@@ -833,26 +900,23 @@ impl AppData {
             }
             additions.push(ClipRow {
                 clip_id: None,
+                name: file_name(&path),
                 url: path,
-                name: String::new(),
                 kind: None,
                 duration: None,
                 timecode: None,
                 state: ClipState::Queued,
             });
         }
-        for row in &mut additions {
-            row.name = file_name(&row.url);
-        }
         if additions.is_empty() {
             return;
         }
         self.inputs.extend(additions.iter().map(|r| r.url.clone()));
         self.timeline_inputs.extend(timelines);
-        self.clips.extend(additions.iter().cloned());
+        let added = additions.len();
+        self.clips.extend(additions);
         self.clips
             .sort_by(|a, b| a.url.to_string_lossy().cmp(&b.url.to_string_lossy()));
-        let added = additions.len();
         if self.result.is_some() {
             self.pending_count += added;
             self.exported_files.clear();
@@ -890,6 +954,7 @@ impl AppData {
         self.timeline_inputs.retain(|u| !selected.contains(u));
         for url in &selected {
             self.timeline_choices.remove(url);
+            self.folder_inputs.remove(url);
         }
         if self.result.is_some() {
             self.pending_count += selected.len();
@@ -916,6 +981,8 @@ impl AppData {
     }
 
     pub fn clear(&mut self) {
+        self.import_cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.cancel
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let generation = self.generation.wrapping_add(1);
@@ -1005,7 +1072,7 @@ impl AppData {
 
     /// Record a sequence choice and queue the timeline as an input.
     pub fn choose_sequence(&mut self, index: usize) {
-        if let Some(picker) = self.sequence_picker.take()
+        if let Some(picker) = self.sequence_pickers.pop_front()
             && picker.options.iter().any(|o| o.index == index)
         {
             self.queue_timeline_sequences(picker.path, vec![index]);
@@ -1013,7 +1080,7 @@ impl AppData {
     }
 
     pub fn choose_all_sequences(&mut self) {
-        if let Some(picker) = self.sequence_picker.take() {
+        if let Some(picker) = self.sequence_pickers.pop_front() {
             let indices = picker.options.iter().map(|option| option.index).collect();
             self.queue_timeline_sequences(picker.path, indices);
         }
@@ -1180,10 +1247,12 @@ impl AppData {
     }
 
     pub fn begin_path_repair(&mut self) -> bool {
-        if matches!(
-            self.operation,
-            Operation::Synchronizing | Operation::Exporting | Operation::Repairing
-        ) {
+        if self.importing()
+            || matches!(
+                self.operation,
+                Operation::Synchronizing | Operation::Exporting | Operation::Repairing
+            )
+        {
             return false;
         }
         self.cancel_run();
@@ -2270,10 +2339,6 @@ fn drift_of_placement(result: &SyncResult, clip_id: &ClipId) -> f64 {
     (mapped / source - 1.0) * 1_000_000.0
 }
 
-fn is_timeline(path: &std::path::Path) -> bool {
-    align_decode::timeline::is_supported(path)
-}
-
 fn sorted_live_matches(map: &HashMap<String, LiveMatch>) -> Vec<LiveMatch> {
     let mut rows: Vec<LiveMatch> = map.values().cloned().collect();
     rows.sort_by(|a, b| LiveMatch::id(&a.left, &a.right).cmp(&LiveMatch::id(&b.left, &b.right)));
@@ -2415,7 +2480,7 @@ mod tests {
         let media = PathBuf::from("/tmp/extra.wav");
         let mut data = AppData::default();
         data.inputs.push(media.clone());
-        data.sequence_picker = Some(SequencePicker {
+        data.sequence_pickers.push_back(SequencePicker {
             path: path.clone(),
             options: vec![
                 TimelineSequenceSummary {
@@ -3072,14 +3137,46 @@ mod tests {
         assert!(data.export_output_selected());
     }
 
+    fn add_paths(data: &mut AppData, paths: Vec<PathBuf>) {
+        let token = data.import_cancel.clone();
+        let inputs = data
+            .begin_import(paths)
+            .into_iter()
+            .map(|p| InputPath::inspect(p, &token))
+            .collect();
+        data.finish_import(&token, inputs);
+    }
+
+    #[test]
+    fn cancelled_import_cannot_restore_a_cleared_or_readded_input() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().to_owned();
+        let mut data = AppData::default();
+        let old = data.import_cancel.clone();
+        data.begin_import(vec![path.clone()]);
+        let input = InputPath::inspect(path.clone(), &old);
+        data.clear();
+        assert_eq!(data.begin_import(vec![path.clone(), path.clone()]).len(), 1);
+        data.finish_import(&old, vec![input]);
+        assert!(data.importing() && data.inputs.is_empty());
+        let token = data.import_cancel.clone();
+        data.finish_import(&token, vec![InputPath::inspect(path.clone(), &token)]);
+        assert!(!data.importing());
+        assert_eq!(data.inputs.as_slice(), std::slice::from_ref(&path));
+        assert!(data.folder_inputs.contains(&path));
+    }
+
     #[test]
     fn add_remove_selection_session() {
         let mut data = AppData::default();
-        data.add_paths(vec![
-            PathBuf::from("/v/b.wav"),
-            PathBuf::from("/v/a.wav"),
-            PathBuf::from("/v/a.wav"),
-        ]);
+        add_paths(
+            &mut data,
+            vec![
+                PathBuf::from("/v/b.wav"),
+                PathBuf::from("/v/a.wav"),
+                PathBuf::from("/v/a.wav"),
+            ],
+        );
         // Deduped + sorted by path.
         assert_eq!(data.clips.len(), 2);
         assert_eq!(data.clips[0].url, PathBuf::from("/v/a.wav"));
@@ -3096,7 +3193,7 @@ mod tests {
     #[test]
     fn synchronize_requires_new_inputs_or_changed_settings_after_a_result() {
         let mut data = AppData::default();
-        data.add_paths(vec![PathBuf::from("/v/a.wav")]);
+        add_paths(&mut data, vec![PathBuf::from("/v/a.wav")]);
         data.result = Some(empty_sequence_result("Finished"));
         data.operation = Operation::Ready;
 
@@ -3113,14 +3210,14 @@ mod tests {
         assert!(!data.sync_dirty);
         assert!(!data.can_synchronize());
 
-        data.add_paths(vec![PathBuf::from("/v/b.wav")]);
+        add_paths(&mut data, vec![PathBuf::from("/v/b.wav")]);
         assert!(data.can_synchronize());
     }
 
     #[test]
     fn quality_retry_upgrades_only_unmatched_fingerprints() {
         let mut data = AppData::default();
-        data.add_paths(vec![PathBuf::from("/v/a.wav")]);
+        add_paths(&mut data, vec![PathBuf::from("/v/a.wav")]);
         let unmatched = ClipId::new("unmatched");
         let matched = ClipId::new("matched");
         let mut previous = empty_sequence_result("Previous");
@@ -3159,7 +3256,7 @@ mod tests {
     #[test]
     fn quality_change_does_not_stale_a_fully_matched_result() {
         let mut data = AppData::default();
-        data.add_paths(vec![PathBuf::from("/v/a.wav")]);
+        add_paths(&mut data, vec![PathBuf::from("/v/a.wav")]);
         let result = empty_sequence_result("Complete");
         data.result = Some(result.clone());
         data.sequence_results = vec![result];
@@ -3173,7 +3270,10 @@ mod tests {
     #[test]
     fn trash_removes_selection_then_clears_session() {
         let mut data = AppData::default();
-        data.add_paths(vec![PathBuf::from("/v/a.wav"), PathBuf::from("/v/b.wav")]);
+        add_paths(
+            &mut data,
+            vec![PathBuf::from("/v/a.wav"), PathBuf::from("/v/b.wav")],
+        );
         data.selection.insert(PathBuf::from("/v/a.wav"));
 
         data.delete_or_clear();
@@ -3221,7 +3321,7 @@ mod tests {
         );
         assert_eq!(data.path_repair_options().redirects, data.redirects);
         assert_eq!(data.path_repair_inputs().len(), data.inputs.len());
-        data.add_paths(vec![PathBuf::from("/v/recorder.wav")]);
+        add_paths(&mut data, vec![PathBuf::from("/v/recorder.wav")]);
         assert!(data.can_synchronize());
         assert!(data.begin_path_repair());
         assert_eq!(data.operation, Operation::Repairing);
@@ -3235,10 +3335,13 @@ mod tests {
     #[test]
     fn current_cache_media_excludes_timeline_containers() {
         let mut data = AppData::default();
-        data.add_paths(vec![
-            PathBuf::from("/v/edit.fcpxml"),
-            PathBuf::from("/v/recorder.wav"),
-        ]);
+        add_paths(
+            &mut data,
+            vec![
+                PathBuf::from("/v/edit.fcpxml"),
+                PathBuf::from("/v/recorder.wav"),
+            ],
+        );
         assert_eq!(
             data.current_cache_media(),
             vec![PathBuf::from("/v/recorder.wav")]

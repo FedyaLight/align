@@ -115,7 +115,7 @@ pub(super) fn floating_notice(
         .border_color(rgb(theme.border))
         .bg(rgb(theme.panel))
         .shadow_lg()
-        .child(img(PathBuf::from(&icons().app)).size(px(36.)).rounded_md())
+        .child(img(crate::icons::APP_ICON).size(px(36.)).rounded_md())
         .child(
             div()
                 .flex_1()
@@ -144,7 +144,7 @@ pub(super) fn floating_notice(
                     .cursor_pointer()
                     .opacity(0.6)
                     .hover(|this| this.opacity(1.))
-                    .child(svg_icon(icons().close.clone(), 12., theme.icon))
+                    .child(svg_icon("icons/close.svg", 12., theme.icon))
                     .tooltip(hover_tip(tip.to_string(), theme))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         dismiss(this);
@@ -387,7 +387,7 @@ pub(super) fn about_panel(
             },
         ))
         .child(
-            img(PathBuf::from(&icons().app))
+            img(crate::icons::APP_ICON)
                 .mt_1()
                 .size(px(72.))
                 .rounded_xl(),
@@ -417,7 +417,7 @@ pub(super) fn about_panel(
                 .flex()
                 .items_center()
                 .gap_1()
-                .child(svg_icon(icons().github.clone(), 13.0, theme.icon))
+                .child(svg_icon("icons/github.svg", 13.0, theme.icon))
                 .child("Star on GitHub"),
             true,
             |_, _, _, cx| cx.open_url(updater::REPOSITORY_URL),

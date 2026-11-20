@@ -65,7 +65,7 @@ pub enum Prepared {
     Package {
         install: Install,
         version: String,
-        file: PathBuf,
+        file: tempfile::TempPath,
     },
 }
 
@@ -304,7 +304,7 @@ fn asset_name(install: &Install, version: &str) -> String {
     }
 }
 
-fn download_verified(asset: &ReleaseAsset) -> Result<PathBuf, String> {
+fn download_verified(asset: &ReleaseAsset) -> Result<tempfile::TempPath, String> {
     let agent = agent();
     let expected = agent
         .get(&asset.checksum_url)
@@ -318,10 +318,13 @@ fn download_verified(asset: &ReleaseAsset) -> Result<PathBuf, String> {
         .next()
         .ok_or("empty checksum file")?
         .to_ascii_lowercase();
-    let dir = std::env::temp_dir().join(format!("align-update-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-    let path = dir.join(&asset.name);
-    let mut file = std::fs::File::create(&path).map_err(|error| error.to_string())?;
+    // Preserve the package suffix for dnf/pacman. TempPath owns the
+    // download until the installer process has finished consuming it.
+    let mut file = tempfile::Builder::new()
+        .prefix("align-update-")
+        .suffix(&asset.name)
+        .tempfile()
+        .map_err(|e| e.to_string())?;
     let mut reader = agent
         .get(&asset.url)
         .call()
@@ -341,17 +344,18 @@ fn download_verified(asset: &ReleaseAsset) -> Result<PathBuf, String> {
         file.write_all(&buffer[..read])
             .map_err(|error| error.to_string())?;
     }
-    file.sync_all().map_err(|error| error.to_string())?;
+    file.as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
     let actual: String = hasher
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
     if actual != expected {
-        let _ = std::fs::remove_file(&path);
         return Err(format!("checksum mismatch for {}", asset.name));
     }
-    Ok(path)
+    Ok(file.into_temp_path())
 }
 
 // ---------------------------------------------------------- installation
@@ -392,10 +396,7 @@ fn detect_install() -> Option<Install> {
 }
 
 fn writable(dir: &Path) -> bool {
-    let probe = dir.join(format!(".align-update-{}", std::process::id()));
-    let ok = std::fs::create_dir(&probe).is_ok();
-    let _ = std::fs::remove_dir(&probe);
-    ok
+    tempfile::tempdir_in(dir).is_ok()
 }
 
 fn run(command: &mut Command) -> Result<(), String> {
@@ -415,8 +416,10 @@ fn run(command: &mut Command) -> Result<(), String> {
 /// swap the two, so a failure leaves the installed app untouched.
 fn replace_app_bundle(bundle: &Path, dmg: &Path) -> Result<(), String> {
     let parent = bundle.parent().ok_or("app bundle has no folder")?;
-    let mount = dmg.with_extension("mount");
-    std::fs::create_dir_all(&mount).map_err(|error| error.to_string())?;
+    let staging = tempfile::tempdir_in(parent).map_err(|e| e.to_string())?;
+    let staged = staging.path().join("Align.app");
+    let mount_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let mount = mount_dir.path();
     run(Command::new("/usr/bin/hdiutil")
         .args([
             "attach",
@@ -425,29 +428,38 @@ fn replace_app_bundle(bundle: &Path, dmg: &Path) -> Result<(), String> {
             "-noautoopen",
             "-mountpoint",
         ])
-        .arg(&mount)
+        .arg(mount)
         .arg(dmg))?;
-    let staged = parent.join(".Align-update.app");
-    let _ = std::fs::remove_dir_all(&staged);
+    // Once attached, never recursively remove a live mount on an error.
+    let mount = mount_dir.keep();
     let copied = run(Command::new("/usr/bin/ditto")
         .arg(mount.join("Align.app"))
         .arg(&staged));
-    let _ = run(Command::new("/usr/bin/hdiutil")
+    run(Command::new("/usr/bin/hdiutil")
         .args(["detach", "-force"])
-        .arg(&mount));
+        .arg(&mount))?;
+    // hdiutil may already have removed the mount point.
+    if let Err(e) = std::fs::remove_dir(&mount)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(e.to_string());
+    }
     copied?;
     let _ = run(Command::new("/usr/bin/xattr")
         .args(["-dr", "com.apple.quarantine"])
         .arg(&staged));
-    let previous = parent.join(".Align-previous.app");
-    let _ = std::fs::remove_dir_all(&previous);
+    let previous = staging.path().join("previous.app");
     std::fs::rename(bundle, &previous).map_err(|error| error.to_string())?;
     if let Err(error) = std::fs::rename(&staged, bundle) {
-        let _ = std::fs::rename(&previous, bundle);
+        if let Err(restore) = std::fs::rename(&previous, bundle) {
+            let _ = staging.keep();
+            return Err(format!(
+                "{error}. Restore {} manually: {restore}",
+                previous.display()
+            ));
+        }
         return Err(error.to_string());
     }
-    let _ = std::fs::remove_dir_all(&previous);
-    let _ = std::fs::remove_file(dmg);
     Ok(())
 }
 
@@ -464,6 +476,49 @@ mod tests {
                 .map(|name| (name.to_string(), format!("https://example.invalid/{name}")))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn simultaneous_downloads_have_independent_lifetimes() {
+        use std::io::{BufRead, BufReader};
+        let server = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = server.local_addr().unwrap();
+        let asset = ReleaseAsset {
+            name: "Align.rpm".into(),
+            url: format!("http://{address}/package"),
+            checksum_url: format!("http://{address}/checksum"),
+        };
+        let worker = std::thread::spawn(move || {
+            for connection in server.incoming().take(4) {
+                let mut connection = connection.unwrap();
+                let mut request = String::new();
+                let mut reader = BufReader::new(&connection);
+                reader.read_line(&mut request).unwrap();
+                for line in reader.lines() {
+                    if line.unwrap().is_empty() {
+                        break;
+                    }
+                }
+                let body = if request.starts_with("GET /checksum ") {
+                    format!("{:x}", Sha256::digest(b"package"))
+                } else {
+                    "package".to_owned()
+                };
+                write!(
+                    connection,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let first = download_verified(&asset).unwrap();
+        let second = download_verified(&asset).unwrap();
+        let path = first.to_path_buf();
+        drop(first);
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&second).unwrap(), b"package");
+        worker.join().unwrap();
     }
 
     #[test]
@@ -578,6 +633,8 @@ mod network_tests {
             .unwrap();
         let file = download_verified(&asset).unwrap();
         assert!(std::fs::metadata(&file).unwrap().len() > 1_000_000);
-        std::fs::remove_file(file).unwrap();
+        let path = file.to_path_buf();
+        drop(file);
+        assert!(!path.exists());
     }
 }

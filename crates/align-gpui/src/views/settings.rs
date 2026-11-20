@@ -212,7 +212,7 @@ pub(super) fn settings_menu_row(
                 .items_center()
                 .justify_center()
                 .when(selected, |slot| {
-                    slot.child(svg_icon(icons().check.clone(), 12., theme.accent))
+                    slot.child(svg_icon("icons/check.svg", 12., theme.accent))
                 }),
         )
 }
@@ -306,7 +306,7 @@ pub(super) fn settings_select_row(
         .on_click(cx.listener(move |this, _, _, cx| this.toggle_settings_select(select, cx)))
         .child(div().min_w(px(0.)).truncate().child(value))
         .child(div().w(px(12.)).h(px(12.)).flex_shrink_0().child(svg_icon(
-            icons().chevron_down.clone(),
+            "icons/chevron-down.svg",
             12.,
             theme.icon,
         )));
@@ -351,7 +351,7 @@ pub(super) fn settings_header(
                 cx,
                 theme,
                 "settings-reset",
-                icons().reset.clone(),
+                "icons/reset.svg",
                 "Reset to defaults",
                 true,
                 |this, _, _, cx| this.reset_settings(cx),
@@ -386,7 +386,7 @@ pub(super) fn settings_header(
                             cx,
                             theme,
                             "settings-close-out",
-                            icons().close.clone(),
+                            "icons/close.svg",
                             "Close",
                             true,
                             |_, _, _, _| {},
@@ -409,7 +409,7 @@ pub(super) fn settings_header(
                         cx,
                         theme,
                         "settings-close",
-                        icons().close.clone(),
+                        "icons/close.svg",
                         "Close",
                         true,
                         |this, _, _, cx| this.finish_search_settings(cx),
@@ -518,7 +518,7 @@ pub(super) fn search_quality_button(
         .text_size(px(12.))
         .child(div().min_w(px(0.)).truncate().child(label))
         .child(div().w(px(12.)).h(px(12.)).flex_shrink_0().child(svg_icon(
-            icons().chevron_down.clone(),
+            "icons/chevron-down.svg",
             12.,
             theme.icon,
         )));
@@ -608,7 +608,7 @@ pub(super) fn search_quality_row(
                 .items_center()
                 .justify_center()
                 .when(selected, |slot| {
-                    slot.child(svg_icon(icons().check.clone(), 12., theme.accent))
+                    slot.child(svg_icon("icons/check.svg", 12., theme.accent))
                 }),
         )
 }

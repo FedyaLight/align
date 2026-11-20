@@ -117,7 +117,7 @@ pub(super) fn drop_zone(
                         .items_center()
                         .justify_center()
                         .bg(rgba((accent << 8) | 0x1A))
-                        .child(svg_icon(icons().drop.clone(), 28.0, accent)),
+                        .child(svg_icon("icons/drop.svg", 28.0, accent)),
                 )
                 .child(
                     div()
@@ -239,16 +239,16 @@ pub(super) fn file_list(
             parts.push(clip.state.status_text());
             parts.join(" · ")
         };
-        let state_icon: Option<(String, u32)> = match &clip.state {
+        let state_icon: Option<(&str, u32)> = match &clip.state {
             ClipState::Synchronized { evidence, .. } => {
                 if *evidence == align_core::MatchEvidence::Timecode {
-                    Some((icons().check.clone(), theme.blue))
+                    Some(("icons/check.svg", theme.blue))
                 } else {
-                    Some((icons().check.clone(), theme.green))
+                    Some(("icons/check.svg", theme.green))
                 }
             }
-            ClipState::Matching { .. } => Some((icons().check.clone(), theme.green)),
-            ClipState::Unmatched | ClipState::Warning => Some((icons().warn.clone(), theme.orange)),
+            ClipState::Matching { .. } => Some(("icons/check.svg", theme.green)),
+            ClipState::Unmatched | ClipState::Warning => Some(("icons/warn.svg", theme.orange)),
             ClipState::Queued | ClipState::Analyzing => None,
         };
         let mut row = div()
@@ -306,7 +306,7 @@ pub(super) fn file_list(
                 .border_color(rgb(if selected { theme.accent } else { theme.border }))
                 .bg(rgb(if selected { theme.accent } else { theme.panel }))
                 .when(selected, |el| {
-                    el.child(svg_icon(icons().check.clone(), 10., theme.on_accent))
+                    el.child(svg_icon("icons/check.svg", 10., theme.on_accent))
                 });
             row = row.child(selection_control_motion(
                 indicator,
@@ -331,8 +331,8 @@ pub(super) fn file_list(
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(if clip.url.is_dir() {
-                        svg_icon(icons().folder.clone(), 13.0, badge_color).into_any_element()
+                    .child(if data.folder_inputs.contains(&clip.url) {
+                        svg_icon("icons/folder.svg", 13.0, badge_color).into_any_element()
                     } else {
                         kind_badge(video, badge_color, None).into_any_element()
                     }),

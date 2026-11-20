@@ -281,7 +281,6 @@ fn main() {
     struct SessionCleanup;
     impl Drop for SessionCleanup {
         fn drop(&mut self) {
-            icons::cleanup();
             align_decode::media_assets::cleanup();
         }
     }
@@ -296,13 +295,12 @@ fn main() {
         })
         .collect();
     Application::new()
-        .with_assets(icons::FileAssets)
+        .with_assets(icons::EmbeddedAssets)
         .run(move |cx: &mut App| {
             text_input::init(cx);
             // Covers every graceful termination path, including an OS-level
             // quit that does not dispatch our custom QuitApp action.
             cx.on_app_quit(|_| async {
-                icons::cleanup();
                 align_decode::media_assets::cleanup();
             })
             .detach();
@@ -342,7 +340,6 @@ fn main() {
             // Generated icon assets are disposable. Fingerprints are an
             // OS-managed performance cache and must outlive the session.
             cx.on_action(|_: &QuitApp, cx| {
-                icons::cleanup();
                 cx.quit();
             });
             cx.on_action(|_: &HideApp, cx| cx.hide());
@@ -371,7 +368,7 @@ fn main() {
             let bounds = Bounds::centered(None, size(px(1120.), px(700.)), cx);
             let view = cx.new(move |cx| {
                 let mut app = views::AlignApp::new(cx);
-                app.data.add_paths(initial_paths);
+                app.add_paths(initial_paths, cx);
                 app.check_for_updates_on_launch(cx);
                 app
             });
