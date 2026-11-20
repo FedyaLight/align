@@ -29,6 +29,9 @@ semver = "1"
 url = "2"
 sha2.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+align-cli = { path = "../align-cli" }
+
 [target.'cfg(windows)'.dependencies]
 velopack = "1.2.0"
 windows-sys = { version = "0.59", features = [

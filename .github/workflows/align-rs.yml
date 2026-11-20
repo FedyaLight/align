@@ -225,7 +225,12 @@ jobs:
           exe=""
           if [[ "${{ runner.os }}" == "Windows" ]]; then exe=".exe"; fi
           mkdir -p dist-bundle
-          cp "target/release/align-cli$exe" "target/release/align$exe" dist-bundle/
+          cp "target/release/align$exe" dist-bundle/
+          if [[ -n "$exe" ]]; then
+            cp target/release/align-cli.exe dist-bundle/
+          else
+            ln -s align dist-bundle/align-cli
+          fi
           cp "target/release/align-aaf$exe" dist-bundle/
           # Windows ships the AAF module's Python runtime as a folder.
           if [[ "${{ runner.os }}" == "Windows" ]]; then

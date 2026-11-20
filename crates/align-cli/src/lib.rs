@@ -1,0 +1,1137 @@
+//! align-cli: batch synchronization and timeline export.
+//! `sync | export | export-json`, progress on stderr, JSON on stdout,
+//! exit 2 on usage errors, 1 on failures. mimalloc for low fragmentation.
+
+use std::io::Write;
+use std::path::PathBuf;
+
+use align_decode::pipeline::{Phase, Pipeline, PipelineError, PipelineInput, PipelineOptions};
+use clap::{Args, Parser, Subcommand};
+
+mod export_job;
+
+#[derive(Parser)]
+#[command(name = "align-cli", version, args_conflicts_with_subcommands = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+    /// Inspect media, folders, or timeline projects without synchronizing.
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Synchronize media, print SyncResult JSON.
+    Sync {
+        /// Atomically save the complete result (or sequence batch) at this path.
+        #[arg(long, value_name = "FILE")]
+        output_json: Option<PathBuf>,
+        /// Print a compact report on stdout. Requires --output-json.
+        #[arg(long, requires = "output_json")]
+        summary: bool,
+        /// Select one sequence from an imported project (1-based).
+        #[arg(long, value_name = "N", conflicts_with = "all_sequences")]
+        sequence: Option<usize>,
+        /// Synchronize every sequence in the imported XML, FCPXML, or AAF.
+        #[arg(long)]
+        all_sequences: bool,
+        #[command(flatten)]
+        settings: SyncSettings,
+        #[command(flatten)]
+        relink: RelinkArgs,
+        paths: Vec<PathBuf>,
+    },
+    /// Synchronize + drift-corrected export, print artifacts JSON.
+    Export {
+        /// Select one sequence from an imported project (1-based).
+        #[arg(long, value_name = "N", conflicts_with = "all_sequences")]
+        sequence: Option<usize>,
+        /// Synchronize and export every sequence in the imported project.
+        #[arg(long)]
+        all_sequences: bool,
+        #[command(flatten)]
+        export: ExportOptions,
+        #[command(flatten)]
+        relink: RelinkArgs,
+        #[command(flatten)]
+        settings: SyncSettings,
+        output: PathBuf,
+        paths: Vec<PathBuf>,
+    },
+    /// Export saved synchronization JSON (one result or a batch).
+    ExportJson {
+        /// Select a completed synchronization stage (1-based).
+        #[arg(long, value_name = "N")]
+        stage: Option<usize>,
+        #[command(flatten)]
+        export: ExportOptions,
+        result: PathBuf,
+        output: PathBuf,
+    },
+    /// Clear the persistent fingerprint cache, print freed stats JSON.
+    ClearCache {
+        /// Only clear entries older than this many days (default: all).
+        #[arg(long, value_name = "N")]
+        older_than_days: Option<u64>,
+    },
+}
+
+#[derive(Args)]
+struct ExportOptions {
+    /// Disable clock-drift correction during export.
+    #[arg(long)]
+    no_drift: bool,
+    /// Export linked picture and audio AAF tracks (requires the bundled align-aaf module).
+    #[arg(long)]
+    aaf: bool,
+    /// Override the composition timecode frame rate in exported AAF.
+    #[arg(long, value_enum, default_value_t = AafFps::Auto)]
+    aaf_fps: AafFps,
+    /// Add a sequence with external audio replacing camera audio.
+    #[arg(long)]
+    replaced_audio: bool,
+    /// Group the source clips editors import by source folder: Premiere bins,
+    /// Final Cut Pro keyword collections, Resolve import-script folders.
+    #[arg(long)]
+    media_bins: bool,
+    /// Group FCPXML tracks into separate storylines.
+    #[arg(long)]
+    fcpxml_storylines: bool,
+    /// Omit the synchronized timeline project from FCPXML.
+    #[arg(long)]
+    no_fcpxml_timeline: bool,
+    /// Omit the multicam project from FCPXML.
+    #[arg(long)]
+    no_fcpxml_multicam: bool,
+    /// Also create complete camera files with external audio replacing scratch audio.
+    #[arg(long)]
+    export_media: bool,
+    /// Placement policy for clips without a synchronization match.
+    #[arg(long, value_enum, default_value_t = Unmatched::OrderTime)]
+    unmatched: Unmatched,
+    /// Place independent synchronization groups without overlaps.
+    #[arg(long)]
+    prevent_group_overlaps: bool,
+    /// Mark unmatched clips as disabled in exported timelines.
+    #[arg(long)]
+    disable_unmatched: bool,
+    /// Label synchronized clips in exported timelines.
+    #[arg(long)]
+    label_synced: bool,
+    /// Label unmatched clips in exported timelines.
+    #[arg(long)]
+    label_unmatched: bool,
+    #[command(flatten)]
+    cut_remove: CutRemoveArgs,
+    #[command(flatten)]
+    assign: AssignArgs,
+}
+
+/// Missing-media relinking: saved redirections apply
+/// on every run, manual picks apply once.
+#[derive(Args, Clone, Debug, Default)]
+struct RelinkArgs {
+    /// Saved old-prefix=new-location mapping (persisted for future runs).
+    #[arg(long, value_name = "OLD=NEW")]
+    redirect: Vec<String>,
+    /// Exact manual filename=path pick for this run.
+    #[arg(long, value_name = "NAME=PATH")]
+    relink: Vec<String>,
+    /// Forget all saved redirections before applying `--redirect`.
+    #[arg(long)]
+    clear_redirects: bool,
+    /// Timeline-referenced extensions skipped silently (comma-separated).
+    #[arg(long, value_name = "EXTS")]
+    omit_extensions: Option<String>,
+    /// Use FCPXML proxy media when the asset provides it.
+    #[arg(long)]
+    prefer_proxies: bool,
+    /// Save relinked media locations into a copy of the imported XML or AAF.
+    #[arg(long, value_name = "PATH")]
+    write_fixed_project: Option<PathBuf>,
+}
+
+/// Resolved `--redirect` / `--relink` / `--omit-extensions`: saved
+/// redirections, one-shot manual picks, silently skipped extensions.
+type RelinkOptions = (
+    Vec<align_core::redirect::PathRedirection>,
+    Vec<(String, PathBuf)>,
+    Vec<String>,
+);
+
+fn relink_options(args: &RelinkArgs) -> Result<RelinkOptions, CliError> {
+    let store = align_core::redirect::config_file();
+    if args.clear_redirects {
+        let _ = std::fs::remove_file(&store);
+    }
+    let mut redirects = align_core::redirect::load_from(&store);
+    for flag in &args.redirect {
+        let (old, new) =
+            align_core::redirect::split_pair("--redirect", flag).map_err(CliError::Failure)?;
+        if !new.is_dir() {
+            return Err(CliError::Failure(format!(
+                "--redirect target is not a directory: {}.",
+                new.display()
+            )));
+        }
+        let entry = align_core::redirect::PathRedirection::new(&old, new);
+        if !redirects.contains(&entry) {
+            redirects.push(entry);
+        }
+    }
+    align_core::redirect::save_to(&store, &redirects);
+    let mut manual = Vec::new();
+    for flag in &args.relink {
+        let (name, path) =
+            align_core::redirect::split_pair("--relink", flag).map_err(CliError::Failure)?;
+        manual.push((name, path));
+    }
+    let omit: Vec<String> = args
+        .omit_extensions
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|extension| {
+            let trimmed = extension.trim().trim_start_matches('.');
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .collect();
+    Ok((redirects, manual, omit))
+}
+
+fn write_fixed_project(
+    pipeline: &Pipeline,
+    input_sets: &[Vec<PipelineInput>],
+    options: &PipelineOptions,
+    destination: Option<&std::path::Path>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), CliError> {
+    let Some(destination) = destination else {
+        return Ok(());
+    };
+    let inputs = input_sets.first().ok_or(CliError::Usage)?;
+    let count = pipeline.write_fixed_timeline_copy(inputs, options, destination, cancel)?;
+    eprintln!(
+        "Wrote {} with {count} repaired media path{}.",
+        destination.display(),
+        if count == 1 { "" } else { "s" }
+    );
+    Ok(())
+}
+
+/// Optional post-synchronization trimming and removal. Disabled by default.
+#[derive(Args, Clone, Copy, Debug, Default)]
+struct CutRemoveArgs {
+    /// Cut ranges empty on every clip and close the timeline.
+    #[arg(long)]
+    cut_common_gaps: bool,
+    /// Drop recorder audio that overlaps no camera clip.
+    #[arg(long)]
+    cut_lone_recorder: bool,
+    /// Drop clips shorter than this many seconds.
+    #[arg(long, value_name = "SECS", default_value_t = 0.0)]
+    cut_shorter_than: f64,
+    /// Trim this many seconds off every clip start.
+    #[arg(long, value_name = "SECS", default_value_t = 0.0)]
+    trim_starts: f64,
+    /// Trim this many seconds off every clip end.
+    #[arg(long, value_name = "SECS", default_value_t = 0.0)]
+    trim_ends: f64,
+}
+
+impl CutRemoveArgs {
+    fn core(self) -> Result<align_core::export_model::CutRemoveOptions, CliError> {
+        for (name, value) in [
+            ("--cut-shorter-than", self.cut_shorter_than),
+            ("--trim-starts", self.trim_starts),
+            ("--trim-ends", self.trim_ends),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(CliError::Failure(format!(
+                    "{name} requires a non-negative number of seconds."
+                )));
+            }
+        }
+        Ok(align_core::export_model::CutRemoveOptions {
+            common_gaps: self.cut_common_gaps,
+            lone_recorder: self.cut_lone_recorder,
+            shorter_than: self.cut_shorter_than,
+            trim_starts: self.trim_starts,
+            trim_ends: self.trim_ends,
+        })
+    }
+}
+
+/// Export naming and labels: sequence name plus symbol,
+/// color and role labels for synchronized and unmatched clips.
+#[derive(Args, Clone, Debug, Default)]
+struct AssignArgs {
+    /// Override the exported sequence/project name.
+    #[arg(long, value_name = "NAME")]
+    sequence_name: Option<String>,
+    /// Custom symbol for synchronized names (implies labeling).
+    #[arg(long, value_name = "TEXT")]
+    synced_symbol: Option<String>,
+    /// Attach the synchronized symbol as a suffix instead of a prefix.
+    #[arg(long)]
+    synced_symbol_suffix: bool,
+    /// FCP 7 color label for synchronized clips (Premiere XML; the Resolve import
+    /// script applies the nearest Resolve clip color).
+    #[arg(long, value_name = "COLOR")]
+    synced_color: Option<String>,
+    /// Final Cut audio role for synchronized audio (FCPXML only).
+    #[arg(long, value_name = "ROLE")]
+    synced_role: Option<String>,
+    /// Custom symbol for unmatched names (implies labeling).
+    #[arg(long, value_name = "TEXT")]
+    unmatched_symbol: Option<String>,
+    /// Attach the unmatched symbol as a suffix instead of a prefix.
+    #[arg(long)]
+    unmatched_symbol_suffix: bool,
+    /// FCP 7 color label for unmatched clips (Premiere XML; the Resolve import
+    /// script applies the nearest Resolve clip color).
+    #[arg(long, value_name = "COLOR")]
+    unmatched_color: Option<String>,
+    /// Final Cut audio role for unmatched audio (FCPXML only).
+    #[arg(long, value_name = "ROLE")]
+    unmatched_role: Option<String>,
+}
+
+macro_rules! cli_enum {
+    ($name:ident { $($variant:ident),+ $(,)? }) => {
+        #[derive(Clone, Copy, Debug, clap::ValueEnum)]
+        enum $name { $($variant),+ }
+        impl $name {
+            fn core(self) -> align_core::$name {
+                match self { $(Self::$variant => align_core::$name::$variant),+ }
+            }
+        }
+    }
+}
+
+cli_enum! { SearchAccuracy { Fast, Balanced, Thorough, Deep, Exhaustive } }
+
+#[derive(Args, Clone, Debug)]
+struct SyncSettings {
+    /// Select a completed synchronization stage (1-based); default is most synced clips.
+    #[arg(long, value_name = "N")]
+    stage: Option<usize>,
+    /// Search more spectral bands at the cost of time and memory.
+    #[arg(long, value_enum, default_value_t = SearchAccuracy::Balanced)]
+    search_accuracy: SearchAccuracy,
+    /// Whether clips from one source track may synchronize together.
+    #[arg(long, value_enum, default_value_t = TrackContent::Auto)]
+    track_content: TrackContent,
+    /// Preserve trims, duplicates, order, positions and gaps on an imported
+    /// track (for example A1 or V2). Repeat for more than one anchor track.
+    #[arg(long = "preserve-basic-editing", value_name = "TRACK", value_parser = parse_imported_track)]
+    preserve_editing_tracks: Vec<String>,
+    /// Timestamp evidence used to support synchronization.
+    #[arg(long, value_enum, default_value_t = TimeSource::Auto)]
+    time_source: TimeSource,
+    /// Required waveform confidence.
+    #[arg(long, value_enum, default_value_t = MatchThreshold::Balanced)]
+    match_threshold: MatchThreshold,
+    /// Preserve chronology when selecting between competing matches.
+    #[arg(long, value_enum, default_value_t = ClipOrder::Auto)]
+    clip_order: ClipOrder,
+}
+
+impl SyncSettings {
+    fn pipeline_options(&self) -> PipelineOptions {
+        PipelineOptions {
+            search_accuracy: self.search_accuracy.core(),
+            temporal: align_core::TemporalPolicy {
+                default: self.time_source.mode(),
+                modes: std::collections::HashMap::new(),
+            },
+            match_policy: align_core::MatchPolicy {
+                default: self.match_threshold.core(),
+                thresholds: std::collections::HashMap::new(),
+            },
+            clip_order: align_core::ClipOrderPolicy {
+                default: self.clip_order.core(),
+                modes: std::collections::HashMap::new(),
+            },
+            track_content: align_core::TrackContentPolicy {
+                default: self.track_content.core(),
+                modes: std::collections::HashMap::new(),
+            },
+            preserve_editing_tracks: self.preserve_editing_tracks.iter().cloned().collect(),
+            ..PipelineOptions::default()
+        }
+    }
+}
+
+fn parse_imported_track(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let (kind, number) = value.split_at_checked(1).ok_or_else(|| {
+        "track must be an imported video or audio track such as V1 or A2".to_string()
+    })?;
+    let number: usize = number.parse().map_err(|_| {
+        "track must be an imported video or audio track such as V1 or A2".to_string()
+    })?;
+    if number == 0 {
+        return Err("track numbers start at 1".into());
+    }
+    let kind = match kind.to_ascii_uppercase().as_str() {
+        "V" => align_core::MediaKind::Video,
+        "A" => align_core::MediaKind::Audio,
+        _ => {
+            return Err("track must be an imported video or audio track such as V1 or A2".into());
+        }
+    };
+    Ok(align_core::export_model::imported_track_key(kind, number))
+}
+
+pub fn main_entry() -> ! {
+    struct SessionCleanup;
+    impl Drop for SessionCleanup {
+        fn drop(&mut self) {
+            align_decode::media_assets::cleanup();
+        }
+    }
+    let session_cleanup = SessionCleanup;
+    let code = run();
+    drop(session_cleanup);
+    std::process::exit(code);
+}
+
+fn run() -> i32 {
+    match run_inner(Cli::parse()) {
+        Ok(()) => 0,
+        Err(CliError::Usage) => {
+            eprintln!(
+                "usage: align-cli sync [OPTIONS] <media-or-folder> [...] | align-cli export [OPTIONS] <output-folder> <media-or-folder> [...] | align-cli export-json [OPTIONS] <result.json> <output-folder>"
+            );
+            2
+        }
+        Err(CliError::Failure(message)) => {
+            eprintln!("error: {message}");
+            1
+        }
+    }
+}
+
+enum CliError {
+    Usage,
+    Failure(String),
+}
+
+impl From<PipelineError> for CliError {
+    fn from(error: PipelineError) -> Self {
+        Self::Failure(error.to_string())
+    }
+}
+
+impl From<align_decode::export::ExportError> for CliError {
+    fn from(error: align_decode::export::ExportError) -> Self {
+        Self::Failure(error.to_string())
+    }
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum TimeSource {
+    Auto,
+    #[value(name = "rec-start")]
+    RecStart,
+    #[value(name = "rec-stop")]
+    RecStop,
+    Timecode,
+}
+
+cli_enum! { MatchThreshold { Permissive, Balanced, Conservative } }
+
+cli_enum! { ClipOrder { Auto, AlternateAuto, AsImported, ByDateTime, ByFileName, Ignore } }
+
+cli_enum! { TrackContent { Auto, Linear, Takes } }
+
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum AafFps {
+    #[default]
+    Auto,
+    #[value(name = "23.976")]
+    Fps23976,
+    #[value(name = "24")]
+    Fps24,
+    #[value(name = "25")]
+    Fps25,
+    #[value(name = "29.97")]
+    Fps2997,
+    #[value(name = "30")]
+    Fps30,
+    #[value(name = "50")]
+    Fps50,
+    #[value(name = "59.94")]
+    Fps5994,
+    #[value(name = "60")]
+    Fps60,
+}
+
+impl AafFps {
+    fn frame_duration(self) -> Option<align_core::MediaTime> {
+        let (value, timescale) = match self {
+            Self::Auto => return None,
+            Self::Fps23976 => (1001, 24_000),
+            Self::Fps24 => (1, 24),
+            Self::Fps25 => (1, 25),
+            Self::Fps2997 => (1001, 30_000),
+            Self::Fps30 => (1, 30),
+            Self::Fps50 => (1, 50),
+            Self::Fps5994 => (1001, 60_000),
+            Self::Fps60 => (1, 60),
+        };
+        Some(align_core::MediaTime::new(value, timescale))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum Unmatched {
+    #[default]
+    OrderTime,
+    OrderOnly,
+    Remove,
+}
+
+impl Unmatched {
+    fn core(self) -> align_core::export_model::UnmatchedPlacement {
+        use align_core::export_model::UnmatchedPlacement as P;
+        match self {
+            Self::OrderTime => P::ByOrderAndTime,
+            Self::OrderOnly => P::ByOrderOnly,
+            Self::Remove => P::Remove,
+        }
+    }
+}
+
+impl TimeSource {
+    fn mode(self) -> align_core::TemporalMode {
+        match self {
+            Self::Auto => align_core::TemporalMode::Auto,
+            Self::RecStart => align_core::TemporalMode::RecStart,
+            Self::RecStop => align_core::TemporalMode::RecStop,
+            Self::Timecode => align_core::TemporalMode::Timecode,
+        }
+    }
+}
+
+fn sequence_index(value: Option<usize>) -> Result<Option<usize>, CliError> {
+    match value {
+        None => Ok(None),
+        Some(0) => Err(CliError::Failure(
+            "--sequence requires a positive, one-based sequence number.".into(),
+        )),
+        Some(n) => Ok(Some(n - 1)),
+    }
+}
+
+fn to_inputs(paths: &[PathBuf], sequence: Option<usize>) -> Vec<PipelineInput> {
+    paths
+        .iter()
+        .map(|path| {
+            if !align_decode::timeline::is_supported(path) {
+                return PipelineInput::Media(path.clone());
+            }
+            match sequence {
+                Some(index) => PipelineInput::TimelineSequence(path.clone(), index),
+                None => PipelineInput::Timeline(path.clone()),
+            }
+        })
+        .collect()
+}
+
+fn input_sets(
+    paths: &[PathBuf],
+    sequence: Option<usize>,
+    all_sequences: bool,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<Vec<PipelineInput>>, CliError> {
+    if !all_sequences {
+        return Ok(vec![to_inputs(paths, sequence)]);
+    }
+    let timelines: Vec<&PathBuf> = paths
+        .iter()
+        .filter(|path| align_decode::timeline::is_supported(path))
+        .collect();
+    if timelines.len() != 1 {
+        return Err(CliError::Failure(
+            "--all-sequences requires exactly one XML, FCPXML, or AAF project path.".into(),
+        ));
+    }
+    let summaries = align_decode::timeline::sequences(timelines[0], cancel)
+        .map_err(|error| CliError::Failure(error.to_string()))?;
+    if summaries.is_empty() {
+        return Err(CliError::Failure(
+            "The imported project contains no sequences.".into(),
+        ));
+    }
+    Ok(summaries
+        .into_iter()
+        .map(|summary| to_inputs(paths, Some(summary.index)))
+        .collect())
+}
+
+fn progress_printer() -> impl Fn(align_decode::pipeline::PipelineProgress) + Send + Sync {
+    |update| {
+        let phase = match update.phase {
+            Phase::Inspect => "inspect",
+            Phase::Fingerprint => "fingerprint",
+            Phase::Match => "match",
+            Phase::Refine => "refine",
+            Phase::Solve => "solve",
+        };
+        let name = update
+            .current
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        eprintln!("{} {}/{} {}", phase, update.completed, update.total, name);
+    }
+}
+
+fn select_stage(
+    result: &mut align_core::SyncResult,
+    requested: Option<usize>,
+) -> Result<(), CliError> {
+    let Some(number) = requested else {
+        return Ok(());
+    };
+    if number
+        .checked_sub(1)
+        .is_some_and(|index| result.select_stage(index))
+    {
+        return Ok(());
+    }
+    Err(CliError::Failure(format!(
+        "Stage {number} is unavailable; choose 1 through {}.",
+        result.stages.len().max(1)
+    )))
+}
+
+fn save_json(path: &std::path::Path, result: &impl serde::Serialize) -> Result<(), CliError> {
+    fn write(path: &std::path::Path, result: &impl serde::Serialize) -> std::io::Result<()> {
+        let staged = align_core::staged::StagedFile::new(path)?;
+        {
+            let mut writer = std::io::BufWriter::new(std::fs::File::create(staged.path())?);
+            serde_json::to_writer(&mut writer, result)?;
+            writer.write_all(b"\n")?;
+            writer.flush()?;
+        }
+        staged.commit()
+    }
+    write(path, result).map_err(|e| CliError::Failure(format!("Save {}: {e}", path.display())))
+}
+
+fn sync_summary(result: &align_core::SyncResult) -> serde_json::Value {
+    use serde_json::json;
+    let names: std::collections::HashMap<_, _> = result
+        .project
+        .clips
+        .iter()
+        .map(|clip| (&clip.id, align_core::model::file_name(&clip.url)))
+        .collect();
+    let name = |id: &align_core::ClipId| names.get(id).cloned().unwrap_or_else(|| id.0.clone());
+    let islands: Vec<_> = result
+        .islands
+        .iter()
+        .map(|island| {
+            json!({
+                "id": island.id,
+                "clips": island.placements.iter().map(|p| name(&p.clip_id)).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    json!({
+        "sequence": result.project.imported_timeline.as_ref().map(|timeline| &timeline.name),
+        "islands": islands,
+        "unmatched": result.unmatched.iter().map(name).collect::<Vec<_>>(),
+        "warnings": result.project.warnings,
+        "maxAbsDriftPPM": result.matches.iter().map(|m| m.drift_ppm.abs()).reduce(f64::max),
+    })
+}
+
+fn print_json(value: &impl serde::Serialize) -> Result<(), CliError> {
+    let mut out = serde_json::to_string_pretty(value)
+        .map_err(|e| CliError::Failure(format!("JSON encode: {e}")))?;
+    out.push('\n');
+    std::io::stdout()
+        .write_all(out.as_bytes())
+        .map_err(|e| CliError::Failure(format!("stdout: {e}")))?;
+    Ok(())
+}
+
+/// A path relative to the working directory, made absolute. Results and
+/// exported timelines name media for other applications, which cannot
+/// resolve paths relative to where the CLI ran.
+fn absolute(path: PathBuf) -> PathBuf {
+    std::path::absolute(&path).unwrap_or(path)
+}
+
+impl Cli {
+    fn with_absolute_paths(mut self) -> Self {
+        let all = |paths: Vec<PathBuf>| paths.into_iter().map(absolute).collect();
+        self.paths = all(self.paths);
+        match &mut self.command {
+            Some(Command::Sync { paths, relink, .. }) => {
+                *paths = all(std::mem::take(paths));
+                relink.write_fixed_project = relink.write_fixed_project.take().map(absolute);
+            }
+            Some(Command::Export {
+                output,
+                paths,
+                relink,
+                ..
+            }) => {
+                *output = absolute(std::mem::take(output));
+                *paths = all(std::mem::take(paths));
+                relink.write_fixed_project = relink.write_fixed_project.take().map(absolute);
+            }
+            Some(Command::ExportJson { output, .. }) => {
+                *output = absolute(std::mem::take(output));
+            }
+            Some(Command::ClearCache { .. }) | None => {}
+        }
+        self
+    }
+}
+
+fn run_inner(cli: Cli) -> Result<(), CliError> {
+    let cli = cli.with_absolute_paths();
+    match cli.command {
+        None if cli.paths.is_empty() => Err(CliError::Usage),
+        None => {
+            // Bare paths inspect without synchronizing.
+            let pipeline = Pipeline::default_backend();
+            let inputs = to_inputs(&cli.paths, None);
+            let redirects = align_core::redirect::load_from(&align_core::redirect::config_file());
+            let options = PipelineOptions {
+                redirects,
+                ..Default::default()
+            };
+            let mut project = pipeline.open_with(&inputs, &options)?;
+            align_decode::media_assets::preserve_project(
+                &mut project,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .map_err(|error| CliError::Failure(format!("Save embedded AAF media: {error}")))?;
+            print_json(&project)
+        }
+        Some(Command::Sync {
+            output_json,
+            summary,
+            sequence,
+            all_sequences,
+            settings,
+            relink,
+            paths,
+        }) => {
+            if paths.is_empty() {
+                return Err(CliError::Usage);
+            }
+            let sequence = sequence_index(sequence)?;
+            let pipeline = Pipeline::default_backend();
+            let progress = progress_printer();
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let input_sets = input_sets(&paths, sequence, all_sequences, &cancel)?;
+            let mut options = settings.pipeline_options();
+            let (redirects, manual, omit) = relink_options(&relink)?;
+            options.redirects = redirects;
+            options.manual_relinks = manual;
+            options.omit_extensions = omit;
+            options.prefer_proxies = relink.prefer_proxies;
+            write_fixed_project(
+                &pipeline,
+                &input_sets,
+                &options,
+                relink.write_fixed_project.as_deref(),
+                &cancel,
+            )?;
+            let mut results = Vec::with_capacity(input_sets.len());
+            for inputs in input_sets {
+                let mut result =
+                    pipeline.synchronize(&inputs, &[], &options, Some(&progress), &cancel)?;
+                select_stage(&mut result, settings.stage)?;
+                align_decode::media_assets::preserve_project(&mut result.project, &cancel)
+                    .map_err(|error| {
+                        CliError::Failure(format!("Save embedded AAF media: {error}"))
+                    })?;
+                results.push(result);
+            }
+            if let Some(path) = output_json {
+                let path = absolute(path);
+                // A selected source can also arrive through a directory or
+                // a project. Protect it if the output path names that file.
+                if let Ok(destination) = path.canonicalize()
+                    && paths
+                        .iter()
+                        .chain(
+                            results
+                                .iter()
+                                .flat_map(|r| r.project.clips.iter().map(|c| &c.url)),
+                        )
+                        .chain(relink.write_fixed_project.iter())
+                        .any(|p| p.canonicalize().is_ok_and(|source| source == destination))
+                {
+                    return Err(CliError::Failure(format!(
+                        "Choose a result file separate from {}",
+                        path.display()
+                    )));
+                }
+                if all_sequences {
+                    save_json(&path, &results)?;
+                } else {
+                    save_json(&path, &results[0])?;
+                }
+                if summary {
+                    let sequences: Vec<_> = results.iter().map(sync_summary).collect();
+                    return print_json(
+                        &serde_json::json!({"outputJson": path, "sequences": sequences}),
+                    );
+                }
+            }
+            if all_sequences {
+                print_json(&results)
+            } else {
+                print_json(&results[0])
+            }
+        }
+        Some(Command::Export {
+            sequence,
+            all_sequences,
+            export,
+            relink,
+            settings,
+            output,
+            paths,
+        }) => {
+            if paths.is_empty() {
+                return Err(CliError::Failure(
+                    "Export requires an output folder and at least one media path.".into(),
+                ));
+            }
+            let sequence = sequence_index(sequence)?;
+            let pipeline = Pipeline::default_backend();
+            let progress = progress_printer();
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let input_sets = input_sets(&paths, sequence, all_sequences, &cancel)?;
+            let mut options = settings.pipeline_options();
+            let (redirects, manual, omit) = relink_options(&relink)?;
+            options.redirects = redirects;
+            options.manual_relinks = manual;
+            options.omit_extensions = omit;
+            options.prefer_proxies = relink.prefer_proxies;
+            write_fixed_project(
+                &pipeline,
+                &input_sets,
+                &options,
+                relink.write_fixed_project.as_deref(),
+                &cancel,
+            )?;
+            let mut results = Vec::with_capacity(input_sets.len());
+            for inputs in input_sets {
+                let mut result =
+                    pipeline.synchronize(&inputs, &[], &options, Some(&progress), &cancel)?;
+                select_stage(&mut result, settings.stage)?;
+                results.push(result);
+            }
+            let artifacts = export.execute(pipeline.backend(), &results, &output, &cancel)?;
+            print_json(&artifacts)
+        }
+        Some(Command::ExportJson {
+            stage,
+            export,
+            result,
+            output,
+        }) => {
+            let mut results = export_job::read_results(&result)?;
+            for result in &mut results {
+                select_stage(result, stage)?;
+            }
+            let pipeline = Pipeline::default_backend();
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let artifacts = export.execute(pipeline.backend(), &results, &output, &cancel)?;
+            print_json(&artifacts)
+        }
+        Some(Command::ClearCache { older_than_days }) => {
+            use align_core::FingerprintCache;
+            let cache = FingerprintCache::new(None);
+            let before = cache.statistics();
+            if let Some(days) = older_than_days {
+                cache.prune_older_than(std::time::Duration::from_secs(days * 24 * 60 * 60));
+            } else {
+                cache.clear();
+            }
+            let after = cache.statistics();
+            print_json(&serde_json::json!({
+                "cleared_files": before.file_count.saturating_sub(after.file_count),
+                "cleared_bytes": before.total_bytes.saturating_sub(after.total_bytes),
+                "remaining_files": after.file_count,
+                "remaining_bytes": after.total_bytes,
+            }))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unexpected_paths_are_rejected_before_running_a_subcommand() {
+        for arguments in [
+            vec![
+                "align-cli",
+                "export-json",
+                "result.json",
+                "out",
+                "extra.wav",
+            ],
+            vec!["align-cli", "clear-cache", "extra.wav"],
+        ] {
+            let error = Cli::try_parse_from(&arguments)
+                .err()
+                .unwrap_or_else(|| panic!("unexpected paths accepted: {arguments:?}"));
+            assert_eq!(error.exit_code(), 2);
+        }
+        assert_eq!(
+            Cli::try_parse_from(["align-cli", "camera.wav", "recorder.wav"])
+                .expect("bare-path inspection")
+                .paths,
+            vec![PathBuf::from("camera.wav"), PathBuf::from("recorder.wav")],
+        );
+    }
+
+    #[test]
+    fn relative_paths_become_absolute_before_running() {
+        let cwd = std::env::current_dir().unwrap();
+        let recorder = cwd.join("Audio").join("rec.wav");
+        let cli = Cli::try_parse_from([
+            "align-cli".as_ref(),
+            "export".as_ref(),
+            "out".as_ref(),
+            "CamA".as_ref(),
+            recorder.as_os_str(),
+        ])
+        .expect("export arguments")
+        .with_absolute_paths();
+        let Some(Command::Export { output, paths, .. }) = cli.command else {
+            panic!("export command")
+        };
+        assert_eq!(output, cwd.join("out"));
+        assert_eq!(paths, [cwd.join("CamA"), recorder]);
+    }
+
+    #[test]
+    fn export_accepts_the_same_sync_settings_as_sync() {
+        let cli = Cli::try_parse_from([
+            "align-cli",
+            "export",
+            "--time-source",
+            "timecode",
+            "--match-threshold",
+            "conservative",
+            "--clip-order",
+            "by-file-name",
+            "--track-content",
+            "linear",
+            "--preserve-basic-editing",
+            "V1",
+            "--preserve-basic-editing",
+            "A2",
+            "--no-drift",
+            "--replaced-audio",
+            "--media-bins",
+            "--no-fcpxml-multicam",
+            "--export-media",
+            "--label-synced",
+            "--label-unmatched",
+            "--synced-symbol",
+            "✓",
+            "--synced-color",
+            "Iris",
+            "--synced-role",
+            "dialogue.interview",
+            "/tmp/out",
+            "/tmp/media",
+        ])
+        .expect("export arguments");
+        let Some(Command::Export {
+            settings,
+            export:
+                ExportOptions {
+                    no_drift,
+                    aaf,
+                    aaf_fps,
+                    replaced_audio,
+                    media_bins,
+                    fcpxml_storylines,
+                    no_fcpxml_timeline,
+                    no_fcpxml_multicam,
+                    export_media,
+                    label_synced,
+                    label_unmatched,
+                    assign,
+                    ..
+                },
+            ..
+        }) = cli.command
+        else {
+            panic!("export command")
+        };
+        let options = settings.pipeline_options();
+
+        assert_eq!(options.temporal.default, align_core::TemporalMode::Timecode);
+        assert_eq!(
+            options.match_policy.default,
+            align_core::MatchThreshold::Conservative
+        );
+        assert_eq!(
+            options.clip_order.default,
+            align_core::ClipOrder::ByFileName
+        );
+        assert_eq!(
+            options.track_content.default,
+            align_core::TrackContent::Linear
+        );
+        assert_eq!(
+            options.preserve_editing_tracks,
+            [
+                "imported-video-000001".to_string(),
+                "imported-audio-000002".to_string()
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(!aaf);
+        assert_eq!(aaf_fps.frame_duration(), None);
+        assert!(no_drift);
+        assert!(replaced_audio);
+        assert!(media_bins);
+        assert!(!fcpxml_storylines);
+        assert!(!no_fcpxml_timeline);
+        assert!(no_fcpxml_multicam);
+        assert!(export_media);
+        assert!(label_synced);
+        assert!(label_unmatched);
+        assert_eq!(assign.synced_symbol.as_deref(), Some("✓"));
+        assert_eq!(assign.synced_color.as_deref(), Some("Iris"));
+        assert_eq!(assign.synced_role.as_deref(), Some("dialogue.interview"));
+    }
+
+    #[test]
+    fn aaf_frame_rate_values_are_exact() {
+        assert_eq!(
+            AafFps::Fps23976.frame_duration(),
+            Some(align_core::MediaTime::new(1001, 24_000))
+        );
+        assert_eq!(
+            AafFps::Fps2997.frame_duration(),
+            Some(align_core::MediaTime::new(1001, 30_000))
+        );
+        assert_eq!(
+            AafFps::Fps5994.frame_duration(),
+            Some(align_core::MediaTime::new(1001, 60_000))
+        );
+        let cli = Cli::try_parse_from([
+            "align-cli",
+            "export-json",
+            "--aaf",
+            "--aaf-fps",
+            "29.97",
+            "/tmp/result.json",
+            "/tmp/out",
+        ])
+        .expect("AAF frame rate");
+        assert!(matches!(
+            cli.command,
+            Some(Command::ExportJson {
+                export: ExportOptions {
+                    aaf_fps: AafFps::Fps2997,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn relink_and_cleanup_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "align-cli",
+            "sync",
+            "--redirect",
+            "/old=/new",
+            "--relink",
+            "a.mov=/new/a.mov",
+            "--clear-redirects",
+            "--prefer-proxies",
+            "--omit-extensions",
+            "jpg,png",
+            "--write-fixed-project",
+            "/tmp/fixed.xml",
+            "/tmp/media",
+        ])
+        .expect("sync arguments");
+        let Some(Command::Sync { relink, .. }) = cli.command else {
+            panic!("sync command")
+        };
+        assert_eq!(relink.redirect, vec!["/old=/new".to_string()]);
+        assert_eq!(relink.relink, vec!["a.mov=/new/a.mov".to_string()]);
+        assert!(relink.clear_redirects);
+        assert!(relink.prefer_proxies);
+        assert_eq!(relink.omit_extensions.as_deref(), Some("jpg,png"));
+        assert_eq!(
+            relink.write_fixed_project.as_deref(),
+            Some(std::path::Path::new("/tmp/fixed.xml"))
+        );
+
+        let cli = Cli::try_parse_from(["align-cli", "clear-cache", "--older-than-days", "7"])
+            .expect("clear-cache arguments");
+        assert!(matches!(
+            cli.command,
+            Some(Command::ClearCache {
+                older_than_days: Some(7)
+            })
+        ));
+    }
+
+    #[test]
+    fn all_sequences_conflicts_with_an_explicit_sequence() {
+        for command in ["sync", "export"] {
+            let mut arguments = vec!["align-cli", command, "--all-sequences", "--sequence", "2"];
+            if command == "export" {
+                arguments.push("/tmp/out");
+            }
+            arguments.push("/tmp/project.xml");
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn all_sequence_input_sets_keep_each_sequence_index() {
+        let dir = std::env::temp_dir().join(format!("align-cli-sequences-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = dir.join("project.xml");
+        std::fs::write(
+            &project,
+            "<xmeml><sequence><name>A</name></sequence><sequence><name>B</name></sequence></xmeml>",
+        )
+        .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let Ok(sets) = input_sets(std::slice::from_ref(&project), None, true, &cancel) else {
+            panic!("input sets")
+        };
+        assert_eq!(sets.len(), 2);
+        assert_eq!(
+            sets[0],
+            vec![PipelineInput::TimelineSequence(project.clone(), 0)]
+        );
+        assert_eq!(
+            sets[1],
+            vec![PipelineInput::TimelineSequence(project.clone(), 1)]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

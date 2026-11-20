@@ -102,6 +102,7 @@ dependencies = [
 name = "align-gpui"
 version = "0.3.5"
 dependencies = [
+ "align-cli",
  "align-core",
  "align-decode",
  "dirs 6.0.0",

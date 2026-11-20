@@ -66,7 +66,7 @@ if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
 fi
 
 echo "==> building release"
-cargo build --locked --release --manifest-path "$ROOT_DIR/Cargo.toml" -p align-cli -p align-gpui
+cargo build --locked --release --manifest-path "$ROOT_DIR/Cargo.toml" -p align-gpui
 
 BIN_DIR="$ROOT_DIR/target/release"
 APP_BUNDLE="$OUT_DIR/$APP_NAME.app"
@@ -85,8 +85,8 @@ cp "$ROOT_DIR/Support/AppIcon.icns" "$RESOURCES/AppIcon.icns"
 cp "$ROOT_DIR/Support/PrivacyInfo.xcprivacy" "$RESOURCES/PrivacyInfo.xcprivacy"
 cp "$ROOT_DIR/THIRD_PARTY_NOTICES.txt" "$RESOURCES/THIRD_PARTY_NOTICES.txt"
 cp "$ROOT_DIR/LICENSE" "$RESOURCES/LICENSE"
-cp "$BIN_DIR/align-cli" "$OUT_DIR/align-cli"
-cp "$BIN_DIR/align-cli" "$APP_MACOS/align-cli"
+ln -s "Align.app/Contents/MacOS/Align" "$OUT_DIR/align-cli"
+ln -s Align "$APP_MACOS/align-cli"
 cp "$ROOT_DIR/THIRD_PARTY_NOTICES.txt" "$OUT_DIR/THIRD_PARTY_NOTICES.txt"
 cp "$ROOT_DIR/LICENSE" "$OUT_DIR/LICENSE"
 chmod +x "$OUT_DIR/align-cli" "$APP_MACOS/align-cli"

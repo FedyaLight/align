@@ -275,6 +275,14 @@ fn app_menus(appearance: theme::AppearancePreference) -> Vec<Menu> {
 }
 
 fn main() {
+    #[cfg(unix)]
+    if std::env::args_os().next().is_some_and(|arg| {
+        std::path::Path::new(&arg)
+            .file_name()
+            .is_some_and(|name| name == "align-cli")
+    }) {
+        align_cli::main_entry();
+    }
     #[cfg(windows)]
     velopack::VelopackApp::build().run();
 
