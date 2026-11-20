@@ -399,11 +399,34 @@ fn export_prepared_internal(
         completed: 0,
         total: plan.jobs.len() + media_plans.len(),
     };
-    for job in &plan.jobs {
-        check_cancel(cancel)?;
-        progress.report(&job.media, ExportJobKind::Audio);
-        job.render(backend, cancel)?;
-        progress.complete(&job.media, ExportJobKind::Audio);
+    // A stem may read a corrected file. Finish every drift writer before
+    // opening stem inputs. The planner has already deduplicated destinations.
+    let (drift, stems): (Vec<_>, Vec<_>) = plan
+        .jobs
+        .iter()
+        .partition(|job| matches!(job.kind, AudioJobKind::Drift { .. }));
+    for phase in [drift, stems] {
+        for pair in phase.chunks(2) {
+            check_cancel(cancel)?;
+            for job in pair {
+                progress.report(&job.media, ExportJobKind::Audio);
+            }
+            if let [first, second] = pair {
+                std::thread::scope(|scope| {
+                    let other = scope.spawn(|| second.render(backend, cancel));
+                    let first_result = first.render(backend, cancel);
+                    let second_result = other.join().expect("audio render worker panicked");
+                    first_result?;
+                    progress.complete(&first.media, ExportJobKind::Audio);
+                    second_result?;
+                    progress.complete(&second.media, ExportJobKind::Audio);
+                    Ok::<_, ExportError>(())
+                })?;
+            } else {
+                pair[0].render(backend, cancel)?;
+                progress.complete(&pair[0].media, ExportJobKind::Audio);
+            }
+        }
     }
     check_cancel(cancel)?;
 

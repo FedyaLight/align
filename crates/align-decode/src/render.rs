@@ -313,7 +313,8 @@ impl WavWriter {
 
 /// Rendered segment: source range stretched to the island range.
 struct Segment {
-    resampler: Vec<SincFixedIn<f32>>,
+    resampler: SincFixedIn<f32>,
+    scratch: Vec<Vec<f32>>,
     pending: Vec<Vec<f32>>,
     skip: usize,
     emitted: usize,
@@ -337,25 +338,21 @@ impl Segment {
         // Arbitrary clock ratios must not determine the FFT size or be
         // rounded to whole ppm: that can accumulate milliseconds on long takes.
         // A fixed sinc kernel bounds work and latency independently of ratio.
-        let mut resampler = Vec::with_capacity(channels);
-        for _ in 0..channels {
-            resampler.push(
-                SincFixedIn::new(
-                    ratio,
-                    1.0,
-                    SincInterpolationParameters {
-                        sinc_len: 128,
-                        f_cutoff: 0.95,
-                        oversampling_factor: 256,
-                        interpolation: SincInterpolationType::Linear,
-                        window: WindowFunction::BlackmanHarris2,
-                    },
-                    BLOCK_FRAMES,
-                    1,
-                )
-                .map_err(|error| RenderError::Resample(error.to_string()))?,
-            );
-        }
+        let resampler = SincFixedIn::new(
+            ratio,
+            1.0,
+            SincInterpolationParameters {
+                sinc_len: 128,
+                f_cutoff: 0.95,
+                oversampling_factor: 256,
+                interpolation: SincInterpolationType::Linear,
+                window: WindowFunction::BlackmanHarris2,
+            },
+            BLOCK_FRAMES,
+            channels,
+        )
+        .map_err(|error| RenderError::Resample(error.to_string()))?;
+        let scratch = resampler.output_buffer_allocate(true);
         // rubato 0.15 SincFixedIn starts its interpolation index at -kernel/2:
         // the first returned sample is already at source time zero. Its
         // output_delay() describes buffered lookahead, not leading samples
@@ -363,6 +360,7 @@ impl Segment {
         let skip = 0;
         Ok(Self {
             resampler,
+            scratch,
             pending: vec![Vec::new(); channels],
             skip,
             flush_rounds: ((4.0 * skip as f64 / ratio).ceil() as usize).div_ceil(BLOCK_FRAMES) + 4,
@@ -377,16 +375,27 @@ impl Segment {
     /// shared counters would starve later channels and ragged planes
     /// would corrupt the interleaved writer.
     fn push(&mut self, planes: Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, RenderError> {
-        let n = planes.len();
-        let mut out = Vec::from_fn(n, |_| Vec::new());
-        for ch in 0..n {
-            self.pending[ch].extend_from_slice(&planes[ch]);
-            while self.pending[ch].len() >= BLOCK_FRAMES {
-                let chunk: Vec<f32> = self.pending[ch].drain(..BLOCK_FRAMES).collect();
-                let produced: Vec<Vec<f32>> = self.resampler[ch]
-                    .process(&[chunk], None)
+        let frames = planes.first().map_or(0, Vec::len);
+        if planes.len() != self.pending.len() || planes.iter().any(|p| p.len() != frames) {
+            return Err(RenderError::InvalidRequest("inconsistent audio planes"));
+        }
+        let mut out = vec![Vec::new(); planes.len()];
+        let mut pos = 0;
+        while pos < frames {
+            let take = (BLOCK_FRAMES - self.pending[0].len()).min(frames - pos);
+            for (pending, plane) in self.pending.iter_mut().zip(&planes) {
+                pending.extend_from_slice(&plane[pos..pos + take]);
+            }
+            pos += take;
+            if self.pending[0].len() == BLOCK_FRAMES {
+                let (_, produced) = self
+                    .resampler
+                    .process_into_buffer(&self.pending, &mut self.scratch, None)
                     .map_err(|error| RenderError::Resample(error.to_string()))?;
-                out[ch].extend_from_slice(&produced[0]);
+                for (dst, src) in out.iter_mut().zip(&self.scratch) {
+                    dst.extend_from_slice(&src[..produced]);
+                }
+                self.pending.iter_mut().for_each(Vec::clear);
             }
         }
         self.uniform_slice(&mut out);
@@ -413,22 +422,13 @@ impl Segment {
     fn finish(&mut self, cancel: &AtomicBool) -> Result<Vec<Vec<f32>>, RenderError> {
         check_cancel(cancel)?;
         // Remainder through process_partial, then bounded tail flush.
-        let mut out = Vec::from_fn(self.resampler.len(), |_| Vec::new());
-        for ((pending, rs), dst) in self
-            .pending
-            .iter_mut()
-            .zip(self.resampler.iter_mut())
-            .zip(out.iter_mut())
-        {
-            if pending.is_empty() {
-                continue;
-            }
-            let rem = std::mem::take(pending);
-            let produced: Vec<Vec<f32>> = rs
-                .process_partial(Some(&[rem]), None)
-                .map_err(|error| RenderError::Resample(error.to_string()))?;
-            dst.extend_from_slice(&produced[0]);
-        }
+        let mut out = if self.pending.first().is_some_and(|p| !p.is_empty()) {
+            self.resampler
+                .process_partial(Some(&self.pending), None)
+                .map_err(|error| RenderError::Resample(error.to_string()))?
+        } else {
+            vec![Vec::new(); self.pending.len()]
+        };
         self.uniform_slice(&mut out);
         // Flush the bounded filter delay and any partial input block.
         for _ in 0..self.flush_rounds {
@@ -436,13 +436,10 @@ impl Segment {
             if self.emitted >= self.expected {
                 break;
             }
-            let mut round = Vec::from_fn(self.resampler.len(), |_| Vec::new());
-            for (ch, rs) in self.resampler.iter_mut().enumerate() {
-                let produced: Vec<Vec<f32>> = rs
-                    .process_partial::<&[f32]>(None, None)
-                    .map_err(|error| RenderError::Resample(error.to_string()))?;
-                round[ch].extend_from_slice(&produced[0]);
-            }
+            let mut round = self
+                .resampler
+                .process_partial::<&[f32]>(None, None)
+                .map_err(|error| RenderError::Resample(error.to_string()))?;
             self.uniform_slice(&mut round);
             for (ch, r) in round.into_iter().enumerate() {
                 out[ch].extend_from_slice(&r);
