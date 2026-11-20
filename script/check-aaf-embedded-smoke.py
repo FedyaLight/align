@@ -49,7 +49,7 @@ with aaf2.open(str(root / 'embedded.aaf'), 'w') as container:
 source.unlink()
 env = dict(os.environ, ALIGN_BACKEND='portable')
 env.pop('ALIGN_AAF', None)
-result = subprocess.run([str(args.cli.resolve()), 'sync', str(root / 'embedded.aaf')],
+result = subprocess.run([str(args.cli.absolute()), 'sync', str(root / 'embedded.aaf')],
     env=env, capture_output=True, text=True, encoding='utf-8', timeout=180)
 (root / 'sync.stderr').write_text(result.stderr, encoding='utf-8')
 if result.returncode:
@@ -65,7 +65,7 @@ with wave.open(str(saved_media), 'rb') as reader:
     assert reader.getnchannels() == args.channels
     assert reader.readframes(reader.getnframes()) == pcm
 # Export in a separate process, using only the saved JSON and retained media.
-exported = subprocess.run([str(args.cli.resolve()), 'export-json', '--aaf',
+exported = subprocess.run([str(args.cli.absolute()), 'export-json', '--aaf',
     str(root / 'sync.json'), str(root / 'export')], env=env,
     capture_output=True, text=True, encoding='utf-8', check=True, timeout=180)
 (root / 'export.json').write_text(exported.stdout, encoding='utf-8')

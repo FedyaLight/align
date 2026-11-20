@@ -47,7 +47,7 @@ if args.isolated_runtime:
     env['PATH'] = str(empty_path)
 
 def run(arguments, name):
-    result = subprocess.run([str(args.cli.resolve()), *map(str, arguments)],
+    result = subprocess.run([str(args.cli.absolute()), *map(str, arguments)],
         env=env, capture_output=True, text=True, encoding='utf-8', timeout=180)
     (root / (name + '.stderr')).write_text(result.stderr, encoding='utf-8')
     if result.returncode:

@@ -156,7 +156,7 @@ def main():
         parser.error('ffmpeg must be on PATH to generate the corpus')
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)
-    cli = args.cli.resolve()
+    cli = args.cli.absolute()
     media, truth = build_corpus(root, args.cameras, args.duration)
     env, log = counting_tools(root)
 

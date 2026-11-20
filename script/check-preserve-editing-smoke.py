@@ -58,7 +58,7 @@ source.write_text(
 
 def run(arguments, name):
     process = subprocess.run(
-        [str(args.cli.resolve()), *map(str, arguments)],
+        [str(args.cli.absolute()), *map(str, arguments)],
         capture_output=True,
         text=True,
         encoding="utf-8",

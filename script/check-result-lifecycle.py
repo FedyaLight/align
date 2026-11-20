@@ -89,7 +89,7 @@ def main():
     env = dict(os.environ, ALIGN_BACKEND='portable')
 
     def run(name, arguments, success=True):
-        process = subprocess.run([str(args.cli.resolve()), *map(str, arguments)],
+        process = subprocess.run([str(args.cli.absolute()), *map(str, arguments)],
             env=env, capture_output=True, text=True, encoding='utf-8', timeout=180)
         (root / f'{name}.stderr').write_text(process.stderr, encoding='utf-8')
         (root / f'{name}.json').write_text(process.stdout, encoding='utf-8')

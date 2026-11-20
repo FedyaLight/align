@@ -21,7 +21,7 @@ def main():
     parser.add_argument('cli', type=Path)
     parser.add_argument('output', type=Path)
     args = parser.parse_args()
-    cli = args.cli.resolve()
+    cli = args.cli.absolute()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     media = output / 'media'
