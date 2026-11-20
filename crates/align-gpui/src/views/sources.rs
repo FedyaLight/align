@@ -2,17 +2,36 @@
 
 use super::*;
 
+pub(super) struct SourcePreviewPresentation {
+    pub image: Option<std::sync::Arc<gpui::Image>>,
+    pub error: Option<String>,
+    pub height: f32,
+}
+
+pub(super) struct MainContentPresentation<'a> {
+    pub data: &'a crate::state::AppData,
+    pub timeline_transitions: &'a HashMap<ClipId, TimelineTransition>,
+    pub fit_width: f32,
+    pub active: bool,
+    pub selection_controls_closing: bool,
+    pub source_preview: SourcePreviewPresentation,
+}
+
 // ---------------- main content (drop zone → file list → timeline)
 
 pub(super) fn main_content(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
-    data: &crate::state::AppData,
-    timeline_transitions: &HashMap<ClipId, TimelineTransition>,
-    fit_width: f32,
-    active: bool,
-    selection_controls_closing: bool,
+    presentation: MainContentPresentation<'_>,
 ) -> impl IntoElement {
+    let MainContentPresentation {
+        data,
+        timeline_transitions,
+        fit_width,
+        active,
+        selection_controls_closing,
+        source_preview,
+    } = presentation;
     let mut content = div()
         .id("main")
         .flex_1()
@@ -27,6 +46,19 @@ pub(super) fn main_content(
                 this.close_selection_controls(cx);
             }
         }));
+    }
+    if data
+        .review_session
+        .selected_clip
+        .as_ref()
+        .and_then(|selected| {
+            data.clips
+                .iter()
+                .find(|clip| clip.clip_id.as_ref() == Some(selected))
+        })
+        .is_some_and(|clip| clip.kind == Some(MediaKind::Video))
+    {
+        content = content.child(source_monitor(cx, theme, data, source_preview, active));
     }
     if data.lanes.is_empty() {
         if data.clips.is_empty() {
@@ -60,6 +92,100 @@ pub(super) fn main_content(
     // A stable ID animates only screen changes, never progress notifications,
     // scrolling, or zoom. GPUI stops requesting frames after the one-shot.
     slide_in(content, screen, 0)
+}
+
+fn source_monitor(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    data: &crate::state::AppData,
+    source_preview: SourcePreviewPresentation,
+    active: bool,
+) -> impl IntoElement {
+    let height = source_preview.height;
+    let selected = data.review_session.selected_clip.as_ref().and_then(|id| {
+        data.clips
+            .iter()
+            .find(|clip| clip.clip_id.as_ref() == Some(id))
+    });
+    let title = selected.map_or_else(|| "Source monitor".to_string(), |clip| clip.name.clone());
+    let mut panel = div()
+        .id("source-monitor")
+        .w_full()
+        .h(px(height.clamp(120.0, 640.0)))
+        .flex_shrink_0()
+        .flex()
+        .flex_col()
+        .bg(rgb(0x101014))
+        .child(
+            div()
+                .px_3()
+                .py_1()
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(rgb(theme.dim))
+                .child(title),
+        );
+    let frame = div()
+        .flex_1()
+        .min_h(px(0.0))
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .overflow_hidden();
+    let frame = if let Some(image) = source_preview.image {
+        frame.child(img(image).size_full().object_fit(gpui::ObjectFit::Contain))
+    } else if let Some(error) = source_preview.error {
+        frame.child(
+            div()
+                .max_w(px(560.0))
+                .px_4()
+                .text_sm()
+                .text_color(rgb(theme.warning))
+                .child(format!("Preview unavailable: {error}")),
+        )
+    } else {
+        frame.child(
+            div()
+                .text_sm()
+                .text_color(rgb(theme.dim))
+                .child("Loading source frame…"),
+        )
+    };
+    panel = panel.child(frame);
+    let mut resize = div()
+        .id("source-monitor-resize")
+        .h(px(8.0))
+        .flex_shrink_0()
+        .cursor_pointer()
+        .bg(rgb(theme.separator));
+    if active {
+        resize = resize
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, _| {
+                    this.source_preview_drag = Some((f32::from(event.position.y), height));
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if !matches!(event.pressed_button, Some(MouseButton::Left)) {
+                    this.source_preview_drag = None;
+                    return;
+                }
+                if let Some((start_y, start_height)) = this.source_preview_drag {
+                    this.source_preview_height =
+                        (start_height + start_y - f32::from(event.position.y)).clamp(120.0, 640.0);
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| {
+                    this.source_preview_drag = None;
+                }),
+            );
+    }
+    panel.child(resize)
 }
 
 pub(super) fn drop_zone(
@@ -226,7 +352,19 @@ pub(super) fn file_list(
     for (index, clip) in data.clips.iter().enumerate() {
         let selected = data.selection.contains(&clip.url);
         let url = clip.url.clone();
-        let video = matches!(clip.kind, Some(MediaKind::Video));
+        let preview_path = clip.url.clone();
+        let preview_id = clip.clip_id.clone();
+        let video = matches!(clip.kind, Some(MediaKind::Video))
+            || clip
+                .url
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    matches!(
+                        extension.to_ascii_lowercase().as_str(),
+                        "mov" | "mp4" | "m4v" | "mxf" | "mts" | "r3d"
+                    )
+                });
         let badge_color = if video { theme.cyan } else { theme.dim };
         let second_line = {
             let mut parts = Vec::new();
@@ -270,6 +408,9 @@ pub(super) fn file_list(
                 cx.stop_propagation();
                 if !active {
                     return;
+                }
+                if video && let Some(clip_id) = preview_id.clone() {
+                    this.select_source_preview(clip_id, preview_path.clone(), cx);
                 }
                 if this.data.selection.contains(&url) {
                     this.data.selection.remove(&url);

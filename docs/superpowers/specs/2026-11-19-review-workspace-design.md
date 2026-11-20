@@ -6,7 +6,7 @@ Add an in-app review workspace that lets editors preview source video, inspect a
 
 ## Context and scope
 
-The timestamp-placement PR handles unmatched clips: only waveform-matched clips from the same device may anchor a relative recording-timestamp estimate; waveform matches are never moved, and estimated placements remain visibly unconfirmed. This design does not change that algorithm.
+The timestamp-placement PR independently handles unmatched-clip estimates from relative recording timestamps. This review-workspace design does not implement or change that algorithm.
 
 The review-workspace PR covers: a resizable source-video monitor; a distinct NLE-style timeline playhead with seek, pan, zoom, and playback; visible audio waveforms; manual clip placement with snapping, frame/millisecond nudges, undo/redo; and session restoration. Clip-preview mode remains separate from timeline playback and is active only for a selected video clip. Playback starts paused. If only one audio track is present at the playhead, that track is audible regardless of solo/mute settings.
 
@@ -19,7 +19,7 @@ Keep the upstream change cohesive in one review-workspace PR, rather than mixing
 1. Selecting a video clip loads that source into the monitor. Resizing the monitor scales the displayed frame to fit without distortion. Clip preview does not take over the timeline playhead.
 2. The timeline playhead can be clicked or dragged to any point, and transport controls play/pause from that position. Timeline audio playback is paused at app startup. When only one audio track overlaps the playhead, it is audible even if track solo/mute state would otherwise silence it; normal solo/mute behavior applies when multiple tracks overlap.
 3. Waveforms identify embedded camera audio and external recorder tracks. Editors can drag clips with snapping, nudge by frame or milliseconds, and undo/redo edits. The same effective placements drive review playback and NLE timeline exports.
-4. Manual placements are represented in the review result/session, not only in transient UI state. A sync rerun must not silently discard a manual placement; clips that are no longer unmatched are not timestamp-estimated or moved by the estimate pass. Exports use the effective manually placed positions. Tentative timestamp estimates stay labeled as estimates in result and export metadata.
+4. Manual placements are represented in the review result/session, not only in transient UI state. A sync rerun must not silently discard a manual placement; stale or conflicting overrides are surfaced for review. Exports use the effective manually placed positions.
 5. On reopening, restore selected inputs, latest sync result, manual edits, and relevant review state. Failed-to-decode media remains visible with an actionable warning rather than disappearing.
 
 ## Architecture and data flow
@@ -40,7 +40,7 @@ Missing media, unsupported or undecodable media, and stale session references re
 - A sole overlapping audio track is audible regardless of solo/mute state; multi-track behavior remains covered by existing controls.
 - Drag, snapping, nudge, undo, and redo produce stable effective placements shared by review and exports.
 - Session save/restore retains manual edits and review state; a subsequent sync does not silently erase a compatible manual placement.
-- Unmatched clips without a waveform anchor are not forced to the end; same-device relative timestamp estimates remain visibly unconfirmed and do not move waveform matches.
+- Manual placements remain separate from automatic sync results and are not silently lost on rerun.
 - Decoder failures remain visible and do not crash the workspace.
 - Run the checks required by upstream CONTRIBUTING.md, including relevant Rust tests and formatting.
 

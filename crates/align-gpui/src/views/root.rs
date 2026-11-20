@@ -5,6 +5,32 @@ use super::*;
 impl Render for AlignApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::current(window.appearance());
+        if let Some(scroll) = self.data.pending_session_scroll {
+            let max_scroll = f32::from(self.data.timeline_scroll.max_offset().width);
+            if max_scroll > 0.0 || scroll == 0.0 {
+                self.data
+                    .pan_to(Some(-(scroll as f32).min(max_scroll)), None);
+                self.data.pending_session_scroll = None;
+            }
+        }
+        if let Some(selected) = self.data.review_session.selected_clip.clone()
+            && let Some(path) = self
+                .data
+                .result
+                .as_ref()
+                .and_then(|result| {
+                    result
+                        .project
+                        .clips
+                        .iter()
+                        .find(|clip| clip.id == selected && clip.kind == MediaKind::Video)
+                })
+                .map(|clip| clip.url.clone())
+            && (self.source_preview_clip.as_ref() != Some(&selected)
+                || self.source_preview_path.as_ref() != Some(&path))
+        {
+            self.select_source_preview(selected, path, cx);
+        }
         // Fit width excludes the label column and content padding.
         let fit_width =
             (f32::from(window.viewport_size().width) - crate::lane::LABEL_WIDTH - 16.0).max(100.0);
@@ -115,30 +141,67 @@ impl Render for AlignApp {
                 if this.data.show_path_fixer && this.path_fixer_inputs.any_focused(window, cx) {
                     return;
                 }
+                if e.keystroke.modifiers.secondary() && key == "z" {
+                    if this.apply_placement_history(!e.keystroke.modifiers.shift) {
+                        cx.notify();
+                    }
+                    return;
+                }
                 if this.data.lanes.is_empty() {
                     return;
                 }
-                let step = if e.keystroke.modifiers.shift {
-                    480.0
-                } else {
-                    120.0
-                };
+                let frame = this
+                    .data
+                    .result
+                    .as_ref()
+                    .and_then(|result| {
+                        result
+                            .project
+                            .clips
+                            .iter()
+                            .find_map(|clip| clip.video.as_ref()?.frame_duration)
+                    })
+                    .map_or(1.0 / 25.0, |frame| frame.as_seconds());
+                let seek = frame
+                    * if e.keystroke.modifiers.shift {
+                        10.0
+                    } else {
+                        1.0
+                    };
+                if e.keystroke.modifiers.secondary() && matches!(key, "left" | "right") {
+                    let direction = if key == "left" { -1.0 } else { 1.0 };
+                    let amount = if e.keystroke.modifiers.alt {
+                        0.001
+                    } else {
+                        seek
+                    };
+                    if this.nudge_selected_review_clip(direction * amount) {
+                        cx.notify();
+                    }
+                    return;
+                }
+                let duration = timeline_duration(&this.data);
                 match key {
-                    "left" => this.data.pan_by(step, 0.0),
-                    "right" => this.data.pan_by(-step, 0.0),
-                    "up" => this.data.pan_by(0.0, step),
-                    "down" => this.data.pan_by(0.0, -step),
-                    "home" => this.data.pan_to(Some(0.0), None),
-                    "end" => this.data.pan_to(
-                        Some(-f32::from(this.data.timeline_scroll.max_offset().width)),
-                        None,
-                    ),
+                    "left" => {
+                        this.data.review_session.playhead =
+                            (this.data.review_session.playhead - seek).max(0.0);
+                    }
+                    "right" => {
+                        this.data.review_session.playhead =
+                            (this.data.review_session.playhead + seek).min(duration);
+                    }
+                    "up" => this.data.pan_by(0.0, 120.0),
+                    "down" => this.data.pan_by(0.0, -120.0),
+                    "home" => this.data.review_session.playhead = 0.0,
+                    "end" => this.data.review_session.playhead = duration,
                     _ => return,
                 }
+                let _ = this.data.save_session();
                 cx.notify();
             }))
             .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
                 this.data.add_paths(paths.paths().to_vec());
+                let _ = this.data.save_session();
                 cx.notify();
             }));
         let mut content = div()
@@ -158,6 +221,8 @@ impl Render for AlignApp {
                     &self.data,
                     content_active,
                     self.search_quality_exit.is_active(),
+                    !self.placement_undo.is_empty(),
+                    !self.placement_redo.is_empty(),
                 ),
                 "top-toolbar-entrance",
             ));
@@ -165,11 +230,18 @@ impl Render for AlignApp {
         content = content.child(main_content(
             cx,
             &theme,
-            &self.data,
-            &self.timeline_transitions,
-            fit_width,
-            content_active,
-            self.selection_controls_exit.is_active(),
+            MainContentPresentation {
+                data: &self.data,
+                timeline_transitions: &self.timeline_transitions,
+                fit_width,
+                active: content_active,
+                selection_controls_closing: self.selection_controls_exit.is_active(),
+                source_preview: SourcePreviewPresentation {
+                    image: self.source_preview_image.clone(),
+                    error: self.source_preview_error.clone(),
+                    height: self.source_preview_height,
+                },
+            },
         ));
         if !self.data.warnings.is_empty() {
             content = content.child(warning_banner(cx, &theme, &self.data));

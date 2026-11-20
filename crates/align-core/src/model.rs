@@ -1030,11 +1030,13 @@ mod tests {
     #[test]
     fn review_override_round_trips_and_overrides_only_the_effective_start() {
         let clip = review_test_clip("clip-a", "/media/a.wav");
-        let mut session = ReviewSession::default();
-        session.selected_clip = Some(clip.id.clone());
-        session.playhead = 12.25;
-        session.zoom = 2.5;
-        session.horizontal_scroll = 4.0;
+        let mut session = ReviewSession {
+            selected_clip: Some(clip.id.clone()),
+            playhead: 12.25,
+            zoom: 2.5,
+            horizontal_scroll: 4.0,
+            ..Default::default()
+        };
         session.overrides.insert(
             clip.id.clone(),
             ManualPlacementOverride::for_clip(&clip, 42.5),
@@ -1069,9 +1071,9 @@ mod tests {
             ManualPlacementOverride::for_clip(&clip, 42.5),
         );
 
-        assert!(session.validate(&[clip.clone()]).is_empty());
+        assert!(session.validate(std::slice::from_ref(&clip)).is_empty());
         let changed_source = review_test_clip("clip-a", "/media/replaced.wav");
-        let issues = session.validate(&[changed_source.clone()]);
+        let issues = session.validate(std::slice::from_ref(&changed_source));
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].clip_id, Some(clip.id));
         assert_eq!(

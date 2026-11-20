@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use align_core::{
@@ -510,12 +511,37 @@ pub struct AlignApp {
     feedback_error: Option<SharedString>,
     /// The update card was closed; the About panel still offers the update.
     update_notice_dismissed: bool,
+    source_preview_clip: Option<ClipId>,
+    source_preview_path: Option<PathBuf>,
+    source_preview_image: Option<Arc<gpui::Image>>,
+    source_preview_error: Option<String>,
+    source_preview_height: f32,
+    source_preview_drag: Option<(f32, f32)>,
+    source_preview_generation: u64,
+    timeline_playhead_dragging: bool,
+    timeline_clip_drag: Option<ManualPlacementDrag>,
+    placement_undo: Vec<ManualPlacementEdit>,
+    placement_redo: Vec<ManualPlacementEdit>,
 }
 
 impl Focusable for AlignApp {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
+}
+
+#[derive(Clone)]
+struct ManualPlacementDrag {
+    clip_id: ClipId,
+    start: f64,
+    pointer_x: f32,
+    before: Option<align_core::ManualPlacementOverride>,
+}
+
+struct ManualPlacementEdit {
+    clip_id: ClipId,
+    before: Option<align_core::ManualPlacementOverride>,
+    after: Option<align_core::ManualPlacementOverride>,
 }
 
 impl AlignApp {
@@ -549,10 +575,57 @@ impl AlignApp {
             feedback_notice_pending: crate::feedback::notice_pending(),
             feedback_error: None,
             update_notice_dismissed: false,
+            source_preview_clip: None,
+            source_preview_path: None,
+            source_preview_image: None,
+            source_preview_error: None,
+            source_preview_height: 240.0,
+            source_preview_drag: None,
+            source_preview_generation: 0,
+            timeline_playhead_dragging: false,
+            timeline_clip_drag: None,
+            placement_undo: Vec::new(),
+            placement_redo: Vec::new(),
         };
         app.export_inputs
             .set_labels(&app.data.export_baseline().labels, cx);
         app
+    }
+
+    fn select_source_preview(&mut self, clip_id: ClipId, path: PathBuf, cx: &mut Context<Self>) {
+        self.data.review_session.selected_clip = Some(clip_id.clone());
+        let _ = self.data.save_session();
+        self.source_preview_clip = Some(clip_id);
+        self.source_preview_path = Some(path.clone());
+        self.source_preview_image = None;
+        self.source_preview_error = None;
+        self.source_preview_generation = self.source_preview_generation.wrapping_add(1);
+        let generation = self.source_preview_generation;
+        let view = cx.entity();
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(align_decode::ff::preview_frame(&path, 0.0));
+        });
+        cx.spawn(async move |_, cx| {
+            let Ok(result) = receiver.await else { return };
+            let _ = view.update(cx, |this, cx| {
+                if this.source_preview_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(bytes) => {
+                        this.source_preview_image = Some(Arc::new(gpui::Image::from_bytes(
+                            gpui::ImageFormat::Png,
+                            bytes,
+                        )));
+                    }
+                    Err(error) => this.source_preview_error = Some(error.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     // ---------------- actions
@@ -562,6 +635,11 @@ impl AlignApp {
     pub(crate) fn delete_or_clear(&mut self, cx: &mut Context<Self>) {
         let clearing = self.data.selection.is_empty();
         self.data.delete_or_clear();
+        if clearing {
+            let _ = std::fs::remove_file(AppData::default_session_path());
+        } else {
+            let _ = self.data.save_session();
+        }
         if clearing {
             self.export_inputs
                 .set_labels(&self.data.export_baseline().labels, cx);
@@ -612,6 +690,7 @@ impl AlignApp {
             };
             let _ = view.update(cx, |this, cx| {
                 this.data.add_paths(paths);
+                let _ = this.data.save_session();
                 cx.notify();
             });
         })
@@ -1355,6 +1434,168 @@ impl AlignApp {
         }
     }
 
+    fn begin_timeline_clip_drag(&mut self, clip_id: ClipId, start: f64, pointer_x: f32) {
+        let before = self.data.review_session.overrides.get(&clip_id).cloned();
+        self.timeline_clip_drag = Some(ManualPlacementDrag {
+            clip_id,
+            start,
+            pointer_x,
+            before,
+        });
+    }
+
+    fn update_timeline_clip_drag(&mut self, pointer_x: f32, px_per_sec: f64) -> bool {
+        let Some(drag) = self.timeline_clip_drag.clone() else {
+            return false;
+        };
+        if px_per_sec <= 0.0 || !px_per_sec.is_finite() {
+            return false;
+        }
+        let frame = self
+            .data
+            .result
+            .as_ref()
+            .and_then(|result| {
+                result
+                    .project
+                    .clips
+                    .iter()
+                    .find_map(|clip| clip.video.as_ref()?.frame_duration)
+            })
+            .map_or(1.0 / 25.0, |frame| frame.as_seconds());
+        let new_start = crate::lane::snap_timeline_time(
+            drag.start + (pointer_x - drag.pointer_x) as f64 / px_per_sec,
+            frame,
+        );
+        let Some(clip) = self.data.result.as_ref().and_then(|result| {
+            result
+                .project
+                .clips
+                .iter()
+                .find(|clip| clip.id == drag.clip_id)
+                .cloned()
+        }) else {
+            return false;
+        };
+        let placement = align_core::ManualPlacementOverride::for_clip(&clip, new_start);
+        if self.data.review_session.overrides.get(&drag.clip_id) == Some(&placement) {
+            return false;
+        }
+        self.data
+            .review_session
+            .overrides
+            .insert(drag.clip_id, placement);
+        self.data.refresh_review_view();
+        true
+    }
+
+    fn finish_timeline_clip_drag(&mut self) -> bool {
+        let Some(drag) = self.timeline_clip_drag.take() else {
+            return false;
+        };
+        let after = self
+            .data
+            .review_session
+            .overrides
+            .get(&drag.clip_id)
+            .cloned();
+        if after == drag.before {
+            return false;
+        }
+        self.placement_undo.push(ManualPlacementEdit {
+            clip_id: drag.clip_id,
+            before: drag.before,
+            after,
+        });
+        self.placement_redo.clear();
+        let _ = self.data.save_session();
+        true
+    }
+
+    fn nudge_selected_review_clip(&mut self, delta: f64) -> bool {
+        let Some(clip_id) = self.data.review_session.selected_clip.clone() else {
+            return false;
+        };
+        let current = self
+            .data
+            .review_session
+            .overrides
+            .get(&clip_id)
+            .map(|placement| placement.timeline_start)
+            .or_else(|| {
+                self.data
+                    .lanes
+                    .iter()
+                    .flat_map(|lane| lane.clips.iter())
+                    .filter(|bar| bar.clip_id == clip_id)
+                    .map(|bar| bar.start)
+                    .min_by(f64::total_cmp)
+            });
+        let Some(current) = current else {
+            return false;
+        };
+        let duration = timeline_duration(&self.data);
+        let next = crate::lane::nudge_timeline_time(current, delta, duration);
+        let Some(clip) = self.data.result.as_ref().and_then(|result| {
+            result
+                .project
+                .clips
+                .iter()
+                .find(|clip| clip.id == clip_id)
+                .cloned()
+        }) else {
+            return false;
+        };
+        let before = self.data.review_session.overrides.get(&clip_id).cloned();
+        let after = align_core::ManualPlacementOverride::for_clip(&clip, next);
+        if before.as_ref() == Some(&after) {
+            return false;
+        }
+        self.data
+            .review_session
+            .overrides
+            .insert(clip_id.clone(), after.clone());
+        self.data.refresh_review_view();
+        self.placement_undo.push(ManualPlacementEdit {
+            clip_id,
+            before,
+            after: Some(after),
+        });
+        self.placement_redo.clear();
+        let _ = self.data.save_session();
+        true
+    }
+
+    fn apply_placement_history(&mut self, undo: bool) -> bool {
+        let edit = if undo {
+            self.placement_undo.pop()
+        } else {
+            self.placement_redo.pop()
+        };
+        let Some(edit) = edit else {
+            return false;
+        };
+        let target = if undo { &edit.before } else { &edit.after };
+        match target {
+            Some(placement) => {
+                self.data
+                    .review_session
+                    .overrides
+                    .insert(edit.clip_id.clone(), placement.clone());
+            }
+            None => {
+                self.data.review_session.overrides.remove(&edit.clip_id);
+            }
+        }
+        self.data.refresh_review_view();
+        if undo {
+            self.placement_redo.push(edit);
+        } else {
+            self.placement_undo.push(edit);
+        }
+        let _ = self.data.save_session();
+        true
+    }
     pub(crate) fn open_path_fixer(&mut self, cx: &mut Context<Self>) {
         self.data.discard_path_redirection_edits();
         self.data.path_fixer_prefer_proxies = self.data.prefer_proxies;

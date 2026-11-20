@@ -1,8 +1,8 @@
 //! Desktop application state and synchronization job lifecycle.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
 
 use align_core::{
     AudioAnalysisSource, Clip, ClipId, ClipOrder, MatchEvidence, MatchPreview, MatchThreshold,
@@ -465,6 +465,8 @@ pub struct AppData {
     pub show_about: bool,
     pub show_agent_setup: bool,
     pub zoom_level: f64,
+    /// Horizontal review position restored after the timeline viewport is laid out.
+    pub(crate) pending_session_scroll: Option<f64>,
     /// Scroll position of the main content (timeline panning).
     pub timeline_scroll: ScrollHandle,
     /// In-flight run coordination: `cancel` stops the worker
@@ -555,6 +557,7 @@ impl Default for AppData {
             show_about: false,
             show_agent_setup: false,
             zoom_level: 0.0,
+            pending_session_scroll: None,
             timeline_scroll: ScrollHandle::new(),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             generation: 0,
@@ -991,7 +994,6 @@ impl AppData {
             ..Default::default()
         };
         self.apply_export_settings(&self.export_baseline());
-        let _ = std::fs::remove_file(Self::default_session_path());
     }
 
     /// The export options in the sheet; `labels` come from its text fields.
@@ -1734,10 +1736,7 @@ impl AppData {
         if !path.is_file() {
             return Ok(false);
         }
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(err) => return Err(err),
-        };
+        let bytes = std::fs::read(path)?;
         let session: ProjectSession = serde_json::from_slice(&bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
@@ -1749,6 +1748,13 @@ impl AppData {
         self.omit_extensions = session.omit_extensions;
         self.prefer_proxies = session.prefer_proxies;
         self.review_session = session.review_session;
+        self.zoom_level = if self.review_session.zoom.is_finite() && self.review_session.zoom > 0.0
+        {
+            (self.review_session.zoom.ln() / 8.0f64.ln()).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.pending_session_scroll = Some(self.review_session.horizontal_scroll.max(0.0));
 
         let mut missing_inputs = Vec::new();
         for input in &self.inputs {
@@ -1763,11 +1769,52 @@ impl AppData {
                 self.active_sequence_result = 0;
             } else {
                 self.sequence_results = session.sequence_results;
-                self.active_sequence_result = session.active_sequence_result.min(self.sequence_results.len().saturating_sub(1));
+                self.active_sequence_result = session
+                    .active_sequence_result
+                    .min(self.sequence_results.len().saturating_sub(1));
             }
             self.apply_visible_result(result);
+            let missing_clips: Vec<_> = self
+                .result
+                .as_ref()
+                .into_iter()
+                .flat_map(|result| &result.project.clips)
+                .filter(|clip| !clip.url.exists())
+                .cloned()
+                .collect();
+            for clip in missing_clips {
+                if !self
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(&clip.url.display().to_string()))
+                {
+                    self.warnings.push(format!(
+                        "{}: Media file was not found at {}.",
+                        file_name(&clip.url),
+                        clip.url.display()
+                    ));
+                }
+                if let Some(row) = self
+                    .clips
+                    .iter_mut()
+                    .find(|row| row.clip_id.as_ref() == Some(&clip.id))
+                {
+                    row.state = ClipState::Warning;
+                } else {
+                    self.clips.push(ClipRow {
+                        clip_id: Some(clip.id.clone()),
+                        url: clip.url.clone(),
+                        name: file_name(&clip.url),
+                        kind: Some(clip.kind),
+                        duration: Some(clip.duration.as_seconds()),
+                        timecode: clip.source_timecode().map(|tc| tc.text.clone()),
+                        state: ClipState::Warning,
+                    });
+                }
+            }
         } else if !self.inputs.is_empty() {
-            self.clips = self.inputs
+            self.clips = self
+                .inputs
                 .iter()
                 .map(|path| ClipRow {
                     clip_id: None,
@@ -1779,13 +1826,17 @@ impl AppData {
                     state: ClipState::Queued,
                 })
                 .collect();
-            self.clips.sort_by(|a, b| a.url.to_string_lossy().cmp(&b.url.to_string_lossy()));
+            self.clips
+                .sort_by(|a, b| a.url.to_string_lossy().cmp(&b.url.to_string_lossy()));
         }
 
         // Check for missing media across inputs and result clips
         for missing in missing_inputs {
             let name = file_name(&missing);
-            self.warnings.push(format!("{name}: Media file was not found at {}.", missing.display()));
+            self.warnings.push(format!(
+                "{name}: Media file was not found at {}.",
+                missing.display()
+            ));
             if let Some(clip_row) = self.clips.iter_mut().find(|c| c.url == missing) {
                 clip_row.state = ClipState::Warning;
             } else {
@@ -1800,10 +1851,15 @@ impl AppData {
                 });
             }
         }
-        self.clips.sort_by(|a, b| a.url.to_string_lossy().cmp(&b.url.to_string_lossy()));
+        self.clips
+            .sort_by(|a, b| a.url.to_string_lossy().cmp(&b.url.to_string_lossy()));
 
         // Revalidate review session overrides and flag stale / missing references
-        let project_clips = self.result.as_ref().map(|r| r.project.clips.as_slice()).unwrap_or(&[]);
+        let project_clips = self
+            .result
+            .as_ref()
+            .map(|r| r.project.clips.as_slice())
+            .unwrap_or(&[]);
         self.review_issues = self.review_session.validate(project_clips);
 
         self.operation = Operation::Idle;
@@ -3811,8 +3867,10 @@ mod tests {
         let media_file = directory.path().join("camera.mov");
         std::fs::write(&media_file, b"video-content").unwrap();
 
-        let mut data = AppData::default();
-        data.inputs = vec![media_file.clone()];
+        let mut data = AppData {
+            inputs: vec![media_file.clone()],
+            ..Default::default()
+        };
         data.selection.insert(media_file.clone());
 
         let clip = Clip {
@@ -3870,13 +3928,20 @@ mod tests {
         assert!(session_file.is_file());
 
         let mut restored = AppData::default();
-        restored.restore_session_from(&session_file).expect("restore session");
+        restored
+            .restore_session_from(&session_file)
+            .expect("restore session");
 
         assert_eq!(restored.inputs, vec![media_file]);
         assert_eq!(restored.review_session.playhead, 8.5);
         assert_eq!(restored.review_session.zoom, 2.0);
         assert_eq!(restored.review_session.horizontal_scroll, 120.0);
-        assert_eq!(restored.review_session.selected_clip, Some(ClipId::new("cam-1")));
+        assert!((restored.zoom() - 2.0).abs() < 1e-9);
+        assert_eq!(restored.pending_session_scroll, Some(120.0));
+        assert_eq!(
+            restored.review_session.selected_clip,
+            Some(ClipId::new("cam-1"))
+        );
         assert_eq!(restored.lanes[0].clips[0].start, 15.0);
         assert!(restored.review_issues.is_empty());
     }
@@ -3911,15 +3976,26 @@ mod tests {
                 }
             }
         });
-        std::fs::write(&session_file, serde_json::to_vec_pretty(&session_json).unwrap()).unwrap();
+        std::fs::write(
+            &session_file,
+            serde_json::to_vec_pretty(&session_json).unwrap(),
+        )
+        .unwrap();
 
         let mut restored = AppData::default();
-        restored.restore_session_from(&session_file).expect("restore session with missing media");
+        restored
+            .restore_session_from(&session_file)
+            .expect("restore session with missing media");
 
         assert_eq!(restored.inputs.len(), 1);
         assert_eq!(restored.clips.len(), 1);
         assert_eq!(restored.clips[0].state, ClipState::Warning);
-        assert!(restored.warnings.iter().any(|w| w.contains("deleted.wav") && w.contains("not found")));
+        assert!(
+            restored
+                .warnings
+                .iter()
+                .any(|w| w.contains("deleted.wav") && w.contains("not found"))
+        );
         assert!(restored.review_issues.iter().any(|issue| {
             issue.clip_id == Some(ClipId::new("audio-1"))
                 && issue.reason == align_core::ReviewValidationReason::MissingClip
@@ -3938,10 +4014,16 @@ mod tests {
                 "playhead": 5.0
             }
         });
-        std::fs::write(&session_file, serde_json::to_vec_pretty(&session_json).unwrap()).unwrap();
+        std::fs::write(
+            &session_file,
+            serde_json::to_vec_pretty(&session_json).unwrap(),
+        )
+        .unwrap();
 
         let mut restored = AppData::default();
-        restored.restore_session_from(&session_file).expect("restore");
+        restored
+            .restore_session_from(&session_file)
+            .expect("restore");
         assert_eq!(restored.operation, Operation::Idle);
         assert_eq!(restored.review_session.playhead, 5.0);
     }

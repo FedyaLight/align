@@ -113,6 +113,10 @@ pub(super) fn zoom_slider(
                 let viewport = this.data.timeline_scroll.bounds();
                 this.data
                     .zoom_at(level, f32::from(viewport.size.width) * 0.5);
+                this.data.review_session.zoom = this.data.zoom();
+                let offset = this.data.timeline_scroll.offset();
+                this.data.review_session.horizontal_scroll = -f32::from(offset.x) as f64;
+                let _ = this.data.save_session();
                 cx.notify();
             }
         }))
@@ -181,6 +185,44 @@ pub(super) fn timeline_lanes(
                 )
             });
     }
+    let playhead = data.review_session.playhead.clamp(0.0, duration);
+    let playhead_x = (playhead * px_per_sec) as f32;
+    ticks = ticks
+        .child(
+            div()
+                .absolute()
+                .left(px(playhead_x))
+                .top(px(0.0))
+                .bottom(px(0.0))
+                .w(px(2.0))
+                .bg(rgb(theme.warning)),
+        )
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                this.timeline_playhead_dragging = true;
+                seek_playhead_from_pointer(this, event.position.x, px_per_sec, duration);
+                cx.notify();
+                cx.stop_propagation();
+            }),
+        )
+        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+            if this.timeline_playhead_dragging
+                && matches!(event.pressed_button, Some(MouseButton::Left))
+            {
+                seek_playhead_from_pointer(this, event.position.x, px_per_sec, duration);
+                cx.notify();
+                cx.stop_propagation();
+            }
+        }))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, _, _, _| {
+                this.timeline_playhead_dragging = false;
+                let _ = this.data.save_session();
+            }),
+        );
     tracks = tracks.child(ticks);
 
     // Rows.
@@ -277,6 +319,11 @@ pub(super) fn timeline_lanes(
                 let color = clip_color(bar.match_state);
                 let ink = 0xFFFFFF;
                 let clip_id = bar.clip_id.clone();
+                let dragged_clip_id = bar.clip_id.clone();
+                let dragged_start = bar.start;
+                let preview_clip_id = bar.clip_id.clone();
+                let preview_path = bar.url.clone();
+                let is_video = bar.kind == MediaKind::Video;
                 // Keep narrow slivers square; cap other corner radii at 4 px.
                 let mut el = div()
                     .id(SharedString::from(format!("bar-{}", bar.clip_id.0)))
@@ -380,6 +427,30 @@ pub(super) fn timeline_lanes(
                         cx.notify();
                     }),
                 );
+                if active {
+                    el = el.on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.data.review_session.selected_clip = Some(dragged_clip_id.clone());
+                            this.begin_timeline_clip_drag(
+                                dragged_clip_id.clone(),
+                                dragged_start,
+                                f32::from(event.position.x),
+                            );
+                            cx.notify();
+                            cx.stop_propagation();
+                        }),
+                    );
+                }
+                if is_video {
+                    el = el.on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_source_preview(
+                            preview_clip_id.clone(),
+                            preview_path.clone(),
+                            cx,
+                        );
+                    }));
+                }
                 let transition =
                     timeline_transitions
                         .get(&bar.clip_id)
@@ -407,6 +478,15 @@ pub(super) fn timeline_lanes(
                     ));
                 }
             }
+            track = track.child(
+                div()
+                    .absolute()
+                    .left(px(playhead_x))
+                    .top(px(0.0))
+                    .bottom(px(0.0))
+                    .w(px(2.0))
+                    .bg(rgb(theme.warning)),
+            );
             tracks = tracks.child(track);
         }
         // Row separator.
@@ -435,6 +515,8 @@ pub(super) fn timeline_lanes(
                 let anchor = f32::from(event.position.x - bounds.origin.x)
                     .clamp(0.0, f32::from(bounds.size.width));
                 this.data.zoom_at(next, anchor);
+                this.data.review_session.zoom = this.data.zoom();
+                let _ = this.data.save_session();
                 cx.stop_propagation();
                 cx.notify();
             }
@@ -456,6 +538,18 @@ pub(super) fn timeline_lanes(
                 e.pressed_button,
                 Some(MouseButton::Left) | Some(MouseButton::Middle)
             );
+            if matches!(e.pressed_button, Some(MouseButton::Left))
+                && this.timeline_clip_drag.is_some()
+            {
+                let fit_width = f32::from(this.data.timeline_scroll.bounds().size.width).max(100.0);
+                let duration = timeline_duration(&this.data);
+                let (px_per_sec, _) = timeline_scale(duration, this.data.zoom(), fit_width);
+                if this.update_timeline_clip_drag(f32::from(e.position.x), px_per_sec) {
+                    cx.notify();
+                }
+                cx.stop_propagation();
+                return;
+            }
             if !dragging {
                 this.pan_origin = None;
                 return;
@@ -468,11 +562,24 @@ pub(super) fn timeline_lanes(
         }))
         .on_mouse_up(
             MouseButton::Left,
-            cx.listener(|this, _, _, _| this.pan_origin = None),
+            cx.listener(|this, _, _, cx| {
+                this.pan_origin = None;
+                if this.finish_timeline_clip_drag() {
+                    cx.notify();
+                }
+                let offset = this.data.timeline_scroll.offset();
+                this.data.review_session.horizontal_scroll = -f32::from(offset.x) as f64;
+                let _ = this.data.save_session();
+            }),
         )
         .on_mouse_up(
             MouseButton::Middle,
-            cx.listener(|this, _, _, _| this.pan_origin = None),
+            cx.listener(|this, _, _, _| {
+                this.pan_origin = None;
+                let offset = this.data.timeline_scroll.offset();
+                this.data.review_session.horizontal_scroll = -f32::from(offset.x) as f64;
+                let _ = this.data.save_session();
+            }),
         )
         .child(tracks);
 
@@ -483,4 +590,20 @@ pub(super) fn timeline_lanes(
         lanes.p_2()
     };
     lanes.child(labels).child(viewport)
+}
+
+fn seek_playhead_from_pointer(
+    app: &mut AlignApp,
+    pointer_x: Pixels,
+    px_per_sec: f64,
+    duration: f64,
+) {
+    if px_per_sec <= 0.0 {
+        return;
+    }
+    let bounds = app.data.timeline_scroll.bounds();
+    let offset = app.data.timeline_scroll.offset();
+    let content_x = f32::from(pointer_x - bounds.origin.x) - f32::from(offset.x);
+    app.data.review_session.playhead =
+        (content_x.max(0.0) as f64 / px_per_sec).clamp(0.0, duration);
 }

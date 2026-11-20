@@ -301,9 +301,14 @@ fn main() {
             text_input::init(cx);
             // Covers every graceful termination path, including an OS-level
             // quit that does not dispatch our custom QuitApp action.
-            cx.on_app_quit(|_| async {
-                icons::cleanup();
-                align_decode::media_assets::cleanup();
+            cx.on_app_quit(|cx| {
+                update_view(cx, |this, _| {
+                    let _ = this.data.save_session();
+                });
+                async {
+                    icons::cleanup();
+                    align_decode::media_assets::cleanup();
+                }
             })
             .detach();
             // System commands: without registered actions + bindings + menus
