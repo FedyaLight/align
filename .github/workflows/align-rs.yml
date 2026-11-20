@@ -191,7 +191,7 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install -y nasm libxkbcommon-dev
           libxkbcommon-x11-dev libwayland-dev libasound2-dev libudev-dev libvulkan-dev
-          libgtk-4-dev rpm
+          libgtk-4-dev rpm patchelf
       - name: Install assembler (macOS)
         if: runner.os == 'macOS'
         run: brew install nasm
@@ -239,6 +239,12 @@ jobs:
           cp -R target/release/AAF-Licenses dist-bundle/
           cp LICENSE THIRD_PARTY_NOTICES.txt dist-bundle/
           cp "target/ffmpeg-minimal/ffmpeg$exe" "target/ffmpeg-minimal/ffprobe$exe" dist-bundle/
+          shopt -s nullglob
+          for library in target/ffmpeg-minimal/*.so.* target/ffmpeg-minimal/*.dylib; do
+            cp "$library" dist-bundle/
+          done
+          "dist-bundle/ffmpeg$exe" -version >/dev/null
+          "dist-bundle/ffprobe$exe" -version >/dev/null
           cp target/ffmpeg-minimal/FFMPEG-LICENSE.txt dist-bundle/
           ls -la dist-bundle/
       - name: Verify staged sidecars without MSYS2 (Windows)

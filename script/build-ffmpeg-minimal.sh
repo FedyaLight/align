@@ -36,7 +36,12 @@ case "$(uname -s)" in
   Darwin)
     # The tools must run on the oldest macOS Align supports (Info.plist
     # LSMinimumSystemVersion), not only on the build machine's.
+    platform_options=(--enable-shared --disable-static --install-name-dir=@loader_path)
     export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
+    ;;
+  Linux)
+    command -v patchelf >/dev/null || { echo "patchelf is required" >&2; exit 1; }
+    platform_options=(--enable-shared --disable-static)
     ;;
   MINGW*|MSYS*|CYGWIN*)
     EXE=".exe"
@@ -70,6 +75,28 @@ esac
 
 make -j"$JOBS" "ffmpeg$EXE" "ffprobe$EXE"
 cp "ffmpeg$EXE" "ffprobe$EXE" "$OUT_DIR/"
+# Ship only runtime SONAMEs (no development symlinks). Each executable
+# and each transitive dependency resolves siblings in its own directory.
+case "$(uname -s)" in
+  Darwin)
+    for library in lib*/*.dylib; do
+      [[ -L "$library" ]] && continue
+      cp "$library" "$OUT_DIR/"
+      strip -x "$OUT_DIR/${library##*/}"
+      codesign -f -s - "$OUT_DIR/${library##*/}"
+    done
+    ;;
+  Linux)
+    for library in lib*/*.so.*; do
+      [[ -L "$library" ]] && continue
+      soname="$(patchelf --print-soname "$library")"
+      cp "$library" "$OUT_DIR/$soname"
+      strip --strip-unneeded "$OUT_DIR/$soname"
+      patchelf --set-rpath '$ORIGIN' "$OUT_DIR/$soname"
+    done
+    for tool in ffmpeg ffprobe; do patchelf --set-rpath '$ORIGIN' "$OUT_DIR/$tool"; done
+    ;;
+esac
 cp COPYING.LGPLv2.1 "$OUT_DIR/FFMPEG-LICENSE.txt"
 if [[ -n "$EXE" ]]; then
   # The static link embeds winpthreads (MIT AND BSD-3-Clause); binary
@@ -86,5 +113,7 @@ cp ffbuild/config.mak "$OUT_DIR/Sources/config.mak"
 printf '%s\n' "$FFMPEG_VERSION" > "$OUT_DIR/Sources/version.txt"
 strip "$OUT_DIR/ffmpeg$EXE" "$OUT_DIR/ffprobe$EXE" 2>/dev/null || true
 
-"$OUT_DIR/ffmpeg$EXE" -hide_banner -version | head -1
+for tool in ffmpeg ffprobe; do
+  "$OUT_DIR/$tool$EXE" -hide_banner -version >/dev/null
+done
 du -h "$OUT_DIR/ffmpeg$EXE" "$OUT_DIR/ffprobe$EXE"

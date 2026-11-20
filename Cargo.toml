@@ -64,7 +64,7 @@ sha2 = { opt-level = 3 }
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 # Size levers that cost no runtime speed: single codegen unit and no
 # unwind tables in the shipped binaries (tests keep the dev profile).
 codegen-units = 1

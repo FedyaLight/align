@@ -46,15 +46,20 @@ if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
     FFMPEG_DIR="$AAF_BUILD_DIR/ffmpeg"
     "$ROOT_DIR/script/build-ffmpeg-minimal.sh" "$FFMPEG_DIR"
   fi
-  for tool in ffmpeg ffprobe; do
-    test -x "$FFMPEG_DIR/$tool"
-    "$FFMPEG_DIR/$tool" -version >/dev/null
-    # Only macOS system libraries: a Homebrew or local dylib would be
-    # missing on users' Macs.
-    if otool -L "$FFMPEG_DIR/$tool" | tail -n +2 | grep -v -E '^[[:space:]]+(/usr/lib/|/System/Library/)'; then
-      echo "$tool links libraries outside macOS" >&2
-      exit 1
-    fi
+  for tool in ffmpeg ffprobe; do "$FFMPEG_DIR/$tool" -version >/dev/null; done
+  shopt -s nullglob
+  dylibs=("$FFMPEG_DIR"/*.dylib)
+  for binary in "$FFMPEG_DIR/ffmpeg" "$FFMPEG_DIR/ffprobe" ${dylibs[@]+"${dylibs[@]}"}; do
+    tool="${binary##*/}"
+    while read -r dependency; do
+      case "$dependency" in
+        /usr/lib/*|/System/Library/*) ;;
+        @loader_path/*)
+          sibling="${dependency#@loader_path/}"
+          [[ "$sibling" != */* && -f "$FFMPEG_DIR/$sibling" ]] || exit 1 ;;
+        *) echo "$tool links an unbundled library: $dependency" >&2; exit 1 ;;
+      esac
+    done < <(otool -L "$binary" | awk 'NR > 1 {print $1}')
     # Built for arm64 and for the app's minimum macOS, like the app itself.
     minos="$(vtool -show-build "$FFMPEG_DIR/$tool" | awk '$1 == "minos" { print $2; exit }')"
     if [[ "$(lipo -archs "$FFMPEG_DIR/$tool")" != "arm64" || "$minos" != "$MIN_MACOS" ]]; then
@@ -107,6 +112,10 @@ if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
     cp "$FFMPEG_DIR/$tool" "$APP_MACOS/$tool"
     cp "$FFMPEG_DIR/$tool" "$OUT_DIR/$tool"
     chmod +x "$APP_MACOS/$tool" "$OUT_DIR/$tool"
+  done
+  for lib in ${dylibs[@]+"${dylibs[@]}"}; do
+    cp "$lib" "$APP_MACOS/"
+    cp "$lib" "$OUT_DIR/"
   done
   cp "$FFMPEG_DIR/FFMPEG-LICENSE.txt" "$RESOURCES/FFMPEG-LICENSE.txt"
   cp "$FFMPEG_DIR/FFMPEG-LICENSE.txt" "$OUT_DIR/FFMPEG-LICENSE.txt"

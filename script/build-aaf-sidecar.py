@@ -141,6 +141,9 @@ def main():
             '--name', 'align-aaf',
             '--workpath', str(Path(temporary) / 'work'), '--specpath', temporary,
             '--collect-all', 'aaf2',
+            # The bridge processes local files and hashes embedded essence with
+            # SHA-256. CPython supplies SHA-256 without its OpenSSL accelerator.
+            '--exclude-module', 'ssl', '--exclude-module', '_hashlib',
         ]
         if windows:
             # A one-file build unpacks a Python runtime to %TEMP% and runs it

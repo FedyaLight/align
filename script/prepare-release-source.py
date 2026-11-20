@@ -122,6 +122,8 @@ def main():
         if args.ffmpeg is not None:
             binaries += [args.ffmpeg.parent / f'ffmpeg{extension}',
                          args.ffmpeg.parent / f'ffprobe{extension}']
+            binaries += sorted(args.ffmpeg.parent.glob('*.dylib'))
+            binaries += sorted(args.ffmpeg.parent.glob('*.so.*'))
         runtime = args.aaf.parent / 'align-aaf-runtime'
         if args.platform == 'Windows' and runtime.is_dir():
             binaries += sorted(path for path in runtime.rglob('*')

@@ -108,7 +108,9 @@ uses the bundled tools for MXF, which AVFoundation cannot open, and analysis
 uses them to retry a file AVFoundation fails on. `package-macos.sh` bundles
 them with `BUNDLE_FFMPEG=1`; the build targets the app's minimum macOS (15.0),
 and packaging rejects tools for another architecture or minimum version, or
-linking libraries outside macOS. The build manifest's component hashes
+linking to libraries outside the bundle and macOS system directories. The tools
+share adjacent FFmpeg libraries via `@loader_path` on macOS and `$ORIGIN`
+on Linux (the Linux build requires `patchelf`). The build manifest's component hashes
 describe the tools as built; macOS packaging re-signs its copies. The build has no video decoders: video is only parsed for timing.
 On Windows, the tools are linked statically against the MinGW-w64 runtime,
 including the winpthreads library that provides FFmpeg's clock and sleep
