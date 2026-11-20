@@ -67,6 +67,7 @@ impl ExportOptions {
             let timeline = align_core::export_model::ExportTimeline::from_result_with_options(
                 result,
                 align_core::export_model::ExportAssemblyOptions {
+                    review_session: Default::default(),
                     unmatched: unmatched.core(),
                     prevent_group_overlaps,
                     disable_unmatched,

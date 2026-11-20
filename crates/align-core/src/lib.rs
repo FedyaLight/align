@@ -20,6 +20,7 @@ pub mod order;
 pub mod parallel;
 pub mod piecewise;
 pub mod redirect;
+pub mod review;
 pub mod spanned;
 pub mod staged;
 pub mod timecode;
@@ -51,6 +52,10 @@ pub use order::{
 };
 pub use parallel::par_map;
 pub use piecewise::{MapPoint, PiecewiseTimeMapping, SolvedMappingPoint};
+pub use review::{
+    ManualPlacementOverride, ReviewClipIdentity, ReviewSession, ReviewValidationIssue,
+    ReviewValidationReason,
+};
 pub use spanned::{SpannedAnalysis, analyze_spans};
 pub use timecode::analyze_timecodes;
 pub use timing::{RangeAccumulator, VideoTimingInspection, canonical_frame_duration, classify};

@@ -15,6 +15,7 @@ use crate::model::{
     TimelineTransitionKind, file_name,
 };
 use crate::piecewise::{MapPoint, PiecewiseTimeMapping};
+use crate::review::{ReviewSession, ReviewValidationIssue, ReviewValidationReason};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExportTransitionKind {
@@ -497,6 +498,8 @@ pub struct ExportTimeline {
     pub preserve_origin: bool,
     /// Islands whose unmatched clips should be packed by stable order only.
     order_only_islands: HashSet<usize>,
+    /// Review-state validation details associated with the effective view.
+    pub review_issues: Vec<ReviewValidationIssue>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -510,6 +513,8 @@ pub enum UnmatchedPlacement {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExportAssemblyOptions {
+    /// Manual timeline starts layered over the immutable automatic solve.
+    pub review_session: ReviewSession,
     pub unmatched: UnmatchedPlacement,
     pub prevent_group_overlaps: bool,
     pub disable_unmatched: bool,
@@ -539,6 +544,101 @@ pub struct ExportAssemblyOptions {
     pub unmatched_role: Option<String>,
     /// Override the exported sequence/project name.
     pub sequence_name: Option<String>,
+}
+
+/// Effective timeline starts projected from an automatic result plus review
+/// overrides. Automatic placements in `SyncResult` remain untouched.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EffectivePlacementView {
+    pub starts: HashMap<ClipId, f64>,
+    /// Valid manual overrides represented in this view.
+    pub manual_overrides: HashSet<ClipId>,
+    pub issues: Vec<ReviewValidationIssue>,
+}
+
+impl EffectivePlacementView {
+    pub fn from_result(result: &SyncResult, review: &ReviewSession) -> Self {
+        let base_starts: HashMap<ClipId, f64> = result
+            .islands
+            .iter()
+            .flat_map(|island| &island.placements)
+            .filter_map(|placement| {
+                placement
+                    .mapping
+                    .points
+                    .first()
+                    .map(|point| (placement.clip_id.clone(), point.island.as_seconds()))
+            })
+            .collect();
+        let clips_by_id: HashMap<&ClipId, &Clip> = result
+            .project
+            .clips
+            .iter()
+            .map(|clip| (&clip.id, clip))
+            .collect();
+        let mut issues = review.validate(&result.project.clips);
+        let issue_by_id: HashMap<ClipId, ReviewValidationReason> = issues
+            .iter()
+            .filter_map(|issue| Some((issue.clip_id.clone()?, issue.reason)))
+            .collect();
+        let mut deltas: HashMap<ClipId, f64> = HashMap::new();
+        for (clip_id, override_) in &review.overrides {
+            if issue_by_id.contains_key(clip_id) {
+                continue;
+            }
+            if let Some(clip) = clips_by_id.get(clip_id) {
+                let base = base_starts.get(clip_id).copied().unwrap_or(0.0);
+                if review.effective_start(clip, base).is_ok() {
+                    deltas.insert(clip_id.clone(), override_.timeline_start - base);
+                }
+            }
+        }
+
+        // Imported edits on one source track move together to preserve their
+        // edit-relative gaps and overlaps. Different requested shifts on the
+        // same track cannot all be honored, so flag those overrides and leave
+        // the entire conflicting track on its automatic placement.
+        let mut conflicting = HashSet::new();
+        if let Some(imported) = &result.project.imported_timeline {
+            let mut by_track: HashMap<String, Vec<(ClipId, f64)>> = HashMap::new();
+            for edit in &imported.edits {
+                if let Some(delta) = deltas.get(&edit.clip_id) {
+                    by_track
+                        .entry(imported_track_key(edit.media_type, edit.track_index))
+                        .or_default()
+                        .push((edit.clip_id.clone(), *delta));
+                }
+            }
+            for overrides in by_track.values() {
+                if let Some((_, first)) = overrides.first()
+                    && overrides
+                        .iter()
+                        .any(|(_, delta)| (delta - first).abs() > 1e-6)
+                {
+                    conflicting.extend(overrides.iter().map(|(id, _)| id.clone()));
+                }
+            }
+        }
+        for clip_id in conflicting {
+            deltas.remove(&clip_id);
+            issues.push(ReviewValidationIssue {
+                clip_id: Some(clip_id),
+                reason: ReviewValidationReason::ConflictingPlacement,
+            });
+        }
+
+        let mut starts = base_starts.clone();
+        for (clip_id, delta) in &deltas {
+            let base = base_starts.get(clip_id).copied().unwrap_or(0.0);
+            starts.insert(clip_id.clone(), base + delta);
+        }
+        let manual_overrides = deltas.keys().cloned().collect();
+        Self {
+            starts,
+            manual_overrides,
+            issues,
+        }
+    }
 }
 
 impl ExportAssemblyOptions {
@@ -872,7 +972,11 @@ pub enum TimelineExportError {
 }
 
 /// One solved island's placements as items, in timeline order.
-fn solved_island(island: &SyncIsland, clips_by_id: &HashMap<&ClipId, &Clip>) -> ExportIsland {
+fn solved_island(
+    island: &SyncIsland,
+    clips_by_id: &HashMap<&ClipId, &Clip>,
+    effective: &EffectivePlacementView,
+) -> ExportIsland {
     let mut items: Vec<ExportItem> = island
         .placements
         .iter()
@@ -880,17 +984,37 @@ fn solved_island(island: &SyncIsland, clips_by_id: &HashMap<&ClipId, &Clip>) -> 
             let clip = clips_by_id.get(&placement.clip_id).copied()?;
             let first = placement.mapping.points.first()?;
             let last = placement.mapping.points.last()?;
+            let base_start = first.island.as_seconds();
+            let start = effective
+                .starts
+                .get(&placement.clip_id)
+                .copied()
+                .unwrap_or(base_start);
+            let offset = start - base_start;
+            let mapping_points = if offset == 0.0 {
+                placement.mapping.points.clone()
+            } else {
+                placement
+                    .mapping
+                    .points
+                    .iter()
+                    .map(|point| MappingPoint {
+                        source: point.source,
+                        island: MediaTime::microseconds(point.island.as_seconds() + offset),
+                    })
+                    .collect()
+            };
             let source_span = last.source.as_seconds() - first.source.as_seconds();
             let island_span = last.island.as_seconds() - first.island.as_seconds();
             Some(ExportItem::new(
                 clip.clone(),
-                first.island.as_seconds(),
+                start,
                 if source_span > 0.0 {
                     island_span / source_span
                 } else {
                     1.0
                 },
-                placement.mapping.points.clone(),
+                mapping_points,
                 placement.confidence,
             ))
         })
@@ -912,22 +1036,35 @@ fn solved_island(island: &SyncIsland, clips_by_id: &HashMap<&ClipId, &Clip>) -> 
 }
 
 /// A clip without a synchronization match, played whole at its own rate.
-fn unmatched_item(clip: &Clip, options: &ExportAssemblyOptions) -> ExportItem {
+fn unmatched_item(
+    clip: &Clip,
+    options: &ExportAssemblyOptions,
+    manual_start: Option<f64>,
+) -> ExportItem {
     let zero = MediaTime::new(0, 1);
+    let start = manual_start.unwrap_or(0.0);
     let identity = vec![
         MappingPoint {
             source: zero,
-            island: zero,
+            island: if manual_start.is_some() {
+                MediaTime::microseconds(start)
+            } else {
+                zero
+            },
         },
         MappingPoint {
             source: clip.duration,
-            island: clip.duration,
+            island: if manual_start.is_some() {
+                MediaTime::microseconds(clip.duration.as_seconds() + start)
+            } else {
+                clip.duration
+            },
         },
     ];
     let mut item = ExportItem {
         display_name: options.unmatched_label(&file_name(&clip.url)),
         enabled: !options.disable_unmatched,
-        ..ExportItem::new(clip.clone(), 0.0, 1.0, identity, 0.0)
+        ..ExportItem::new(clip.clone(), start, 1.0, identity, 0.0)
     };
     options.apply_unmatched_assignment(&mut item);
     item
@@ -940,7 +1077,9 @@ fn imported_track_shifts(
     imported: &ImportedTimeline,
     base_by_id: &HashMap<&ClipId, &ExportItem>,
     result: &SyncResult,
-) -> HashMap<String, f64> {
+    effective: &EffectivePlacementView,
+    issues: &mut Vec<ReviewValidationIssue>,
+) -> (HashMap<String, f64>, f64) {
     let mut track_diffs: HashMap<String, Vec<f64>> = HashMap::new();
     for edit in &imported.edits {
         let Some(base) = base_by_id.get(&edit.clip_id) else {
@@ -976,7 +1115,7 @@ fn imported_track_shifts(
         .map(|(_, value)| *value)
         .collect();
     let anchor_shift = (!anchor_diffs.is_empty()).then(|| median(&mut anchor_diffs));
-    track_medians
+    let mut shifts: HashMap<String, f64> = track_medians
         .into_iter()
         .map(|(key, synchronized_shift)| {
             let shift = if result.preserve_editing_tracks.contains(&key) {
@@ -986,7 +1125,76 @@ fn imported_track_shifts(
             };
             (key, shift)
         })
-        .collect()
+        .collect();
+    let automatic_origin = if result.preserve_editing_tracks.is_empty() {
+        imported
+            .edits
+            .iter()
+            .flat_map(|edit| {
+                let video_start = edit.timeline_start.as_seconds()
+                    + shifts
+                        .get(&imported_track_key(edit.media_type, edit.track_index))
+                        .copied()
+                        .unwrap_or(0.0);
+                std::iter::once(video_start).chain(edit.linked_audio_edit.iter().map(|audio| {
+                    audio.timeline_start.as_seconds()
+                        + shifts
+                            .get(&imported_track_key(MediaKind::Audio, audio.track_index))
+                            .copied()
+                            .unwrap_or(0.0)
+                }))
+            })
+            .fold(f64::INFINITY, f64::min)
+    } else {
+        0.0
+    };
+    // Manual starts are absolute in the assembled timeline. Measure each
+    // requested move from the clip's current visible imported position, after
+    // automatic track alignment and origin normalization.
+    let mut manual_by_track: HashMap<String, HashMap<ClipId, (f64, f64)>> = HashMap::new();
+    for edit in &imported.edits {
+        let Some(target) = effective
+            .manual_overrides
+            .contains(&edit.clip_id)
+            .then(|| effective.starts.get(&edit.clip_id).copied())
+            .flatten()
+        else {
+            continue;
+        };
+        let key = imported_track_key(edit.media_type, edit.track_index);
+        if !base_by_id.contains_key(&edit.clip_id) {
+            continue;
+        }
+        let current_start = edit.timeline_start.as_seconds()
+            + shifts.get(&key).copied().unwrap_or(0.0)
+            - automatic_origin;
+        let by_clip = manual_by_track.entry(key).or_default();
+        let candidate = (edit.timeline_start.as_seconds(), target - current_start);
+        by_clip
+            .entry(edit.clip_id.clone())
+            .and_modify(|current| {
+                if candidate.0 < current.0 {
+                    *current = candidate;
+                }
+            })
+            .or_insert(candidate);
+    }
+    for (key, moves) in &manual_by_track {
+        let deltas: Vec<_> = moves.values().map(|(_, delta)| *delta).collect();
+        if let Some(first) = deltas.first()
+            && deltas.iter().any(|delta| (delta - first).abs() > 1e-6)
+        {
+            issues.extend(moves.keys().map(|id| ReviewValidationIssue {
+                clip_id: Some(id.clone()),
+                reason: ReviewValidationReason::ConflictingPlacement,
+            }));
+            continue;
+        }
+        if let Some((_, delta)) = moves.values().next() {
+            *shifts.entry(key.clone()).or_default() += *delta;
+        }
+    }
+    (shifts, automatic_origin)
 }
 
 /// Places imported editing-timeline edits by their synchronized media.
@@ -1193,6 +1401,7 @@ impl ExportTimeline {
             prevent_group_overlaps: false,
             preserve_origin: false,
             order_only_islands: HashSet::new(),
+            review_issues: Vec::new(),
         }
     }
 
@@ -1219,6 +1428,12 @@ impl ExportTimeline {
     ) -> Result<Self, TimelineExportError> {
         let clips_by_id: HashMap<&ClipId, &Clip> =
             result.project.clips.iter().map(|c| (&c.id, c)).collect();
+        let effective = EffectivePlacementView::from_result(result, &options.review_session);
+        let automatic = if result.project.imported_timeline.is_some() {
+            EffectivePlacementView::from_result(result, &crate::ReviewSession::default())
+        } else {
+            effective.clone()
+        };
         if let Some(imported) = &result.project.imported_timeline {
             for edit in &imported.edits {
                 if let Some(clip) = clips_by_id.get(&edit.clip_id) {
@@ -1232,7 +1447,7 @@ impl ExportTimeline {
         let mut groups: Vec<ExportIsland> = result
             .islands
             .iter()
-            .map(|island| solved_island(island, &clips_by_id))
+            .map(|island| solved_island(island, &clips_by_id, &automatic))
             .collect();
         for item in groups.iter_mut().flat_map(|island| &mut island.clips) {
             let fallback = item
@@ -1258,7 +1473,15 @@ impl ExportTimeline {
                 }
                 groups.push(ExportIsland {
                     id,
-                    clips: vec![unmatched_item(clip, &options)],
+                    clips: vec![unmatched_item(
+                        clip,
+                        &options,
+                        effective
+                            .manual_overrides
+                            .contains(clip_id)
+                            .then(|| effective.starts.get(clip_id).copied())
+                            .flatten(),
+                    )],
                     duration: clip.duration.as_seconds(),
                 });
             }
@@ -1271,7 +1494,7 @@ impl ExportTimeline {
             if islands.is_empty() {
                 return Err(TimelineExportError::NoSynchronizedIslands);
             }
-            return Ok(Self {
+            let mut timeline = Self {
                 islands,
                 frame_duration: result
                     .project
@@ -1288,7 +1511,25 @@ impl ExportTimeline {
                 prevent_group_overlaps: options.prevent_group_overlaps,
                 preserve_origin: false,
                 order_only_islands,
-            });
+                review_issues: effective.issues,
+            };
+            if !effective.manual_overrides.is_empty() {
+                // Review starts are absolute positions in the visible,
+                // assembled timeline. First lay out the automatic result,
+                // then apply the user's exact positions and preserve them.
+                let mut combined = timeline.combined_island(1.0);
+                for item in &mut combined.clips {
+                    if effective.manual_overrides.contains(&item.clip.id)
+                        && let Some(start) = effective.starts.get(&item.clip.id)
+                    {
+                        *item = item.offset_by(*start - item.start);
+                    }
+                }
+                timeline.islands = vec![combined];
+                timeline.order_only_islands.clear();
+                timeline.preserve_origin = true;
+            }
+            return Ok(timeline);
         };
 
         // Imported edits replace the solved islands: each edit keeps its own
@@ -1302,12 +1543,20 @@ impl ExportTimeline {
         combined_base.temporal_policy = result.temporal_policy.clone();
         combined_base.prevent_group_overlaps = options.prevent_group_overlaps;
         combined_base.order_only_islands = order_only_islands;
+        combined_base.review_issues = effective.issues.clone();
         let combined = combined_base.combined_island(1.0);
         let base_by_id = combined.clips.iter().map(|i| (&i.clip.id, i)).collect();
+        let (track_shifts, automatic_origin) = imported_track_shifts(
+            imported,
+            &base_by_id,
+            result,
+            &effective,
+            &mut combined_base.review_issues,
+        );
         let assembly = ImportedAssembly {
             result,
             options: &options,
-            track_shifts: imported_track_shifts(imported, &base_by_id, result),
+            track_shifts,
             base_by_id,
             parent_by_linked: imported
                 .edits
@@ -1328,14 +1577,13 @@ impl ExportTimeline {
         if imported_items.is_empty() {
             return Err(TimelineExportError::NoImportedEdits);
         }
-        let origin = imported_items
-            .iter()
-            .map(|i| i.minimum_timeline_start())
-            .fold(f64::INFINITY, f64::min);
-        if result.preserve_editing_tracks.is_empty() && origin != 0.0 && origin.is_finite() {
+        if result.preserve_editing_tracks.is_empty()
+            && automatic_origin != 0.0
+            && automatic_origin.is_finite()
+        {
             imported_items = imported_items
                 .iter()
-                .map(|i| i.offset_by(-origin))
+                .map(|i| i.offset_by(-automatic_origin))
                 .collect();
         }
         let duration = imported_items
@@ -1361,6 +1609,7 @@ impl ExportTimeline {
             prevent_group_overlaps: options.prevent_group_overlaps,
             preserve_origin: !result.preserve_editing_tracks.is_empty(),
             order_only_islands: HashSet::new(),
+            review_issues: combined_base.review_issues,
         })
     }
 
@@ -2130,6 +2379,74 @@ mod tests {
         assert_eq!(by_name["recorder"].start, 12.5);
         assert!(!by_name["recorder"].track_locked);
 
+        let mut review_session = crate::ReviewSession::default();
+        review_session.overrides.insert(
+            camera.id.clone(),
+            crate::ManualPlacementOverride::for_clip(&camera, 40.0),
+        );
+        let reviewed = ExportTimeline::from_result_with_options(
+            &result,
+            ExportAssemblyOptions {
+                review_session,
+                ..Default::default()
+            },
+        )
+        .expect("reviewed imported edit timeline");
+        let reviewed_by_name: HashMap<_, _> = reviewed.islands[0]
+            .clips
+            .iter()
+            .map(|item| (item.display_name.as_deref().unwrap(), item))
+            .collect();
+        assert_eq!(reviewed_by_name["trim"].start, 40.0);
+        assert_eq!(reviewed_by_name["duplicate"].start, 47.0);
+        assert_eq!(
+            reviewed_by_name["duplicate"].start - reviewed_by_name["trim"].start,
+            7.0,
+            "manual placement must preserve same-track edit spacing"
+        );
+
+        let mut recorder_review = crate::ReviewSession::default();
+        recorder_review.overrides.insert(
+            recorder.id.clone(),
+            crate::ManualPlacementOverride::for_clip(&recorder, 50.0),
+        );
+        let recorder_reviewed = ExportTimeline::from_result_with_options(
+            &result,
+            ExportAssemblyOptions {
+                review_session: recorder_review,
+                ..Default::default()
+            },
+        )
+        .expect("reviewed non-preserved imported track");
+        let recorder_item = recorder_reviewed.islands[0]
+            .clips
+            .iter()
+            .find(|item| item.display_name.as_deref() == Some("recorder"))
+            .expect("recorder edit");
+        assert_eq!(recorder_item.start, 50.0);
+
+        let mut unpreserved_result = result.clone();
+        unpreserved_result.preserve_editing_tracks.clear();
+        let mut unpreserved_review = crate::ReviewSession::default();
+        unpreserved_review.overrides.insert(
+            recorder.id.clone(),
+            crate::ManualPlacementOverride::for_clip(&recorder, 50.0),
+        );
+        let unpreserved_reviewed = ExportTimeline::from_result_with_options(
+            &unpreserved_result,
+            ExportAssemblyOptions {
+                review_session: unpreserved_review,
+                ..Default::default()
+            },
+        )
+        .expect("reviewed imported timeline with normalized origin");
+        let unpreserved_recorder = unpreserved_reviewed.islands[0]
+            .clips
+            .iter()
+            .find(|item| item.display_name.as_deref() == Some("recorder"))
+            .expect("recorder edit");
+        assert_eq!(unpreserved_recorder.start, 50.0);
+
         result
             .preserve_editing_tracks
             .insert(imported_track_key(MediaKind::Audio, 2));
@@ -2441,6 +2758,146 @@ mod tests {
             matches: Vec::new(),
             temporal_policy: TemporalPolicy::default(),
         }
+    }
+
+    #[test]
+    fn manual_review_start_changes_export_without_mutating_the_sync_result() {
+        let result = synced_result();
+        let clip = result.project.clips[0].clone();
+        let original_start = result.islands[0].placements[0].mapping.points[0]
+            .island
+            .as_seconds();
+        let mut review_session = crate::ReviewSession::default();
+        review_session.overrides.insert(
+            clip.id.clone(),
+            crate::ManualPlacementOverride::for_clip(&clip, 42.5),
+        );
+
+        let timeline = ExportTimeline::from_result_with_options(
+            &result,
+            ExportAssemblyOptions {
+                review_session,
+                ..Default::default()
+            },
+        )
+        .expect("timeline");
+
+        assert_eq!(timeline.islands[0].clips[0].start, 42.5);
+        assert_eq!(
+            result.islands[0].placements[0].mapping.points[0]
+                .island
+                .as_seconds(),
+            original_start,
+            "review placement must not rewrite the automatic match"
+        );
+    }
+
+    #[test]
+    fn manual_review_start_keeps_other_islands_in_their_assembled_positions() {
+        let mut result = synced_result();
+        let second = placed_clip("camera.mov", false, 100.0, 10.0);
+        result.project.clips.push(second.clip.clone());
+        result.islands.push(crate::model::SyncIsland {
+            id: 1,
+            placements: vec![crate::model::ClipPlacement {
+                clip_id: second.clip.id.clone(),
+                mapping: crate::model::TimeMap {
+                    points: second.mapping_points,
+                },
+                confidence: 0.9,
+            }],
+        });
+        let first = result.project.clips[0].clone();
+        let mut review_session = crate::ReviewSession::default();
+        review_session.overrides.insert(
+            first.id.clone(),
+            crate::ManualPlacementOverride::for_clip(&first, 42.5),
+        );
+
+        let timeline = ExportTimeline::from_result_with_options(
+            &result,
+            ExportAssemblyOptions {
+                review_session,
+                ..Default::default()
+            },
+        )
+        .expect("timeline");
+        let starts: HashMap<_, _> = timeline.islands[0]
+            .clips
+            .iter()
+            .map(|item| (item.clip.id.clone(), item.start))
+            .collect();
+
+        assert_eq!(starts[&first.id], 42.5);
+        assert_eq!(starts[&second.clip.id], 11.0);
+    }
+
+    #[test]
+    fn empty_review_session_preserves_export_structure() {
+        let result = synced_result();
+        let legacy = ExportTimeline::from_result(&result, true).expect("legacy timeline");
+        let reviewed = ExportTimeline::from_result_with_options(
+            &result,
+            ExportAssemblyOptions {
+                review_session: crate::ReviewSession::default(),
+                ..Default::default()
+            },
+        )
+        .expect("timeline with empty review session");
+
+        assert_eq!(
+            format!("{:?}", legacy.islands),
+            format!("{:?}", reviewed.islands)
+        );
+        assert!(reviewed.review_issues.is_empty());
+    }
+
+    #[test]
+    fn no_review_override_preserves_original_mapping_precision() {
+        let mut result = synced_result();
+        let precise = MediaTime::new(1, 48_000);
+        result.islands[0].placements[0].mapping.points[0].island = precise;
+
+        let timeline = ExportTimeline::from_result(&result, true).expect("timeline");
+
+        assert_eq!(
+            timeline.islands[0].clips[0].mapping_points[0].island,
+            precise
+        );
+    }
+
+    #[test]
+    fn manual_review_start_places_unmatched_clip_at_absolute_time_once() {
+        let result = unmatched_result();
+        let clip = result.project.clips[0].clone();
+        let mut review_session = crate::ReviewSession::default();
+        review_session.overrides.insert(
+            clip.id.clone(),
+            crate::ManualPlacementOverride::for_clip(&clip, 42.5),
+        );
+
+        let timeline = ExportTimeline::from_result_with_options(
+            &result,
+            ExportAssemblyOptions {
+                review_session,
+                unmatched: UnmatchedPlacement::ByOrderAndTime,
+                ..Default::default()
+            },
+        )
+        .expect("timeline");
+        let placements: Vec<_> = timeline
+            .islands
+            .iter()
+            .flat_map(|island| &island.clips)
+            .filter(|item| item.clip.id == clip.id)
+            .collect();
+
+        assert_eq!(
+            placements.len(),
+            1,
+            "manual placement must not duplicate the unmatched clip"
+        );
+        assert_eq!(placements[0].start, 42.5);
     }
 
     #[test]

@@ -115,6 +115,8 @@ pub(super) fn toolbar(
     data: &crate::state::AppData,
     active: bool,
     quality_closing: bool,
+    undo_available: bool,
+    redo_available: bool,
 ) -> Div {
     let live = matches!(data.operation, crate::state::Operation::Synchronizing);
     let busy = matches!(
@@ -175,6 +177,30 @@ pub(super) fn toolbar(
         if live {
             bar = bar.child(div().text_color(rgb(theme.dim)).child("…"));
         }
+        bar = bar.child(button(
+            cx,
+            theme,
+            "btn-review-undo",
+            "Undo",
+            undo_available,
+            |this, _, _, cx| {
+                if this.apply_placement_history(true) {
+                    cx.notify();
+                }
+            },
+        ));
+        bar = bar.child(button(
+            cx,
+            theme,
+            "btn-review-redo",
+            "Redo",
+            redo_available,
+            |this, _, _, cx| {
+                if this.apply_placement_history(false) {
+                    cx.notify();
+                }
+            },
+        ));
         bar = bar.child(div().flex_1());
     } else {
         bar = bar.child(div().font_weight(gpui::FontWeight(600.0)).child("Sources"));

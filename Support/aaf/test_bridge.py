@@ -40,11 +40,12 @@ class SourceValidation(unittest.TestCase):
             self.assertEqual(changed, 1)
             with aaf2.open(str(source), 'r') as container:
                 locator = next(iter(container.content.sourcemobs())).descriptor['Locator'].value[0]
-                self.assertEqual(locator_path(locator['URLString'].value), str(old.resolve()))
+                self.assertEqual(locator_path(locator['URLString'].value),
+                                 str(old.resolve()).replace('\\', '/'))
             with aaf2.open(str(output), 'r') as container:
                 locator = next(iter(container.content.sourcemobs())).descriptor['Locator'].value[0]
                 self.assertEqual(locator_path(locator['URLString'].value),
-                                 str(replacement.resolve()))
+                                 str(replacement.resolve()).replace('\\', '/'))
 
     def test_embedded_pcm_extracts_exact_samples_without_external_source(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -460,7 +461,7 @@ class SourceValidation(unittest.TestCase):
             track = result['sequences'][0]['tracks'][0]
             self.assertEqual(track['media_kind'], 'picture')
             self.assertEqual(track['edit_rate'], {'numerator': 30000, 'denominator': 1001})
-            self.assertEqual(track['clips'], [{'path': str(media), 'start': 7,
+            self.assertEqual(track['clips'], [{'path': str(media).replace('\\', '/'), 'start': 7,
                 'source_in': 11, 'length': 101, 'channel': None}])
             with self.assertRaises(ValueError):
                 read_timeline(path, audio_only=True)

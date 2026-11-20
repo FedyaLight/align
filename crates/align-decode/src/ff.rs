@@ -63,6 +63,47 @@ pub fn ffmpeg_bin() -> Option<PathBuf> {
     resolve_bin("ALIGN_FFMPEG", "ffmpeg")
 }
 
+/// Decode one bounded PNG frame for the source monitor.
+///
+/// This is deliberately independent of timeline playback: it seeks only in
+/// the selected source file and returns image bytes to the caller.
+pub fn preview_frame(path: &Path, at_seconds: f64) -> Result<Vec<u8>, DecodeError> {
+    if !at_seconds.is_finite() || at_seconds < 0.0 {
+        return Err(DecodeError::Incomplete(
+            "preview position must be a finite non-negative time".into(),
+        ));
+    }
+    let bin = ffmpeg_bin().ok_or_else(|| DecodeError::FfmpegMissing("ffmpeg not found".into()))?;
+    let seek = format!("{at_seconds:.6}");
+    let output = command(bin)
+        .args(["-v", "error", "-ss", &seek, "-i"])
+        .arg(path)
+        .args([
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=1280:720:force_original_aspect_ratio=decrease",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "pipe:1",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(DecodeError::Incomplete(format!(
+            "could not decode a preview frame from {}",
+            path.display()
+        )));
+    }
+    if output.stdout.is_empty() || output.stdout.len() > 20 * 1024 * 1024 {
+        return Err(DecodeError::Incomplete(
+            "preview frame was empty or exceeded the size limit".into(),
+        ));
+    }
+    Ok(output.stdout)
+}
+
 /// FFmpeg (or ffprobe) for a test that generates fixtures. Without it the
 /// test is skipped with a notice, or fails when `ALIGN_REQUIRE_FFMPEG` is set
 /// (as in CI), so a missing tool never lets a test pass silently.
@@ -1123,5 +1164,28 @@ mod tests {
             video.frame_duration,
             Some(align_core::MediaTime::new(1, 25))
         );
+    }
+
+    #[test]
+    fn source_monitor_decodes_one_png_frame_without_reencoding_media() {
+        let Some(ffmpeg) = test_ffmpeg() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("preview.mp4");
+        let generated = command(&ffmpeg)
+            .args(["-v", "error", "-f", "lavfi", "-i"])
+            .arg("color=c=blue:s=1920x1080:r=25")
+            .args(["-t", "0.2", "-c:v", "mpeg4"])
+            .arg(&source)
+            .status()
+            .is_ok_and(|status| status.success());
+        if !generated {
+            eprintln!("SKIP: FFmpeg cannot generate the source-monitor fixture");
+            return;
+        }
+        let png = preview_frame(&source, 0.08).expect("decode source preview");
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(preview_frame(&source, f64::NAN).is_err());
     }
 }

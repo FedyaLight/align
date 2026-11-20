@@ -34,6 +34,25 @@ For an existing edit, enable Preserve basic editing on the tracks that should
 remain fixed. This preserves their trims, duplicates, positions, and gaps while
 other tracks align to them. See [format limits](formats.md) for unsupported edits.
 
+### Session restoration and review workspace
+
+Align automatically persists the current session on exit and whenever a
+synchronization completes. On launch, unless media paths are passed as command-line
+arguments, Align restores your selected inputs, latest synchronization results,
+timeline view, and any manual review placement overrides. Restored sessions always
+open paused. Missing media files and stale placement overrides remain visible as
+actionable warnings rather than discarding your project. Clearing the session removes
+the saved state.
+
+Drag a timeline clip to create a manual placement, or select it and use
+Cmd/Ctrl+Left or Right to nudge it. Nudges use one frame; Alt+Cmd/Ctrl+Arrow
+moves it by exactly one millisecond. Manual edits can be undone and redone.
+Align stores each override with the clip identity and chosen timeline start,
+separate from the automatic synchronization result. A later synchronization
+keeps overrides whose clip identity still matches and flags stale overrides for
+review. Timeline exports use the same effective placements shown in the review
+workspace, including manually placed unmatched clips.
+
 ### Keyboard shortcuts
 
 | Action | macOS | Windows and Linux |
@@ -42,7 +61,10 @@ other tracks align to them. See [format limits](formats.md) for unsupported edit
 | Synchronize again | Cmd+R | Ctrl+R |
 | Export | Cmd+E | Ctrl+E |
 | Zoom the timeline | Cmd or Option + scroll | Ctrl or Alt + scroll |
-| Pan the timeline | Arrow keys (Shift for larger steps), Home, End | same |
+| Seek the timeline playhead | Left/Right (Shift for ten frames), Home/End | same |
+| Pan the timeline | Up/Down | same |
+| Nudge selected clip | Cmd+Left/Right (Alt for 1 ms) | Ctrl+Left/Right (Alt for 1 ms) |
+| Undo / redo placement | Cmd+Z / Shift+Cmd+Z | Ctrl+Z / Ctrl+Shift+Z |
 | Full screen | Ctrl+Cmd+F | F11 |
 | Quit | Cmd+Q | Ctrl+Q |
 

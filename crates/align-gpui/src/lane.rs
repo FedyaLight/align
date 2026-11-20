@@ -11,6 +11,25 @@ use align_core::{
     model::file_name,
 };
 
+/// Snap a review edit to the nearest valid timeline frame.
+pub fn snap_timeline_time(seconds: f64, frame_duration: f64) -> f64 {
+    if !seconds.is_finite() {
+        return 0.0;
+    }
+    if !frame_duration.is_finite() || frame_duration <= 0.0 {
+        return seconds.max(0.0);
+    }
+    (seconds.max(0.0) / frame_duration).round() * frame_duration
+}
+
+/// Move a timeline position by an exact amount, clamped to the sequence.
+pub fn nudge_timeline_time(seconds: f64, delta: f64, duration: f64) -> f64 {
+    if !duration.is_finite() || duration <= 0.0 {
+        return 0.0;
+    }
+    (seconds + delta).clamp(0.0, duration)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BarMatchState {
     Pending,
@@ -184,9 +203,24 @@ pub fn provisional_bars(
 /// Final bars from the same assembled timeline used by every exporter.
 /// This keeps timestamp/timecode placement, gaps and overlaps identical in
 /// the UI and the NLE output.
+#[cfg(test)]
 pub fn final_bars(result: &align_core::SyncResult) -> FinalTimeline {
+    final_bars_with_review(result, &align_core::ReviewSession::default())
+}
+
+pub fn final_bars_with_review(
+    result: &align_core::SyncResult,
+    review_session: &align_core::ReviewSession,
+) -> FinalTimeline {
     let unmatched: HashSet<ClipId> = result.unmatched.iter().cloned().collect();
-    let Ok(timeline) = ExportTimeline::from_result(result, true) else {
+    let Ok(timeline) = ExportTimeline::from_result_with_options(
+        result,
+        align_core::export_model::ExportAssemblyOptions {
+            review_session: review_session.clone(),
+            unmatched: align_core::export_model::UnmatchedPlacement::ByOrderAndTime,
+            ..Default::default()
+        },
+    ) else {
         return FinalTimeline {
             bars: Vec::new(),
             states: Vec::new(),
@@ -441,6 +475,14 @@ pub fn apply_preview(matches: &mut HashMap<String, LiveMatch>, preview: &MatchPr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_drag_snaps_to_frames_and_nudges_in_exact_time_units() {
+        assert_eq!(snap_timeline_time(1.019, 1.0 / 25.0), 1.0);
+        assert_eq!(snap_timeline_time(-0.2, 1.0 / 25.0), 0.0);
+        assert_eq!(nudge_timeline_time(1.0, 0.001, 3.0), 1.001);
+        assert_eq!(nudge_timeline_time(2.999, 0.04, 3.0), 3.0);
+    }
 
     fn clip_id(s: &str) -> ClipId {
         ClipId::new(s)
