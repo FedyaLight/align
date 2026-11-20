@@ -651,7 +651,11 @@ mod tests {
             total: 1.0,
         };
         let output = dir.path().join("out.mov");
+        // If size validation regresses, stop at audio probing rather than
+        // writing a day of PCM to the test machine.
+        let missing = dir.path().join("absent.wav");
         let too_long = ReplacementAudio {
+            source: &missing,
             total: (1u64 << 32) as f64 / OUTPUT_RATE as f64,
             ..audio
         };

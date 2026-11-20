@@ -36,8 +36,9 @@ struct LtcPayload {
 
 /// The same bytes and metadata used by the on-disk v5 and v6 formats.
 /// Keep these only for the duration of one clip's fingerprint pass.
+#[derive(PartialEq)]
 pub struct MediaSample {
-    revision: String,
+    revision: Option<String>,
     path: PathBuf,
     size: u64,
     mtime: f64,
@@ -49,7 +50,7 @@ impl MediaSample {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = std::fs::File::open(media)?;
         let meta = file.metadata()?;
-        let revision = file_revision(&file, &meta)?;
+        let revision = file_revision(&file, &meta).ok();
         let size = meta.len();
         let mtime = meta
             .modified()
@@ -75,6 +76,14 @@ impl MediaSample {
             mtime,
             bytes,
         })
+    }
+    fn is_current(&self) -> bool {
+        match &self.revision {
+            Some(revision) => media_revision(&self.path).as_ref().ok() == Some(revision),
+            // Some filesystems do not expose a change time. Keep v5/v6
+            // caching available and recheck the sampled identity before writing.
+            None => Self::read(&self.path).is_ok_and(|sample| sample == *self),
+        }
     }
 }
 
@@ -463,9 +472,7 @@ impl FingerprintEntry<'_> {
     }
 
     pub fn save(&self, fingerprints: &[Fingerprint]) {
-        if media_revision(&self.sample.path).ok().as_ref() != Some(&self.sample.revision)
-            || std::fs::create_dir_all(&self.cache.dir).is_err()
-        {
+        if !self.sample.is_current() || std::fs::create_dir_all(&self.cache.dir).is_err() {
             return;
         }
         let payload = Payload {
@@ -503,9 +510,7 @@ impl FingerprintEntry<'_> {
             return;
         }
         let url = self.path.with_extension("waveform");
-        if media_revision(&self.sample.path).ok().as_ref() != Some(&self.sample.revision)
-            || std::fs::create_dir_all(&self.cache.dir).is_err()
-        {
+        if !self.sample.is_current() || std::fs::create_dir_all(&self.cache.dir).is_err() {
             return;
         }
         let Ok(bytes) = bincode::serialize(waveform) else {
