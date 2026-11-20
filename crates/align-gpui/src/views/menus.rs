@@ -5,7 +5,7 @@ use super::settings::{
     audio_source_label, clip_order_label, match_threshold_label, track_content_label,
 };
 use super::{
-    AlignApp, AudioAnalysisSource, ClickEvent, ClipOrder, Context, Div, HashMap,
+    AlignApp, AppData, AudioAnalysisSource, ClickEvent, ClipOrder, Context, Div, HashMap,
     InteractiveElement, IntoElement, MatchThreshold, MenuTarget, MouseButton, ParentElement,
     SequencePicker, SharedString, Stateful, StatefulInteractiveElement, Styled, TemporalMode,
     Theme, TrackContent, Window, div, px, rgb,
@@ -253,7 +253,7 @@ pub(super) fn stream_menu_section(
             format!("Inherit ({})", audio_source_label(inherited))
         },
         false,
-        |this, _, _, cx| this.set_stream_source(None, cx),
+        |this, _, _, cx| this.set_lane_option(AppData::set_analysis_source, None, cx),
     ));
     panel = panel.child(menu_row(
         cx,
@@ -261,7 +261,13 @@ pub(super) fn stream_menu_section(
         "stream-auto",
         label(AudioAnalysisSource::Automatic, "Automatic".to_string()),
         false,
-        |this, _, _, cx| this.set_stream_source(Some(AudioAnalysisSource::Automatic), cx),
+        |this, _, _, cx| {
+            this.set_lane_option(
+                AppData::set_analysis_source,
+                Some(AudioAnalysisSource::Automatic),
+                cx,
+            )
+        },
     ));
     if counts.len() > 1 {
         panel = panel.child(menu_row(
@@ -273,7 +279,13 @@ pub(super) fn stream_menu_section(
                 "Mix all audio streams".to_string(),
             ),
             false,
-            |this, _, _, cx| this.set_stream_source(Some(AudioAnalysisSource::AllMixed), cx),
+            |this, _, _, cx| {
+                this.set_lane_option(
+                    AppData::set_analysis_source,
+                    Some(AudioAnalysisSource::AllMixed),
+                    cx,
+                )
+            },
         ));
     }
     for index in indices {
@@ -292,7 +304,11 @@ pub(super) fn stream_menu_section(
                 ),
                 false,
                 move |this, _, _, cx| {
-                    this.set_stream_source(Some(AudioAnalysisSource::MixedStream(index)), cx)
+                    this.set_lane_option(
+                        AppData::set_analysis_source,
+                        Some(AudioAnalysisSource::MixedStream(index)),
+                        cx,
+                    )
                 },
             ));
             for ch in 0..channels {
@@ -306,7 +322,11 @@ pub(super) fn stream_menu_section(
                     ),
                     false,
                     move |this, _, _, cx| {
-                        this.set_stream_source(Some(AudioAnalysisSource::Channel(ch)), cx)
+                        this.set_lane_option(
+                            AppData::set_analysis_source,
+                            Some(AudioAnalysisSource::Channel(ch)),
+                            cx,
+                        )
                     },
                 ));
             }
@@ -324,7 +344,8 @@ pub(super) fn stream_menu_section(
                 ),
                 false,
                 move |this, _, _, cx| {
-                    this.set_stream_source(
+                    this.set_lane_option(
+                        AppData::set_analysis_source,
                         Some(AudioAnalysisSource::Stream {
                             index,
                             channel: None,
@@ -345,7 +366,11 @@ pub(super) fn stream_menu_section(
                 ),
                 false,
                 move |this, _, _, cx| {
-                    this.set_stream_source(Some(AudioAnalysisSource::MixedStream(index)), cx)
+                    this.set_lane_option(
+                        AppData::set_analysis_source,
+                        Some(AudioAnalysisSource::MixedStream(index)),
+                        cx,
+                    )
                 },
             ));
             panel = panel.child(menu_row(
@@ -361,7 +386,8 @@ pub(super) fn stream_menu_section(
                 ),
                 false,
                 move |this, _, _, cx| {
-                    this.set_stream_source(
+                    this.set_lane_option(
+                        AppData::set_analysis_source,
                         Some(AudioAnalysisSource::Stream {
                             index,
                             channel: None,
@@ -384,7 +410,8 @@ pub(super) fn stream_menu_section(
                     ),
                     false,
                     move |this, _, _, cx| {
-                        this.set_stream_source(
+                        this.set_lane_option(
+                            AppData::set_analysis_source,
                             Some(AudioAnalysisSource::Stream {
                                 index,
                                 channel: Some(ch),
@@ -465,7 +492,7 @@ pub(super) fn preserve_editing_section(
             "Preserve basic editing".to_string()
         },
         false,
-        move |this, _, _, cx| this.set_preserve_editing(!selected, cx),
+        move |this, _, _, cx| this.set_lane_option(AppData::set_preserve_editing, !selected, cx),
     ))
 }
 
@@ -508,7 +535,7 @@ pub(super) fn track_content_section(
             row_id,
             label,
             false,
-            move |this, _, _, cx| this.set_track_content(mode, cx),
+            move |this, _, _, cx| this.set_lane_option(AppData::set_track_content, mode, cx),
         ));
     }
     panel
@@ -568,7 +595,7 @@ pub(super) fn clip_order_section(
             row_id,
             label,
             false,
-            move |this, _, _, cx| this.set_clip_order(mode, cx),
+            move |this, _, _, cx| this.set_lane_option(AppData::set_clip_order, mode, cx),
         ));
     }
     panel
@@ -641,7 +668,7 @@ pub(super) fn time_source_section(
             label,
             false,
             move |this, _, _, cx| {
-                this.set_temporal_mode(mode, cx);
+                this.set_lane_option(AppData::set_temporal_mode, mode, cx);
             },
         ));
     }
@@ -695,7 +722,7 @@ pub(super) fn match_threshold_section(
             row_id,
             label,
             false,
-            move |this, _, _, cx| this.set_match_threshold(threshold, cx),
+            move |this, _, _, cx| this.set_lane_option(AppData::set_match_threshold, threshold, cx),
         ));
     }
     panel

@@ -1773,70 +1773,18 @@ impl AlignApp {
         }
     }
 
-    fn set_stream_source(&mut self, source: Option<AudioAnalysisSource>, cx: &mut Context<Self>) {
-        let lane_id = self.data.menu.clone().and_then(|m| m.lane_id.clone());
-        let changed = match lane_id {
-            Some(id) => self.data.set_analysis_source(source, &id),
-            None => false,
-        };
-        if changed {
-            self.data.menu = None;
-            self.start_sync(cx);
-        }
-    }
-
-    fn set_temporal_mode(&mut self, mode: Option<TemporalMode>, cx: &mut Context<Self>) {
-        let lane_id = self.data.menu.clone().and_then(|m| m.lane_id.clone());
-        let changed = match lane_id {
-            Some(id) => self.data.set_temporal_mode(mode, &id),
-            None => false,
-        };
-        if changed {
-            self.data.menu = None;
-            self.start_sync(cx);
-        }
-    }
-
-    fn set_match_threshold(&mut self, threshold: Option<MatchThreshold>, cx: &mut Context<Self>) {
-        let lane_id = self.data.menu.clone().and_then(|m| m.lane_id.clone());
-        let changed = match lane_id {
-            Some(id) => self.data.set_match_threshold(threshold, &id),
-            None => false,
-        };
-        if changed {
-            self.data.menu = None;
-            self.start_sync(cx);
-        }
-    }
-
-    fn set_clip_order(&mut self, mode: Option<ClipOrder>, cx: &mut Context<Self>) {
-        let lane_id = self.data.menu.clone().and_then(|m| m.lane_id.clone());
-        let changed = match lane_id {
-            Some(id) => self.data.set_clip_order(mode, &id),
-            None => false,
-        };
-        if changed {
-            self.data.menu = None;
-            self.start_sync(cx);
-        }
-    }
-
-    fn set_track_content(&mut self, mode: Option<TrackContent>, cx: &mut Context<Self>) {
-        let lane_id = self.data.menu.clone().and_then(|m| m.lane_id.clone());
-        let changed = match lane_id {
-            Some(id) => self.data.set_track_content(mode, &id),
-            None => false,
-        };
-        if changed {
-            self.data.menu = None;
-            self.start_sync(cx);
-        }
-    }
-
-    fn set_preserve_editing(&mut self, preserve: bool, cx: &mut Context<Self>) {
-        let lane_id = self.data.menu.clone().and_then(|menu| menu.lane_id);
-        let changed = lane_id.is_some_and(|id| self.data.set_preserve_editing(preserve, &id));
-        if changed {
+    fn set_lane_option<T>(
+        &mut self,
+        update: fn(&mut AppData, T, &str) -> bool,
+        value: T,
+        cx: &mut Context<Self>,
+    ) {
+        let lane_id = self
+            .data
+            .menu
+            .as_ref()
+            .and_then(|menu| menu.lane_id.clone());
+        if lane_id.is_some_and(|id| update(&mut self.data, value, &id)) {
             self.data.menu = None;
             self.start_sync(cx);
         }
