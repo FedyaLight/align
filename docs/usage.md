@@ -23,7 +23,7 @@ open "/Applications/Align.app"
 The export sheet starts from Align's defaults. **Save as Default** keeps the
 current export options for new sessions and later launches; the destination
 and sequence name are not saved. **Revert to Saved** and **Use Align Defaults**
-load either set back into the sheet. The command line and MCP server do not
+load either set back into the sheet. The command line does not
 read these saved defaults.
 
 Search accuracy controls how much analysis work is performed. Start with
@@ -231,27 +231,16 @@ Embedded AAF audio retained for saved JSON is application data, not cache.
 Do not delete it while those results are needed. See
 [media ownership](formats.md#media-ownership) for file locations and export behavior.
 
-## MCP integration
+## AI agents
 
-`align-mcp` is a stdio server. Keep `align-cli` beside it. The server exposes
-`align_inspect`, `align_sync`, and `align_export`; it invokes the adjacent CLI and
-returns its result. The structured result is an object: a list the CLI prints
-appears under `media`, `results`, or `artifacts` respectively. Use absolute
-media and output paths.
+Open **Align → Use with AI Agents…** to copy the installed CLI path or a prompt.
+Inspect media by passing paths directly. Save the complete synchronization result
+and print a short JSON summary with:
 
-For clients that accept an `mcpServers` configuration:
-
-```json
-{
-  "mcpServers": {
-    "align": {
-      "command": "/absolute/path/to/align-mcp",
-      "args": []
-    }
-  }
-}
+```sh
+align-cli sync --output-json result.json --summary /path/to/media
+align-cli export-json result.json /path/to/export
 ```
 
-The desktop menu **Align → Use with AI Agents…** provides a configuration using
-its installed executable path. The MCP tool schema is the reference for supported
-arguments; it does not expose every CLI setting.
+The same flags work with `--all-sequences`. Without `--summary`, sync prints
+the full result. See the [agent skill](../skills/align-cli/SKILL.md).

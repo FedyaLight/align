@@ -47,7 +47,7 @@ matching, timecode, and recording metadata.
 - **More reliable synchronization.** On macOS, a file AVFoundation stops
   reading is read with the bundled decoder instead of stopping the run. A
   clip whose timecode alignment with one partner was rejected now joins the
-  next one. MCP tool results are JSON objects, as MCP clients expect.
+  next one.
 
 Exports from this version place sound in Premiere Pro, DaVinci Resolve and AAF
 on frames: an edit that relied on sub-frame placement in those formats can
@@ -63,7 +63,7 @@ sound on its sample.
 | Fedora (x86_64) | `Align-@VERSION@-Fedora-x86_64-Setup.run` or `Align-@VERSION@-Fedora-x86_64.rpm` |
 | Omarchy / Arch Linux (x86_64) | `Align-@VERSION@-Omarchy-x86_64-Setup.run` or `align-@VERSION@-1-x86_64.pkg.tar.zst` |
 
-Every build includes the desktop app, the CLI, the MCP server, and the AAF
+Every build includes the desktop app, the CLI, and the AAF
 module. No separate Python installation is needed.
 
 ### macOS

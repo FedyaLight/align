@@ -44,7 +44,7 @@ Where things live:
 | `crates/align-core` | Data model, fingerprints, matching, time mappings, timeline writers. No platform media APIs. |
 | `crates/align-decode` | Media backends, import, audio rendering, export jobs. |
 | `crates/align-gpui` | The desktop app. |
-| `crates/align-cli`, `crates/align-mcp` | The command line and the MCP server around it. |
+| `crates/align-cli` | The command-line interface. |
 | `Support/` | Icons, the privacy manifest, and the AAF module. |
 | `script/` | Build, fixture, benchmark, and acceptance scripts. |
 | `docs/` | User and developer documentation. |

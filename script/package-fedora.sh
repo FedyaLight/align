@@ -7,7 +7,7 @@ STAGE="$(cd "${1:?staged release required}" && pwd)"
 mkdir -p "${2:?output directory required}"
 OUT="$(cd "$2" && pwd)"
 VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
-for bin in align align-cli align-mcp align-aaf ffmpeg ffprobe; do
+for bin in align align-cli align-aaf ffmpeg ffprobe; do
   test -x "$STAGE/$bin"
 done
 for notice in LICENSE THIRD_PARTY_NOTICES.txt FFMPEG-LICENSE.txt; do
@@ -41,13 +41,13 @@ Requires: hicolor-icon-theme
 %description
 Sync your recordings. Keep your edit.
 Align synchronizes camera footage and separately recorded audio using waveforms,
-timecode, and recording metadata. Includes the desktop app, CLI, MCP server,
+timecode, and recording metadata. Includes the desktop app, CLI,
 self-contained AAF module, FFmpeg, and ffprobe.
 
 %install
 mkdir -p %{buildroot}/opt/align %{buildroot}/usr/bin
 tar -C "$STAGE" --exclude=./AAF-Sources -cf - . | tar -C %{buildroot}/opt/align -xf -
-for executable in align align-cli align-mcp; do
+for executable in align align-cli; do
   ln -s /opt/align/\$executable %{buildroot}/usr/bin/\$executable
 done
 install -Dm644 "$ROOT/Support/Linux/com.align.app.desktop" %{buildroot}/usr/share/applications/com.align.app.desktop
@@ -58,7 +58,6 @@ install -Dm644 "$ROOT/Support/AppIcon.png" %{buildroot}/usr/share/icons/hicolor/
 /opt/align
 /usr/bin/align
 /usr/bin/align-cli
-/usr/bin/align-mcp
 /usr/share/applications/com.align.app.desktop
 /usr/share/metainfo/com.align.app.metainfo.xml
 /usr/share/icons/hicolor/1024x1024/apps/com.align.app.png

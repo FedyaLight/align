@@ -21,7 +21,7 @@ sha256sums=('@PAYLOAD_SHA256@')
 package() {
     install -d "$pkgdir/opt/align" "$pkgdir/usr/bin"
     cp -a "$srcdir/payload/." "$pkgdir/opt/align/"
-    for executable in align align-cli align-mcp; do
+    for executable in align align-cli; do
         ln -s "/opt/align/$executable" "$pkgdir/usr/bin/$executable"
     done
     install -Dm644 "$srcdir/integration/com.align.app.desktop" \

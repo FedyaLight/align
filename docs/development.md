@@ -32,7 +32,7 @@ versions during dependency updates. Versions already in `Cargo.lock` remain usab
 ## Build
 
 ```sh
-cargo build --release -p align-cli -p align-mcp -p align-gpui
+cargo build --release -p align-cli -p align-gpui
 cargo run -p align-gpui
 cargo run -p align-cli -- --help
 ```
@@ -41,7 +41,7 @@ On macOS, `./script/build_and_run.sh` wraps a debug build in a signed
 `dist/Align.app` and opens it; `--debug` starts it under LLDB, `--logs` streams
 its unified log, and `--verify` checks that it launched.
 
-Binaries are written to `target/release`: `align`, `align-cli`, and `align-mcp`
+Binaries are written to `target/release`: `align` and `align-cli`
 (with `.exe` on Windows). Build only `align-cli` when desktop support is not
 needed. Backend selection is automatic; `ALIGN_BACKEND=portable` selects the
 portable implementation on macOS.
@@ -71,7 +71,6 @@ Build the module separately for each target OS.
 | `align-decode` | Media backends, import orchestration, AAF bridge, audio rendering, export jobs, and media ownership. |
 | `align-cli` | Argument parsing, synchronization, saved result loading, and common single/batch export settings. |
 | `align-gpui` | Desktop state, views, timeline interaction, and background job coordination. |
-| `align-mcp` | Stdio protocol adapter around the adjacent CLI. |
 
 `Pipeline` expands and inspects inputs, obtains cached or newly decoded
 fingerprints, matches candidates, refines them with audio windows, and solves
@@ -194,13 +193,13 @@ timeline before reading them. It is not part of the unattended CLI test suite.
 ./script/package-macos.sh /path/to/new/Align-macOS
 ```
 
-The script builds the application, CLI, MCP server, and AAF module; includes
+The script builds the application, CLI, and AAF module; includes
 the privacy manifest and license files;
 signs ad hoc; and runs a brief launch check. The output directory must not exist.
 It produces a local macOS bundle, not a notarized installer.
 
 Set `ALIGN_SKIP_LAUNCH_CHECK=1` to package without opening the desktop app.
-Bundle validation and the CLI/MCP checks still run.
+Bundle validation and the CLI checks still run.
 
 The macOS bundle has no FFmpeg: AVFoundation decodes media, and camera-file
 export and AAF picture metadata read QuickTime/MP4 natively. `BUNDLE_FFMPEG=1`

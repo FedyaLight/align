@@ -11,7 +11,7 @@ if [[ $(id -u) == 0 ]]; then
   echo 'Run this script as an unprivileged build user (makepkg requires it).' >&2
   exit 1
 fi
-for bin in align align-cli align-mcp align-aaf ffmpeg ffprobe; do
+for bin in align align-cli align-aaf ffmpeg ffprobe; do
   test -x "$STAGE/$bin"
 done
 for notice in LICENSE THIRD_PARTY_NOTICES.txt FFMPEG-LICENSE.txt; do

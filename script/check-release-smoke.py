@@ -55,7 +55,15 @@ def main():
         offsets[names[placement['clipID']]] = seconds(first['island']) - seconds(first['source'])
     error = abs(offsets['b.wav'] - offsets['a.wav'] - 2)
     assert error < 0.001, f'known offset error: {error}s'
-    artifacts = run(['export-json', str(output / 'sync.json'), str(output / 'export')], 'export')
+    saved = output / 'saved.json'
+    summary = run(['sync', '--summary', '--output-json', str(saved), str(media)], 'summary')
+    assert Path(summary['outputJson']) == saved
+    sequence, = summary['sequences']
+    island, = sequence['islands']
+    assert sorted(island['clips']) == ['a.wav', 'b.wav'] and sequence['unmatched'] == []
+    assert not sequence['warnings'] and sequence['maxAbsDriftPPM'] < 1
+    assert json.loads(saved.read_text(encoding='utf-8')) == result
+    artifacts = run(['export-json', str(saved), str(output / 'export')], 'export')
     expected = {'resolveOTIO', 'resolveXML', 'resolveScript', 'premiereXML', 'finalCutProXML'}
     assert {item['format'] for item in artifacts} == expected, 'missing export format'
     for item in artifacts:

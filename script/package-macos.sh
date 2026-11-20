@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Packages Align for macOS (arm64): Align.app bundle +
-# align-cli, align-mcp and the AAF sidecar, ad-hoc signed.
+# align-cli and the AAF sidecar, ad-hoc signed.
 # Usage: ./script/package-macos.sh [output-dir]   (default: ~/Downloads/Align-macOS)
 set -euo pipefail
 
@@ -66,7 +66,7 @@ if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
 fi
 
 echo "==> building release"
-cargo build --locked --release --manifest-path "$ROOT_DIR/Cargo.toml" -p align-cli -p align-mcp -p align-gpui
+cargo build --locked --release --manifest-path "$ROOT_DIR/Cargo.toml" -p align-cli -p align-gpui
 
 BIN_DIR="$ROOT_DIR/target/release"
 APP_BUNDLE="$OUT_DIR/$APP_NAME.app"
@@ -87,11 +87,9 @@ cp "$ROOT_DIR/THIRD_PARTY_NOTICES.txt" "$RESOURCES/THIRD_PARTY_NOTICES.txt"
 cp "$ROOT_DIR/LICENSE" "$RESOURCES/LICENSE"
 cp "$BIN_DIR/align-cli" "$OUT_DIR/align-cli"
 cp "$BIN_DIR/align-cli" "$APP_MACOS/align-cli"
-cp "$BIN_DIR/align-mcp" "$OUT_DIR/align-mcp"
-cp "$BIN_DIR/align-mcp" "$APP_MACOS/align-mcp"
 cp "$ROOT_DIR/THIRD_PARTY_NOTICES.txt" "$OUT_DIR/THIRD_PARTY_NOTICES.txt"
 cp "$ROOT_DIR/LICENSE" "$OUT_DIR/LICENSE"
-chmod +x "$OUT_DIR/align-cli" "$APP_MACOS/align-cli" "$OUT_DIR/align-mcp" "$APP_MACOS/align-mcp"
+chmod +x "$OUT_DIR/align-cli" "$APP_MACOS/align-cli"
 cp "$AAF_DIR/align-aaf" "$APP_MACOS/align-aaf"
 cp "$AAF_DIR/align-aaf" "$OUT_DIR/align-aaf"
 cp -R "$AAF_DIR/AAF-Licenses" "$RESOURCES/AAF-Licenses"
@@ -148,7 +146,6 @@ Align — audio synchronization for video editing
 
   Align.app            — desktop application
   align-cli            — batch CLI: sync / export / export-json
-  align-mcp            — MCP server for AI agents (stdio)
   align-aaf            — self-contained AAF module (no Python installation needed)
   LICENSE              — Align license
   THIRD_PARTY_NOTICES.txt — third-party license notices
@@ -162,7 +159,7 @@ CLI:
   ./align-cli export-json result.json /path/to/output
 
 AI AGENTS:
-  Open Align → Use with AI Agents… and copy the MCP configuration
+  Open Align → Use with AI Agents… and copy the CLI path
   and ready-to-use prompt.
 
 Requirements: macOS 15 or later, Apple Silicon.
@@ -178,7 +175,6 @@ codesign -dv --verbose=2 "$APP_BUNDLE" 2>&1 | head -5
 
 echo "==> smoke test"
 "$OUT_DIR/align-cli" --help >/dev/null
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | "$OUT_DIR/align-mcp" | grep -q 'align_sync'
 if [[ "$ALIGN_SKIP_LAUNCH_CHECK" != "1" ]]; then
   "$APP_MACOS/$APP_NAME" >"$AAF_BUILD_DIR/launch.log" 2>&1 &
   launch_pid=$!

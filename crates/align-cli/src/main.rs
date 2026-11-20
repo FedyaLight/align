@@ -26,6 +26,12 @@ struct Cli {
 enum Command {
     /// Synchronize media, print SyncResult JSON.
     Sync {
+        /// Atomically save the complete result (or sequence batch) at this path.
+        #[arg(long, value_name = "FILE")]
+        output_json: Option<PathBuf>,
+        /// Print a compact report on stdout. Requires --output-json.
+        #[arg(long, requires = "output_json")]
+        summary: bool,
         /// Select one sequence from an imported project (1-based).
         #[arg(long, value_name = "N", conflicts_with = "all_sequences")]
         sequence: Option<usize>,
@@ -667,6 +673,48 @@ fn select_stage(
     )))
 }
 
+fn save_json(path: &std::path::Path, result: &impl serde::Serialize) -> Result<(), CliError> {
+    fn write(path: &std::path::Path, result: &impl serde::Serialize) -> std::io::Result<()> {
+        let staged = align_core::staged::StagedFile::new(path)?;
+        {
+            let mut writer = std::io::BufWriter::new(std::fs::File::create(staged.path())?);
+            serde_json::to_writer(&mut writer, result)?;
+            writer.write_all(b"\n")?;
+            writer.flush()?;
+        }
+        staged.commit()
+    }
+    write(path, result).map_err(|e| CliError::Failure(format!("Save {}: {e}", path.display())))
+}
+
+fn sync_summary(result: &align_core::SyncResult) -> serde_json::Value {
+    use serde_json::json;
+    let names: std::collections::HashMap<_, _> = result
+        .project
+        .clips
+        .iter()
+        .map(|clip| (&clip.id, align_core::model::file_name(&clip.url)))
+        .collect();
+    let name = |id: &align_core::ClipId| names.get(id).cloned().unwrap_or_else(|| id.0.clone());
+    let islands: Vec<_> = result
+        .islands
+        .iter()
+        .map(|island| {
+            json!({
+                "id": island.id,
+                "clips": island.placements.iter().map(|p| name(&p.clip_id)).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    json!({
+        "sequence": result.project.imported_timeline.as_ref().map(|timeline| &timeline.name),
+        "islands": islands,
+        "unmatched": result.unmatched.iter().map(name).collect::<Vec<_>>(),
+        "warnings": result.project.warnings,
+        "maxAbsDriftPPM": result.matches.iter().map(|m| m.drift_ppm.abs()).reduce(f64::max),
+    })
+}
+
 fn print_json(value: &impl serde::Serialize) -> Result<(), CliError> {
     let mut out = serde_json::to_string_pretty(value)
         .map_err(|e| CliError::Failure(format!("JSON encode: {e}")))?;
@@ -734,6 +782,8 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
             print_json(&project)
         }
         Some(Command::Sync {
+            output_json,
+            summary,
             sequence,
             all_sequences,
             settings,
@@ -771,6 +821,38 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
                         CliError::Failure(format!("Save embedded AAF media: {error}"))
                     })?;
                 results.push(result);
+            }
+            if let Some(path) = output_json {
+                let path = absolute(path);
+                // A selected source can also arrive through a directory or
+                // a project. Protect it if the output path names that file.
+                if let Ok(destination) = path.canonicalize()
+                    && paths
+                        .iter()
+                        .chain(
+                            results
+                                .iter()
+                                .flat_map(|r| r.project.clips.iter().map(|c| &c.url)),
+                        )
+                        .chain(relink.write_fixed_project.iter())
+                        .any(|p| p.canonicalize().is_ok_and(|source| source == destination))
+                {
+                    return Err(CliError::Failure(format!(
+                        "Choose a result file separate from {}",
+                        path.display()
+                    )));
+                }
+                if all_sequences {
+                    save_json(&path, &results)?;
+                } else {
+                    save_json(&path, &results[0])?;
+                }
+                if summary {
+                    let sequences: Vec<_> = results.iter().map(sync_summary).collect();
+                    return print_json(
+                        &serde_json::json!({"outputJson": path, "sequences": sequences}),
+                    );
+                }
             }
             if all_sequences {
                 print_json(&results)

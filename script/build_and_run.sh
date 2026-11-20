@@ -14,11 +14,12 @@ APP_BINARY="$APP_MACOS/$APP_NAME"
 APP_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT_DIR/Cargo.toml" | head -1)"
 
 pkill -f "^$APP_BINARY$" >/dev/null 2>&1 || true
-cargo build --manifest-path "$ROOT_DIR/Cargo.toml" -p align-gpui
+cargo build --manifest-path "$ROOT_DIR/Cargo.toml" -p align-gpui -p align-cli
 
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_MACOS" "$APP_RESOURCES"
 cp "$ROOT_DIR/target/debug/align" "$APP_BINARY"
+cp "$ROOT_DIR/target/debug/align-cli" "$APP_MACOS/align-cli"
 cp "$ROOT_DIR/Support/AppIcon.icns" "$APP_RESOURCES/AppIcon.icns"
 cp "$ROOT_DIR/Support/PrivacyInfo.xcprivacy" "$APP_RESOURCES/PrivacyInfo.xcprivacy"
 

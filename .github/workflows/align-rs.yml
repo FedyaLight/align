@@ -196,7 +196,7 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install nasm
       - name: Build release
-        run: cargo build --locked --release -p align-cli -p align-mcp -p align-gpui
+        run: cargo build --locked --release -p align-cli -p align-gpui
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -225,7 +225,7 @@ jobs:
           exe=""
           if [[ "${{ runner.os }}" == "Windows" ]]; then exe=".exe"; fi
           mkdir -p dist-bundle
-          cp "target/release/align-cli$exe" "target/release/align-mcp$exe" "target/release/align$exe" dist-bundle/
+          cp "target/release/align-cli$exe" "target/release/align$exe" dist-bundle/
           cp "target/release/align-aaf$exe" dist-bundle/
           # Windows ships the AAF module's Python runtime as a folder.
           if [[ "${{ runner.os }}" == "Windows" ]]; then
@@ -341,7 +341,6 @@ jobs:
         run: |
           pacman -U --noconfirm installers/*.pkg.tar.zst
           align-cli --help >/dev/null
-          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | align-mcp | grep -q align_sync
           pacman -Qkk align
       - uses: actions/upload-artifact@v4
         with:
@@ -362,7 +361,6 @@ jobs:
         run: |
           dnf install -y ./Align-*-Fedora-x86_64.rpm
           align-cli --help >/dev/null
-          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | align-mcp | grep -q align_sync
           rpm -V align
           sha256sum -c ./*.sha256
 
