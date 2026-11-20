@@ -47,16 +47,11 @@ impl MediaBackend for PortableBackend {
         range: Option<(f64, Option<f64>)>,
         consume: &mut dyn FnMut(crate::backend::NativeBlock) -> Result<(), DecodeError>,
     ) -> Result<f64, DecodeError> {
-        use crate::backend::{NativeBlock, ProbeReport};
+        use crate::backend::NativeBlock;
         let (start, duration) = range.unwrap_or((0.0, None));
-        if crate::sym::can_decode(path, stream_index) {
-            let probe = self.audio_probe(path).ok();
-            let rate = probe
-                .as_ref()
-                .and_then(|p: &ProbeReport| p.audio_streams.get(stream_index))
-                .map_or(48_000.0, |s| s.sample_rate);
-            let limit = duration.map(|d| (d * rate).ceil() as u64 + 64);
-            return crate::sym::decode_native(path, stream_index, start, limit, consume);
+        if let Ok(reader) = crate::sym::AudioReader::validated(path, stream_index) {
+            let limit = duration.map(|d| (d * reader.rate()).ceil() as u64 + 64);
+            return reader.decode_native(start, limit, consume);
         }
         let probe = self.audio_probe(path)?;
         let stream = probe
@@ -100,16 +95,11 @@ impl MediaBackend for PortableBackend {
         range: Option<(f64, Option<f64>)>,
         consume: &mut dyn FnMut(crate::backend::NativeBlockI32) -> Result<(), DecodeError>,
     ) -> Result<f64, DecodeError> {
-        use crate::backend::{NativeBlockI32, ProbeReport};
+        use crate::backend::NativeBlockI32;
         let (start, duration) = range.unwrap_or((0.0, None));
-        if crate::sym::can_decode(path, stream_index) {
-            let probe = self.audio_probe(path).ok();
-            let rate = probe
-                .as_ref()
-                .and_then(|p: &ProbeReport| p.audio_streams.get(stream_index))
-                .map_or(48_000.0, |s| s.sample_rate);
-            let limit = duration.map(|d| (d * rate).ceil() as u64 + 64);
-            return crate::sym::decode_native_i32(path, stream_index, start, limit, consume);
+        if let Ok(reader) = crate::sym::AudioReader::validated(path, stream_index) {
+            let limit = duration.map(|d| (d * reader.rate()).ceil() as u64 + 64);
+            return reader.decode_native_i32(start, limit, consume);
         }
         // FFmpeg s32le pipe (bit-exact integer path for containers).
         let probe = self.audio_probe(path)?;
@@ -195,8 +185,8 @@ impl MediaBackend for PortableBackend {
             let stream_count = self.inspect(path)?.audio_streams.len();
             return crate::mix::decode_all_streams_mono_8k(self, path, stream_count, consume);
         }
-        if crate::sym::can_decode(path, source.stream_index()) {
-            return crate::sym::decode_mono_8k(path, source, consume);
+        if let Ok(reader) = crate::sym::AudioReader::validated(path, source.stream_index()) {
+            return reader.decode_mono_8k(source, consume);
         }
         // Symphonia cannot demux this container: FFmpeg pipe with
         // the probed discrete channel count (stereo guess only when

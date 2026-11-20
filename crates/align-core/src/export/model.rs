@@ -249,23 +249,27 @@ impl ExportItem {
             None => own,
         }
     }
-    fn mapped_value(&self, source: f64) -> f64 {
+    fn mapping(&self) -> PiecewiseTimeMapping {
         PiecewiseTimeMapping::new(
             self.mapping_points
                 .iter()
                 .map(|p| MapPoint::new(p.source.as_seconds(), p.island.as_seconds()))
                 .collect(),
         )
-        .value_at(source)
     }
     pub fn corrected_source_in(&self) -> f64 {
-        self.mapped_value(self.source_in) - self.mapped_value(0.0)
+        let mapping = self.mapping();
+        mapping.value_at(self.source_in) - mapping.value_at(0.0)
     }
     pub fn corrected_source_out(&self) -> f64 {
-        self.mapped_value(self.source_out) - self.mapped_value(0.0)
+        let mapping = self.mapping();
+        mapping.value_at(self.source_out) - mapping.value_at(0.0)
     }
     pub fn corrected_selected_duration(&self) -> f64 {
-        (self.corrected_source_out() - self.corrected_source_in()).max(0.0)
+        let mapping = self.mapping();
+        let origin = mapping.value_at(0.0);
+        ((mapping.value_at(self.source_out) - origin) - (mapping.value_at(self.source_in) - origin))
+            .max(0.0)
     }
     pub fn is_full_source_selection(&self) -> bool {
         let tolerance = 0.5 / self.clip.audio.first().map_or(48_000.0, |a| a.sample_rate);

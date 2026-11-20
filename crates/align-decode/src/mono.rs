@@ -42,6 +42,8 @@ pub struct MonoPipe<F> {
     mix_channels: bool,
     selected: Option<usize>,
     adaptive_pending: Vec<f32>,
+    energies: Vec<f64>,
+    resampled: Vec<Vec<f32>>,
     resampler: Option<FftFixedIn<f32>>,
     source_rate: f64,
     target_rate: f64,
@@ -96,12 +98,17 @@ where
             )
         };
         let skip = resampler.as_ref().map(|r| r.output_delay()).unwrap_or(0);
+        let resampled = resampler
+            .as_ref()
+            .map_or_else(Vec::new, |r| r.output_buffer_allocate(true));
         Ok(Self {
             channels,
             explicit,
             mix_channels: mix_channels && explicit.is_none(),
             selected: None,
             adaptive_pending: Vec::new(),
+            energies: vec![0.; channels],
+            resampled,
             resampler,
             source_rate,
             target_rate,
@@ -116,48 +123,58 @@ where
 
     /// Push owned planar channels.
     pub fn push_owned(&mut self, planes: &[Vec<f32>]) -> Result<(), DecodeError> {
-        let refs: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
-        self.push_planar(&refs)
+        self.planar(planes)
     }
 
-    /// Push planar channels (Symphonia `AudioBuffer.chan(i)` slices).
+    /// Push planar channels (Symphonia AudioBuffer channel slices).
     pub fn push_planar(&mut self, planes: &[&[f32]]) -> Result<(), DecodeError> {
+        self.planar(planes)
+    }
+
+    fn planar<P: AsRef<[f32]>>(&mut self, planes: &[P]) -> Result<(), DecodeError> {
         if planes.len() != self.channels {
             return Err(DecodeError::InvalidPcm);
         }
-        if planes.iter().any(|p| p.len() != planes[0].len()) {
-            // Ragged trailing packet: process the common prefix only.
-            let n = planes.iter().map(|p| p.len()).min().unwrap_or(0);
-            if n == 0 {
-                return Ok(());
-            }
-            return self.push_planar_truncated(planes, n);
-        }
-        let n = planes[0].len();
-        self.push_planar_truncated(planes, n)
-    }
-
-    fn push_planar_truncated(&mut self, planes: &[&[f32]], n: usize) -> Result<(), DecodeError> {
+        let n = planes.iter().map(|p| p.as_ref().len()).min().unwrap_or(0);
         if self.mix_channels {
             let scale = 1.0 / self.channels as f32;
             return self.push_mono(
-                (0..n).map(|i| planes.iter().map(|plane| plane[i]).sum::<f32>() * scale),
+                (0..n).map(|i| planes.iter().map(|plane| plane.as_ref()[i]).sum::<f32>() * scale),
             );
         }
-        if self.explicit.is_none() && self.channels > 1 {
-            for start in (0..n).step_by(512) {
-                let end = (start + 512).min(n);
-                let interleaved: Vec<f32> = (start..end)
-                    .flat_map(|i| planes.iter().map(move |plane| plane[i]))
-                    .collect();
-                self.push_adaptive(&interleaved)?;
-            }
-            return Ok(());
+        if self.explicit.is_some() || self.channels == 1 {
+            let channel = self.explicit.unwrap_or(0);
+            self.selected = Some(channel);
+            return self.push_mono(planes[channel].as_ref()[..n].iter().copied());
         }
-        let channel = self.pick(planes, n, |planes, ch| {
-            planes[ch][..n].iter().map(|&v| v as f64 * v as f64).sum()
-        });
-        self.push_mono(planes[channel][..n].iter().copied())
+        let mut start = 0;
+        while start < n {
+            let needed = 512 - self.adaptive_pending.len() / self.channels;
+            let end = (start + needed).min(n);
+            if end - start == 512 {
+                // An intact window: analyse the planes and copy only the winner.
+                for (energy, plane) in self.energies.iter_mut().zip(planes) {
+                    *energy = plane.as_ref()[start..end]
+                        .iter()
+                        .map(|&v| v as f64 * v as f64)
+                        .sum();
+                }
+                let channel = align_core::select_mono_channel(&self.energies, self.selected);
+                self.selected = Some(channel);
+                self.push_mono(planes[channel].as_ref()[start..end].iter().copied())?;
+            } else {
+                // Keep only the packet boundary in the common interleaved buffer.
+                for i in start..end {
+                    self.adaptive_pending
+                        .extend(planes.iter().map(|p| p.as_ref()[i]));
+                }
+                if end - start == needed {
+                    self.flush_adaptive()?;
+                }
+            }
+            start = end;
+        }
+        Ok(())
     }
 
     /// Push interleaved frames (FFmpeg `f32le` pipe). Never a downmix:
@@ -216,56 +233,36 @@ where
             self.selected = Some(ch);
             return ch;
         }
-        let mut energies = vec![0.0f64; self.channels];
+        self.energies.fill(0.0);
         for i in 0..n {
             for ch in 0..self.channels {
                 let v = frames[i * self.channels + ch] as f64;
-                energies[ch] += v * v;
+                self.energies[ch] += v * v;
             }
         }
-        let selected = align_core::select_mono_channel(&energies, self.selected);
-        self.selected = Some(selected);
-        selected
-    }
-
-    fn pick(
-        &mut self,
-        planes: &[&[f32]],
-        _n: usize,
-        energy: impl Fn(&[&[f32]], usize) -> f64,
-    ) -> usize {
-        if let Some(ch) = self.explicit {
-            self.selected = Some(ch);
-            return ch;
-        }
-        let energies: Vec<f64> = (0..self.channels).map(|ch| energy(planes, ch)).collect();
-        let selected = align_core::select_mono_channel(&energies, self.selected);
+        let selected = align_core::select_mono_channel(&self.energies, self.selected);
         self.selected = Some(selected);
         selected
     }
 
     fn push_mono(&mut self, samples: impl Iterator<Item = f32>) -> Result<(), DecodeError> {
-        match self.resampler.as_mut() {
-            None => {
-                // Passthrough: collect to one slice per call (still streaming).
-                let v: Vec<f32> = samples.collect();
-                if !v.is_empty() {
-                    self.out_total += v.len();
-                    (self.consume)(&v)?;
-                }
-                Ok(())
+        let mut pending = std::mem::take(&mut self.pending);
+        let before = pending.len();
+        pending.extend(samples);
+        if self.resampler.is_none() {
+            self.emit(&pending)?;
+            pending.clear();
+        } else {
+            self.in_total += (pending.len() - before) as u64;
+            let (chunks, tail) = pending.as_chunks::<CHUNK>();
+            for chunk in chunks {
+                self.emit_chunk(chunk)?;
             }
-            Some(_) => {
-                let before = self.pending.len();
-                self.pending.extend(samples);
-                self.in_total += (self.pending.len() - before) as u64;
-                while self.pending.len() >= CHUNK {
-                    let chunk: Vec<f32> = self.pending.drain(..CHUNK).collect();
-                    self.emit_chunk(&chunk)?;
-                }
-                Ok(())
-            }
+            let consumed = pending.len() - tail.len();
+            pending.drain(..consumed);
         }
+        self.pending = pending;
+        Ok(())
     }
 
     fn emit(&mut self, frames: &[f32]) -> Result<(), DecodeError> {
@@ -293,10 +290,13 @@ where
             .resampler
             .as_mut()
             .expect("resampler present: guarded by caller");
-        let out = resampler
-            .process(&[chunk], None)
+        let mut out = std::mem::take(&mut self.resampled);
+        let (_, written) = resampler
+            .process_into_buffer(&[chunk], &mut out, None)
             .map_err(|e| DecodeError::Resample(e.to_string()))?;
-        self.emit(&out[0])
+        let result = self.emit(&out[0][..written]);
+        self.resampled = out;
+        result
     }
 
     pub fn finish(mut self) -> Result<(), DecodeError> {

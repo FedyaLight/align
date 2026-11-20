@@ -6,13 +6,13 @@
 use std::sync::{Arc, OnceLock};
 
 use num_complex::Complex32;
-use rustfft::{Fft, FftPlanner};
+use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 
 /// FFT plans and analysis window for one window size. Immutable, so every
 /// refine worker shares them.
 struct SizeTables {
-    forward: Arc<dyn Fft<f32>>,
-    inverse: Arc<dyn Fft<f32>>,
+    forward: Arc<dyn RealToComplex<f32>>,
+    inverse: Arc<dyn ComplexToReal<f32>>,
     hann: Vec<f32>,
 }
 
@@ -23,7 +23,7 @@ static TABLES: [OnceLock<SizeTables>; 4] = [const { OnceLock::new() }; 4];
 fn tables(count: usize) -> &'static SizeTables {
     debug_assert!(count.is_power_of_two() && (16_384..=131_072).contains(&count));
     TABLES[count.trailing_zeros() as usize - 14].get_or_init(|| {
-        let mut planner = FftPlanner::<f32>::new();
+        let mut planner = RealFftPlanner::<f32>::new();
         SizeTables {
             forward: planner.plan_fft_forward(count),
             inverse: planner.plan_fft_inverse(count),
@@ -42,51 +42,79 @@ pub struct GccPhatResult {
     pub quality: f64,
 }
 
+#[derive(Default)]
+struct Buffers {
+    time: Vec<f32>,
+    left: Vec<Complex32>,
+    right: Vec<Complex32>,
+    scratch: Vec<Complex32>,
+}
+
+thread_local! {
+    static BUFFERS: std::cell::RefCell<Buffers> = Default::default();
+}
+
 pub fn align(left: &[f32], right: &[f32], maximum_lag: usize) -> Option<GccPhatResult> {
     let available = left.len().min(right.len());
     let count = 131_072.min(prev_pow2(available));
-    if count < 16_384 || maximum_lag == 0 || maximum_lag + 1 >= count / 2 {
+    if count < 16_384 || maximum_lag == 0 || maximum_lag >= count / 2 - 1 {
         return None;
     }
 
-    let tables = tables(count);
-    let l = preprocess(&left[..count], &tables.hann);
-    let r = preprocess(&right[..count], &tables.hann);
-    let l_rms = rms(&l);
-    let r_rms = rms(&r);
-    if l_rms <= 1e-5 || r_rms <= 1e-5 {
-        return None;
-    }
-
-    let (forward, inverse) = (&tables.forward, &tables.inverse);
-
-    let mut lb: Vec<Complex32> = l.iter().map(|&v| Complex32::new(v, 0.0)).collect();
-    let mut rb: Vec<Complex32> = r.iter().map(|&v| Complex32::new(v, 0.0)).collect();
-    forward.process(&mut lb);
-    forward.process(&mut rb);
-
-    // Cross-spectrum with PHAT weighting: conj(left) * right. Observation
-    // timestamps add the signed lag directly; flipping the conjugation
-    // biases every refined offset by twice the
-    // in-window lag with a deceptively tiny residual.
-    let mut cross: Vec<Complex32> = Vec::with_capacity(count);
-    for i in 0..count {
-        let c = rb[i] * lb[i].conj();
-        let mag = c.norm();
-        if mag > 1e-12 {
-            cross.push(c / mag);
-        } else {
-            cross.push(Complex32::new(0.0, 0.0));
+    BUFFERS.with_borrow_mut(|buffers| {
+        let tables = tables(count);
+        let Buffers {
+            time,
+            left: lb,
+            right: rb,
+            scratch,
+        } = buffers;
+        time.resize(count, 0.0);
+        lb.resize(count / 2 + 1, Complex32::default());
+        rb.resize(lb.len(), Complex32::default());
+        scratch.resize(
+            tables
+                .forward
+                .get_scratch_len()
+                .max(tables.inverse.get_scratch_len()),
+            Complex32::default(),
+        );
+        for (signal, spectrum) in [(left, &mut *lb), (right, &mut *rb)] {
+            preprocess(&signal[..count], &tables.hann, time);
+            if rms(time) <= 1e-5 {
+                return None;
+            }
+            tables
+                .forward
+                .process_with_scratch(time, spectrum, scratch)
+                .ok()?;
         }
-    }
-    inverse.process(&mut cross);
-    // rustfft inverse is unnormalized; scale cancels in relative metrics.
-    let correlation: Vec<f32> = cross.iter().map(|c| c.re / count as f32).collect();
+        // conj(left) * right gives a positive lag for a delayed right channel.
+        for (l, r) in lb.iter_mut().zip(rb.iter()) {
+            let c = *r * l.conj();
+            let mag = c.norm();
+            *l = if mag > 1e-12 {
+                c / mag
+            } else {
+                Complex32::default()
+            };
+        }
+        tables
+            .inverse
+            .process_with_scratch(lb, time, scratch)
+            .ok()?;
+        // Normalize only the samples used by the peak and confidence tests.
+        peak(time, maximum_lag)
+    })
+}
 
+fn peak(samples: &[f32], maximum_lag: usize) -> Option<GccPhatResult> {
+    let count = samples.len();
+    let correlation = |lag| samples[idx(lag, count)] / count as f32;
     let mut best_lag = 0isize;
     let mut best_val = f32::MIN;
     for lag in -(maximum_lag as isize)..=(maximum_lag as isize) {
-        let v = correlation[idx(lag, count)].abs();
+        let v = correlation(lag).abs();
         if v > best_val {
             best_val = v;
             best_lag = lag;
@@ -96,7 +124,7 @@ pub fn align(left: &[f32], right: &[f32], maximum_lag: usize) -> Option<GccPhatR
     let mut sum_sq = 0.0f64;
     let mut n = 0usize;
     for lag in -(maximum_lag as isize)..=(maximum_lag as isize) {
-        let v = correlation[idx(lag, count)].abs();
+        let v = correlation(lag).abs();
         sum_sq += (v as f64) * (v as f64);
         n += 1;
         if (lag - best_lag).abs() > 32 && v > second {
@@ -110,9 +138,9 @@ pub fn align(left: &[f32], right: &[f32], maximum_lag: usize) -> Option<GccPhatR
         return None;
     }
 
-    let prev = correlation[idx(best_lag - 1, count)];
-    let center = correlation[idx(best_lag, count)];
-    let next = correlation[idx(best_lag + 1, count)];
+    let prev = correlation(best_lag - 1);
+    let center = correlation(best_lag);
+    let next = correlation(best_lag + 1);
     let denom = prev - 2.0 * center + next;
     let frac = if denom.abs() > 1e-12 {
         0.5 * (prev - next) / denom
@@ -127,14 +155,12 @@ pub fn align(left: &[f32], right: &[f32], maximum_lag: usize) -> Option<GccPhatR
     })
 }
 
-fn preprocess(input: &[f32], window: &[f32]) -> Vec<f32> {
-    let mut out = vec![0.0f32; input.len()];
+fn preprocess(input: &[f32], window: &[f32], out: &mut [f32]) {
     for (i, &v) in input.iter().enumerate() {
         // Hann (NORM scale-insensitive here) * first-order pre-emphasis.
         let p = if i > 0 { v - 0.97 * input[i - 1] } else { 0.0 };
         out[i] = p * window[i];
     }
-    out
 }
 
 fn rms(v: &[f32]) -> f32 {
@@ -142,17 +168,8 @@ fn rms(v: &[f32]) -> f32 {
     (sum / v.len() as f64).sqrt() as f32
 }
 
-fn prev_pow2(mut v: usize) -> usize {
-    if v == 0 {
-        return 0;
-    }
-    v |= v >> 1;
-    v |= v >> 2;
-    v |= v >> 4;
-    v |= v >> 8;
-    v |= v >> 16;
-    v |= v >> 32;
-    v - (v >> 1)
+pub(crate) fn prev_pow2(v: usize) -> usize {
+    v.checked_ilog2().map_or(0, |n| 1usize << n)
 }
 
 fn idx(lag: isize, count: usize) -> usize {
@@ -210,6 +227,24 @@ mod tests {
                 "lag={}",
                 r2.lag_samples
             );
+        }
+    }
+
+    #[test]
+    fn half_sample_delay_at_the_edge_of_the_search_window() {
+        let base = pseudo_noise(32_768, 5);
+        let mut right = vec![0.0; base.len()];
+        for i in 126..right.len() {
+            right[i] = (base[i - 125] + base[i - 126]) * 0.5;
+        }
+        for (left, right, sign) in [(&base, &right, 1.), (&right, &base, -1.)] {
+            let result = align(left, right, 125).unwrap();
+            assert!(
+                (result.lag_samples - sign * 125.5).abs() < 0.03,
+                "{result:?}"
+            );
+            // The established confidence for this truncated search is ~0.899.
+            assert!((0.89..0.91).contains(&result.quality), "{result:?}");
         }
     }
 

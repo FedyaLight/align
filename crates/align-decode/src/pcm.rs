@@ -20,6 +20,10 @@ use crate::isobmff::{self, TrackKind};
 /// Frames converted per callback block.
 const BLOCK_FRAMES: usize = 8_192;
 
+/// Analysis borrows the planes so the next block reuses their capacity.
+/// Native render callbacks take ownership of a block handed to the backend.
+type ConsumePlanes<'a, T> = dyn FnMut(&mut Vec<Vec<T>>) -> Result<(), DecodeError> + 'a;
+
 pub struct PcmTrack {
     file: File,
     pub sample_rate: f64,
@@ -44,7 +48,7 @@ impl PcmTrack {
         if !isobmff::is_candidate(path) {
             return None;
         }
-        let movie = isobmff::read(path)?;
+        let movie = isobmff::shared_movie(path)?;
         let track = movie
             .tracks
             .iter()
@@ -61,14 +65,9 @@ impl PcmTrack {
         let bytes_per_frame = audio.channels as u64 * bits as u64 / 8;
         let mut chunks = Vec::with_capacity(track.chunk_offsets.len());
         let mut frame = 0u64;
-        for (index, &offset) in track.chunk_offsets.iter().enumerate() {
-            let number = index as u32 + 1;
-            let run = track
-                .chunk_runs
-                .iter()
-                .rev()
-                .find(|run| run.first_chunk <= number)?;
-            let frames = run.samples_per_chunk as u64;
+        for chunk in track.chunk_layout() {
+            let (offset, count) = chunk?;
+            let frames = u64::from(count);
             chunks.push((offset, frame, frames));
             frame += frames;
         }
@@ -76,10 +75,11 @@ impl PcmTrack {
         let length = file.metadata().ok()?.len();
         // Every chunk must lie inside the file; anything else is not a
         // layout this reader understands.
-        if chunks
-            .iter()
-            .any(|&(offset, _, frames)| offset + frames * bytes_per_frame > length)
-            || frame != track.sample_count()
+        if chunks.iter().any(|&(offset, _, frames)| {
+            offset
+                .checked_add(frames * bytes_per_frame)
+                .is_none_or(|end| end > length)
+        }) || frame != track.sample_count()
         {
             return None;
         }
@@ -211,7 +211,7 @@ impl PcmTrack {
         start: u64,
         count: Option<u64>,
         convert: F,
-        consume: &mut dyn FnMut(Vec<Vec<T>>) -> Result<(), DecodeError>,
+        consume: &mut ConsumePlanes<'_, T>,
     ) -> Result<(), DecodeError> {
         let first = start + self.lead;
         let end = count.map_or(self.total, |n| (first + n).min(self.total));
@@ -223,6 +223,7 @@ impl PcmTrack {
         let index = self
             .chunks
             .partition_point(|&(_, chunk_first, frames)| chunk_first + frames <= first);
+        let mut planes: Vec<Vec<T>> = Vec::new();
         let mut bytes = Vec::new();
         let mut frame = first;
         for &(offset, chunk_first, frames) in &self.chunks[index..] {
@@ -237,15 +238,16 @@ impl PcmTrack {
                 let take = remaining.min(BLOCK_FRAMES);
                 bytes.resize(take * frame_bytes, 0);
                 self.file.read_exact(&mut bytes)?;
-                let planes = (0..self.channels)
-                    .map(|channel| {
+                planes.resize_with(self.channels, Vec::new);
+                for (channel, plane) in planes.iter_mut().enumerate() {
+                    plane.clear();
+                    plane.extend(
                         bytes[channel * width..]
                             .chunks(frame_bytes)
-                            .map(|frame| convert(&frame[..width]))
-                            .collect()
-                    })
-                    .collect();
-                consume(planes)?;
+                            .map(|frame| convert(&frame[..width])),
+                    );
+                }
+                consume(&mut planes)?;
                 remaining -= take;
                 frame += take as u64;
             }
@@ -257,7 +259,7 @@ impl PcmTrack {
         &mut self,
         start: u64,
         count: Option<u64>,
-        consume: &mut dyn FnMut(Vec<Vec<f32>>) -> Result<(), DecodeError>,
+        consume: &mut ConsumePlanes<'_, f32>,
     ) -> Result<(), DecodeError> {
         const SCALE: f32 = 1.0 / 2_147_483_648.0;
         macro_rules! int {
@@ -288,7 +290,7 @@ impl PcmTrack {
         &mut self,
         start: u64,
         count: Option<u64>,
-        consume: &mut dyn FnMut(Vec<Vec<i32>>) -> Result<(), DecodeError>,
+        consume: &mut ConsumePlanes<'_, i32>,
     ) -> Result<(), DecodeError> {
         match (self.bits, self.float, self.big_endian) {
             (16, false, false) => self.read_with(start, count, integer::<2, false>, consume),

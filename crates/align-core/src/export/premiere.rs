@@ -680,25 +680,13 @@ fn links(
             })
             .collect();
     };
-    let mut linked_audio: Vec<(String, (usize, usize))> = ids
-        .keys()
-        .filter(|k| k.0 == entry.item.instance_id && k.1 == MediaKind::Audio)
-        .filter_map(|k| Some((ids.get(k)?.clone(), *positions.get(k)?)))
+    let mut linked_audio: Vec<_> = ids
+        .iter()
+        .filter(|(k, _)| k.0 == entry.item.instance_id && k.1 == MediaKind::Audio)
+        .filter_map(|(key, id)| Some((key.2, id, *positions.get(key)?)))
         .collect();
-    linked_audio.sort_by(|a, b| {
-        let ka = ids
-            .iter()
-            .find(|(_, v)| **v == a.0)
-            .map(|(k, _)| k.2)
-            .unwrap_or(0);
-        let kb = ids
-            .iter()
-            .find(|(_, v)| **v == b.0)
-            .map(|(k, _)| k.2)
-            .unwrap_or(0);
-        ka.cmp(&kb)
-    });
-    let Some(first_audio) = linked_audio.first() else {
+    linked_audio.sort_by_key(|&(channel, _, _)| channel);
+    let Some((_, first_audio, _)) = linked_audio.first() else {
         return Vec::new();
     };
     if format == TimelineExportFormat::PremiereXML {
@@ -709,13 +697,17 @@ fn links(
             clip_index: Some(video_position.1),
             group_index: None,
         }];
-        out.extend(linked_audio.iter().map(|audio| LinkReference {
-            clip_item_id: audio.0.clone(),
-            media_type: Some(MediaKind::Audio),
-            track_index: Some(audio.1.0),
-            clip_index: Some(audio.1.1),
-            group_index: Some(1),
-        }));
+        out.extend(
+            linked_audio
+                .into_iter()
+                .map(|(_, id, (track, clip))| LinkReference {
+                    clip_item_id: id.clone(),
+                    media_type: Some(MediaKind::Audio),
+                    track_index: Some(track),
+                    clip_index: Some(clip),
+                    group_index: Some(1),
+                }),
+        );
         return out;
     }
     vec![
@@ -731,7 +723,7 @@ fn links(
             group_index: None,
         },
         LinkReference {
-            clip_item_id: first_audio.0.clone(),
+            clip_item_id: (*first_audio).clone(),
             media_type: None,
             track_index: None,
             clip_index: None,
@@ -1272,7 +1264,7 @@ impl TimeRemap {
         xml += "                  <parameter><parameterid>variablespeed</parameterid><name>variablespeed</name><valuemin>0</valuemin><valuemax>1</valuemax><value>0</value></parameter>\n";
         xml += &format!(
             "                  <parameter><parameterid>speed</parameterid><name>speed</name><valuemin>-100000</valuemin><valuemax>100000</valuemax><value>{}</value></parameter>\n",
-            xml_number(graph_slope * 100.0)
+            xml_text::number(graph_slope * 100.0)
         );
         xml += &format!(
             "                  <parameter><parameterid>reverse</parameterid><name>reverse</name><value>{}</value></parameter>\n",
@@ -1281,12 +1273,12 @@ impl TimeRemap {
         xml += "                  <parameter><parameterid>frameblending</parameterid><name>frameblending</name><value>FALSE</value></parameter>\n";
         xml += &format!(
             "                  <parameter><parameterid>graphdict</parameterid><name>graphdict</name><valuemin>0</valuemin><valuemax>{}</valuemax><value>0</value>\n",
-            xml_number(media_duration)
+            xml_text::number(media_duration)
         );
         for (when, value, flag) in keyframes {
             xml += &format!(
                 "                    <keyframe><when>{when}</when><value>{}</value><speedvirtualkf>TRUE</speedvirtualkf><{flag}>TRUE</{flag}></keyframe>\n",
-                xml_number(value)
+                xml_text::number(value)
             );
         }
         xml += "                    <interpolation><name>FCPCurve</name></interpolation>\n                  </parameter>\n                </effect></filter>\n";
@@ -1316,26 +1308,11 @@ fn reverse_out_at_speed(graph: &str, slope: f64) -> String {
         Some(format!(
             "{}{}{}",
             &graph[..start + value],
-            xml_number(when * slope),
+            xml_text::number(when * slope),
             &graph[start + value_end..]
         ))
     })();
     rewritten.unwrap_or_else(|| graph.to_string())
-}
-
-fn xml_number(value: f64) -> String {
-    let rounded = value.round();
-    if (value - rounded).abs() < 0.000_001 {
-        return format!("{}", rounded as i64);
-    }
-    let mut s = format!("{value:.9}");
-    while s.ends_with('0') {
-        s.pop();
-    }
-    if s.ends_with('.') {
-        s.pop();
-    }
-    s
 }
 
 /// The file one side of an item plays: its source or its drift sidecar, with

@@ -358,7 +358,7 @@ impl Pair<'_> {
             &right_window.samples,
             (0.25 * FINE_SAMPLE_RATE) as usize,
         )?;
-        let common = 131_072.min(prev_pow2(
+        let common = 131_072.min(crate::gccphat::prev_pow2(
             left_window.samples.len().min(right_window.samples.len()),
         ));
         if common == 0 {
@@ -569,19 +569,6 @@ fn fit(points: &[Observation], allow_rate: bool) -> Affine {
 
 fn bounded_window_start(center: f64, duration: f64, clip_duration: f64) -> f64 {
     (center - duration / 2.0).clamp(0.0, (clip_duration - duration).max(0.0))
-}
-
-fn prev_pow2(mut v: usize) -> usize {
-    if v == 0 {
-        return 0;
-    }
-    v |= v >> 1;
-    v |= v >> 2;
-    v |= v >> 4;
-    v |= v >> 8;
-    v |= v >> 16;
-    v |= v >> 32;
-    v - (v >> 1)
 }
 
 // ------------------------------------------------------------ disjoint set

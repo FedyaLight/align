@@ -657,7 +657,10 @@ impl Pipeline {
         // *differences* of embedded timestamps steer matching, and the BWF
         // date resolves in UTC (see meta.rs) — consistent per machine.
         let bwf = align_core::meta::read_bwf(url);
-        let sony = align_core::meta::read_sony_tail(url);
+        let sony = probe
+            .has_video
+            .then(|| align_core::meta::read_sony_tail(url))
+            .flatten();
         let (recorded_at, recorded_at_source) = sony
             .as_deref()
             .and_then(align_core::meta::sony_recording_date)
@@ -719,34 +722,23 @@ impl Pipeline {
             .and_then(|v| v.source_timecode.as_ref())
             .is_some()
             || audio.iter().any(|a| a.source_timecode.is_some());
-        if !has_timecode {
-            'streams: for (stream_index, stream) in probe.audio_streams.iter().enumerate() {
-                let mut sample_rate = stream.sample_rate;
-                let mut channels = vec![Vec::new(); stream.channels];
-                let decoded = self.backend.decode_native(
-                    url,
-                    stream_index,
-                    Some((0.0, Some(3.0))),
-                    &mut |block| {
-                        sample_rate = block.sample_rate;
-                        for (output, input) in channels.iter_mut().zip(&block.frames) {
-                            output.extend_from_slice(input);
-                        }
-                        Ok(())
-                    },
-                );
-                if decoded.is_err() {
-                    continue;
+        if !has_timecode && !audio.is_empty() {
+            let entry = self.cache.ltc_entry(url);
+            let cached = entry
+                .as_ref()
+                .and_then(|e| e.load())
+                .filter(|hit| hit.as_ref().is_none_or(|(index, _)| *index < audio.len()));
+            let detection = cached.unwrap_or_else(|| {
+                let (detection, complete) = self.detect_ltc(url, &probe.audio_streams);
+                // Retry incomplete reads, including failures before a later
+                // stream supplied a clock.
+                if complete && let Some(entry) = &entry {
+                    entry.save(detection.clone());
                 }
-                for samples in &channels {
-                    if let Some(timecode) = crate::ltc::detect(samples, sample_rate) {
-                        audio[stream_index].source_timecode = Some(align_core::SourceTimecode {
-                            derived: true,
-                            ..timecode
-                        });
-                        break 'streams;
-                    }
-                }
+                detection
+            });
+            if let Some((stream, timecode)) = detection {
+                audio[stream].source_timecode = Some(timecode);
             }
         }
 
@@ -861,6 +853,49 @@ impl Pipeline {
         }
     }
 
+    fn detect_ltc(
+        &self,
+        url: &Path,
+        streams: &[crate::backend::AudioStreamProbe],
+    ) -> (Option<(usize, align_core::SourceTimecode)>, bool) {
+        let mut complete = true;
+        for (stream_index, stream) in streams.iter().enumerate() {
+            let mut sample_rate = stream.sample_rate;
+            let mut channels = vec![Vec::new(); stream.channels];
+            let decoded = self.backend.decode_native(
+                url,
+                stream_index,
+                Some((0.0, Some(3.0))),
+                &mut |block| {
+                    sample_rate = block.sample_rate;
+                    for (output, input) in channels.iter_mut().zip(&block.frames) {
+                        output.extend_from_slice(input);
+                    }
+                    Ok(())
+                },
+            );
+            if decoded.is_err() {
+                complete = false;
+                continue;
+            }
+            for samples in &channels {
+                if let Some(timecode) = crate::ltc::detect(samples, sample_rate) {
+                    return (
+                        Some((
+                            stream_index,
+                            align_core::SourceTimecode {
+                                derived: true,
+                                ..timecode
+                            },
+                        )),
+                        complete,
+                    );
+                }
+            }
+        }
+        (None, complete)
+    }
+
     fn fingerprints(
         &self,
         clips: &[&Clip],
@@ -907,13 +942,15 @@ impl Pipeline {
                 };
             let mut variants = Vec::with_capacity(sources.len());
             let mut failure = None;
+            let sample = align_core::cache::MediaSample::read(&clip.url).ok();
             for source in sources {
                 let variant = (|| -> Result<Variant, PipelineError> {
                     let cache_key = accuracy.cache_key(&source.cache_key());
-                    if let Some(cached) = self.cache.load(&clip.url, &cache_key) {
+                    let entry = sample.as_ref().map(|s| self.cache.entry(s, &cache_key));
+                    if let Some((entry, cached)) = entry.as_ref().and_then(|e| Some((e, e.load()?)))
+                    {
                         let waveform = if generate_waveform_previews {
-                            if let Some(waveform) = self.cache.load_waveform(&clip.url, &cache_key)
-                            {
+                            if let Some(waveform) = entry.load_waveform() {
                                 Some(waveform)
                             } else {
                                 let preview = self.decode_mono_8k_into(
@@ -924,7 +961,7 @@ impl Pipeline {
                                     |preview, block| preview.consume(block),
                                 )?;
                                 let waveform = preview.finish();
-                                self.cache.save_waveform(&waveform, &clip.url, &cache_key);
+                                entry.save_waveform(&waveform);
                                 Some(waveform)
                             }
                         } else {
@@ -958,10 +995,12 @@ impl Pipeline {
                         return Err(PipelineError::Cancelled);
                     }
                     let fingerprints = extractor.finish();
-                    self.cache.save(&fingerprints, &clip.url, &cache_key);
+                    if let Some(entry) = &entry {
+                        entry.save(&fingerprints);
+                    }
                     let waveform = preview.map(WaveformPreview::finish);
-                    if let Some(waveform) = &waveform {
-                        self.cache.save_waveform(waveform, &clip.url, &cache_key);
+                    if let (Some(waveform), Some(entry)) = (&waveform, &entry) {
+                        entry.save_waveform(waveform);
                     }
                     Ok(Variant {
                         source,
@@ -1945,6 +1984,7 @@ mod tests {
     /// fails like a decoder part way through the audio, after passing some
     /// samples on.
     struct FaultyAnalysis {
+        native_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         fails: fn(&Path, AudioAnalysisSource) -> Option<crate::DecodeError>,
         /// Whether refinement windows of those sources fail too.
         windows_fail: bool,
@@ -1993,6 +2033,8 @@ mod tests {
             range: Option<(f64, Option<f64>)>,
             consume: &mut dyn FnMut(crate::backend::NativeBlock) -> Result<(), crate::DecodeError>,
         ) -> Result<f64, crate::DecodeError> {
+            self.native_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             crate::portable::PortableBackend.decode_native(path, stream, range, consume)
         }
 
@@ -2041,6 +2083,7 @@ mod tests {
             let pipe = faulty_pipeline(
                 &dir,
                 FaultyAnalysis {
+                    native_reads: Default::default(),
                     fails: |path, _| {
                         named(path, "a.wav").then(|| {
                             crate::DecodeError::Symphonia("unexpected end of bitstream".into())
@@ -2105,6 +2148,7 @@ mod tests {
         let pipe = faulty_pipeline(
             &dir,
             FaultyAnalysis {
+                native_reads: Default::default(),
                 fails: |path, source| {
                     (named(path, "two-streams.mov") && source.stream_index() == 0)
                         .then(|| crate::DecodeError::Incomplete("stream 0 is unreadable".into()))
@@ -2704,7 +2748,7 @@ mod tests {
         let baseline = pipe
             .synchronize(&inputs, &[], &PipelineOptions::default(), None, &cancel)
             .unwrap();
-        assert_eq!(pipe.cache.statistics().file_count, 2);
+        let baseline_entries = pipe.cache.statistics().file_count;
         let id = baseline.project.clips[0].id.clone();
         let options = PipelineOptions {
             search_overrides: [(id, align_core::SearchAccuracy::Exhaustive)]
@@ -2717,7 +2761,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             pipe.cache.statistics().file_count,
-            3,
+            baseline_entries + 1,
             "only overridden clip needs another cache entry"
         );
         assert_eq!(result.search_overrides, options.search_overrides);
@@ -2808,7 +2852,7 @@ mod tests {
             );
             assert_eq!(
                 pipe.cache.statistics().file_count,
-                (index + 1) * 2,
+                (index + 1) * 2 + 2,
                 "search levels must not reuse incompatible fingerprints"
             );
             let warm = pipe
@@ -2946,17 +2990,33 @@ mod tests {
     #[test]
     fn pipeline_reads_ltc_from_audio_signal() {
         let dir = fixture_dir("ltc");
-        let wav = write_mono_wav(&dir, "ltc.wav", &crate::ltc::synthetic_ltc(0, 40, 25));
-        let pipe = Pipeline::new_in(BackendKind::Portable, Some(dir.join(".cache")));
-        let project = pipe
-            .open(&[PipelineInput::Media(wav)])
-            .expect("inspect LTC WAV");
-        let timecode = project.clips[0].audio[0]
-            .source_timecode
-            .as_ref()
-            .expect("LTC source timecode");
-        assert_eq!(timecode.text, "01:02:03:00");
-        assert_eq!(timecode.frame_duration, MediaTime::new(1, 25));
+        let clock = crate::ltc::synthetic_ltc(0, 40, 25);
+        let wav = write_mono_wav(&dir, "ltc.wav", &vec![0.0; clock.len()]);
+        let native_reads = std::sync::Arc::<std::sync::atomic::AtomicUsize>::default();
+        let pipe = faulty_pipeline(
+            &dir,
+            FaultyAnalysis {
+                native_reads: native_reads.clone(),
+                fails: |_, _| None,
+                windows_fail: false,
+            },
+        );
+        let inputs = [PipelineInput::Media(wav)];
+        for _ in 0..2 {
+            let project = pipe.open(&inputs).unwrap();
+            assert!(project.clips[0].source_timecode().is_none());
+        }
+        assert_eq!(native_reads.load(std::sync::atomic::Ordering::Relaxed), 1);
+        write_mono_wav(&dir, "ltc.wav", &clock);
+        for _ in 0..2 {
+            let project = pipe.open(&inputs).unwrap();
+            let timecode = project.clips[0]
+                .source_timecode()
+                .expect("LTC source timecode");
+            assert_eq!(timecode.text, "01:02:03:00");
+            assert_eq!(timecode.frame_duration, MediaTime::new(1, 25));
+        }
+        assert_eq!(native_reads.load(std::sync::atomic::Ordering::Relaxed), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

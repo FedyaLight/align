@@ -186,10 +186,15 @@ impl FingerprintExtractor {
                     max_bin = bin;
                 }
             }
+            // A corrupt float sample can overflow even a finite FFT bin's
+            // squared magnitude. Discard this frame, preserving hop timing.
+            if !sum.is_finite() {
+                return;
+            }
             let mean = sum / band.len() as f32;
             candidates[slot] = (max / mean.max(1e-12), max_bin);
         }
-        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
         for (score, bin) in candidates.iter().take(self.accuracy.peak_count()) {
             if *score >= 2.5 {
                 self.peaks.push(Peak {
@@ -268,6 +273,17 @@ mod tests {
         (0..(secs * SAMPLE_RATE as f32) as usize)
             .map(|n| (2.0 * std::f32::consts::PI * freq * n as f32 / SAMPLE_RATE as f32).sin())
             .collect()
+    }
+
+    #[test]
+    fn damaged_samples_do_not_mask_surrounding_tones() {
+        let mut samples = sine(440.0, 4.0);
+        samples[1500] = 1e20;
+        samples[6000] = f32::NAN;
+        samples[16000] = f32::INFINITY;
+        let mut ex = FingerprintExtractor::with_accuracy(crate::SearchAccuracy::Balanced);
+        ex.consume(&samples);
+        assert!(!ex.finish().is_empty());
     }
 
     #[test]

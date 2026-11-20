@@ -213,6 +213,7 @@ pub fn inspect(path: &Path) -> Result<SymphoniaProbe, DecodeError> {
 }
 
 struct Stream {
+    pending_steps: std::collections::VecDeque<Step>,
     format: Box<dyn FormatReader>,
     track_id: u32,
     time_base: TimeBase,
@@ -253,6 +254,13 @@ fn packet_frames(time_base: TimeBase, sample_rate: u32, duration: u64) -> usize 
 }
 
 fn decode_next(stream: &mut Stream) -> Result<Step, DecodeError> {
+    if let Some(step) = stream.pending_steps.pop_front() {
+        return Ok(step);
+    }
+    read_packet(stream)
+}
+
+fn read_packet(stream: &mut Stream) -> Result<Step, DecodeError> {
     loop {
         let packet = match stream.format.next_packet() {
             Ok(p) => p,
@@ -322,10 +330,10 @@ fn open_stream(path: &Path, stream_index: usize) -> Result<Stream, DecodeError> 
     // Symphonia's MP4 reader leaves the channel count of AAC tracks to the
     // decoder and ignores edit lists. The movie header (track ids are movie
     // track indices) supplies both, keeping camera AAC in-process.
-    let movie_track = is_iso_media(path)
-        .then(|| crate::isobmff::read(path))
-        .flatten()
-        .and_then(|movie| movie.tracks.into_iter().nth(track.id as usize));
+    let movie = is_iso_media(path)
+        .then(|| crate::isobmff::shared_movie(path))
+        .flatten();
+    let movie_track = movie.as_ref().and_then(|m| m.tracks.get(track.id as usize));
     let channels = track
         .codec_params
         .channels
@@ -354,6 +362,7 @@ fn open_stream(path: &Path, stream_index: usize) -> Result<Stream, DecodeError> 
         return Err(DecodeError::Symphonia("unknown audio format".into()));
     }
     Ok(Stream {
+        pending_steps: Default::default(),
         format,
         track_id: track.id,
         time_base,
@@ -378,21 +387,59 @@ fn open_stream(path: &Path, stream_index: usize) -> Result<Stream, DecodeError> 
 /// not, since Symphonia decodes only its AAC core (half the samples), so
 /// FFmpeg decodes it.
 pub fn can_decode(path: &Path, stream_index: usize) -> bool {
-    if PcmTrack::open(path, stream_index).is_some() {
-        return true;
+    AudioReader::validated(path, stream_index).is_ok()
+}
+
+/// Own the PCM reader or demuxer selected before emitting any samples.
+pub(crate) struct AudioReader(Reader);
+
+enum Reader {
+    Pcm(PcmTrack),
+    Codec(Box<Stream>),
+}
+
+impl AudioReader {
+    pub(crate) fn pcm(path: &Path, stream_index: usize) -> Option<Self> {
+        PcmTrack::open(path, stream_index).map(|track| Self(Reader::Pcm(track)))
     }
-    let Ok(mut stream) = open_stream(path, stream_index) else {
-        return false;
-    };
-    // A few damaged packets at the start do not decide the tier.
-    for _ in 0..16 {
-        match decode_next(&mut stream) {
-            Ok(Step::Decoded) => return true,
-            Ok(Step::Silence(_)) => {}
-            Ok(Step::End) | Err(_) => return false,
+
+    fn open(path: &Path, stream_index: usize) -> Result<Self, DecodeError> {
+        if let Some(reader) = Self::pcm(path, stream_index) {
+            return Ok(reader);
+        }
+        Ok(Self(Reader::Codec(Box::new(open_stream(
+            path,
+            stream_index,
+        )?))))
+    }
+
+    pub(crate) fn validated(path: &Path, stream_index: usize) -> Result<Self, DecodeError> {
+        let mut reader = Self::open(path, stream_index)?;
+        if let Reader::Codec(stream) = &mut reader.0 {
+            // Keep initial damaged packet durations and the first good packet
+            // in decoder.last_decoded(). Replay them if reading from the head.
+            for _ in 0..16 {
+                let step = read_packet(stream)?;
+                let decoded = matches!(step, Step::Decoded);
+                if matches!(step, Step::End) {
+                    break;
+                }
+                stream.pending_steps.push_back(step);
+                if decoded {
+                    return Ok(reader);
+                }
+            }
+            return Err(DecodeError::Symphonia("no decodable opening packet".into()));
+        }
+        Ok(reader)
+    }
+
+    pub(crate) fn rate(&self) -> f64 {
+        match &self.0 {
+            Reader::Pcm(track) => track.sample_rate,
+            Reader::Codec(stream) => stream.sample_rate as f64,
         }
     }
-    false
 }
 
 /// Stream a whole file to 8 kHz mono through `consume` (fingerprint path).
@@ -403,40 +450,51 @@ pub fn decode_mono_8k(
     source: AudioAnalysisSource,
     consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
 ) -> Result<(), DecodeError> {
-    if let Some(mut track) = PcmTrack::open(path, source.stream_index()) {
+    AudioReader::open(path, source.stream_index())?.decode_mono_8k(source, consume)
+}
+
+impl AudioReader {
+    pub(crate) fn decode_mono_8k(
+        self,
+        source: AudioAnalysisSource,
+        consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
+    ) -> Result<(), DecodeError> {
+        let mut stream = match self.0 {
+            Reader::Pcm(mut track) => {
+                let mut pipe = crate::mono::MonoPipe::new(
+                    track.sample_rate,
+                    8000.0,
+                    track.channels,
+                    source.selected_channel(),
+                    source.mixes_channels(),
+                    consume,
+                )?;
+                track.read_f32(0, None, &mut |planes| pipe.push_owned(planes))?;
+                return pipe.finish();
+            }
+            Reader::Codec(stream) => stream,
+        };
+        let explicit = source.selected_channel();
         let mut pipe = crate::mono::MonoPipe::new(
-            track.sample_rate,
+            stream.sample_rate as f64,
             8000.0,
-            track.channels,
-            source.selected_channel(),
+            stream.channels,
+            explicit,
             source.mixes_channels(),
             consume,
         )?;
-        track.read_f32(0, None, &mut |planes| pipe.push_owned(&planes))?;
-        return pipe.finish();
-    }
-    let mut stream = open_stream(path, source.stream_index())?;
-    let explicit = source.selected_channel();
-    let mut pipe = crate::mono::MonoPipe::new(
-        stream.sample_rate as f64,
-        8000.0,
-        stream.channels,
-        explicit,
-        source.mixes_channels(),
-        consume,
-    )?;
-    let mut skip = stream.lead;
-    loop {
-        match decode_packet_planes(&mut stream)? {
-            None => break,
-            Some(mut planes) => {
-                trim_native_packet(&mut planes, &mut skip, None);
-                let refs: Vec<&[f32]> = planes.iter().map(|v| v.as_slice()).collect();
-                pipe.push_planar(&refs)?;
+        let mut skip = stream.lead;
+        loop {
+            match decode_packet_planes(&mut stream)? {
+                None => break,
+                Some(mut planes) => {
+                    trim_native_packet(&mut planes, &mut skip, None);
+                    pipe.push_owned(&planes)?;
+                }
             }
         }
+        pipe.finish()
     }
-    pipe.finish()
 }
 
 /// Decode one 16 kHz window (refine path). Returns actual start + samples.
@@ -446,66 +504,78 @@ pub fn decode_window(
     duration: f64,
     source: AudioAnalysisSource,
 ) -> Result<(f64, Vec<f32>), DecodeError> {
-    let actual_start = start.max(0.0);
-    let want = (duration * 16_000.0).ceil() as usize + 64;
-    if let Some(mut track) = PcmTrack::open(path, source.stream_index()) {
-        let mut samples = Vec::with_capacity(want);
+    AudioReader::open(path, source.stream_index())?.decode_window(start, duration, source)
+}
+
+impl AudioReader {
+    pub(crate) fn decode_window(
+        self,
+        start: f64,
+        duration: f64,
+        source: AudioAnalysisSource,
+    ) -> Result<(f64, Vec<f32>), DecodeError> {
+        let actual_start = start.max(0.0);
+        let want = (duration * 16_000.0).ceil() as usize + 64;
+        let mut stream = match self.0 {
+            Reader::Pcm(mut track) => {
+                let mut samples = Vec::with_capacity(want);
+                let mut pipe = crate::mono::MonoPipe::new(
+                    track.sample_rate,
+                    16_000.0,
+                    track.channels,
+                    source.selected_channel(),
+                    source.mixes_channels(),
+                    |s: &[f32]| {
+                        samples.extend_from_slice(s);
+                        Ok(())
+                    },
+                )?;
+                let first = (actual_start * track.sample_rate).round() as u64;
+                // Read past the window so the resampler's last outputs are filtered
+                // from real audio, as with streamed packets, not from flush padding.
+                let count = (want as f64 / 16_000.0 * track.sample_rate).ceil() as u64 + 8_192;
+                track.read_f32(first, Some(count), &mut |planes| pipe.push_owned(planes))?;
+                pipe.finish()?;
+                samples.truncate(want);
+                return Ok((actual_start, samples));
+            }
+            Reader::Codec(stream) => stream,
+        };
+        let mut skip = position(&mut stream, actual_start)?;
+        let explicit = source.selected_channel();
+        // Shared collection: the closure owns the mutable borrow for the pipe's
+        // lifetime, so length checks go through the cell (windows are small).
+        let samples = std::cell::RefCell::new(Vec::with_capacity(want.min(16_000 * 12)));
         let mut pipe = crate::mono::MonoPipe::new(
-            track.sample_rate,
+            stream.sample_rate as f64,
             16_000.0,
-            track.channels,
-            source.selected_channel(),
+            stream.channels,
+            explicit,
             source.mixes_channels(),
             |s: &[f32]| {
-                samples.extend_from_slice(s);
+                samples.borrow_mut().extend_from_slice(s);
                 Ok(())
             },
         )?;
-        let first = (actual_start * track.sample_rate).round() as u64;
-        // Read past the window so the resampler's last outputs are filtered
-        // from real audio, as with streamed packets, not from flush padding.
-        let count = (want as f64 / 16_000.0 * track.sample_rate).ceil() as u64 + 8_192;
-        track.read_f32(first, Some(count), &mut |planes| pipe.push_owned(&planes))?;
-        pipe.finish()?;
-        samples.truncate(want);
-        return Ok((actual_start, samples));
-    }
-    let mut stream = open_stream(path, source.stream_index())?;
-    let mut skip = position(&mut stream, actual_start)?;
-    let explicit = source.selected_channel();
-    // Shared collection: the closure owns the mutable borrow for the pipe's
-    // lifetime, so length checks go through the cell (windows are small).
-    let samples = std::cell::RefCell::new(Vec::with_capacity(want.min(16_000 * 12)));
-    let mut pipe = crate::mono::MonoPipe::new(
-        stream.sample_rate as f64,
-        16_000.0,
-        stream.channels,
-        explicit,
-        source.mixes_channels(),
-        |s: &[f32]| {
-            samples.borrow_mut().extend_from_slice(s);
-            Ok(())
-        },
-    )?;
-    // Pre-roll and seek-packet lead are discarded: the window starts at the
-    // requested sample.
-    loop {
-        if samples.borrow().len() >= want {
-            break;
-        }
-        match decode_packet_planes(&mut stream)? {
-            None => break,
-            Some(mut planes) => {
-                trim_native_packet(&mut planes, &mut skip, None);
-                let refs: Vec<&[f32]> = planes.iter().map(|v| v.as_slice()).collect();
-                pipe.push_planar(&refs)?;
+        // Pre-roll and seek-packet lead are discarded: the window starts at the
+        // requested sample.
+        loop {
+            if samples.borrow().len() >= want {
+                break;
+            }
+            match decode_packet_planes(&mut stream)? {
+                None => break,
+                Some(mut planes) => {
+                    trim_native_packet(&mut planes, &mut skip, None);
+                    pipe.push_owned(&planes)?;
+                }
             }
         }
+        pipe.finish()?;
+        let mut samples = samples.into_inner();
+        samples.truncate(want);
+        Ok((actual_start, samples))
     }
-    pipe.finish()?;
-    let mut samples = samples.into_inner();
-    samples.truncate(want);
-    Ok((actual_start, samples))
 }
 
 /// Decode one packet into owned planar f32 channels. Owned (not borrowed)
@@ -557,6 +627,10 @@ fn position(stream: &mut Stream, start: f64) -> Result<u64, DecodeError> {
             },
         )
         .map_err(|e| DecodeError::Unseekable(e.to_string()))?;
+    stream.pending_steps.clear();
+    stream.decoder.reset();
+    stream.last_channels = 0;
+    stream.last_frames = 0;
     let t = stream.time_base.calc_time(seeked.actual_ts);
     let actual = ((t.seconds as f64 + t.frac) * rate).round() as u64;
     if actual > target {
@@ -588,47 +662,60 @@ pub fn decode_native(
     limit_frames: Option<u64>,
     consume: &mut dyn FnMut(crate::backend::NativeBlock) -> Result<(), DecodeError>,
 ) -> Result<f64, DecodeError> {
-    if let Some(mut track) = PcmTrack::open(path, stream_index) {
-        let (rate, channels) = (track.sample_rate, track.channels);
-        let wanted = (start.max(0.0) * rate).round();
-        track.read_f32(wanted as u64, limit_frames, &mut |frames| {
-            consume(crate::backend::NativeBlock {
-                sample_rate: rate,
-                channels,
-                frames,
-            })
-        })?;
-        return Ok(wanted / rate);
-    }
-    let mut stream = open_stream(path, stream_index)?;
-    let wanted = (start.max(0.0) * stream.sample_rate as f64).round();
-    let mut skip = position(&mut stream, start)?;
-    let mut emitted = 0u64;
-    loop {
-        if limit_frames.is_some_and(|lim| emitted >= lim) {
-            break;
-        }
-        match decode_packet_planes(&mut stream)? {
-            None => break,
-            Some(mut planes) => {
-                trim_native_packet(
-                    &mut planes,
-                    &mut skip,
-                    limit_frames.map(|n| n.saturating_sub(emitted)),
-                );
-                if planes.first().is_none_or(Vec::is_empty) {
-                    continue;
-                }
-                emitted += planes.first().map_or(0, |p| p.len() as u64);
-                consume(crate::backend::NativeBlock {
-                    sample_rate: stream.sample_rate as f64,
-                    channels: stream.channels,
-                    frames: planes,
+    AudioReader::open(path, stream_index)?.decode_native(start, limit_frames, consume)
+}
+
+impl AudioReader {
+    pub(crate) fn decode_native(
+        self,
+        start: f64,
+        limit_frames: Option<u64>,
+        consume: &mut dyn FnMut(crate::backend::NativeBlock) -> Result<(), DecodeError>,
+    ) -> Result<f64, DecodeError> {
+        let mut stream = match self.0 {
+            Reader::Pcm(mut track) => {
+                let (rate, channels) = (track.sample_rate, track.channels);
+                let wanted = (start.max(0.0) * rate).round();
+                track.read_f32(wanted as u64, limit_frames, &mut |frames| {
+                    consume(crate::backend::NativeBlock {
+                        sample_rate: rate,
+                        channels,
+                        frames: std::mem::take(frames),
+                    })
                 })?;
+                return Ok(wanted / rate);
+            }
+            Reader::Codec(stream) => stream,
+        };
+        let wanted = (start.max(0.0) * stream.sample_rate as f64).round();
+        let mut skip = position(&mut stream, start)?;
+        let mut emitted = 0u64;
+        loop {
+            if limit_frames.is_some_and(|lim| emitted >= lim) {
+                break;
+            }
+            match decode_packet_planes(&mut stream)? {
+                None => break,
+                Some(mut planes) => {
+                    trim_native_packet(
+                        &mut planes,
+                        &mut skip,
+                        limit_frames.map(|n| n.saturating_sub(emitted)),
+                    );
+                    if planes.first().is_none_or(Vec::is_empty) {
+                        continue;
+                    }
+                    emitted += planes.first().map_or(0, |p| p.len() as u64);
+                    consume(crate::backend::NativeBlock {
+                        sample_rate: stream.sample_rate as f64,
+                        channels: stream.channels,
+                        frames: planes,
+                    })?;
+                }
             }
         }
+        Ok(wanted / stream.sample_rate as f64)
     }
-    Ok(wanted / stream.sample_rate as f64)
 }
 
 /// Full-rate planar i32 streaming. S32 buffers pass through bit-exactly;
@@ -640,77 +727,92 @@ pub fn decode_native_i32(
     limit_frames: Option<u64>,
     consume: &mut dyn FnMut(crate::backend::NativeBlockI32) -> Result<(), DecodeError>,
 ) -> Result<f64, DecodeError> {
-    use symphonia::core::audio::{AudioBufferRef, Signal};
-    if let Some(mut track) = PcmTrack::open(path, stream_index) {
-        let (rate, channels) = (track.sample_rate, track.channels);
-        let wanted = (start.max(0.0) * rate).round();
-        track.read_i32(wanted as u64, limit_frames, &mut |frames| {
-            consume(crate::backend::NativeBlockI32 {
-                sample_rate: rate,
-                channels,
-                frames,
-            })
-        })?;
-        return Ok(wanted / rate);
-    }
-    let mut stream = open_stream(path, stream_index)?;
-    let mut scratch_f32 = AudioBuffer::<f32>::unused();
-    let wanted = (start.max(0.0) * stream.sample_rate as f64).round();
-    let mut skip = position(&mut stream, start)?;
-    let mut emitted = 0u64;
-    loop {
-        if limit_frames.is_some_and(|lim| emitted >= lim) {
-            break;
-        }
-        let mut planes: Vec<Vec<i32>> = match decode_next(&mut stream)? {
-            Step::End => break,
-            Step::Silence(frames) => silence(&stream, frames, 0),
-            Step::Decoded => {
-                let decoded = stream.decoder.last_decoded();
-                let nch = decoded.spec().channels.count();
-                match &decoded {
-                    AudioBufferRef::S32(buf) => (0..nch).map(|ch| buf.chan(ch).to_vec()).collect(),
-                    _ => {
-                        if scratch_f32.spec() != decoded.spec()
-                            || scratch_f32.capacity() != decoded.capacity()
-                        {
-                            scratch_f32 = decoded.make_equivalent::<f32>();
+    AudioReader::open(path, stream_index)?.decode_native_i32(start, limit_frames, consume)
+}
+
+impl AudioReader {
+    pub(crate) fn decode_native_i32(
+        self,
+        start: f64,
+        limit_frames: Option<u64>,
+        consume: &mut dyn FnMut(crate::backend::NativeBlockI32) -> Result<(), DecodeError>,
+    ) -> Result<f64, DecodeError> {
+        use symphonia::core::audio::{AudioBufferRef, Signal};
+        let mut stream = match self.0 {
+            Reader::Pcm(mut track) => {
+                let (rate, channels) = (track.sample_rate, track.channels);
+                let wanted = (start.max(0.0) * rate).round();
+                track.read_i32(wanted as u64, limit_frames, &mut |frames| {
+                    consume(crate::backend::NativeBlockI32 {
+                        sample_rate: rate,
+                        channels,
+                        frames: std::mem::take(frames),
+                    })
+                })?;
+                return Ok(wanted / rate);
+            }
+            Reader::Codec(stream) => stream,
+        };
+        let mut scratch_f32 = AudioBuffer::<f32>::unused();
+        let wanted = (start.max(0.0) * stream.sample_rate as f64).round();
+        let mut skip = position(&mut stream, start)?;
+        let mut emitted = 0u64;
+        loop {
+            if limit_frames.is_some_and(|lim| emitted >= lim) {
+                break;
+            }
+            let mut planes: Vec<Vec<i32>> = match decode_next(&mut stream)? {
+                Step::End => break,
+                Step::Silence(frames) => silence(&stream, frames, 0),
+                Step::Decoded => {
+                    let decoded = stream.decoder.last_decoded();
+                    let nch = decoded.spec().channels.count();
+                    match &decoded {
+                        AudioBufferRef::S32(buf) => {
+                            (0..nch).map(|ch| buf.chan(ch).to_vec()).collect()
                         }
-                        decoded.convert(&mut scratch_f32);
-                        (0..nch)
-                            .map(|ch| {
-                                scratch_f32
-                                    .chan(ch)
-                                    .iter()
-                                    .map(|&v| {
-                                        (v as f64 * 2_147_483_648.0)
-                                            .round()
-                                            .clamp(-2_147_483_648.0, 2_147_483_647.0)
-                                            as i32
-                                    })
-                                    .collect()
-                            })
-                            .collect()
+                        _ => {
+                            if scratch_f32.spec() != decoded.spec()
+                                || scratch_f32.capacity() != decoded.capacity()
+                            {
+                                scratch_f32 = decoded.make_equivalent::<f32>();
+                            }
+                            decoded.convert(&mut scratch_f32);
+                            (0..nch)
+                                .map(|ch| {
+                                    scratch_f32
+                                        .chan(ch)
+                                        .iter()
+                                        .map(|&v| {
+                                            (v as f64 * 2_147_483_648.0)
+                                                .round()
+                                                .clamp(-2_147_483_648.0, 2_147_483_647.0)
+                                                as i32
+                                        })
+                                        .collect()
+                                })
+                                .collect()
+                        }
                     }
                 }
+            };
+            trim_native_packet(
+                &mut planes,
+                &mut skip,
+                limit_frames.map(|n| n.saturating_sub(emitted)),
+            );
+            if planes.first().is_none_or(Vec::is_empty) {
+                continue;
             }
-        };
-        trim_native_packet(
-            &mut planes,
-            &mut skip,
-            limit_frames.map(|n| n.saturating_sub(emitted)),
-        );
-        if planes.first().is_none_or(Vec::is_empty) {
-            continue;
+            emitted += planes.first().map_or(0, |p| p.len() as u64);
+            consume(crate::backend::NativeBlockI32 {
+                sample_rate: stream.sample_rate as f64,
+                channels: stream.channels,
+                frames: planes,
+            })?;
         }
-        emitted += planes.first().map_or(0, |p| p.len() as u64);
-        consume(crate::backend::NativeBlockI32 {
-            sample_rate: stream.sample_rate as f64,
-            channels: stream.channels,
-            frames: planes,
-        })?;
+        Ok(wanted / stream.sample_rate as f64)
     }
-    Ok(wanted / stream.sample_rate as f64)
 }
 
 #[cfg(test)]

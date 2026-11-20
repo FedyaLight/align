@@ -36,9 +36,6 @@ pub(super) fn summaries_fcp7(
                 .unwrap_or_else(|| format!("Sequence {}", index + 1));
             let mut clip_count = 0;
             for media in ["video", "audio"] {
-                for m in doc.children_named(seq, "media") {
-                    let _ = m;
-                }
                 // ./media/<video|audio>/track/clipitem
                 for media_node in doc.children_named(seq, "media") {
                     for typed in doc.children_named(media_node, media) {
