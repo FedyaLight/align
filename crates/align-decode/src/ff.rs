@@ -496,14 +496,39 @@ fn timecode_from_header(header: &FfVideoStream) -> Option<align_core::SourceTime
     let duration = header_frame_duration(header)?;
     align_core::SourceTimecode::from_label(header.timecode.as_deref()?, duration)
 }
-pub struct AudioPipe {
+
+pub type AudioPipe = PcmPipe<f32>;
+pub type AudioPipeI32 = PcmPipe<i32>;
+
+pub trait PipeSample: Sized {
+    const FORMAT: &'static str;
+    const CODEC: &'static str;
+    fn decode(bytes: [u8; 4]) -> Self;
+}
+
+impl PipeSample for f32 {
+    const FORMAT: &'static str = "f32le";
+    const CODEC: &'static str = "pcm_f32le";
+    fn decode(bytes: [u8; 4]) -> Self {
+        Self::from_le_bytes(bytes)
+    }
+}
+impl PipeSample for i32 {
+    const FORMAT: &'static str = "s32le";
+    const CODEC: &'static str = "pcm_s32le";
+    fn decode(bytes: [u8; 4]) -> Self {
+        Self::from_le_bytes(bytes)
+    }
+}
+pub struct PcmPipe<T> {
+    sample: std::marker::PhantomData<T>,
     child: Child,
     stdout: ChildStdout,
     channels: usize,
     leftover: Vec<u8>,
 }
 
-impl AudioPipe {
+impl<T: PipeSample> PcmPipe<T> {
     /// Spawn `ffmpeg -i path [-ss start -t dur] -map 0:a:N -vn -f f32le …`.
     /// Seek args go *after* `-i` (accurate, windows are short). Native rate,
     /// discrete channels — no `-ar`, no downmix, ever.
@@ -528,9 +553,9 @@ impl AudioPipe {
         cmd.args(["-map", &format!("0:a:{stream_index}"), "-vn"])
             .args([
                 "-f",
-                "f32le",
+                T::FORMAT,
                 "-acodec",
-                "pcm_f32le",
+                T::CODEC,
                 "-ac",
                 &channels.to_string(),
                 "pipe:1",
@@ -545,17 +570,18 @@ impl AudioPipe {
             stdout,
             channels,
             leftover: Vec::new(),
+            sample: std::marker::PhantomData,
         })
     }
 
-    /// Pump stdout through `consume` as interleaved f32 frames until EOF.
+    /// Pump stdout through `consume` as interleaved native frames until EOF.
     /// Returns `true` when the child exited successfully.
     pub fn pump(
         &mut self,
-        consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
+        consume: &mut dyn FnMut(&[T]) -> Result<(), DecodeError>,
     ) -> Result<bool, DecodeError> {
         let mut chunk = vec![0u8; 65536];
-        let mut frames = Vec::<f32>::with_capacity(16384);
+        let mut frames = Vec::<T>::with_capacity(16384);
         loop {
             let n = self.stdout.read(&mut chunk).map_err(DecodeError::Io)?;
             if n == 0 {
@@ -569,7 +595,7 @@ impl AudioPipe {
                     .as_chunks::<4>()
                     .0
                     .iter()
-                    .map(|b| f32::from_le_bytes(*b)),
+                    .map(|b| T::decode(*b)),
             );
             self.leftover.drain(..usable);
             if !frames.is_empty() {
@@ -585,7 +611,7 @@ impl AudioPipe {
     }
 }
 
-impl Drop for AudioPipe {
+impl<T> Drop for PcmPipe<T> {
     fn drop(&mut self) {
         // Never leave a zombie transcoder behind (cancel path included).
         let _ = self.child.kill();
@@ -599,98 +625,6 @@ fn complete_frame_bytes(bytes: usize, channels: usize) -> Result<usize, DecodeEr
         .filter(|&n| n > 0)
         .ok_or(DecodeError::InvalidPcm)?;
     Ok(bytes / frame_bytes * frame_bytes)
-}
-
-/// s32le twin of [`AudioPipe`] for bit-exact integer stems.
-pub struct AudioPipeI32 {
-    child: Child,
-    stdout: ChildStdout,
-    channels: usize,
-    leftover: Vec<u8>,
-}
-
-impl AudioPipeI32 {
-    pub fn spawn(
-        path: &Path,
-        stream_index: usize,
-        window: Option<(f64, f64)>,
-        channels: usize,
-    ) -> Result<Self, DecodeError> {
-        let bin =
-            ffmpeg_bin().ok_or_else(|| DecodeError::FfmpegMissing("ffmpeg not found".into()))?;
-        let mut cmd = command(bin);
-        cmd.args(["-v", "error", "-hide_banner", "-i"]).arg(path);
-        if let Some((start, duration)) = window {
-            cmd.args([
-                "-ss",
-                &start.max(0.0).to_string(),
-                "-t",
-                &duration.to_string(),
-            ]);
-        }
-        cmd.args(["-map", &format!("0:a:{stream_index}"), "-vn"])
-            .args([
-                "-f",
-                "s32le",
-                "-acodec",
-                "pcm_s32le",
-                "-ac",
-                &channels.to_string(),
-                "pipe:1",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut child = cmd.spawn().map_err(DecodeError::Io)?;
-        let stdout = child.stdout.take().ok_or(DecodeError::UnsupportedOutput)?;
-        Ok(Self {
-            child,
-            stdout,
-            channels,
-            leftover: Vec::new(),
-        })
-    }
-
-    pub fn pump(
-        &mut self,
-        consume: &mut dyn FnMut(&[i32]) -> Result<(), DecodeError>,
-    ) -> Result<bool, DecodeError> {
-        let mut chunk = vec![0u8; 65536];
-        let mut frames = Vec::<i32>::with_capacity(16384);
-        loop {
-            let n = self.stdout.read(&mut chunk).map_err(DecodeError::Io)?;
-            if n == 0 {
-                break;
-            }
-            self.leftover.extend_from_slice(&chunk[..n]);
-            let usable = complete_frame_bytes(self.leftover.len(), self.channels)?;
-            frames.clear();
-            frames.extend(
-                self.leftover[..usable]
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| i32::from_le_bytes(*b)),
-            );
-            self.leftover.drain(..usable);
-            if !frames.is_empty() {
-                debug_assert_eq!(frames.len() % self.channels, 0);
-                consume(&frames)?;
-            }
-        }
-        let status = self.child.wait().map_err(DecodeError::Io)?;
-        if !self.leftover.is_empty() {
-            return Err(DecodeError::InvalidPcm);
-        }
-        Ok(status.success())
-    }
-}
-
-impl Drop for AudioPipeI32 {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 /// A window duration that reaches the end of any file.

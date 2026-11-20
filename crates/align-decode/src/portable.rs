@@ -37,6 +37,43 @@ impl PortableBackend {
             self.inspect(path)
         }
     }
+
+    fn ffmpeg_native<T: crate::ff::PipeSample>(
+        &self,
+        path: &Path,
+        stream_index: usize,
+        start: f64,
+        duration: Option<f64>,
+        mut consume: impl FnMut(f64, usize, &[T]) -> Result<(), DecodeError>,
+    ) -> Result<f64, DecodeError> {
+        let probe = self.audio_probe(path)?;
+        let stream = probe
+            .audio_streams
+            .get(stream_index)
+            .ok_or_else(|| DecodeError::NoAudio(path.display().to_string()))?;
+        let (sample_rate, channels) = (stream.sample_rate, stream.channels);
+        if sample_rate <= 0.0 || channels == 0 {
+            return Err(DecodeError::InvalidPcm);
+        }
+        let actual = start.max(0.0);
+        let mut pipe = crate::ff::PcmPipe::<T>::spawn(
+            path,
+            stream_index,
+            Some((
+                actual + stream.decoder_delay,
+                duration.unwrap_or(crate::ff::WHOLE_FILE),
+            )),
+            channels,
+        )?;
+        let ok = pipe.pump(&mut |frames| consume(sample_rate, channels, frames))?;
+        if !ok {
+            return Err(DecodeError::Incomplete(format!(
+                "ffmpeg native of {}",
+                path.display()
+            )));
+        }
+        Ok(actual)
+    }
 }
 
 impl MediaBackend for PortableBackend {
@@ -53,39 +90,19 @@ impl MediaBackend for PortableBackend {
             let limit = duration.map(|d| (d * reader.rate()).ceil() as u64 + 64);
             return reader.decode_native(start, limit, consume);
         }
-        let probe = self.audio_probe(path)?;
-        let stream = probe
-            .audio_streams
-            .get(stream_index)
-            .ok_or_else(|| DecodeError::NoAudio(path.display().to_string()))?;
-        let (sample_rate, channels) = (stream.sample_rate, stream.channels);
-        if sample_rate <= 0.0 || channels == 0 {
-            return Err(DecodeError::InvalidPcm);
-        }
-        let actual = start.max(0.0);
-        let mut pipe = crate::ff::AudioPipe::spawn(
+        self.ffmpeg_native(
             path,
             stream_index,
-            Some((
-                actual + stream.decoder_delay,
-                duration.unwrap_or(crate::ff::WHOLE_FILE),
-            )),
-            channels,
-        )?;
-        let ok = pipe.pump(&mut |frames| {
-            consume(NativeBlock {
-                sample_rate,
-                channels,
-                frames: crate::mono::deinterleave_f32(frames, channels),
-            })
-        })?;
-        if !ok {
-            return Err(DecodeError::Incomplete(format!(
-                "ffmpeg native of {}",
-                path.display()
-            )));
-        }
-        Ok(actual)
+            start,
+            duration,
+            |sample_rate, channels, frames| {
+                consume(NativeBlock {
+                    sample_rate,
+                    channels,
+                    frames: crate::mono::deinterleave_f32(frames, channels),
+                })
+            },
+        )
     }
 
     fn decode_native_i32(
@@ -102,39 +119,19 @@ impl MediaBackend for PortableBackend {
             return reader.decode_native_i32(start, limit, consume);
         }
         // FFmpeg s32le pipe (bit-exact integer path for containers).
-        let probe = self.audio_probe(path)?;
-        let stream = probe
-            .audio_streams
-            .get(stream_index)
-            .ok_or_else(|| DecodeError::NoAudio(path.display().to_string()))?;
-        let (sample_rate, channels) = (stream.sample_rate, stream.channels);
-        if sample_rate <= 0.0 || channels == 0 {
-            return Err(DecodeError::InvalidPcm);
-        }
-        let actual = start.max(0.0);
-        let mut pipe = crate::ff::AudioPipeI32::spawn(
+        self.ffmpeg_native(
             path,
             stream_index,
-            Some((
-                actual + stream.decoder_delay,
-                duration.unwrap_or(crate::ff::WHOLE_FILE),
-            )),
-            channels,
-        )?;
-        let ok = pipe.pump(&mut |frames| {
-            consume(NativeBlockI32 {
-                sample_rate,
-                channels,
-                frames: crate::mono::deinterleave_i32(frames, channels),
-            })
-        })?;
-        if !ok {
-            return Err(DecodeError::Incomplete(format!(
-                "ffmpeg native of {}",
-                path.display()
-            )));
-        }
-        Ok(actual)
+            start,
+            duration,
+            |sample_rate, channels, frames| {
+                consume(NativeBlockI32 {
+                    sample_rate,
+                    channels,
+                    frames: crate::mono::deinterleave_i32(frames, channels),
+                })
+            },
+        )
     }
 
     fn kind(&self) -> BackendKind {

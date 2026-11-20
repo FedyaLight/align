@@ -1218,7 +1218,7 @@ pub(super) fn export_sheet(
     // Progress / completion.
     if data.export_started && busy {
         sheet = sheet.child(data.status.clone());
-        if data.export_drift || data.export_media {
+        if data.export.correct_drift || data.export.media_files {
             sheet = sheet.child(
                 div()
                     .w(px(420.))
@@ -1252,16 +1252,16 @@ fn export_source_bins(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Statef
         ExportTarget::ResolveOtio,
     ]
     .iter()
-    .any(|target| data.export_selected.contains(target));
+    .any(|target| data.export.targets.contains(target));
     check_row(
         cx,
         theme,
         "exp-media-bins",
-        data.export_media_bins,
+        data.export.media_bins,
         "Organize imported source clips".to_string(),
         !busy && applies,
         |this, _, _, cx| {
-            this.data.export_media_bins = !this.data.export_media_bins;
+            this.data.export.media_bins = !this.data.export.media_bins;
             cx.notify();
         },
     )
@@ -1418,12 +1418,12 @@ fn export_names_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Div 
         cx,
         theme,
         "exp-label-synced",
-        data.export_label_synced,
+        data.export.label_synced,
         "Label synchronized clips".to_string(),
         !busy,
         |this, _, _, cx| {
             this.update_export_options(cx, |data| {
-                data.export_label_synced = !data.export_label_synced;
+                data.export.label_synced = !data.export.label_synced;
             });
         },
     ));
@@ -1441,11 +1441,11 @@ fn export_names_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Div 
                 cx,
                 theme,
                 "exp-synced-symbol-suffix",
-                data.export_synced_symbol_suffix,
+                data.export.synced_symbol_suffix,
                 "Place marker after clip name".to_string(),
                 !busy,
                 |this, _, _, cx| {
-                    this.data.export_synced_symbol_suffix = !this.data.export_synced_symbol_suffix;
+                    this.data.export.synced_symbol_suffix = !this.data.export.synced_symbol_suffix;
                     cx.notify();
                 },
             ));
@@ -1480,12 +1480,12 @@ fn export_names_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Div 
             cx,
             theme,
             "exp-label-unmatched",
-            data.export_label_unmatched,
+            data.export.label_unmatched,
             "Label unmatched clips".to_string(),
             !busy,
             |this, _, _, cx| {
                 this.update_export_options(cx, |data| {
-                    data.export_label_unmatched = !data.export_label_unmatched;
+                    data.export.label_unmatched = !data.export.label_unmatched;
                 });
             },
         ));
@@ -1503,12 +1503,12 @@ fn export_names_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Div 
                     cx,
                     theme,
                     "exp-symbol-suffix",
-                    data.export_unmatched_symbol_suffix,
+                    data.export.unmatched_symbol_suffix,
                     "Place marker after clip name".to_string(),
                     !busy,
                     |this, _, _, cx| {
-                        this.data.export_unmatched_symbol_suffix =
-                            !this.data.export_unmatched_symbol_suffix;
+                        this.data.export.unmatched_symbol_suffix =
+                            !this.data.export.unmatched_symbol_suffix;
                         cx.notify();
                     },
                 ));
@@ -1587,11 +1587,11 @@ fn export_unmatched_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> 
             cx,
             theme,
             id,
-            data.export_unmatched == placement,
+            data.export.unmatched == placement,
             title,
             move |this, _, _, cx| {
                 this.update_export_options(cx, |data| {
-                    data.export_unmatched = placement;
+                    data.export.unmatched = placement;
                 });
             },
         ));
@@ -1602,7 +1602,7 @@ fn export_unmatched_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> 
         Dropdown::new(
             "exp-unmatched-placement",
             "Placement",
-            unmatched_placement_label(data.export_unmatched).to_string(),
+            unmatched_placement_label(data.export.unmatched).to_string(),
             ExportSelect::UnmatchedPlacement,
             export_select,
             export_select_closing,
@@ -1619,11 +1619,11 @@ fn export_unmatched_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> 
                     cx,
                     theme,
                     "exp-disable-unmatched",
-                    data.export_disable_unmatched,
+                    data.export.disable_unmatched,
                     "Disable in timeline".to_string(),
                     !busy,
                     |this, _, _, cx| {
-                        this.data.export_disable_unmatched = !this.data.export_disable_unmatched;
+                        this.data.export.disable_unmatched = !this.data.export.disable_unmatched;
                         cx.notify();
                     },
                 ),
@@ -1648,11 +1648,11 @@ fn export_cleanup_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
         cx,
         theme,
         "exp-cut-gaps",
-        data.export_cut_common_gaps,
+        data.export.cut_common_gaps,
         "Cut gaps empty on all tracks".to_string(),
         !busy,
         |this, _, _, cx| {
-            this.data.export_cut_common_gaps = !this.data.export_cut_common_gaps;
+            this.data.export.cut_common_gaps = !this.data.export.cut_common_gaps;
             cx.notify();
         },
     ));
@@ -1660,11 +1660,11 @@ fn export_cleanup_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
         cx,
         theme,
         "exp-cut-lone",
-        data.export_cut_lone_recorder,
+        data.export.cut_lone_recorder,
         "Cut recorder audio with no camera".to_string(),
         !busy,
         |this, _, _, cx| {
-            this.data.export_cut_lone_recorder = !this.data.export_cut_lone_recorder;
+            this.data.export.cut_lone_recorder = !this.data.export.cut_lone_recorder;
             cx.notify();
         },
     ));
@@ -1675,18 +1675,18 @@ fn export_cleanup_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
             Stepper {
                 id: "exp-cut-short",
                 title: "Remove clips shorter than",
-                value: data.export_cut_shorter_than,
+                value: data.export.cut_shorter_than,
                 decimals: 0,
                 enabled: !busy,
             },
             |this, _, _, cx| {
-                this.data.export_cut_shorter_than =
-                    (this.data.export_cut_shorter_than - 1.0).max(0.0);
+                this.data.export.cut_shorter_than =
+                    (this.data.export.cut_shorter_than - 1.0).max(0.0);
                 cx.notify();
             },
             |this, _, _, cx| {
-                this.data.export_cut_shorter_than =
-                    (this.data.export_cut_shorter_than + 1.0).min(3_600.0);
+                this.data.export.cut_shorter_than =
+                    (this.data.export.cut_shorter_than + 1.0).min(3_600.0);
                 cx.notify();
             },
         ));
@@ -1696,18 +1696,18 @@ fn export_cleanup_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
             Stepper {
                 id: "exp-trim-start",
                 title: "Trim each clip start",
-                value: data.export_trim_starts,
+                value: data.export.trim_starts,
                 decimals: 1,
                 enabled: !busy,
             },
             |this, _, _, cx| {
-                this.data.export_trim_starts =
-                    ((this.data.export_trim_starts - 0.1).max(0.0) * 10.0).round() / 10.0;
+                this.data.export.trim_starts =
+                    ((this.data.export.trim_starts - 0.1).max(0.0) * 10.0).round() / 10.0;
                 cx.notify();
             },
             |this, _, _, cx| {
-                this.data.export_trim_starts =
-                    ((this.data.export_trim_starts + 0.1).min(3_600.0) * 10.0).round() / 10.0;
+                this.data.export.trim_starts =
+                    ((this.data.export.trim_starts + 0.1).min(3_600.0) * 10.0).round() / 10.0;
                 cx.notify();
             },
         ));
@@ -1717,18 +1717,18 @@ fn export_cleanup_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
             Stepper {
                 id: "exp-trim-end",
                 title: "Trim each clip end",
-                value: data.export_trim_ends,
+                value: data.export.trim_ends,
                 decimals: 1,
                 enabled: !busy,
             },
             |this, _, _, cx| {
-                this.data.export_trim_ends =
-                    ((this.data.export_trim_ends - 0.1).max(0.0) * 10.0).round() / 10.0;
+                this.data.export.trim_ends =
+                    ((this.data.export.trim_ends - 0.1).max(0.0) * 10.0).round() / 10.0;
                 cx.notify();
             },
             |this, _, _, cx| {
-                this.data.export_trim_ends =
-                    ((this.data.export_trim_ends + 0.1).min(3_600.0) * 10.0).round() / 10.0;
+                this.data.export.trim_ends =
+                    ((this.data.export.trim_ends + 0.1).min(3_600.0) * 10.0).round() / 10.0;
                 cx.notify();
             },
         ));
@@ -1743,7 +1743,7 @@ fn export_timeline_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> D
     } = sheet;
     let mut group = div().flex().flex_col().gap_1();
     group = group.child(export_section_title(theme, "Timeline"));
-    let on = data.export_prevent_overlaps;
+    let on = data.export.prevent_group_overlaps;
     group = group.child(check_row(
         cx,
         theme,
@@ -1752,7 +1752,7 @@ fn export_timeline_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> D
         "Prevent overlaps".to_string(),
         !busy,
         |this, _, _, cx| {
-            this.data.export_prevent_overlaps = !this.data.export_prevent_overlaps;
+            this.data.export.prevent_group_overlaps = !this.data.export.prevent_group_overlaps;
             cx.notify();
         },
     ));
@@ -1766,7 +1766,7 @@ fn export_audio_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Div 
     } = sheet;
     let mut group = div().flex().flex_col();
     group = group.child(export_section_title(theme, "Audio"));
-    let on = data.export_drift && data.has_drift();
+    let on = data.export.correct_drift && data.has_drift();
     group = group.child(check_row(
         cx,
         theme,
@@ -1775,7 +1775,7 @@ fn export_audio_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Div 
         "Render drift-corrected audio".to_string(),
         !busy,
         |this, _, _, cx| {
-            this.data.export_drift = !this.data.export_drift;
+            this.data.export.correct_drift = !this.data.export.correct_drift;
             cx.notify();
         },
     ));
@@ -1801,7 +1801,7 @@ fn export_formats_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
     let mut group = div().flex().flex_col().gap_1().flex_shrink_0();
     group = group.child(export_section_title(theme, "Formats"));
     for target in ExportTarget::all() {
-        let active = data.export_selected.contains(&target);
+        let active = data.export.targets.contains(&target);
         let title = target.title().to_string();
         group = group.child(check_row(
             cx,
@@ -1812,10 +1812,10 @@ fn export_formats_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
             !busy,
             move |this, _, _, cx| {
                 this.update_export_options(cx, |data| {
-                    if data.export_selected.contains(&target) {
-                        data.export_selected.remove(&target);
+                    if data.export.targets.contains(&target) {
+                        data.export.targets.retain(|t| *t != target);
                     } else {
-                        data.export_selected.insert(target);
+                        data.export.targets.push(target);
                     }
                 });
             },
@@ -1828,12 +1828,12 @@ fn export_formats_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
                 cx,
                 theme,
                 "exp-fcpxml-timeline",
-                data.export_fcpxml_timeline,
+                data.export.fcpxml_timeline,
                 "Synchronized timeline".to_string(),
                 !busy,
                 |this, _, _, cx| {
                     this.update_export_options(cx, |data| {
-                        data.export_fcpxml_timeline = !data.export_fcpxml_timeline;
+                        data.export.fcpxml_timeline = !data.export.fcpxml_timeline;
                     });
                 },
             ));
@@ -1841,11 +1841,11 @@ fn export_formats_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
                 cx,
                 theme,
                 "exp-fcpxml-multicam",
-                data.export_fcpxml_multicam,
+                data.export.fcpxml_multicam,
                 "Multicam clip".to_string(),
                 !busy,
                 |this, _, _, cx| {
-                    this.data.export_fcpxml_multicam = !this.data.export_fcpxml_multicam;
+                    this.data.export.fcpxml_multicam = !this.data.export.fcpxml_multicam;
                     cx.notify();
                 },
             ));
@@ -1855,11 +1855,12 @@ fn export_formats_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
                         cx,
                         theme,
                         "exp-storylines",
-                        data.export_storylines,
+                        data.export.fcpxml_storylines,
                         "Group tracks as storylines".to_string(),
                         !busy,
                         |this, _, _, cx| {
-                            this.data.export_storylines = !this.data.export_storylines;
+                            this.data.export.fcpxml_storylines =
+                                !this.data.export.fcpxml_storylines;
                             cx.notify();
                         },
                     ),
@@ -1885,11 +1886,12 @@ fn export_formats_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
                         cx,
                         theme,
                         "exp-replaced",
-                        data.export_replaced,
+                        data.export.replaced_sequence,
                         "Add a sequence with replaced camera audio".to_string(),
                         !busy,
                         |this, _, _, cx| {
-                            this.data.export_replaced = !this.data.export_replaced;
+                            this.data.export.replaced_sequence =
+                                !this.data.export.replaced_sequence;
                             cx.notify();
                         },
                     ),
@@ -1919,10 +1921,10 @@ fn export_formats_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
                     cx,
                     theme,
                     format!("exp-aaf-fps-{id}"),
-                    data.export_aaf_frame_duration == frame_duration,
+                    data.export.aaf_frame_duration == frame_duration,
                     title,
                     move |this, _, _, cx| {
-                        this.data.export_aaf_frame_duration = frame_duration;
+                        this.data.export.aaf_frame_duration = frame_duration;
                         cx.notify();
                     },
                 ));
@@ -1933,7 +1935,7 @@ fn export_formats_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
                 Dropdown::new(
                     "exp-aaf-frame-rate",
                     "Frame rate",
-                    aaf_frame_rate_label(data.export_aaf_frame_duration).to_string(),
+                    aaf_frame_rate_label(data.export.aaf_frame_duration).to_string(),
                     ExportSelect::AafFrameRate,
                     export_select,
                     export_select_closing,
@@ -1954,11 +1956,11 @@ fn export_formats_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
         cx,
         theme,
         "exp-media",
-        data.export_media,
+        data.export.media_files,
         "Video files with external audio (.mov)".to_string(),
         !busy,
         |this, _, _, cx| {
-            this.data.export_media = !this.data.export_media;
+            this.data.export.media_files = !this.data.export.media_files;
             cx.notify();
         },
     ));

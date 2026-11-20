@@ -287,24 +287,24 @@ fn middle_ellipsis(value: &str, max_chars: usize) -> String {
 
 impl ExportReveals {
     fn new(data: &AppData) -> Self {
-        let final_cut = data.export_selected.contains(&ExportTarget::FinalCutPro);
-        let xml = data.export_selected.contains(&ExportTarget::Premiere)
-            || data.export_selected.contains(&ExportTarget::ResolveXml);
+        let final_cut = data.export.targets.contains(&ExportTarget::FinalCutPro);
+        let xml = data.export.targets.contains(&ExportTarget::Premiere)
+            || data.export.targets.contains(&ExportTarget::ResolveXml);
         let unmatched_kept = data.unmatched_count() > 0
-            && data.export_unmatched != align_core::export_model::UnmatchedPlacement::Remove;
+            && data.export.unmatched != align_core::export_model::UnmatchedPlacement::Remove;
         Self {
             final_cut,
-            storylines: final_cut && data.export_fcpxml_timeline,
-            premiere: data.export_selected.contains(&ExportTarget::Premiere),
-            aaf: data.export_selected.contains(&ExportTarget::Aaf),
+            storylines: final_cut && data.export.fcpxml_timeline,
+            premiere: data.export.targets.contains(&ExportTarget::Premiere),
+            aaf: data.export.targets.contains(&ExportTarget::Aaf),
             unmatched_kept,
             unmatched_label_control: unmatched_kept,
-            synced_labels: data.export_label_synced,
-            synced_xml: data.export_label_synced && xml,
-            synced_final_cut: data.export_label_synced && final_cut,
-            unmatched_labels: unmatched_kept && data.export_label_unmatched,
-            unmatched_xml: unmatched_kept && data.export_label_unmatched && xml,
-            unmatched_final_cut: unmatched_kept && data.export_label_unmatched && final_cut,
+            synced_labels: data.export.label_synced,
+            synced_xml: data.export.label_synced && xml,
+            synced_final_cut: data.export.label_synced && final_cut,
+            unmatched_labels: unmatched_kept && data.export.label_unmatched,
+            unmatched_xml: unmatched_kept && data.export.label_unmatched && xml,
+            unmatched_final_cut: unmatched_kept && data.export.label_unmatched && final_cut,
         }
     }
 
@@ -1288,7 +1288,7 @@ impl AlignApp {
         update(&mut self.data);
         let select_is_available = match self.export_select {
             Some(ExportSelect::AafFrameRate) => {
-                self.data.export_selected.contains(&ExportTarget::Aaf)
+                self.data.export.targets.contains(&ExportTarget::Aaf)
             }
             Some(ExportSelect::UnmatchedPlacement) => self.data.unmatched_count() > 0,
             None => true,
@@ -1605,24 +1605,24 @@ impl AlignApp {
         let mut timelines = Vec::with_capacity(result_count);
         for (index, result) in results.iter().enumerate() {
             let options = ExportAssemblyOptions {
-                unmatched: self.data.export_unmatched,
-                prevent_group_overlaps: self.data.export_prevent_overlaps,
-                disable_unmatched: self.data.export_disable_unmatched,
-                label_synced: self.data.export_label_synced,
-                label_unmatched: self.data.export_label_unmatched,
+                unmatched: self.data.export.unmatched,
+                prevent_group_overlaps: self.data.export.prevent_group_overlaps,
+                disable_unmatched: self.data.export.disable_unmatched,
+                label_synced: self.data.export.label_synced,
+                label_unmatched: self.data.export.label_unmatched,
                 cut_remove: CutRemoveOptions {
-                    common_gaps: self.data.export_cut_common_gaps,
-                    lone_recorder: self.data.export_cut_lone_recorder,
-                    shorter_than: self.data.export_cut_shorter_than,
-                    trim_starts: self.data.export_trim_starts,
-                    trim_ends: self.data.export_trim_ends,
+                    common_gaps: self.data.export.cut_common_gaps,
+                    lone_recorder: self.data.export.cut_lone_recorder,
+                    shorter_than: self.data.export.cut_shorter_than,
+                    trim_starts: self.data.export.trim_starts,
+                    trim_ends: self.data.export.trim_ends,
                 },
                 synced_symbol: synced_symbol.clone(),
-                synced_symbol_suffix: self.data.export_synced_symbol_suffix,
+                synced_symbol_suffix: self.data.export.synced_symbol_suffix,
                 synced_color: synced_color.clone(),
                 synced_role: synced_role.clone(),
                 unmatched_symbol: unmatched_symbol.clone(),
-                unmatched_symbol_suffix: self.data.export_unmatched_symbol_suffix,
+                unmatched_symbol_suffix: self.data.export.unmatched_symbol_suffix,
                 unmatched_color: unmatched_color.clone(),
                 unmatched_role: unmatched_role.clone(),
                 sequence_name: sequence_name.as_ref().map(|name| {
@@ -1644,9 +1644,9 @@ impl AlignApp {
         self.data.progress = 0.0;
         self.data.export_started = true;
         self.data.error = None;
-        self.data.status = if self.data.export_drift && self.data.has_drift() {
+        self.data.status = if self.data.export.correct_drift && self.data.has_drift() {
             "Preparing drift-corrected audio…".to_string()
-        } else if self.data.export_media {
+        } else if self.data.export.media_files {
             "Exporting clean-audio video…".to_string()
         } else if timelines.len() > 1 {
             format!("Writing {} sequences…", timelines.len())
@@ -1657,14 +1657,14 @@ impl AlignApp {
 
         let generation = self.data.generation;
         let cancel = self.data.cancel.clone();
-        let drift = self.data.export_drift;
-        let replaced = self.data.export_replaced;
-        let media_bins = self.data.export_media_bins;
-        let storylines = self.data.export_storylines;
-        let fcpxml_timeline = self.data.export_fcpxml_timeline;
-        let fcpxml_multicam = self.data.export_fcpxml_multicam;
-        let aaf_frame_duration = self.data.export_aaf_frame_duration;
-        let media = self.data.export_media;
+        let drift = self.data.export.correct_drift;
+        let replaced = self.data.export.replaced_sequence;
+        let media_bins = self.data.export.media_bins;
+        let storylines = self.data.export.fcpxml_storylines;
+        let fcpxml_timeline = self.data.export.fcpxml_timeline;
+        let fcpxml_multicam = self.data.export.fcpxml_multicam;
+        let aaf_frame_duration = self.data.export.aaf_frame_duration;
+        let media = self.data.export.media_files;
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<ExportMsg>();
         std::thread::spawn(move || {
             let pipeline = Pipeline::default_backend();

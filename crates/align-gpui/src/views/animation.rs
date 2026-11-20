@@ -350,19 +350,19 @@ mod motion_tests {
         assert!(!initial.aaf);
         assert!(!initial.synced_labels);
 
-        data.export_selected.extend([
+        data.export.targets.extend([
             ExportTarget::FinalCutPro,
             ExportTarget::Premiere,
             ExportTarget::Aaf,
         ]);
-        data.export_label_synced = true;
+        data.export.label_synced = true;
         let selected = ExportReveals::new(&data);
         assert!(selected.final_cut && selected.storylines);
         assert!(selected.premiere && selected.aaf);
         assert!(selected.synced_xml && selected.synced_final_cut);
 
-        data.export_fcpxml_timeline = false;
-        data.export_label_synced = false;
+        data.export.fcpxml_timeline = false;
+        data.export.label_synced = false;
         let disabled = ExportReveals::new(&data);
         assert!(!disabled.storylines);
         assert!(!disabled.synced_xml && !disabled.synced_final_cut);
