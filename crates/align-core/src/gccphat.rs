@@ -111,10 +111,17 @@ pub fn align(left: &[f32], right: &[f32], maximum_lag: usize) -> Option<GccPhatR
 fn peak(samples: &[f32], maximum_lag: usize) -> Option<GccPhatResult> {
     let count = samples.len();
     let correlation = |lag| samples[idx(lag, count)] / count as f32;
+    let values = || {
+        (-(maximum_lag as isize)..).zip(
+            samples[count - maximum_lag..]
+                .iter()
+                .chain(&samples[..=maximum_lag])
+                .map(|sample| (sample / count as f32).abs()),
+        )
+    };
     let mut best_lag = 0isize;
     let mut best_val = f32::MIN;
-    for lag in -(maximum_lag as isize)..=(maximum_lag as isize) {
-        let v = correlation(lag).abs();
+    for (lag, v) in values() {
         if v > best_val {
             best_val = v;
             best_lag = lag;
@@ -123,8 +130,7 @@ fn peak(samples: &[f32], maximum_lag: usize) -> Option<GccPhatResult> {
     let mut second = 0.0f32;
     let mut sum_sq = 0.0f64;
     let mut n = 0usize;
-    for lag in -(maximum_lag as isize)..=(maximum_lag as isize) {
-        let v = correlation(lag).abs();
+    for (lag, v) in values() {
         sum_sq += (v as f64) * (v as f64);
         n += 1;
         if (lag - best_lag).abs() > 32 && v > second {

@@ -24,6 +24,8 @@ mod ridge;
 
 use std::collections::{HashMap, HashSet};
 
+use rustc_hash::FxHashMap;
+
 use crate::fingerprint::{Fingerprint, HOP_SIZE, SAMPLE_RATE};
 use crate::model::{Clip, ClipId, MatchEvidence, SyncConstraint, TemporalPolicy};
 
@@ -245,7 +247,7 @@ pub fn match_fingerprints(
 
     // Hash groups are ordered by clip, then frame. Look up each pair's
     // histogram once per group; occurrences from one clip cannot vote.
-    let mut votes: HashMap<PairKey, HashMap<i64, usize>> = HashMap::new();
+    let mut votes: FxHashMap<PairKey, FxHashMap<i64, usize>> = FxHashMap::default();
     for &(start, end) in &groups {
         for_each_clip_pair(&records[start..end], |key, left, right| {
             let histogram = votes.entry(key).or_default();
@@ -261,8 +263,8 @@ pub fn match_fingerprints(
     }
 
     // Winners + repeated-take guard.
-    let mut winning: HashMap<PairKey, (i64, usize, usize)> = HashMap::new();
-    let mut drifting = HashMap::new();
+    let mut winning: FxHashMap<PairKey, (i64, usize, usize)> = FxHashMap::default();
+    let mut drifting = FxHashMap::default();
     for (pair, histogram) in &votes {
         let left_id = &clip_ids[pair.left as usize];
         let right_id = &clip_ids[pair.right as usize];
@@ -325,7 +327,7 @@ pub fn match_fingerprints(
     // Only the last eligible right occurrence survives each anchor write.
     // Its upper bound moves monotonically through the sorted right frames,
     // so recovering anchors takes O(left.len() + right.len()) per clip pair.
-    let mut anchors: HashMap<PairKey, HashMap<i64, Anchor>> = HashMap::new();
+    let mut anchors: FxHashMap<PairKey, FxHashMap<i64, Anchor>> = FxHashMap::default();
     for &(start, end) in &groups {
         for_each_clip_pair(&records[start..end], |key, left, right| {
             if let Some(candidate) = drifting.get_mut(&key) {
@@ -356,24 +358,56 @@ pub fn match_fingerprints(
     }
     drop(records);
 
-    let mut out: Vec<PairwiseMatch> = winning
-        .iter()
-        .filter_map(|(key, winner)| {
-            let mut points: Vec<Anchor> = anchors
-                .remove(key)
-                .unwrap_or_default()
-                .into_values()
-                .collect();
-            points.sort_by(|a, b| a.left.total_cmp(&b.left));
-            let fit = robust_fit(&points)?;
-            let margin = winner.1 as f64 / winner.2.max(1) as f64;
-            Some(fitted_match(*key, fit, margin, &clip_ids))
+    enum Evidence {
+        Peak(FxHashMap<i64, Anchor>, f64),
+        Ridge(ridge::Candidate),
+    }
+    let jobs: Vec<_> = anchors
+        .into_iter()
+        .map(|(key, points)| {
+            let (_, votes, runner_up) = winning[&key];
+            (
+                key,
+                Evidence::Peak(points, votes as f64 / runner_up.max(1) as f64),
+            )
         })
+        .chain(
+            drifting
+                .into_iter()
+                .map(|(key, c)| (key, Evidence::Ridge(c))),
+        )
         .collect();
-    out.extend(drifting.into_iter().filter_map(|(key, candidate)| {
-        let (fit, margin) = candidate.fit()?;
+    let fit_pair = |(key, evidence)| {
+        let (fit, margin) = match evidence {
+            Evidence::Peak(points, margin) => {
+                let mut points: Vec<_> = points.into_values().collect();
+                points.sort_by(|a, b| a.left.total_cmp(&b.left));
+                (robust_fit(&points)?, margin)
+            }
+            Evidence::Ridge(candidate) => candidate.fit()?,
+        };
         Some(fitted_match(key, fit, margin, &clip_ids))
-    }));
+    };
+    let mut out: Vec<_> = if jobs.len() < 8 {
+        jobs.into_iter().filter_map(fit_pair).collect()
+    } else {
+        let queue = std::sync::Mutex::new(jobs.into_iter());
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        std::iter::from_fn(|| queue.lock().unwrap().next())
+                            .filter_map(fit_pair)
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect()
+        })
+    };
     // Drift can move allowed histogram buckets back to a rejected affine
     // offset. Apply the user's constraint to the fitted result as well.
     out.retain(|m| !SyncConstraint::rejects_alignment(constraints, &m.left, &m.right, m.offset));

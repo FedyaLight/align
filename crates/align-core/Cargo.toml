@@ -17,6 +17,7 @@ dirs = "6"
 quick-xml.workspace = true
 sha2.workspace = true
 blake3.workspace = true
+rustc-hash = "2"
 realfft.workspace = true
 num-complex.workspace = true
 tempfile.workspace = true
