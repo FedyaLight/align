@@ -477,10 +477,13 @@ const AUDIO_SIDECAR_REVISION: u32 = 16;
 /// file in an editor's bin; the hash keeps every rendering input, so a file
 /// with this name can be reused as is.
 fn sidecar_name(media: &Path, label: &str, identity: &[&str]) -> String {
-    let stem = media
+    let stem: String = media
         .file_stem()
         .and_then(|name| name.to_str())
-        .unwrap_or("clip");
+        .unwrap_or("clip")
+        .chars()
+        .take(32)
+        .collect();
     let mut hash = blake3::Hasher::new();
     hash.update(&AUDIO_SIDECAR_REVISION.to_le_bytes());
     for part in identity {
@@ -1035,6 +1038,19 @@ mod tests {
     use align_core::{
         AudioSummary, Clip, ClipId, MediaKind, MediaTime, VideoFrameRateMode, VideoSummary,
     };
+
+    #[test]
+    fn prepared_audio_name_bounds_long_source_stems() {
+        let media = PathBuf::from(format!("{}.wav", "a".repeat(96)));
+        let name = sidecar_name(&media, "channel 1", &["source", "identity"]);
+
+        assert!(
+            name.len() <= 80,
+            "sidecar name too long: {} chars",
+            name.len()
+        );
+        assert!(name.ends_with(".wav"));
+    }
 
     #[cfg(unix)]
     #[test]
