@@ -1,6 +1,13 @@
 //! Shared controls (buttons, overlays, tips) and display formatting.
 
-use super::*;
+use super::animation::{entrance, slide_in};
+use super::{
+    AlignApp, AnimationExt, AnyView, App, ClickEvent, Context, Div, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Render, SIDEBAR_CLOSE_MS, SettingsScope, SharedString,
+    Stateful, StatefulInteractiveElement, Styled, Theme, ThemeMode, Window, div, px, rgb, rgba,
+    svg_icon,
+};
+use gpui::AppContext as _;
 
 // ------------------------------------------------------------ rendering
 //

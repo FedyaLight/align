@@ -1557,7 +1557,7 @@ mod tests {
         // The recorder alone, as an asset clip; no camera sound.
         assert_eq!(xml.matches("<audio ref=").count(), 0, "{xml}");
         assert_eq!(xml.matches("<asset-clip lane=").count(), 1, "{xml}");
-        timeline.islands[0].clips[0].enabled = false;
+        timeline.islands[0].clips[0].flags.enabled = false;
         let xml = write(&timeline, FcpxmlOptions::TIMELINE);
         assert!(xml.contains("enabled=\"0\""));
         assert_eq!(xml.matches("<video ref=").count(), 1);
@@ -1566,7 +1566,7 @@ mod tests {
     #[test]
     fn fcpxml_preserves_disabled_clip_state() {
         let mut timeline = fixture_timeline();
-        timeline.islands[0].clips[0].enabled = false;
+        timeline.islands[0].clips[0].flags.enabled = false;
         let xml = write(&timeline, FcpxmlOptions::TIMELINE);
         assert!(xml.contains("enabled=\"0\""));
     }

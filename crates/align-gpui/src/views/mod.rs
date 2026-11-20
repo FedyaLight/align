@@ -43,16 +43,7 @@ mod sources;
 mod timeline;
 mod toolbar;
 
-use animation::*;
-use controls::*;
-use export::*;
-use menus::*;
-use operation::*;
-use panels::*;
-use settings::*;
-use sources::*;
-use timeline::*;
-use toolbar::*;
+use animation::motion_ease;
 
 // ------------------------------------------------------------ messages
 

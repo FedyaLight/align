@@ -275,9 +275,9 @@ pub(super) fn clip_edit_to_window(edit: &mut DraftEdit, lo: f64, hi: f64) -> boo
     if hi <= lo {
         return false;
     }
-    let rate = edit.playback_rate;
+    let rate = edit.retime.playback_rate;
     let src_at = |t: f64| {
-        if edit.plays_backward {
+        if edit.retime.plays_backward {
             edit.source_out - (t - edit.timeline_start) * rate
         } else {
             edit.source_in + (t - edit.timeline_start) * rate
@@ -641,16 +641,16 @@ pub(super) fn read_fcp7(
             t.is_otio_portable
                 && edits_by_id
                     .get(&format!("video:{}", t.left_edit_id))
-                    .is_some_and(|e| e.playback_rate == 1.0)
+                    .is_some_and(|e| e.retime.playback_rate == 1.0)
                 && edits_by_id
                     .get(&format!("video:{}", t.right_edit_id))
-                    .is_some_and(|e| e.playback_rate == 1.0)
+                    .is_some_and(|e| e.retime.playback_rate == 1.0)
                 && edits_by_id
                     .get(&format!("video:{}", t.left_edit_id))
-                    .is_some_and(|e| !e.plays_backward)
+                    .is_some_and(|e| !e.retime.plays_backward)
                 && edits_by_id
                     .get(&format!("video:{}", t.right_edit_id))
-                    .is_some_and(|e| !e.plays_backward)
+                    .is_some_and(|e| !e.retime.plays_backward)
         })
         .count();
     if portable_count < video_transitions.len() {
@@ -676,17 +676,17 @@ pub(super) fn read_fcp7(
     }
     if edits
         .iter()
-        .any(|e| e.plays_backward || (e.playback_rate - 1.0).abs() > RATE_TOLERANCE)
+        .any(|e| e.retime.plays_backward || (e.retime.playback_rate - 1.0).abs() > RATE_TOLERANCE)
     {
         warn(
             &mut warnings,
             "Speed changes are kept in Premiere XML, Resolve XML, and Resolve OTIO; FCPXML plays these clips at normal speed.".into(),
         );
     }
-    if edits.iter().any(|e| e.plays_backward)
-        && edits
-            .iter()
-            .any(|e| e.plays_backward && (e.playback_rate - 1.0).abs() > RATE_TOLERANCE)
+    if edits.iter().any(|e| e.retime.plays_backward)
+        && edits.iter().any(|e| {
+            e.retime.plays_backward && (e.retime.playback_rate - 1.0).abs() > RATE_TOLERANCE
+        })
     {
         warn(
             &mut warnings,
@@ -941,22 +941,28 @@ pub(super) fn read_track_items(
                 .map_or(source_out as f64 / fps, |r| r.source_out),
             timeline_start: start_frames as f64 * ctx.sequence_rate.as_seconds(),
             timeline_end: end_frames as f64 * ctx.sequence_rate.as_seconds(),
-            playback_rate: retime.as_ref().map_or(1.0, |r| r.playback_rate),
-            plays_backward: retime.as_ref().is_some_and(|r| r.plays_backward),
-            fcp7_time_remap_xml: remap_filter_xml,
-            fcp7_filter_xmls: other_filters,
-            fcp7_retime_in: retime.as_ref().map(|_| source_in),
-            fcp7_retime_out: retime.as_ref().map(|_| source_out),
-            fcp7_retime_duration: if retime.is_some() {
-                ctx.doc.child_int(clip_item, "duration")
-            } else {
-                None
+            retime: crate::model::RetimeSpec {
+                playback_rate: retime.as_ref().map_or(1.0, |r| r.playback_rate),
+                plays_backward: retime.as_ref().is_some_and(|r| r.plays_backward),
             },
-            fcp7_labels_xml: ctx
-                .doc
-                .children_named(clip_item, "labels")
-                .first()
-                .map(|&labels| ctx.doc.verbatim(labels).to_string()),
+
+            fcp7: crate::model::Fcp7Passthrough {
+                fcp7_time_remap_xml: remap_filter_xml,
+                fcp7_filter_xmls: other_filters,
+                fcp7_retime_in: retime.as_ref().map(|_| source_in),
+                fcp7_retime_out: retime.as_ref().map(|_| source_out),
+                fcp7_retime_duration: if retime.is_some() {
+                    ctx.doc.child_int(clip_item, "duration")
+                } else {
+                    None
+                },
+                fcp7_labels_xml: ctx
+                    .doc
+                    .children_named(clip_item, "labels")
+                    .first()
+                    .map(|&labels| ctx.doc.verbatim(labels).to_string()),
+            },
+
             time_scale: 1_000_000,
             include_embedded_audio: true,
             audio_source_channel: if ctx.media_type == DraftMediaKind::Audio {
@@ -971,12 +977,15 @@ pub(super) fn read_track_items(
             },
             fcpxml_audio_role: None,
             track_index: ctx.track_number,
-            enabled: ctx
-                .doc
-                .child_text(clip_item, "enabled")
-                .is_none_or(|t| !t.eq_ignore_ascii_case("FALSE")),
-            track_enabled: ctx.track_enabled,
-            track_locked: ctx.track_locked,
+            flags: crate::model::TrackFlags {
+                enabled: ctx
+                    .doc
+                    .child_text(clip_item, "enabled")
+                    .is_none_or(|t| !t.eq_ignore_ascii_case("FALSE")),
+                track_enabled: ctx.track_enabled,
+                track_locked: ctx.track_locked,
+            },
+
             linked_edit_ids: ctx
                 .doc
                 .children_named(clip_item, "link")
@@ -997,20 +1006,20 @@ pub(super) fn read_track_items(
             let map = |t: f64| w.parent_start + (t - w.nested_in) * w.speed;
             edit.timeline_start = map(edit.timeline_start);
             edit.timeline_end = map(edit.timeline_end);
-            edit.playback_rate *= w.speed;
+            edit.retime.playback_rate *= w.speed;
             edit.id = format!("{}/{}", w.id_prefix, edit.id);
             edit.linked_edit_ids = edit
                 .linked_edit_ids
                 .into_iter()
                 .map(|l| format!("{}/{}", w.id_prefix, l))
                 .collect();
-            edit.enabled = edit.enabled && w.parent_enabled;
+            edit.flags.enabled = edit.flags.enabled && w.parent_enabled;
             if w.drop_verbatim {
-                edit.fcp7_time_remap_xml = None;
-                edit.fcp7_filter_xmls.clear();
-                edit.fcp7_retime_in = None;
-                edit.fcp7_retime_out = None;
-                edit.fcp7_retime_duration = None;
+                edit.fcp7.fcp7_time_remap_xml = None;
+                edit.fcp7.fcp7_filter_xmls.clear();
+                edit.fcp7.fcp7_retime_in = None;
+                edit.fcp7.fcp7_retime_out = None;
+                edit.fcp7.fcp7_retime_duration = None;
             }
         }
         edits.push(edit);

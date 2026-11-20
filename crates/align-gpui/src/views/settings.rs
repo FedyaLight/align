@@ -1,6 +1,15 @@
 //! Search quality and synchronization settings.
 
-use super::*;
+use super::animation::{entrance, settings_reset_motion, settings_select_motion};
+use super::controls::{icon_button, prominent_button, segmented_control};
+use super::menus::menu_row;
+use super::{
+    AlignApp, AnchoredPositionMode, AnimationExt, AudioAnalysisSource, ClipOrder, Context, Div,
+    FluentBuilder, InteractiveElement, IntoElement, MatchThreshold, MouseButton, ParentElement,
+    SETTINGS_MOTION_MS, SettingsScope, SettingsSelect, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, TemporalMode, Theme, TrackContent, anchored, deferred, div,
+    point, px, rgb, svg_icon,
+};
 
 pub(super) fn audio_source_label(source: AudioAnalysisSource) -> &'static str {
     match source {

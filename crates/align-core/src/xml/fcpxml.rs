@@ -434,22 +434,20 @@ pub(super) fn emit_fcpxml_asset_clip(
             source_out: start + duration,
             timeline_start: offset + place.shift,
             timeline_end: offset + place.shift + duration,
-            playback_rate: 1.0,
-            plays_backward: false,
-            fcp7_time_remap_xml: None,
-            fcp7_filter_xmls: Vec::new(),
-            fcp7_retime_in: None,
-            fcp7_retime_out: None,
-            fcp7_retime_duration: None,
-            fcp7_labels_xml: None,
+            retime: Default::default(),
+
+            fcp7: Default::default(),
+
             time_scale: 1_000_000,
             include_embedded_audio: true,
             audio_source_channel: None,
             fcpxml_audio_role: None,
             track_index: (lane + place.lane_shift).max(0) as usize,
-            enabled,
-            track_enabled: true,
-            track_locked: false,
+            flags: crate::model::TrackFlags {
+                enabled,
+                ..Default::default()
+            },
+
             linked_edit_ids: if asset.has_audio && audio_enabled {
                 [audio_id.clone()].into_iter().collect()
             } else {
@@ -467,14 +465,10 @@ pub(super) fn emit_fcpxml_asset_clip(
             source_out: start + duration,
             timeline_start: offset + place.shift,
             timeline_end: offset + place.shift + duration,
-            playback_rate: 1.0,
-            plays_backward: false,
-            fcp7_time_remap_xml: None,
-            fcp7_filter_xmls: Vec::new(),
-            fcp7_retime_in: None,
-            fcp7_retime_out: None,
-            fcp7_retime_duration: None,
-            fcp7_labels_xml: None,
+            retime: Default::default(),
+
+            fcp7: Default::default(),
+
             time_scale: 1_000_000,
             include_embedded_audio: true,
             audio_source_channel: {
@@ -490,9 +484,11 @@ pub(super) fn emit_fcpxml_asset_clip(
             },
             fcpxml_audio_role: audio_role.clone(),
             track_index: (lane + place.lane_shift).abs().max(0) as usize,
-            enabled,
-            track_enabled: true,
-            track_locked: false,
+            flags: crate::model::TrackFlags {
+                enabled,
+                ..Default::default()
+            },
+
             linked_edit_ids: if asset.has_video && video_enabled {
                 [video_id.clone()].into_iter().collect()
             } else {
@@ -586,14 +582,10 @@ pub(super) fn emit_fcpxml_std_clip(
             source_out: media_in + (local_out - local_in),
             timeline_start,
             timeline_end: timeline_start + (local_out - local_in),
-            playback_rate: 1.0,
-            plays_backward: false,
-            fcp7_time_remap_xml: None,
-            fcp7_filter_xmls: Vec::new(),
-            fcp7_retime_in: None,
-            fcp7_retime_out: None,
-            fcp7_retime_duration: None,
-            fcp7_labels_xml: None,
+            retime: Default::default(),
+
+            fcp7: Default::default(),
+
             time_scale: 1_000_000,
             include_embedded_audio: audio || holds_sound(refs.doc.attr(element, "ref")),
             audio_source_channel: if audio {
@@ -617,9 +609,11 @@ pub(super) fn emit_fcpxml_std_clip(
             } else {
                 (lane + place.lane_shift).max(0) as usize
             },
-            enabled,
-            track_enabled: true,
-            track_locked: false,
+            flags: crate::model::TrackFlags {
+                enabled,
+                ..Default::default()
+            },
+
             linked_edit_ids: HashSet::new(),
         });
     }

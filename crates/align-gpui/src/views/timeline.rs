@@ -1,6 +1,18 @@
 //! Timeline preview: toolbar, ruler, and lanes.
 
-use super::*;
+use super::animation::{entrance, timeline_bar_motion};
+use super::controls::{
+    RULER_LABEL_W, ZoomDrag, ZoomDragGhost, clip_color, fmt_duration, fmt_timecode, hover_tip,
+    ruler_ticks, waveform_columns,
+};
+use super::{
+    AlignApp, AnimationExt, AudioAnalysisSource, ClipId, Context, DragMoveEvent, FluentBuilder,
+    HashMap, InteractiveElement, IntoElement, MediaKind, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
+    TIMELINE_ROW_H, Theme, TimelineTransition, div, point, poses_differ, px, rgb, rgba, svg_icon,
+    timeline_duration, timeline_poses,
+};
+use gpui::AppContext as _;
 
 // ---------------- timeline preview (toolbar + ruler + lanes)
 

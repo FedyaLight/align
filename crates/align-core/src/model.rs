@@ -435,6 +435,49 @@ pub enum TimelineTransitionKind {
     AudioTransition,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RetimeSpec {
+    pub playback_rate: f64,
+    pub plays_backward: bool,
+}
+impl Default for RetimeSpec {
+    fn default() -> Self {
+        Self {
+            playback_rate: 1.0,
+            plays_backward: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Fcp7Passthrough {
+    pub fcp7_time_remap_xml: Option<String>,
+    pub fcp7_filter_xmls: Vec<String>,
+    pub fcp7_retime_in: Option<i64>,
+    pub fcp7_retime_out: Option<i64>,
+    pub fcp7_retime_duration: Option<i64>,
+    pub fcp7_labels_xml: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TrackFlags {
+    pub enabled: bool,
+    pub track_enabled: bool,
+    pub track_locked: bool,
+}
+impl Default for TrackFlags {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            track_enabled: true,
+            track_locked: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TimelineEdit {
@@ -448,18 +491,12 @@ pub struct TimelineEdit {
     pub source_out: MediaTime,
     pub timeline_start: MediaTime,
     pub timeline_end: MediaTime,
-    #[serde(default = "default_rate")]
-    pub playback_rate: f64,
-    #[serde(default)]
-    pub plays_backward: bool,
-    pub fcp7_time_remap_xml: Option<String>,
-    #[serde(default)]
-    pub fcp7_filter_xmls: Vec<String>,
-    pub fcp7_retime_in: Option<i64>,
-    pub fcp7_retime_out: Option<i64>,
-    pub fcp7_retime_duration: Option<i64>,
-    #[serde(default)]
-    pub fcp7_labels_xml: Option<String>,
+    #[serde(flatten)]
+    pub retime: crate::model::RetimeSpec,
+
+    #[serde(flatten)]
+    pub fcp7: crate::model::Fcp7Passthrough,
+
     /// Zero-based physical source channel; absent means all channels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_source_channel: Option<usize>,
@@ -467,25 +504,15 @@ pub struct TimelineEdit {
     pub fcpxml_audio_role: Option<String>,
     pub track_index: usize,
     pub audio_track_index: Option<usize>,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_true")]
-    pub track_enabled: bool,
-    #[serde(default)]
-    pub track_locked: bool,
+    #[serde(flatten)]
+    pub flags: crate::model::TrackFlags,
+
     pub audio_enabled: Option<bool>,
     pub audio_track_enabled: Option<bool>,
     pub audio_track_locked: Option<bool>,
     pub transition_after: Option<TimelineTransition>,
     pub audio_transition_after: Option<TimelineTransition>,
     pub linked_audio_edit: Option<TimelineLinkedAudioEdit>,
-}
-
-fn default_rate() -> f64 {
-    1.0
-}
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -496,30 +523,21 @@ pub struct TimelineLinkedAudioEdit {
     pub source_out: MediaTime,
     pub timeline_start: MediaTime,
     pub timeline_end: MediaTime,
-    #[serde(default = "default_rate")]
-    pub playback_rate: f64,
-    #[serde(default)]
-    pub plays_backward: bool,
-    pub fcp7_time_remap_xml: Option<String>,
-    #[serde(default)]
-    pub fcp7_filter_xmls: Vec<String>,
-    pub fcp7_retime_in: Option<i64>,
-    pub fcp7_retime_out: Option<i64>,
-    pub fcp7_retime_duration: Option<i64>,
-    #[serde(default)]
-    pub fcp7_labels_xml: Option<String>,
+    #[serde(flatten)]
+    pub retime: crate::model::RetimeSpec,
+
+    #[serde(flatten)]
+    pub fcp7: crate::model::Fcp7Passthrough,
+
     /// Zero-based physical source channel; absent means all channels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_source_channel: Option<usize>,
     #[serde(default)]
     pub fcpxml_audio_role: Option<String>,
     pub track_index: usize,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_true")]
-    pub track_enabled: bool,
-    #[serde(default)]
-    pub track_locked: bool,
+    #[serde(flatten)]
+    pub flags: crate::model::TrackFlags,
+
     pub transition_after: Option<TimelineTransition>,
 }
 

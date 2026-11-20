@@ -1,6 +1,12 @@
 //! Updates, feedback, About, AI agent setup, and error alerts.
 
-use super::*;
+use super::animation::slide_in;
+use super::controls::{button, hover_tip, modal_header, prominent_button};
+use super::{
+    AlignApp, ClipboardItem, Context, Div, FluentBuilder, InteractiveElement, IntoElement,
+    Operation, ParentElement, PathBuf, SharedString, StatefulInteractiveElement, Styled, Theme,
+    UpdateState, div, img, px, rgb, svg_icon, updater,
+};
 
 // ---------------- updates
 

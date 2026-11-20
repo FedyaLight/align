@@ -577,14 +577,14 @@ fn replaced_island(island: &ExportIsland) -> Option<ExportIsland> {
             source_in: recorder.source_in.max(inverse.value_at(overlap_start)),
             source_out: recorder.source_out.min(inverse.value_at(overlap_end)),
             timeline_duration: overlap_end - overlap_start,
-            playback_rate: 1.0,
-            plays_backward: false,
-            fcp7_time_remap_xml: None,
-            fcp7_retime_in: None,
-            fcp7_retime_out: None,
-            fcp7_retime_duration: None,
-            fcp7_filter_xmls: recorder.fcp7_filter_xmls.clone(),
-            fcp7_labels_xml: recorder.fcp7_labels_xml.clone(),
+            retime: Default::default(),
+
+            fcp7: crate::model::Fcp7Passthrough {
+                fcp7_filter_xmls: recorder.fcp7.fcp7_filter_xmls.clone(),
+                fcp7_labels_xml: recorder.fcp7.fcp7_labels_xml.clone(),
+                ..Default::default()
+            },
+
             audio_source_channel: recorder.audio_source_channel,
             fcpxml_audio_role: recorder.fcpxml_audio_role.clone(),
             preferred_source_key: recorder.preferred_source_key.clone(),
@@ -594,9 +594,8 @@ fn replaced_island(island: &ExportIsland) -> Option<ExportIsland> {
             confidence: video.confidence.min(recorder.confidence),
             corrected_audio_url: recorder.corrected_audio_url.clone(),
             precision_audio_urls: Vec::new(),
-            enabled: recorder.enabled,
-            track_enabled: recorder.track_enabled,
-            track_locked: recorder.track_locked,
+            flags: recorder.flags,
+
             audio_enabled: None,
             audio_track_enabled: None,
             audio_track_locked: None,
@@ -1973,7 +1972,7 @@ mod tests {
     #[test]
     fn premiere_sequence_structure() {
         let mut timeline = fixture_timeline();
-        timeline.islands[0].clips[0].fcp7_labels_xml =
+        timeline.islands[0].clips[0].fcp7.fcp7_labels_xml =
             Some("<labels><label2>Mango</label2></labels>".to_string());
         let xml = write(
             &timeline,
@@ -2258,13 +2257,13 @@ mod tests {
             .find(|e| e.clip_id == cam.id)
             .expect("cam edit");
         assert_eq!(
-            edit.fcp7_labels_xml.as_deref(),
+            edit.fcp7.fcp7_labels_xml.as_deref(),
             Some("<labels><label2>Grape</label2></labels>")
         );
         assert_eq!(
             edit.linked_audio_edit
                 .as_ref()
-                .and_then(|a| a.fcp7_labels_xml.as_deref()),
+                .and_then(|a| a.fcp7.fcp7_labels_xml.as_deref()),
             Some("<labels><label2>Forest</label2></labels>")
         );
 
@@ -2416,11 +2415,12 @@ mod tests {
             .iter()
             .find(|e| e.clip_id == cam.id)
             .expect("cam edit");
-        assert_eq!(edit.fcp7_filter_xmls.len(), 1);
+        assert_eq!(edit.fcp7.fcp7_filter_xmls.len(), 1);
         assert_eq!(
             edit.linked_audio_edit
                 .as_ref()
                 .expect("linked")
+                .fcp7
                 .fcp7_filter_xmls
                 .len(),
             1

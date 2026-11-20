@@ -98,20 +98,15 @@ pub struct ExportLinkedAudio {
     pub source_in: f64,
     pub source_out: f64,
     pub timeline_duration: f64,
-    pub playback_rate: f64,
-    pub plays_backward: bool,
-    pub fcp7_time_remap_xml: Option<String>,
-    pub fcp7_filter_xmls: Vec<String>,
-    pub fcp7_retime_in: Option<i64>,
-    pub fcp7_retime_out: Option<i64>,
-    pub fcp7_retime_duration: Option<i64>,
-    pub fcp7_labels_xml: Option<String>,
+    pub retime: crate::model::RetimeSpec,
+
+    pub fcp7: crate::model::Fcp7Passthrough,
+
     pub audio_source_channel: Option<usize>,
     pub fcpxml_audio_role: Option<String>,
     pub preferred_source_key: String,
-    pub enabled: bool,
-    pub track_enabled: bool,
-    pub track_locked: bool,
+    pub flags: crate::model::TrackFlags,
+
     pub transition_after: Option<ExportTransition>,
 }
 
@@ -133,14 +128,10 @@ pub struct ExportItem {
     pub source_in: f64,
     pub source_out: f64,
     pub timeline_duration: f64,
-    pub playback_rate: f64,
-    pub plays_backward: bool,
-    pub fcp7_time_remap_xml: Option<String>,
-    pub fcp7_filter_xmls: Vec<String>,
-    pub fcp7_retime_in: Option<i64>,
-    pub fcp7_retime_out: Option<i64>,
-    pub fcp7_retime_duration: Option<i64>,
-    pub fcp7_labels_xml: Option<String>,
+    pub retime: crate::model::RetimeSpec,
+
+    pub fcp7: crate::model::Fcp7Passthrough,
+
     pub audio_source_channel: Option<usize>,
     pub fcpxml_audio_role: Option<String>,
     pub preferred_source_key: Option<String>,
@@ -150,9 +141,8 @@ pub struct ExportItem {
     pub confidence: f64,
     pub corrected_audio_url: Option<PathBuf>,
     pub precision_audio_urls: Vec<PathBuf>,
-    pub enabled: bool,
-    pub track_enabled: bool,
-    pub track_locked: bool,
+    pub flags: crate::model::TrackFlags,
+
     pub audio_enabled: Option<bool>,
     pub audio_track_enabled: Option<bool>,
     pub audio_track_locked: Option<bool>,
@@ -194,14 +184,10 @@ impl ExportItem {
             timeline_duration: source_out.max(0.0),
             clip,
             start,
-            playback_rate: 1.0,
-            plays_backward: false,
-            fcp7_time_remap_xml: None,
-            fcp7_filter_xmls: Vec::new(),
-            fcp7_retime_in: None,
-            fcp7_retime_out: None,
-            fcp7_retime_duration: None,
-            fcp7_labels_xml: None,
+            retime: Default::default(),
+
+            fcp7: Default::default(),
+
             audio_source_channel: None,
             fcpxml_audio_role: None,
             preferred_source_key: None,
@@ -211,9 +197,8 @@ impl ExportItem {
             confidence,
             corrected_audio_url: None,
             precision_audio_urls: Vec::new(),
-            enabled: true,
-            track_enabled: true,
-            track_locked: false,
+            flags: Default::default(),
+
             audio_enabled: None,
             audio_track_enabled: None,
             audio_track_locked: None,
@@ -348,30 +333,30 @@ impl ExportItem {
 
     pub fn is_enabled(&self, media: MediaKind) -> bool {
         if let Some(linked) = self.linked_audio(media) {
-            return linked.enabled;
+            return linked.flags.enabled;
         }
         if self.is_embedded_audio(media) {
-            return self.audio_enabled.unwrap_or(self.enabled);
+            return self.audio_enabled.unwrap_or(self.flags.enabled);
         }
-        self.enabled
+        self.flags.enabled
     }
     pub fn is_track_enabled(&self, media: MediaKind) -> bool {
         if let Some(linked) = self.linked_audio(media) {
-            return linked.track_enabled;
+            return linked.flags.track_enabled;
         }
         if self.is_embedded_audio(media) {
-            return self.audio_track_enabled.unwrap_or(self.track_enabled);
+            return self.audio_track_enabled.unwrap_or(self.flags.track_enabled);
         }
-        self.track_enabled
+        self.flags.track_enabled
     }
     pub fn is_track_locked(&self, media: MediaKind) -> bool {
         if let Some(linked) = self.linked_audio(media) {
-            return linked.track_locked;
+            return linked.flags.track_locked;
         }
         if self.is_embedded_audio(media) {
-            return self.audio_track_locked.unwrap_or(self.track_locked);
+            return self.audio_track_locked.unwrap_or(self.flags.track_locked);
         }
-        self.track_locked
+        self.flags.track_locked
     }
     pub fn timeline_start(&self, media: MediaKind) -> f64 {
         self.linked_audio(media).map_or(self.start, |l| l.start)
@@ -390,34 +375,34 @@ impl ExportItem {
     }
     pub fn playback_rate(&self, media: MediaKind) -> f64 {
         self.linked_audio(media)
-            .map_or(self.playback_rate, |l| l.playback_rate)
+            .map_or(self.retime.playback_rate, |l| l.retime.playback_rate)
     }
     pub fn plays_backward(&self, media: MediaKind) -> bool {
         self.linked_audio(media)
-            .map_or(self.plays_backward, |l| l.plays_backward)
+            .map_or(self.retime.plays_backward, |l| l.retime.plays_backward)
     }
     pub fn fcp7_time_remap_xml(&self, media: MediaKind) -> Option<&str> {
         self.linked_audio(media)
-            .and_then(|l| l.fcp7_time_remap_xml.as_deref())
-            .or(self.fcp7_time_remap_xml.as_deref())
+            .and_then(|l| l.fcp7.fcp7_time_remap_xml.as_deref())
+            .or(self.fcp7.fcp7_time_remap_xml.as_deref())
     }
     pub fn fcp7_retime_geometry(&self, media: MediaKind) -> Option<(i64, i64, i64)> {
         let linked = self.linked_audio(media);
         let input = linked
-            .and_then(|l| l.fcp7_retime_in)
-            .or(self.fcp7_retime_in);
+            .and_then(|l| l.fcp7.fcp7_retime_in)
+            .or(self.fcp7.fcp7_retime_in);
         let output = linked
-            .and_then(|l| l.fcp7_retime_out)
-            .or(self.fcp7_retime_out);
+            .and_then(|l| l.fcp7.fcp7_retime_out)
+            .or(self.fcp7.fcp7_retime_out);
         let duration = linked
-            .and_then(|l| l.fcp7_retime_duration)
-            .or(self.fcp7_retime_duration);
+            .and_then(|l| l.fcp7.fcp7_retime_duration)
+            .or(self.fcp7.fcp7_retime_duration);
         Some((input?, output?, duration?))
     }
     pub fn fcp7_labels_xml(&self, media: MediaKind) -> Option<&str> {
         match self.linked_audio(media) {
-            Some(linked) => linked.fcp7_labels_xml.as_deref(),
-            None => self.fcp7_labels_xml.as_deref(),
+            Some(linked) => linked.fcp7.fcp7_labels_xml.as_deref(),
+            None => self.fcp7.fcp7_labels_xml.as_deref(),
         }
     }
     /// Verbatim non-timeremap filters for one clipitem side. Like labels
@@ -425,8 +410,8 @@ impl ExportItem {
     /// onto the linked audio clipitem.
     pub fn fcp7_filter_xmls(&self, media: MediaKind) -> &[String] {
         match self.linked_audio(media) {
-            Some(linked) => &linked.fcp7_filter_xmls,
-            None => &self.fcp7_filter_xmls,
+            Some(linked) => &linked.fcp7.fcp7_filter_xmls,
+            None => &self.fcp7.fcp7_filter_xmls,
         }
     }
     pub fn fcpxml_audio_role(&self) -> Option<&str> {
@@ -607,9 +592,9 @@ fn apply_clip_assignment(item: &mut ExportItem, color: Option<&str>, role: Optio
             "<labels><label2>{}</label2></labels>",
             xml_text::escape(color)
         );
-        item.fcp7_labels_xml = Some(labels.clone());
+        item.fcp7.fcp7_labels_xml = Some(labels.clone());
         if let Some(linked) = item.linked_audio_edit.as_mut() {
-            linked.fcp7_labels_xml = Some(labels);
+            linked.fcp7.fcp7_labels_xml = Some(labels);
         }
     }
     if let Some(role) = role {
@@ -757,8 +742,8 @@ fn trim_item(mut item: ExportItem, head: f64, tail: f64) -> Option<ExportItem> {
             source_in: &mut item.source_in,
             source_out: &mut item.source_out,
             duration: &mut item.timeline_duration,
-            rate: item.playback_rate,
-            backward: item.plays_backward,
+            rate: item.retime.playback_rate,
+            backward: item.retime.plays_backward,
         },
         head,
         tail,
@@ -770,8 +755,8 @@ fn trim_item(mut item: ExportItem, head: f64, tail: f64) -> Option<ExportItem> {
                 source_in: &mut linked.source_in,
                 source_out: &mut linked.source_out,
                 duration: &mut linked.timeline_duration,
-                rate: linked.playback_rate,
-                backward: linked.plays_backward,
+                rate: linked.retime.playback_rate,
+                backward: linked.retime.plays_backward,
             },
             head,
             tail,
@@ -930,7 +915,10 @@ fn unmatched_item(clip: &Clip, options: &ExportAssemblyOptions) -> ExportItem {
     ];
     let mut item = ExportItem {
         display_name: options.unmatched_label(&file_name(&clip.url)),
-        enabled: !options.disable_unmatched,
+        flags: crate::model::TrackFlags {
+            enabled: !options.disable_unmatched,
+            ..Default::default()
+        },
         ..ExportItem::new(clip.clone(), 0.0, 1.0, identity, 0.0)
     };
     options.apply_unmatched_assignment(&mut item);
@@ -1068,23 +1056,22 @@ impl ImportedAssembly<'_> {
             source_out: edit.source_out.as_seconds().min(base.source_duration()),
             timeline_duration: (edit.timeline_end.as_seconds() - edit.timeline_start.as_seconds())
                 .max(0.0),
-            playback_rate: edit.playback_rate,
-            plays_backward: edit.plays_backward,
-            fcp7_time_remap_xml: edit.fcp7_time_remap_xml.clone(),
-            fcp7_filter_xmls: edit.fcp7_filter_xmls.clone(),
-            fcp7_retime_in: edit.fcp7_retime_in,
-            fcp7_retime_out: edit.fcp7_retime_out,
-            fcp7_retime_duration: edit.fcp7_retime_duration,
-            fcp7_labels_xml: edit.fcp7_labels_xml.clone(),
+            retime: edit.retime,
+
+            fcp7: edit.fcp7.clone(),
+
             audio_source_channel: edit.audio_source_channel,
             fcpxml_audio_role: edit.fcpxml_audio_role.clone(),
             preferred_source_key: Some(track_key),
             preferred_audio_source_key: edit
                 .audio_track_index
                 .map(|t| format!("imported-audio-{t:06}")),
-            enabled: edit.enabled && base.enabled,
-            track_enabled: edit.track_enabled,
-            track_locked: edit.track_locked || preserve_track,
+            flags: crate::model::TrackFlags {
+                enabled: edit.flags.enabled && base.flags.enabled,
+                track_enabled: edit.flags.track_enabled,
+                track_locked: edit.flags.track_locked || preserve_track,
+            },
+
             audio_enabled: edit.audio_enabled,
             audio_track_enabled: edit.audio_track_enabled,
             audio_track_locked: edit.audio_track_index.map(|index| {
@@ -1147,20 +1134,19 @@ impl ImportedAssembly<'_> {
             timeline_duration: (audio.timeline_end.as_seconds()
                 - audio.timeline_start.as_seconds())
             .max(0.0),
-            playback_rate: audio.playback_rate,
-            plays_backward: audio.plays_backward,
-            fcp7_time_remap_xml: audio.fcp7_time_remap_xml.clone(),
-            fcp7_filter_xmls: audio.fcp7_filter_xmls.clone(),
-            fcp7_retime_in: audio.fcp7_retime_in,
-            fcp7_retime_out: audio.fcp7_retime_out,
-            fcp7_retime_duration: audio.fcp7_retime_duration,
-            fcp7_labels_xml: audio.fcp7_labels_xml.clone(),
+            retime: audio.retime,
+
+            fcp7: audio.fcp7.clone(),
+
             audio_source_channel: audio.audio_source_channel,
             fcpxml_audio_role: audio.fcpxml_audio_role.clone(),
             preferred_source_key: audio_key,
-            enabled: audio.enabled && base.enabled,
-            track_enabled: audio.track_enabled,
-            track_locked: audio.track_locked || preserve_audio,
+            flags: crate::model::TrackFlags {
+                enabled: audio.flags.enabled && base.flags.enabled,
+                track_enabled: audio.flags.track_enabled,
+                track_locked: audio.flags.track_locked || preserve_audio,
+            },
+
             transition_after,
         }
     }
@@ -2046,21 +2032,16 @@ mod tests {
             source_out: MediaTime::seconds(source_out),
             timeline_start: MediaTime::seconds(start),
             timeline_end: MediaTime::seconds(end),
-            playback_rate: 1.0,
-            plays_backward: false,
-            fcp7_time_remap_xml: None,
-            fcp7_filter_xmls: Vec::new(),
-            fcp7_retime_in: None,
-            fcp7_retime_out: None,
-            fcp7_retime_duration: None,
-            fcp7_labels_xml: None,
+            retime: Default::default(),
+
+            fcp7: Default::default(),
+
             audio_source_channel: None,
             fcpxml_audio_role: None,
             track_index,
             audio_track_index: None,
-            enabled: true,
-            track_enabled: true,
-            track_locked: false,
+            flags: Default::default(),
+
             audio_enabled: None,
             audio_track_enabled: None,
             audio_track_locked: None,
@@ -2127,12 +2108,12 @@ mod tests {
         assert_eq!(by_name["trim"].source_out, 4.0);
         assert_eq!(by_name["duplicate"].start, 17.0);
         assert_eq!(by_name["duplicate"].timeline_duration, 2.0);
-        assert!(by_name["trim"].track_locked);
-        assert!(by_name["duplicate"].track_locked);
+        assert!(by_name["trim"].flags.track_locked);
+        assert!(by_name["duplicate"].flags.track_locked);
         // The selected track's median solved difference is 9.5 seconds;
         // recorder source zero at solved time 22 therefore lands at 12.5.
         assert_eq!(by_name["recorder"].start, 12.5);
-        assert!(!by_name["recorder"].track_locked);
+        assert!(!by_name["recorder"].flags.track_locked);
 
         result
             .preserve_editing_tracks
@@ -2147,7 +2128,7 @@ mod tests {
         assert_eq!(anchored["trim"].start, 10.0);
         assert_eq!(anchored["duplicate"].start, 17.0);
         assert_eq!(anchored["recorder"].start, 100.0);
-        assert!(anchored.values().all(|item| item.track_locked));
+        assert!(anchored.values().all(|item| item.flags.track_locked));
 
         result.preserve_editing_tracks.clear();
         let ordinary = ExportTimeline::from_result_with_options(&result, Default::default())
@@ -2254,20 +2235,15 @@ mod tests {
             source_in: 0.0,
             source_out: 10.0,
             timeline_duration: 10.0,
-            playback_rate: 1.0,
-            plays_backward: false,
-            fcp7_time_remap_xml: None,
-            fcp7_filter_xmls: Vec::new(),
-            fcp7_retime_in: None,
-            fcp7_retime_out: None,
-            fcp7_retime_duration: None,
-            fcp7_labels_xml: None,
+            retime: Default::default(),
+
+            fcp7: Default::default(),
+
             audio_source_channel: None,
             fcpxml_audio_role: None,
             preferred_source_key: "audio".to_string(),
-            enabled: true,
-            track_enabled: true,
-            track_locked: false,
+            flags: Default::default(),
+
             transition_after: None,
         });
         let islands = apply_cut_remove(
