@@ -761,7 +761,16 @@ impl Pipeline {
             .is_some()
             || audio.iter().any(|a| a.source_timecode.is_some());
         if !has_timecode && !audio.is_empty() {
-            let cache = self.decoder_cache(url);
+            let cache = self.decoder_cache(url).or_else(|| {
+                // These containers use the FFmpeg absolute packet clock for
+                // the opening LTC window. Earlier versions could inspect
+                // audio beyond the window when a mapped track started late.
+                let ext = url.extension()?;
+                let external = ext.eq_ignore_ascii_case("mxf")
+                    || (ext.eq_ignore_ascii_case("mts")
+                        && self.backend.kind() == BackendKind::Portable);
+                external.then(|| self.cache.decoder_variant("ltc-presented"))
+            });
             let entry = cache.as_ref().unwrap_or(&self.cache).ltc_entry(url);
             let cached = entry
                 .as_ref()

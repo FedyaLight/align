@@ -155,16 +155,10 @@ fn run_probe(path: &Path) -> Result<Vec<u8>, DecodeError> {
 
 /// Header-only inspect. No sample data is read (audio-only invariant).
 pub fn inspect(path: &Path) -> Result<ProbeReport, DecodeError> {
-    let json = probe_json(path)?;
-    let header = serde_json::from_slice(&json)
-        .map_err(|_| DecodeError::Incomplete(format!("ffprobe JSON for {}", path.display())))?;
-    let mut report = parse_header(&header)
-        .ok_or_else(|| DecodeError::Incomplete(format!("ffprobe JSON for {}", path.display())))?;
-    if let Some(audio) = apple_gapless(path, &header) {
-        report.duration_seconds = audio.duration;
-        report.audio_streams[0].end_seconds = None;
-    }
-    Ok(report)
+    // Clip IDs and source-time exports use the container's original duration.
+    // Gapless trimming belongs to decoded PCM, not to source metadata.
+    parse_ffprobe_json(&probe_json(path)?)
+        .ok_or_else(|| DecodeError::Incomplete(format!("ffprobe JSON for {}", path.display())))
 }
 
 pub(crate) fn probed_sbr(path: &Path, index: usize) -> Option<bool> {
@@ -626,8 +620,10 @@ impl<T: PipeSample> PcmPipe<T> {
     ) -> Result<Self, DecodeError> {
         let bin =
             ffmpeg_bin().ok_or_else(|| DecodeError::FfmpegMissing("ffmpeg not found".into()))?;
-        let header: Option<serde_json::Value> = probe_json(path)
-            .ok()
+        let header: Option<serde_json::Value> = path
+            .is_file()
+            .then(|| probe_json(path).ok())
+            .flatten()
             .and_then(|raw| serde_json::from_slice(&raw).ok());
         let header = header.as_ref();
         let format = header.map(|h| &h["format"]);
