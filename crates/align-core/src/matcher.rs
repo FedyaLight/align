@@ -436,11 +436,19 @@ fn fitted_match(key: PairKey, fit: Fit, margin: f64, clip_ids: &[ClipId]) -> Pai
         } else {
             1.0
         };
+    // If the evidence is too short for drift, fit the intercept at the
+    // chosen rate. Reusing the sloped line's intercept at time zero can
+    // move every predicted observation outside the refinement window.
+    let offset = if rate == fit.rate {
+        fit.offset
+    } else {
+        fit.points.iter().map(|p| p.right - p.left).sum::<f64>() / fit.points.len() as f64
+    };
     PairwiseMatch {
         left: clip_ids[key.left as usize].clone(),
         right: clip_ids[key.right as usize].clone(),
         rate,
-        offset: fit.offset,
+        offset,
         confidence,
         anchors: fit.inliers,
         left_start_seconds: fit.start,
@@ -668,6 +676,25 @@ mod tests {
         assert!(m.residual_seconds < 1e-9);
         assert!(approx(m.confidence, 0.63, 0.05), "conf={}", m.confidence);
         assert_eq!(m.evidence, MatchEvidence::Waveform);
+    }
+
+    #[test]
+    fn pinning_drift_preserves_the_observed_offset_far_from_the_origin() {
+        let mut clips = synth_pair("a", "b", 20, 16, 0xace);
+        for clip in &mut clips {
+            for fp in &mut clip.fingerprints {
+                fp.frame += 20000;
+            }
+        }
+        for (i, fp) in clips[1].fingerprints.iter_mut().enumerate() {
+            fp.frame += (i / 4) as u32;
+        }
+        let matches = match_fingerprints(clips, None, &[]);
+        let m = &matches[0];
+        assert_eq!(m.rate, 1.);
+        // The anchors span offsets of 20–23 hops. A pinned prediction must
+        // still reach those observations inside the 250 ms refinement search.
+        assert!((20. * SECONDS_PER_FRAME..=23. * SECONDS_PER_FRAME).contains(&m.offset));
     }
 
     #[test]
