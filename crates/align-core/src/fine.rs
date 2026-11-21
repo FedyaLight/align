@@ -15,7 +15,7 @@
 //!
 //! Audio access goes through [`WindowProvider`] so this crate stays
 //! backend-agnostic: production wires it to `MediaBackend::decode_window_16k`
-//! (either engine), tests use synthetic clips. Four parallel workers return
+//! (either engine), tests use synthetic clips. Bounded parallel workers return
 //! indexed results, so acceptance remains deterministic.
 
 use std::collections::HashMap;
@@ -42,6 +42,11 @@ pub struct AudioWindow {
 
 /// 16 kHz mono window source. `None` means undecodable or cancelled.
 pub trait WindowProvider: Send + Sync {
+    /// Maximum simultaneous window requests this source handles efficiently.
+    fn worker_cap(&self) -> usize {
+        8
+    }
+
     fn window(
         &self,
         clip: &ClipId,
@@ -70,10 +75,6 @@ pub struct RefineEvent {
 
 /// A refined pair that closes a cycle below this confidence is dropped.
 const WEAK_CYCLE_CONFIDENCE: f64 = 0.85;
-/// Keep at most two candidates per worker in flight. Earlier decisions can
-/// eliminate weak cycles before their audio is read.
-const WORKERS: usize = 4;
-const LOOKAHEAD: usize = WORKERS * 2;
 
 /// Workers refine independently. The caller accepts and reports the results
 /// in input order, even if later candidates finish first.
@@ -100,6 +101,9 @@ pub fn refine_forest(
         }
     }
     let total = usable.len();
+    let workers = crate::parallel::worker_limit(provider.worker_cap().min(8)).min(total);
+    // Limit speculative reads before earlier decisions can prune weak cycles.
+    let lookahead = (workers * 2).min(8);
     let clips: Vec<_> = durations.keys().cloned().collect();
     let mut components = FineDisjointSet::new(&clips);
     let mut accepted = Vec::new();
@@ -108,7 +112,7 @@ pub fn refine_forest(
     let receive = Mutex::new(receive);
     std::thread::scope(|scope| {
         let send = send;
-        for _ in 0..WORKERS.min(total) {
+        for _ in 0..workers {
             let receive = &receive;
             // Workers share a queue but release its lock before decoding.
             scope.spawn(move || {
@@ -133,7 +137,7 @@ pub fn refine_forest(
         let mut next = 0;
         let mut pending = std::collections::VecDeque::new();
         for (index, &candidate) in usable.iter().enumerate() {
-            while next < total && pending.len() < LOOKAHEAD {
+            while next < total && pending.len() < lookahead {
                 let job = usable[next];
                 let skip = cancel.load(Ordering::Relaxed)
                     || (job.confidence < WEAK_CYCLE_CONFIDENCE

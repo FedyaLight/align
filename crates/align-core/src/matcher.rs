@@ -388,12 +388,13 @@ pub fn match_fingerprints(
         };
         Some(fitted_match(key, fit, margin, &clip_ids))
     };
-    let mut out: Vec<_> = if jobs.len() < 8 {
+    let workers = crate::parallel::worker_limit(8).min(jobs.len() / 2);
+    let mut out: Vec<_> = if jobs.len() < 8 || workers <= 1 {
         jobs.into_iter().filter_map(fit_pair).collect()
     } else {
         let queue = std::sync::Mutex::new(jobs.into_iter());
         std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..4)
+            let workers: Vec<_> = (0..workers)
                 .map(|_| {
                     scope.spawn(|| {
                         std::iter::from_fn(|| queue.lock().unwrap().next())

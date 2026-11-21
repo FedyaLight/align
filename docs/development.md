@@ -148,7 +148,14 @@ python script/bench-sync.py target/release/align-cli target/bench
 The benchmark generates cameras with known offsets (MOV/MP4 with PCM or AAC,
 timecode) and two split recorder takes, then reports cold and warm synchronization
 time, the number of FFmpeg/ffprobe processes started, and each clip's offset
-error against the generated ground truth. `--cameras`, `--duration`, and
+error against the generated ground truth. On macOS, compare both backends on
+the same files by running again with a new output directory and
+`--corpus target/bench --backend apple-native` (the benchmark defaults to
+`portable`). Each report includes the CLI version and wall seconds for inspect,
+fingerprint, match, refine and solve. To print the same timings to stderr for a
+single sync, set `ALIGN_PHASE_TIMING=1`. Cold and warm refer to Align’s analysis
+cache. The operating system can cache file data in both cases.
+`--cameras`, `--duration`, and
 `--repeat` scale it. Compare results only between runs on the same machine.
 
 ### Drift diagnostics

@@ -6,7 +6,7 @@
 //! (via [`BackendWindowProvider`]) → graph solve → [`align_core::SyncResult`].
 //!
 //! Important implementation choices:
-//! - inspection, fingerprinting and refinement use four bounded workers with
+//! - inspection, fingerprinting and refinement use bounded workers with
 //!   indexed deterministic results;
 //! - ClipIDs hash `path\0duration-micros`, using the same units across backends;
 //! - spanned-file, BWF/iXML/container/LTC timecode, FCP 7 XML and FCPXML
@@ -29,8 +29,7 @@ use crate::provider::BackendWindowProvider;
 
 /// Files inspected at once. Inspection waits on ffprobe processes and header
 /// reads, and the first time it sees an MXF or MTS file it reads the whole
-/// file to classify frame timing. The bound matches the fingerprint stage's
-/// four concurrent readers of external media.
+/// file to classify frame timing. Limit concurrent full-file scans.
 const INSPECT_WORKERS: usize = 4;
 
 // ------------------------------------------------------------ types
@@ -340,7 +339,7 @@ impl Pipeline {
     /// Full pipeline: media files/dirs (+ optional one timeline) →
     /// [`align_core::SyncResult`].
     ///
-    /// Inspection, fingerprint decode and fine refine run on up to 4 workers
+    /// Inspection, fingerprint decode and fine refine run on CPU-limited workers
     /// with deterministic indexed results; `progress`
     /// is shared across those threads, `cancel` is polled per clip,
     /// candidate and job.
@@ -356,6 +355,17 @@ impl Pipeline {
         if urls.is_empty() {
             return Err(PipelineError::NoMedia);
         }
+
+        let mut last = std::env::var_os("ALIGN_PHASE_TIMING")
+            .filter(|v| v == "1")
+            .map(|_| std::time::Instant::now());
+        let mut end_phase = |phase: &str| {
+            if let Some(start) = &mut last {
+                let now = std::time::Instant::now();
+                eprintln!("align-phase {phase} {:.6}", (now - *start).as_secs_f64());
+                *start = now;
+            }
+        };
 
         // ---- inspect
         let mut clips = Vec::new();
@@ -402,6 +412,7 @@ impl Pipeline {
 
         let search_overrides = search_overrides(&clips, imported_timeline.as_ref(), options);
 
+        end_phase("inspect");
         // ---- fingerprints (multi-stream variants + shared-hash selection)
         let usable: Vec<&Clip> = clips.iter().filter(|c| !c.audio.is_empty()).collect();
         let mut audio_sources = options.audio_sources.clone();
@@ -429,6 +440,7 @@ impl Pipeline {
         let mut source_map = audio_sources;
         source_map.extend(selected_sources);
 
+        end_phase("fingerprint");
         // ---- coarse match
         if let Some(p) = &progress {
             p(PipelineProgress::basic(Phase::Match, 0, 1, None));
@@ -455,6 +467,7 @@ impl Pipeline {
         if cancelled(cancel) {
             return Err(PipelineError::Cancelled);
         }
+        end_phase("match");
         // ---- refine
         let durations: HashMap<ClipId, f64> = clips
             .iter()
@@ -465,6 +478,7 @@ impl Pipeline {
             .map(|c| (c.id.clone(), c.url.clone()))
             .collect();
         let provider = BackendWindowProvider {
+            worker_cap: self.decode_worker_cap(clips.iter().map(|c| c.url.as_path())),
             decode: self.backend.window_decoder(),
             clips: clip_paths,
         };
@@ -548,6 +562,7 @@ impl Pipeline {
         combined.extend(timecoded);
         let refined = eligible(&combined);
 
+        end_phase("refine");
         // ---- solve
         if let Some(p) = &progress {
             p(PipelineProgress::basic(Phase::Solve, 0, 1, None));
@@ -582,6 +597,7 @@ impl Pipeline {
             p(PipelineProgress::basic(Phase::Solve, 1, 1, None));
         }
 
+        end_phase("solve");
         Ok(align_core::SyncResult {
             search_overrides,
             stopped,
@@ -599,6 +615,19 @@ impl Pipeline {
             matches: chosen.matches,
             temporal_policy: options.temporal.clone(),
         })
+    }
+
+    fn decode_worker_cap<'a>(&self, mut paths: impl Iterator<Item = &'a Path>) -> usize {
+        // AVFoundation uses blocking native readers with four reservations.
+        // Other video containers need external decoders with their own threads.
+        if self.backend.kind() == BackendKind::AppleNative
+            || paths
+                .any(|p| crate::portable::is_video_container(p) && !crate::isobmff::is_candidate(p))
+        {
+            4
+        } else {
+            8
+        }
     }
 
     /// Inspects files on bounded workers. Outcomes keep input order, so clips
@@ -622,15 +651,19 @@ impl Pipeline {
             event.discovered = discovered;
             p(event);
         };
-        align_core::par_map(urls, INSPECT_WORKERS, |url| {
-            if cancelled(cancel) {
-                return Err(PipelineError::Cancelled);
-            }
-            publish(false, url, None);
-            let outcome = self.inspect_one(url);
-            publish(true, url, outcome.as_ref().ok().cloned());
-            outcome
-        })
+        align_core::par_map(
+            urls,
+            align_core::parallel::worker_limit(INSPECT_WORKERS),
+            |url| {
+                if cancelled(cancel) {
+                    return Err(PipelineError::Cancelled);
+                }
+                publish(false, url, None);
+                let outcome = self.inspect_one(url);
+                publish(true, url, outcome.as_ref().ok().cloned());
+                outcome
+            },
+        )
     }
 
     fn inspect_one(&self, url: &Path) -> Result<Clip, PipelineError> {
@@ -1023,10 +1056,13 @@ impl Pipeline {
                 _ => Ok(variants),
             }
         };
-        // Four streaming readers avoid saturating external media while
-        // variants of one clip stay sequential and results keep input order.
-        let outcomes: Vec<Result<Vec<Variant>, PipelineError>> =
-            align_core::par_map(clips, 4, |clip| {
+        // Variants of one clip stay sequential.
+        let outcomes: Vec<Result<Vec<Variant>, PipelineError>> = align_core::par_map(
+            clips,
+            align_core::parallel::worker_limit(
+                self.decode_worker_cap(clips.iter().map(|c| c.url.as_path())),
+            ),
+            |clip| {
                 let outcome = analyse(clip);
                 if let Some(p) = &progress
                     && !outcome.as_ref().is_err_and(|error| self.ends_run(error))
@@ -1055,7 +1091,8 @@ impl Pipeline {
                     p(event);
                 }
                 outcome
-            });
+            },
+        );
         // One unreadable file is reported and left unmatched; the others
         // still synchronize. Results stay in input order.
         let mut analysed = Vec::with_capacity(clips.len());
