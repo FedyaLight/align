@@ -139,6 +139,8 @@ pub struct ExportItem {
     pub mapping_rate: f64,
     pub mapping_points: Vec<MappingPoint>,
     pub confidence: f64,
+    /// This item's position is a same-device timestamp estimate, not a sync.
+    pub estimated: bool,
     pub corrected_audio_url: Option<PathBuf>,
     pub precision_audio_urls: Vec<PathBuf>,
     pub flags: crate::model::TrackFlags,
@@ -195,6 +197,7 @@ impl ExportItem {
             mapping_rate,
             mapping_points,
             confidence,
+            estimated: false,
             corrected_audio_url: None,
             precision_audio_urls: Vec::new(),
             flags: Default::default(),
@@ -925,6 +928,14 @@ fn unmatched_item(clip: &Clip, options: &ExportAssemblyOptions) -> ExportItem {
     item
 }
 
+fn estimated_item(clip: &Clip, start: f64, options: &ExportAssemblyOptions) -> ExportItem {
+    let mut item = unmatched_item(clip, options);
+    item.start = start;
+    item.display_name = Some(format!("[ESTIMATED] {}", file_name(&clip.url)));
+    item.estimated = true;
+    item
+}
+
 /// Each track moves by the median difference between where the solve
 /// places its edits' media and where the edit placed them. Preserved
 /// tracks stay put and the others move relative to them.
@@ -992,6 +1003,7 @@ struct ImportedAssembly<'a> {
     /// The video edit owning each linked audio edit.
     parent_by_linked: HashMap<&'a str, &'a str>,
     unmatched_ids: HashSet<&'a ClipId>,
+    estimated_ids: HashSet<&'a ClipId>,
 }
 
 impl ImportedAssembly<'_> {
@@ -1022,6 +1034,7 @@ impl ImportedAssembly<'_> {
             .as_ref()
             .map(|audio| self.linked_audio(audio, base, shift));
         let is_unmatched = self.unmatched_ids.contains(&edit.clip_id);
+        let is_estimated = self.estimated_ids.contains(&edit.clip_id);
         let fallback_name = || {
             edit.name
                 .clone()
@@ -1029,7 +1042,14 @@ impl ImportedAssembly<'_> {
         };
         let mut item = ExportItem {
             instance_id: format!("imported-{media_str}-{}", edit.id),
-            display_name: if is_unmatched {
+            display_name: if is_estimated {
+                Some(format!(
+                    "[ESTIMATED] {}",
+                    self.options
+                        .unmatched_label(&fallback_name())
+                        .unwrap_or_else(&fallback_name)
+                ))
+            } else if is_unmatched {
                 self.options.unmatched_label(&fallback_name())
             } else {
                 self.options
@@ -1087,6 +1107,7 @@ impl ImportedAssembly<'_> {
             mapping_rate: base.mapping_rate,
             mapping_points: base.mapping_points.clone(),
             confidence: base.confidence,
+            estimated: is_estimated,
             corrected_audio_url: None,
             precision_audio_urls: Vec::new(),
             linked_audio_edit: linked,
@@ -1237,8 +1258,39 @@ impl ExportTimeline {
 
         let mut order_only_islands = HashSet::new();
         if options.unmatched != UnmatchedPlacement::Remove {
+            let estimated_ids: HashSet<&ClipId> = result
+                .estimated_placements
+                .iter()
+                .map(|placement| &placement.clip_id)
+                .collect();
+            for placement in &result.estimated_placements {
+                let Some(clip) = clips_by_id.get(&placement.clip_id) else {
+                    continue;
+                };
+                let Some(island) = groups.iter_mut().find(|island| {
+                    island
+                        .clips
+                        .iter()
+                        .any(|item| item.clip.id == placement.anchor_clip_id)
+                }) else {
+                    continue;
+                };
+                island.clips.push(estimated_item(
+                    clip,
+                    placement.timeline_start.as_seconds(),
+                    &options,
+                ));
+                island.duration = island
+                    .duration
+                    .max(placement.timeline_start.as_seconds() + clip.duration.as_seconds());
+            }
             let next_id = groups.iter().map(|g| g.id as i64).max().unwrap_or(-1) + 1;
-            for (index, clip_id) in result.unmatched.iter().enumerate() {
+            for (index, clip_id) in result
+                .unmatched
+                .iter()
+                .filter(|clip_id| !estimated_ids.contains(clip_id))
+                .enumerate()
+            {
                 let Some(clip) = clips_by_id.get(clip_id) else {
                     continue;
                 };
@@ -1309,12 +1361,31 @@ impl ExportTimeline {
                 })
                 .collect(),
             unmatched_ids: result.unmatched.iter().collect(),
+            estimated_ids: result
+                .estimated_placements
+                .iter()
+                .map(|placement| &placement.clip_id)
+                .collect(),
         };
+        let imported_clip_ids: HashSet<&ClipId> =
+            imported.edits.iter().map(|edit| &edit.clip_id).collect();
         let mut imported_items: Vec<ExportItem> = imported
             .edits
             .iter()
             .filter_map(|edit| assembly.item(edit))
             .collect();
+        // Imported edit placement wins when the clip is already on the edit
+        // timeline. Estimates without an imported edit still need to appear
+        // alongside the imported sequence at their inferred synchronized
+        // position, rather than disappearing during the edit reconstruction.
+        for placement in &result.estimated_placements {
+            if imported_clip_ids.contains(&placement.clip_id) {
+                continue;
+            }
+            if let Some(item) = assembly.base_by_id.get(&placement.clip_id) {
+                imported_items.push((**item).clone());
+            }
+        }
         if imported_items.is_empty() {
             return Err(TimelineExportError::NoImportedEdits);
         }
@@ -1590,6 +1661,7 @@ impl ExportTimeline {
                 duration: item.timeline_duration,
                 confidence: item.confidence,
                 matched: !unmatched.contains(&item.clip.id),
+                estimated: item.estimated,
             })
             .collect()
     }
@@ -1956,6 +2028,7 @@ mod tests {
             },
             islands: Vec::new(),
             unmatched: vec![first.id.clone(), second.id.clone()],
+            estimated_placements: Vec::new(),
             matches: Vec::new(),
             temporal_policy: TemporalPolicy::default(),
         };
@@ -2092,6 +2165,7 @@ mod tests {
                 placements: vec![placement(&camera.id, 20.0), placement(&recorder.id, 22.0)],
             }],
             unmatched: Vec::new(),
+            estimated_placements: Vec::new(),
             matches: Vec::new(),
             temporal_policy: Default::default(),
         };
@@ -2388,6 +2462,7 @@ mod tests {
             },
             islands: Vec::new(),
             unmatched: vec![first.clip.id.clone(), second.clip.id.clone()],
+            estimated_placements: Vec::new(),
             matches: Vec::new(),
             temporal_policy: TemporalPolicy::default(),
         }
@@ -2418,9 +2493,93 @@ mod tests {
                 }],
             }],
             unmatched: Vec::new(),
+            estimated_placements: Vec::new(),
             matches: Vec::new(),
             temporal_policy: TemporalPolicy::default(),
         }
+    }
+
+    #[test]
+    fn estimated_unmatched_clip_is_exported_at_estimate_and_marked_unconfirmed() {
+        let mut result = synced_result();
+        let estimated = placed_clip("camera-take.mov", true, 0.0, 8.0);
+        let estimated_id = estimated.clip.id.clone();
+        result.project.clips.push(estimated.clip);
+        result.unmatched.push(estimated_id.clone());
+        result
+            .estimated_placements
+            .push(crate::model::EstimatedPlacement {
+                clip_id: estimated_id.clone(),
+                anchor_clip_id: result.islands[0].placements[0].clip_id.clone(),
+                timeline_start: MediaTime::seconds(80.0),
+                timestamp_delta: MediaTime::seconds(80.0),
+            });
+
+        let timeline = ExportTimeline::from_result(&result, true).expect("estimated timeline");
+        let unmatched: HashSet<ClipId> = result.unmatched.iter().cloned().collect();
+        let item = timeline
+            .preview_items(&unmatched)
+            .into_iter()
+            .find(|item| item.clip_id == estimated_id)
+            .expect("estimated clip in timeline");
+        assert_eq!(item.start, 80.0);
+        assert!(!item.matched);
+        assert!(item.estimated);
+        assert!(item.name.starts_with("[ESTIMATED]"));
+        let anchor = timeline
+            .preview_items(&unmatched)
+            .into_iter()
+            .find(|item| item.clip_id == result.islands[0].placements[0].clip_id)
+            .expect("waveform-matched anchor remains in place");
+        assert!(anchor.matched);
+        assert_eq!(anchor.start, 0.0);
+
+        result.project.imported_timeline = Some(crate::model::ImportedTimeline {
+            name: "Imported edit".into(),
+            frame_duration: MediaTime::new(1, 25),
+            edits: vec![crate::model::TimelineEdit {
+                id: "anchor-edit".into(),
+                name: Some("anchor-edit".into()),
+                clip_id: result.islands[0].placements[0].clip_id.clone(),
+                media_type: MediaKind::Audio,
+                source_in: MediaTime::seconds(0.0),
+                source_out: MediaTime::seconds(10.0),
+                timeline_start: MediaTime::seconds(0.0),
+                timeline_end: MediaTime::seconds(10.0),
+                playback_rate: 1.0,
+                plays_backward: false,
+                fcp7_time_remap_xml: None,
+                fcp7_filter_xmls: Vec::new(),
+                fcp7_retime_in: None,
+                fcp7_retime_out: None,
+                fcp7_retime_duration: None,
+                fcp7_labels_xml: None,
+                audio_source_channel: None,
+                fcpxml_audio_role: None,
+                track_index: 0,
+                audio_track_index: None,
+                enabled: true,
+                track_enabled: true,
+                track_locked: false,
+                audio_enabled: None,
+                audio_track_enabled: None,
+                audio_track_locked: None,
+                transition_after: None,
+                audio_transition_after: None,
+                linked_audio_edit: None,
+            }],
+        });
+        let imported_timeline =
+            ExportTimeline::from_result(&result, true).expect("estimated imported timeline");
+        let imported_preview = imported_timeline.preview_items(&unmatched);
+        let imported_estimate = imported_preview
+            .iter()
+            .find(|item| item.clip_id == estimated_id)
+            .expect("estimate survives imported timeline assembly");
+        assert_eq!(imported_estimate.start, 80.0);
+        assert!(!imported_estimate.matched);
+        assert!(imported_estimate.estimated);
+        assert!(imported_estimate.name.starts_with("[ESTIMATED]"));
     }
 
     #[test]

@@ -1725,6 +1725,7 @@ mod tests {
                 placements: vec![placement("cam"), placement("rec")],
             }],
             unmatched: Vec::new(),
+            estimated_placements: Vec::new(),
             matches: Vec::new(),
             temporal_policy: crate::model::TemporalPolicy::default(),
         };

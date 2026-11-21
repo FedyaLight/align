@@ -2174,7 +2174,9 @@ fn imported_preview(result: &SyncResult) -> ImportedPreview {
         .preview_items(&unmatched)
         .into_iter()
         .map(|item| {
-            let state = if unmatched.contains(&item.clip_id) {
+            let state = if item.estimated {
+                lane::BarMatchState::Estimated
+            } else if unmatched.contains(&item.clip_id) {
                 lane::BarMatchState::Unmatched
             } else {
                 lane::BarMatchState::Matched
@@ -2280,6 +2282,7 @@ mod tests {
             },
             islands: Vec::new(),
             unmatched: Vec::new(),
+            estimated_placements: Vec::new(),
             matches: Vec::new(),
             temporal_policy: Default::default(),
         }
@@ -2524,6 +2527,7 @@ mod tests {
                 placements: vec![placement("a.mov", 0.0, 10.0), placement("b.wav", 0.5, 10.0)],
             }],
             unmatched: vec![ClipId::new("c.wav")],
+            estimated_placements: Vec::new(),
             matches: vec![MatchSummary {
                 left: ClipId::new("a.mov"),
                 right: ClipId::new("b.wav"),
@@ -2929,6 +2933,7 @@ mod tests {
             },
             islands: Vec::new(),
             unmatched: Vec::new(),
+            estimated_placements: Vec::new(),
             matches: Vec::new(),
             temporal_policy: align_core::TemporalPolicy::default(),
         });
@@ -3264,6 +3269,7 @@ mod tests {
                 placements: vec![placement("camera.mov")],
             }],
             unmatched: Vec::new(),
+            estimated_placements: Vec::new(),
             matches: Vec::new(),
             temporal_policy: align_core::TemporalPolicy::default(),
         });
