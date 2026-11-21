@@ -105,6 +105,14 @@ pub struct VideoProbe {
     pub source_timecode: Option<SourceTimecode>,
 }
 
+/// Window decoder owned by one refinement pass. Dropping it releases idle readers.
+pub type WindowDecoder<'a> = Box<
+    dyn Fn(&Path, f64, f64, AudioAnalysisSource) -> Result<(f64, Vec<f32>), DecodeError>
+        + Send
+        + Sync
+        + 'a,
+>;
+
 /// The single seam between shared algorithms and OS media stacks.
 /// Both backends must honor the same contracts:
 /// 8 kHz mono stream / 16 kHz windows, adaptive-mono hysteresis 0.9,
@@ -128,6 +136,12 @@ pub trait MediaBackend: Send + Sync {
         duration_seconds: f64,
         source: AudioAnalysisSource,
     ) -> Result<(f64, Vec<f32>), DecodeError>;
+
+    fn window_decoder(&self) -> WindowDecoder<'_> {
+        Box::new(|path, start, duration, source| {
+            self.decode_window_16k(path, start, duration, source)
+        })
+    }
 
     /// Full-rate discrete-channel streaming (render path): planar `f32`
     /// blocks at the source rate. `range`: optional (start, duration);

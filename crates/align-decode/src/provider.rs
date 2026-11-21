@@ -9,10 +9,10 @@ use std::path::PathBuf;
 
 use align_core::{AudioAnalysisSource, AudioWindow, ClipId, FINE_SAMPLE_RATE, WindowProvider};
 
-use crate::backend::MediaBackend;
+use crate::backend::WindowDecoder;
 
 pub struct BackendWindowProvider<'a> {
-    pub backend: &'a dyn MediaBackend,
+    pub decode: WindowDecoder<'a>,
     pub clips: HashMap<ClipId, PathBuf>,
 }
 
@@ -25,10 +25,7 @@ impl<'a> WindowProvider for BackendWindowProvider<'a> {
         source: AudioAnalysisSource,
     ) -> Option<AudioWindow> {
         let path = self.clips.get(clip)?;
-        let (actual_start, samples) = self
-            .backend
-            .decode_window_16k(path, start, duration, source)
-            .ok()?;
+        let (actual_start, samples) = (self.decode)(path, start, duration, source).ok()?;
         Some(AudioWindow {
             start: actual_start,
             sample_rate: FINE_SAMPLE_RATE,

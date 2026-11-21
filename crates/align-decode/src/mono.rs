@@ -123,15 +123,19 @@ where
 
     /// Push owned planar channels.
     pub fn push_owned(&mut self, planes: &[Vec<f32>]) -> Result<(), DecodeError> {
-        self.planar(planes)
+        self.planar_from(planes, 0)
     }
 
     /// Push planar channels (Symphonia AudioBuffer channel slices).
     pub fn push_planar(&mut self, planes: &[&[f32]]) -> Result<(), DecodeError> {
-        self.planar(planes)
+        self.planar_from(planes, 0)
     }
 
-    fn planar<P: AsRef<[f32]>>(&mut self, planes: &[P]) -> Result<(), DecodeError> {
+    pub(crate) fn planar_from<P: AsRef<[f32]>>(
+        &mut self,
+        planes: &[P],
+        mut start: usize,
+    ) -> Result<(), DecodeError> {
         if planes.len() != self.channels {
             return Err(DecodeError::InvalidPcm);
         }
@@ -139,15 +143,15 @@ where
         if self.mix_channels {
             let scale = 1.0 / self.channels as f32;
             return self.push_mono(
-                (0..n).map(|i| planes.iter().map(|plane| plane.as_ref()[i]).sum::<f32>() * scale),
+                (start..n)
+                    .map(|i| planes.iter().map(|plane| plane.as_ref()[i]).sum::<f32>() * scale),
             );
         }
         if self.explicit.is_some() || self.channels == 1 {
             let channel = self.explicit.unwrap_or(0);
             self.selected = Some(channel);
-            return self.push_mono(planes[channel].as_ref()[..n].iter().copied());
+            return self.push_mono(planes[channel].as_ref()[start..n].iter().copied());
         }
-        let mut start = 0;
         while start < n {
             let needed = 512 - self.adaptive_pending.len() / self.channels;
             let end = (start + needed).min(n);

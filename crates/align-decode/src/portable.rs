@@ -214,6 +214,26 @@ impl MediaBackend for PortableBackend {
         duration_seconds: f64,
         source: AudioAnalysisSource,
     ) -> Result<(f64, Vec<f32>), DecodeError> {
+        self.window(None, path, start_seconds, duration_seconds, source)
+    }
+
+    fn window_decoder(&self) -> crate::backend::WindowDecoder<'_> {
+        let readers = crate::sym::WindowReaders::default();
+        Box::new(move |path, start, duration, source| {
+            self.window(Some(&readers), path, start, duration, source)
+        })
+    }
+}
+
+impl PortableBackend {
+    fn window(
+        &self,
+        readers: Option<&crate::sym::WindowReaders>,
+        path: &Path,
+        start_seconds: f64,
+        duration_seconds: f64,
+        source: AudioAnalysisSource,
+    ) -> Result<(f64, Vec<f32>), DecodeError> {
         if source == AudioAnalysisSource::AllMixed {
             let stream_count = self.inspect(path)?.audio_streams.len();
             return crate::mix::decode_all_streams_window_16k(
@@ -224,7 +244,13 @@ impl MediaBackend for PortableBackend {
                 duration_seconds,
             );
         }
-        match crate::sym::decode_window(path, start_seconds, duration_seconds, source) {
+        match crate::sym::window_with_readers(
+            readers,
+            path,
+            start_seconds,
+            duration_seconds,
+            source,
+        ) {
             Ok(win) => Ok(win),
             Err(_) => {
                 let probe = self.audio_probe(path)?;

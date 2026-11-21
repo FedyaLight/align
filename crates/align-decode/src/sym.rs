@@ -489,21 +489,33 @@ impl AudioReader {
             consume,
         )?;
         let mut skip = stream.lead;
-        loop {
-            match decode_packet_planes(&mut stream)? {
-                None => break,
-                Some(mut planes) => {
-                    trim_native_packet(&mut planes, &mut skip, None);
-                    pipe.push_owned(&planes)?;
-                }
-            }
-        }
+        while push_analysis_packet(&mut stream, &mut skip, &mut pipe)? {}
         pipe.finish()
     }
 }
 
+struct Cached {
+    path: std::path::PathBuf,
+    revision: String,
+    index: usize,
+    stream: Box<Stream>,
+}
+
+#[derive(Default)]
+pub(crate) struct WindowReaders(std::sync::Mutex<std::collections::VecDeque<Cached>>);
+
 /// Decode one 16 kHz window (refine path). Returns actual start + samples.
 pub fn decode_window(
+    path: &Path,
+    start: f64,
+    duration: f64,
+    source: AudioAnalysisSource,
+) -> Result<(f64, Vec<f32>), DecodeError> {
+    window_with_readers(None, path, start, duration, source)
+}
+
+pub(crate) fn window_with_readers(
+    readers: Option<&WindowReaders>,
     path: &Path,
     start: f64,
     duration: f64,
@@ -519,18 +531,10 @@ pub fn decode_window(
     if let Some(reader) = AudioReader::pcm(path, source.stream_index()) {
         return reader.decode_window(start, duration, source);
     }
-    struct Cached {
-        path: std::path::PathBuf,
-        revision: String,
-        index: usize,
-        stream: Box<Stream>,
-    }
-    static IDLE: std::sync::Mutex<std::collections::VecDeque<Cached>> =
-        std::sync::Mutex::new(std::collections::VecDeque::new());
     let index = source.stream_index();
-    let revision = align_core::cache::media_revision(path).ok();
+    let revision = readers.and_then(|_| align_core::cache::media_revision(path).ok());
     let cached = revision.as_ref().and_then(|rev| {
-        let mut idle = IDLE.lock().unwrap();
+        let mut idle = readers?.0.lock().unwrap();
         let pos = idle
             .iter()
             .position(|c| c.path == path && c.index == index && c.revision == *rev)?;
@@ -562,11 +566,11 @@ pub fn decode_window(
         return AudioReader::open(path, index)?.decode_window(start, duration, source);
     }
     let result = codec_window(&mut stream, actual_start, duration, source)?;
-    if let Some(revision) = revision
+    if let (Some(readers), Some(revision)) = (readers, revision)
         && stream.timing_checked
         && align_core::cache::media_revision(path).ok().as_ref() == Some(&revision)
     {
-        let mut idle = IDLE.lock().unwrap();
+        let mut idle = readers.0.lock().unwrap();
         if idle.len() == 4 {
             idle.pop_front();
         }
@@ -643,49 +647,64 @@ fn codec_window(
     )?;
     // Pre-roll and seek-packet lead are discarded: the window starts at the
     // requested sample.
-    loop {
-        if samples.borrow().len() >= want {
-            break;
-        }
-        match decode_packet_planes(stream)? {
-            None => break,
-            Some(mut planes) => {
-                trim_native_packet(&mut planes, &mut skip, None);
-                pipe.push_owned(&planes)?;
-            }
-        }
-    }
+    while samples.borrow().len() < want && push_analysis_packet(stream, &mut skip, &mut pipe)? {}
     pipe.finish()?;
     let mut samples = samples.into_inner();
     samples.truncate(want);
     Ok((actual_start, samples))
 }
 
-/// Decode one packet into owned planar f32 channels. Owned (not borrowed)
-/// so packet scratch can be reused without lifetime gymnastics; packets
-/// are small (≤ a few thousand frames) and everything else stays
-/// allocation-free.
-fn decode_packet_planes(stream: &mut Stream) -> Result<Option<Vec<Vec<f32>>>, DecodeError> {
-    use symphonia::core::audio::Signal;
+/// Visit the decoder's planes before the next packet can overwrite them.
+fn visit_packet(
+    stream: &mut Stream,
+    consume: impl FnOnce(&[&[f32]]) -> Result<(), DecodeError>,
+) -> Result<bool, DecodeError> {
     match decode_next(stream)? {
-        Step::End => Ok(None),
-        Step::Silence(frames) => Ok(Some(silence(stream, frames, 0.0))),
+        Step::End => return Ok(false),
+        Step::Silence(frames) => {
+            let zeros = vec![0.; frames];
+            let channels = if stream.last_channels == 0 {
+                stream.channels
+            } else {
+                stream.last_channels
+            };
+            consume(&vec![zeros.as_slice(); channels])?;
+        }
         Step::Decoded => {
             let decoded = stream.decoder.last_decoded();
-            let spec = *decoded.spec();
-            if stream.scratch_spec != Some(spec) || stream.scratch_cap != decoded.capacity() {
-                stream.scratch = decoded.make_equivalent::<f32>();
-                stream.scratch_spec = Some(spec);
-                stream.scratch_cap = decoded.capacity();
+            if decoded.frames() == 0 {
+                return Ok(true);
             }
-            decoded.convert(&mut stream.scratch);
-            Ok(Some(
-                (0..spec.channels.count())
-                    .map(|ch| stream.scratch.chan(ch).to_vec())
-                    .collect(),
-            ))
+            let planes = match &decoded {
+                symphonia::core::audio::AudioBufferRef::F32(buffer) => buffer.planes(),
+                _ => {
+                    let spec = *decoded.spec();
+                    if stream.scratch_spec != Some(spec) || stream.scratch_cap != decoded.capacity()
+                    {
+                        stream.scratch = decoded.make_equivalent::<f32>();
+                        stream.scratch_spec = Some(spec);
+                        stream.scratch_cap = decoded.capacity();
+                    }
+                    decoded.convert(&mut stream.scratch);
+                    stream.scratch.planes()
+                }
+            };
+            consume(planes.planes())?;
         }
     }
+    Ok(true)
+}
+
+fn push_analysis_packet<F: FnMut(&[f32]) -> Result<(), DecodeError>>(
+    stream: &mut Stream,
+    skip: &mut u64,
+    pipe: &mut crate::mono::MonoPipe<F>,
+) -> Result<bool, DecodeError> {
+    visit_packet(stream, |planes| {
+        let lead = (*skip).min(planes.first().map_or(0, |p| p.len()) as u64);
+        *skip -= lead;
+        pipe.planar_from(planes, lead as usize)
+    })
 }
 
 // ------------------------------------------------------------ native render path
@@ -777,24 +796,28 @@ impl AudioReader {
             if limit_frames.is_some_and(|lim| emitted >= lim) {
                 break;
             }
-            match decode_packet_planes(&mut stream)? {
-                None => break,
-                Some(mut planes) => {
-                    trim_native_packet(
-                        &mut planes,
-                        &mut skip,
-                        limit_frames.map(|n| n.saturating_sub(emitted)),
-                    );
-                    if planes.first().is_none_or(Vec::is_empty) {
-                        continue;
-                    }
-                    emitted += planes.first().map_or(0, |p| p.len() as u64);
+            let rate = stream.sample_rate as f64;
+            let channels = stream.channels;
+            if !visit_packet(&mut stream, |planes| {
+                let frames = planes.first().map_or(0, |p| p.len());
+                let lead = skip.min(frames as u64) as usize;
+                skip -= lead as u64;
+                let take = (frames - lead) as u64;
+                let take = limit_frames.map_or(take, |limit| take.min(limit - emitted));
+                if take > 0 {
+                    emitted += take;
                     consume(crate::backend::NativeBlock {
-                        sample_rate: stream.sample_rate as f64,
-                        channels: stream.channels,
-                        frames: planes,
+                        sample_rate: rate,
+                        channels,
+                        frames: planes
+                            .iter()
+                            .map(|p| p[lead..lead + take as usize].to_vec())
+                            .collect(),
                     })?;
                 }
+                Ok(())
+            })? {
+                break;
             }
         }
         Ok(wanted / stream.sample_rate as f64)
@@ -1222,6 +1245,59 @@ mod damaged_packet_tests {
         );
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn completed_aac_window_releases_the_source_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(clip) = aac_noise(dir.path(), "release.mp4", 18) else {
+            return;
+        };
+        {
+            use crate::backend::MediaBackend;
+            let decode = crate::portable::PortableBackend.window_decoder();
+            decode(&clip, 1.0, 0.5, AudioAnalysisSource::default()).unwrap();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let status = std::process::Command::new("/usr/sbin/lsof")
+                .args(["-a", "-p", &std::process::id().to_string(), "--"])
+                .arg(&clip)
+                .output()
+                .unwrap();
+            assert_eq!(
+                status.status.code(),
+                Some(1),
+                "{}",
+                String::from_utf8_lossy(&status.stdout)
+            );
+            assert!(
+                status.stderr.is_empty(),
+                "{}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let path = clip.canonicalize().unwrap();
+            assert!(
+                !std::fs::read_dir("/proc/self/fd")
+                    .unwrap()
+                    .flatten()
+                    .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+                    .any(|target| target == path)
+            );
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(clip)
+                .unwrap();
+        }
+    }
+
     /// HE-AAC decodes to half the samples each packet records, because
     /// Symphonia has no SBR. Doubling the packet durations of AAC-LC gives
     /// Symphonia the same mismatch without an HE-AAC encoder.
@@ -1232,11 +1308,25 @@ mod damaged_packet_tests {
             return;
         };
         assert!(can_decode(&clip, 0));
-        // A successful later window can leave an idle demuxer for this path.
-        decode_window(&clip, 1.0, 0.5, AudioAnalysisSource::default()).unwrap();
+        let readers = WindowReaders::default();
+        window_with_readers(
+            Some(&readers),
+            &clip,
+            1.0,
+            0.5,
+            AudioAnalysisSource::default(),
+        )
+        .unwrap();
         double_packet_durations(&clip);
         assert!(!can_decode(&clip, 0), "FFmpeg decodes it");
-        let error = decode_window(&clip, 1.0, 1.0, AudioAnalysisSource::default()).unwrap_err();
+        let error = window_with_readers(
+            Some(&readers),
+            &clip,
+            1.0,
+            1.0,
+            AudioAnalysisSource::default(),
+        )
+        .unwrap_err();
         assert!(
             error.to_string().contains("samples a packet records"),
             "{error}"

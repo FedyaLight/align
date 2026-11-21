@@ -465,7 +465,7 @@ impl Pipeline {
             .map(|c| (c.id.clone(), c.url.clone()))
             .collect();
         let provider = BackendWindowProvider {
-            backend: &*self.backend,
+            decode: self.backend.window_decoder(),
             clips: clip_paths,
         };
         if let Some(p) = &progress {
