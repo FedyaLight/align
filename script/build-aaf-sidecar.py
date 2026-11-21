@@ -216,7 +216,15 @@ def main():
         archive = sources / f'Python-{version}.tar.xz'
         download(f'https://www.python.org/ftp/python/{version}/{archive.name}', archive)
         native = collect_native_sources(sources, licenses, archive, version, bundled_binaries)
-        (sources / 'versions.json').write_text(json.dumps({
+        manifest = sources / 'versions.json'
+        if manifest.is_file():
+            previous = json.loads(manifest.read_text())['native_libraries']
+            for name in ('bzip2', 'xz'):
+                version_before = previous.get(name)
+                if name not in native and version_before and re.fullmatch(r'[0-9.]+', version_before):
+                    # Remove the generated archive recorded by the earlier build.
+                    (sources / f'{name}-{version_before}.tar.gz').unlink(missing_ok=True)
+        manifest.write_text(json.dumps({
             **packages, 'python': sys.version, 'platform': sys.platform,
             'bundled_binaries': bundled_binaries, 'native_libraries': native,
         }, indent=2) + '\n')
