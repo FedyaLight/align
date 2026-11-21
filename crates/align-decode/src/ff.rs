@@ -394,18 +394,17 @@ fn cached_video_timing(
         ))
     });
     let cache = align_core::FingerprintCache::with_backend(None, "portable-timing1");
-    if let Some(decoder) = &decoder
-        && let Some(timing) = cache.load_video_timing(path, decoder)
-    {
+    let entry = decoder.and_then(|id| cache.video_timing_entry(path, &id));
+    if let Some(timing) = entry.as_ref().and_then(|e| e.load()) {
         return Ok(timing);
     }
     let timing = video_timing_uncached(path, &bin, frame_duration(&bin)?)?;
     // A scan racing a media rewrite must not publish a cached classification.
     if revision.is_some()
         && revision == media_revision(path)
-        && let Some(decoder) = &decoder
+        && let Some(entry) = entry
     {
-        cache.save_video_timing(path, decoder, timing);
+        entry.save(timing);
     }
     Ok(timing)
 }

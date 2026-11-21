@@ -254,10 +254,10 @@ impl Track {
 
     /// Nominal rate as FFmpeg derives it: samples per summed decode time.
     fn average_rate(&self) -> Option<f64> {
-        let total: u64 = self
+        let total: u128 = self
             .time_to_sample
             .iter()
-            .map(|&(n, d)| n as u64 * d as u64)
+            .map(|&(n, d)| u128::from(n) * u128::from(d))
             .sum();
         (total > 0 && self.timescale > 0)
             .then(|| self.sample_count() as f64 * self.timescale as f64 / total as f64)
@@ -266,6 +266,9 @@ impl Track {
     /// Presentation timing without decoding: decode deltas plus
     /// composition offsets, classified exactly like the FFmpeg packet walk.
     fn timing_mode(&self) -> align_core::VideoFrameRateMode {
+        if self.composition_offsets.is_empty() {
+            return decode_time_mode(self.timescale, &self.time_to_sample);
+        }
         let scale = self.timescale as f64;
         let mut timing = PacketTiming::default();
         let mut offsets = self
@@ -284,6 +287,31 @@ impl Track {
     }
 }
 
+// Without composition offsets every positive PTS spacing is already a
+// sample duration. Work in ticks: subtracting rounded absolute timestamps
+// can turn an exact threshold into a spurious VFR classification.
+fn decode_time_mode(timescale: u32, runs: &[(u32, u32)]) -> align_core::VideoFrameRateMode {
+    use align_core::VideoFrameRateMode;
+    let mut samples = 0u32;
+    let (mut min, mut max) = (u32::MAX, 0);
+    for &(count, delta) in runs {
+        if count > 0 && delta > 0 {
+            samples = samples.saturating_add(count);
+            min = min.min(delta);
+            max = max.max(delta);
+        }
+    }
+    if timescale == 0 || samples < 2 {
+        return VideoFrameRateMode::Unknown;
+    }
+    let spread = u64::from(max - min);
+    if spread * 100_000 > u64::from(timescale) && spread * 200 > u64::from(min) {
+        VideoFrameRateMode::Variable
+    } else {
+        VideoFrameRateMode::Constant
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Movie {
     header_bytes: usize,
@@ -298,6 +326,26 @@ impl Movie {
     pub(crate) fn small_header(&self) -> bool {
         self.header_bytes <= 4 * 1024 * 1024
     }
+    fn retained_bytes(&self) -> usize {
+        size_of::<Movie>()
+            + self.tracks.capacity() * size_of::<Track>()
+            + self
+                .tracks
+                .iter()
+                .map(|t| {
+                    t.sample_entry.capacity()
+                        + t.time_to_sample.capacity() * size_of::<(u32, u32)>()
+                        + t.composition_offsets.capacity() * size_of::<(u32, i32)>()
+                        + t.chunk_runs.capacity() * size_of::<ChunkRun>()
+                        + t.chunk_offsets.capacity() * size_of::<u64>()
+                        + match &t.sample_sizes {
+                            SampleSizes::Constant { .. } => 0,
+                            SampleSizes::Table(v) => v.capacity() * size_of::<u32>(),
+                        }
+                })
+                .sum::<usize>()
+    }
+
     pub fn duration_seconds(&self) -> f64 {
         if self.timescale == 0 {
             return 0.0;
@@ -441,15 +489,16 @@ fn read_movie(file: &mut File, moov: &[u8]) -> Option<Movie> {
 }
 
 /// Share parsed tables across windows without holding media handles. The
-/// moov size bounds all parsed table lengths (32-bit offsets expand to u64).
-/// Large headers remain supported and simply bypass retention.
+/// budget covers parsed table allocations, including expanded chunk offsets.
 pub(crate) fn shared_movie(path: &Path) -> Option<std::sync::Arc<Movie>> {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+    const TABLE_BUDGET: usize = 32 * 1024 * 1024;
     struct Entry {
         path: std::path::PathBuf,
         revision: String,
         movie: Arc<Movie>,
+        bytes: usize,
     }
     static CACHE: Mutex<VecDeque<Entry>> = Mutex::new(VecDeque::new());
     let revision = align_core::cache::media_revision(path).ok();
@@ -458,29 +507,41 @@ pub(crate) fn shared_movie(path: &Path) -> Option<std::sync::Arc<Movie>> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     };
-    if let Some(revision) = &revision
-        && let Some(entry) = cache()
+    if let Some(revision) = &revision {
+        let mut cache = cache();
+        if let Some(i) = cache
             .iter()
-            .find(|e| e.path == path && &e.revision == revision)
-    {
-        return Some(entry.movie.clone());
+            .position(|e| e.path == path && &e.revision == revision)
+        {
+            let entry = cache.remove(i)?;
+            let movie = entry.movie.clone();
+            cache.push_back(entry);
+            return Some(movie);
+        }
     }
     let mut file = File::open(path).ok()?;
+    let revision = align_core::cache::opened_media_revision(&file).ok();
     let moov = read_moov(&mut file)?;
     let movie = Arc::new(read_movie(&mut file, &moov)?);
-    if movie.small_header()
+    let bytes = movie.retained_bytes()
+        + path.as_os_str().len()
+        + size_of::<Entry>()
+        + revision.as_ref().map_or(0, String::capacity);
+    if bytes <= TABLE_BUDGET
         && let Some(revision) = revision
         && align_core::cache::media_revision(path).ok().as_ref() == Some(&revision)
     {
         let mut cache = cache();
         cache.retain(|e| e.path != path);
-        if cache.len() == 8 {
-            cache.pop_front();
+        let mut total = bytes + cache.iter().map(|e| e.bytes).sum::<usize>();
+        while cache.len() >= 128 || total > TABLE_BUDGET {
+            total -= cache.pop_front().expect("new movie fits the budget").bytes;
         }
         cache.push_back(Entry {
             path: path.to_owned(),
             revision,
             movie: movie.clone(),
+            bytes,
         });
     }
     Some(movie)
@@ -583,18 +644,18 @@ pub fn ama_metadata(path: &Path) -> Option<serde_json::Value> {
 
 impl Track {
     fn average_rate_fraction(&self) -> Option<String> {
-        let total: u64 = self
+        let total: u128 = self
             .time_to_sample
             .iter()
-            .map(|&(n, d)| n as u64 * d as u64)
+            .map(|&(n, d)| u128::from(n) * u128::from(d))
             .sum();
-        let frames = self.sample_count() * self.timescale as u64;
+        let frames = u128::from(self.sample_count()) * u128::from(self.timescale);
         let divisor = gcd(frames, total);
         (divisor > 0).then(|| format!("{}/{}", frames / divisor, total / divisor))
     }
 }
 
-fn gcd(mut a: u64, mut b: u64) -> u64 {
+fn gcd(mut a: u128, mut b: u128) -> u128 {
     while b != 0 {
         (a, b) = (b, a % b);
     }
@@ -1281,6 +1342,20 @@ mod tests {
     }
 
     #[test]
+    fn decode_time_runs_use_exact_frame_rate_tolerances() {
+        use VideoFrameRateMode::{Constant, Unknown, Variable};
+        for (scale, runs, expected) in [
+            (1_000_000, &[(u32::MAX, 2000), (3, 2010)][..], Constant),
+            (1_000_000, &[(1, 2000), (1, 2011)], Variable),
+            (1_000_000, &[(1, 100), (1, 110)], Constant),
+            (1_000_000, &[(0, 50), (3, 0), (1, 90)], Unknown),
+            (0, &[(u32::MAX, 2000)], Unknown),
+        ] {
+            assert_eq!(decode_time_mode(scale, runs), expected);
+        }
+    }
+
+    #[test]
     fn variable_frame_timing_is_classified_from_sample_tables() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("vfr.mp4");
@@ -1332,6 +1407,23 @@ mod tests {
         ) {
             let report = inspect(&output).expect("video-only probe");
             assert!(report.has_video && report.audio_streams.is_empty());
+            // A same-length replacement can restore the original mtime.
+            let stamp = std::fs::metadata(&output).unwrap().modified().unwrap();
+            let mut bytes = std::fs::read(&output).unwrap();
+            let tkhd = bytes.windows(4).position(|w| w == b"tkhd").unwrap();
+            let length = u32::from_be_bytes(bytes[tkhd - 4..tkhd].try_into().unwrap()) as usize;
+            let width = tkhd - 4 + length - 8;
+            bytes[width..width + 4].copy_from_slice(&(128u32 << 16).to_be_bytes());
+            let replacement = dir.path().join("replacement.mov");
+            std::fs::write(&replacement, bytes).unwrap();
+            File::options()
+                .write(true)
+                .open(&replacement)
+                .unwrap()
+                .set_modified(stamp)
+                .unwrap();
+            std::fs::rename(replacement, &output).unwrap();
+            assert_eq!(inspect(&output).unwrap().video.unwrap().width, 128);
         }
         let junk = dir.path().join("junk.mov");
         std::fs::write(&junk, b"\0\0\0\x10ftypqt  \0\0\0\0garbage").unwrap();
