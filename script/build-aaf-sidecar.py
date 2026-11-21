@@ -52,27 +52,37 @@ def native_version(module, symbol, windows_source, pattern):
         return match.group(1)
 
 
-def collect_native_sources(sources, licenses, python_archive, python_version):
-    import _bz2
-    import _lzma
+def collect_native_sources(sources, licenses, python_archive, python_version, bundled_binaries):
+    # Frozen extensions can contain static copies (notably on Windows).
+    # A built-in module lives inside the shipped libpython even if excluded
+    # from PyInstaller imports. Also account for standalone shared libraries.
+    if not bundled_binaries:
+        raise RuntimeError('Missing PyInstaller binary inventory for release sources')
+    binaries = [Path(b['name']).name.lower() for b in bundled_binaries]
+    names = [*binaries, *sys.builtin_module_names]
+
     with tarfile.open(python_archive) as tar:
         prefix = f'Python-{python_version}/'
         windows_source = tar.extractfile(prefix + 'PCbuild/get_externals.bat').read().decode()
         (licenses / 'Python-ThirdParty.txt').write_bytes(
             tar.extractfile(prefix + 'Doc/license.rst').read())
-    bz = native_version(_bz2, 'BZ2_bzlibVersion', windows_source, r'bzip2-([0-9.]+)')
-    xz = native_version(_lzma, 'lzma_version_string', windows_source, r'xz-([0-9.]+)')
     openssl = ssl.OPENSSL_VERSION.split()[1]
     z = zlib.ZLIB_RUNTIME_VERSION
-    components = [
-        ('bzip2', bz, f'https://sourceware.org/pub/bzip2/bzip2-{bz}.tar.gz'),
-        # tukaani.org is often unreachable from CI runners; SourceForge is the
-        # project's official mirror and serves byte-identical archives.
-        ('xz', xz, [f'https://tukaani.org/xz/xz-{xz}.tar.gz',
-                    f'https://downloads.sourceforge.net/project/lzmautils/xz-{xz}.tar.gz']),
+    components = []
+    if any(name.startswith(('_bz2', 'libbz2', 'bz2.', 'bz2-', 'bzip2')) for name in names):
+        import _bz2
+        bz = native_version(_bz2, 'BZ2_bzlibVersion', windows_source, r'bzip2-([0-9.]+)')
+        components.append(('bzip2', bz, f'https://sourceware.org/pub/bzip2/bzip2-{bz}.tar.gz'))
+    if any(name.startswith(('_lzma', 'liblzma', 'lzma.', 'lzma-')) for name in names):
+        import _lzma
+        xz = native_version(_lzma, 'lzma_version_string', windows_source, r'xz-([0-9.]+)')
+        components.append(('xz', xz, [f'https://tukaani.org/xz/xz-{xz}.tar.gz',
+                                      f'https://downloads.sourceforge.net/project/lzmautils/xz-{xz}.tar.gz']))
+    # _hashlib and the bootloader/runtime use OpenSSL and zlib respectively.
+    components.extend([
         ('openssl', openssl, f'https://www.openssl.org/source/openssl-{openssl}.tar.gz'),
         ('zlib', z, f'https://zlib.net/fossils/zlib-{z}.tar.gz'),
-    ]
+    ])
     for name, version, url in components:
         archive = sources / f'{name}-{version}.tar.gz'
         download(url, archive)
@@ -205,7 +215,7 @@ def main():
         version = '.'.join(map(str, sys.version_info[:3]))
         archive = sources / f'Python-{version}.tar.xz'
         download(f'https://www.python.org/ftp/python/{version}/{archive.name}', archive)
-        native = collect_native_sources(sources, licenses, archive, version)
+        native = collect_native_sources(sources, licenses, archive, version, bundled_binaries)
         (sources / 'versions.json').write_text(json.dumps({
             **packages, 'python': sys.version, 'platform': sys.platform,
             'bundled_binaries': bundled_binaries, 'native_libraries': native,
