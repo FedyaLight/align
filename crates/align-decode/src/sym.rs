@@ -335,6 +335,11 @@ fn open_stream(path: &Path, stream_index: usize) -> Result<Stream, DecodeError> 
         .then(|| crate::isobmff::shared_movie(path))
         .flatten();
     let movie_track = movie.as_ref().and_then(|m| m.tracks.get(track.id as usize));
+    if movie_track.is_some_and(|t| t.signals_sbr()) {
+        return Err(DecodeError::Symphonia(
+            "AAC spectral band replication requires a full decoder".into(),
+        ));
+    }
     let channels = track
         .codec_params
         .channels
@@ -1331,6 +1336,40 @@ mod damaged_packet_tests {
             error.to_string().contains("samples a packet records"),
             "{error}"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn core_rate_he_aac_is_rejected_before_emitting_any_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let pcm = dir.path().join("source.wav");
+        let mut writer = hound::WavWriter::create(
+            &pcm,
+            hound::WavSpec {
+                channels: 2,
+                sample_rate: 44100,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for i in 0..88200 {
+            writer.write_sample((i % 2048) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        let encoded = dir.path().join("core-rate.m4a");
+        assert!(
+            std::process::Command::new("/usr/bin/afconvert")
+                .args(["-f", "m4af", "-d", "aach", "-b", "48000"])
+                .arg(pcm)
+                .arg(&encoded)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // 1024 samples at the core rate fit the packet duration. Only the
+        // AudioSpecificConfig signals the higher-rate output and SBR.
+        assert!(!can_decode(&encoded, 0));
     }
 
     /// Symphonia's AIFF reader can record a couple more frames for the final

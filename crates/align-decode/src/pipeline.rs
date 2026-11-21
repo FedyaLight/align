@@ -617,6 +617,11 @@ impl Pipeline {
         })
     }
 
+    fn decoder_cache(&self, path: &Path) -> Option<FingerprintCache> {
+        (self.backend.kind() == BackendKind::Portable && crate::isobmff::has_sbr_audio(path))
+            .then(|| self.cache.decoder_variant("full-sbr"))
+    }
+
     fn decode_worker_cap<'a>(&self, mut paths: impl Iterator<Item = &'a Path>) -> usize {
         // AVFoundation uses blocking native readers with four reservations.
         // Other video containers need external decoders with their own threads.
@@ -756,7 +761,8 @@ impl Pipeline {
             .is_some()
             || audio.iter().any(|a| a.source_timecode.is_some());
         if !has_timecode && !audio.is_empty() {
-            let entry = self.cache.ltc_entry(url);
+            let cache = self.decoder_cache(url);
+            let entry = cache.as_ref().unwrap_or(&self.cache).ltc_entry(url);
             let cached = entry
                 .as_ref()
                 .and_then(|e| e.load())
@@ -975,11 +981,13 @@ impl Pipeline {
                 };
             let mut variants = Vec::with_capacity(sources.len());
             let mut failure = None;
+            let decoder_cache = self.decoder_cache(&clip.url);
+            let cache = decoder_cache.as_ref().unwrap_or(&self.cache);
             let sample = align_core::cache::MediaSample::read(&clip.url).ok();
             for source in sources {
                 let variant = (|| -> Result<Variant, PipelineError> {
                     let cache_key = accuracy.cache_key(&source.cache_key());
-                    let entry = sample.as_ref().map(|s| self.cache.entry(s, &cache_key));
+                    let entry = sample.as_ref().map(|s| cache.entry(s, &cache_key));
                     if let Some((entry, cached)) = entry.as_ref().and_then(|e| Some((e, e.load()?)))
                     {
                         let waveform = if generate_waveform_previews {

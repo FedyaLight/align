@@ -176,6 +176,14 @@ impl FingerprintCache {
         }
     }
 
+    /// Keep unaffected generations readable when a decoder changes for one codec.
+    pub fn decoder_variant(&self, variant: &str) -> Self {
+        Self {
+            dir: self.dir.clone(),
+            backend_tag: format!("{}:{variant}", self.backend_tag),
+        }
+    }
+
     pub fn statistics(&self) -> CacheStatistics {
         let mut st = CacheStatistics::default();
         let Ok(entries) = std::fs::read_dir(&self.dir) else {

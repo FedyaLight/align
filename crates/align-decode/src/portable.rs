@@ -31,6 +31,9 @@ impl PortableBackend {
     /// Decode needs audio format headers only. Full video timing inspection
     /// belongs to import, never to each audio window or render block.
     fn audio_probe(&self, path: &Path) -> Result<ProbeReport, DecodeError> {
+        if is_video_container(path) && crate::isobmff::has_sbr_audio(path) {
+            return crate::ff::inspect(path);
+        }
         if is_video_container(path) {
             crate::isobmff::inspect_audio(path).map_or_else(|| crate::ff::inspect(path), Ok)
         } else {
@@ -139,6 +142,19 @@ impl MediaBackend for PortableBackend {
     }
 
     fn inspect(&self, path: &Path) -> Result<ProbeReport, DecodeError> {
+        // The sample entry can describe the AAC core alone. Ask the full
+        // decoder for the output channel layout and rate (also used by LTC).
+        if crate::isobmff::has_sbr_audio(path) {
+            let mut probe = crate::ff::inspect(path)?;
+            if is_video_container(path) {
+                if let Some(header) = crate::isobmff::inspect(path) {
+                    probe.video = header.video;
+                } else {
+                    return crate::ff::inspect_full(path);
+                }
+            }
+            return Ok(probe);
+        }
         if is_video_container(path) {
             // QuickTime/MP4 headers natively; other containers through
             // ffprobe (headers + packet-timing walk + timecode tag).

@@ -213,6 +213,13 @@ impl SampleSizes {
 }
 
 impl Track {
+    pub(crate) fn signals_sbr(&self) -> bool {
+        if &self.codec != b"mp4a" {
+            return false;
+        }
+        aac_config(&self.sample_entry).is_some_and(|config| signals_sbr(config).unwrap_or(false))
+    }
+
     pub fn sample_count(&self) -> u64 {
         self.time_to_sample.iter().map(|&(n, _)| n as u64).sum()
     }
@@ -545,6 +552,14 @@ pub(crate) fn shared_movie(path: &Path) -> Option<std::sync::Arc<Movie>> {
         });
     }
     Some(movie)
+}
+
+pub(crate) fn has_sbr_audio(path: &Path) -> bool {
+    (is_candidate(path)
+        || path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("m4a")))
+        && shared_movie(path).is_some_and(|m| m.audio().any(Track::signals_sbr))
 }
 
 /// Header probe for the portable backend; `None` means "ask FFmpeg".
@@ -1038,6 +1053,85 @@ fn parse_trak(trak: &[u8]) -> Option<Track> {
         chunk_runs,
         chunk_offsets,
     })
+}
+
+// MPEG-4 descriptors use up to four 7-bit groups for a payload length.
+fn descriptor<'a>(mut bytes: Bytes<'a>, tag: u8) -> Option<Bytes<'a>> {
+    while bytes.remaining() > 0 {
+        let kind = bytes.u8()?;
+        let mut size = 0;
+        for group in 0..4 {
+            let part = bytes.u8()?;
+            size = (size << 7) | usize::from(part & 0x7f);
+            if part & 0x80 == 0 {
+                let body = bytes.take(size)?;
+                if kind == tag {
+                    return Some(Bytes::new(body));
+                }
+                break;
+            }
+            if group == 3 {
+                return None;
+            }
+        }
+    }
+    None
+}
+
+fn aac_config(sample_entry: &[u8]) -> Option<&[u8]> {
+    let entry = atoms(sample_entry).next()?;
+    let extensions = match entry.body.get(8..10)? {
+        [0, 0] => entry.body.get(28..)?,
+        [0, 1] => entry.body.get(44..)?,
+        _ => return None,
+    };
+    let esds =
+        child(extensions, b"esds").or_else(|| child(child(extensions, b"wave")?.body, b"esds"))?;
+    let mut es = descriptor(full_box(esds.body)?.1, 3)?;
+    es.skip(2)?; // ES_ID
+    let flags = es.u8()?;
+    if flags & 0x80 != 0 {
+        es.skip(2)?;
+    }
+    if flags & 0x40 != 0 {
+        let length = es.u8()?;
+        es.skip(usize::from(length))?;
+    }
+    if flags & 0x20 != 0 {
+        es.skip(2)?;
+    }
+    let mut decoder = descriptor(es, 4)?;
+    if !matches!(decoder.u8()?, 0x40 | 0x66..=0x68) {
+        return None;
+    }
+    decoder.skip(12)?; // stream type, buffer size and bit rates
+    Some(descriptor(decoder, 5)?.data)
+}
+
+/// HE-AAC can describe packets entirely in core-rate ticks. In that case
+/// the decoded frame count alone cannot tell that Symphonia omitted SBR.
+fn signals_sbr(config: &[u8]) -> std::io::Result<bool> {
+    use symphonia::core::io::{BitReaderLtr, ReadBitsLtr};
+    let mut bits = BitReaderLtr::new(config);
+    match bits.read_bits_leq32(5)? {
+        5 | 29 => return Ok(true), // explicit SBR or Parametric Stereo
+        2 => (),                   // backwards-compatible AAC-LC configuration
+        _ => return Ok(false),
+    }
+    if bits.read_bits_leq32(4)? == 15 {
+        bits.ignore_bits(24)?; // explicit sampling frequency
+    }
+    if bits.read_bits_leq32(4)? == 0 {
+        return Ok(false); // Symphonia already rejects program config elements
+    }
+    bits.ignore_bits(1)?; // frameLengthFlag
+    if bits.read_bool()? {
+        bits.ignore_bits(14)?; // coreCoderDelay
+    }
+    if bits.read_bool()? && bits.read_bool()? {
+        return Ok(false); // unknown GASpecificConfig extension
+    }
+    Ok(bits.read_bits_leq32(11)? == 0x2b7 && bits.read_bits_leq32(5)? == 5 && bits.read_bool()?)
 }
 
 /// QuickTime sound description versions 0–2 and ISO audio sample entries.
