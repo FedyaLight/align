@@ -11,7 +11,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Stdio};
+use std::process::{Child, Command, Stdio};
 
 use crate::DecodeError;
 use crate::backend::{AudioStreamProbe, ProbeReport, VideoProbe};
@@ -597,15 +597,17 @@ impl PipeSample for i32 {
 pub struct PcmPipe<T> {
     sample: std::marker::PhantomData<T>,
     child: Child,
-    stdout: ChildStdout,
+    stdout: Box<dyn Read + Send>,
+    retry: Option<(Command, usize)>,
+    late_by: f64,
     channels: usize,
     leftover: Vec<u8>,
 }
 
 impl<T: PipeSample> PcmPipe<T> {
-    /// Spawn `ffmpeg -i path [-ss start -t dur] -map 0:a:N -vn -f f32le …`.
-    /// Seek args go *after* `-i` (accurate, windows are short). Native rate,
-    /// discrete channels — no `-ar`, no downmix, ever.
+    /// Native-rate, discrete-channel PCM. Window times are relative to the
+    /// file presentation origin (format start). A bounded sparse read may
+    /// seek the demuxer, then trim by timestamp after decoder preroll.
     pub fn spawn(
         path: &Path,
         stream_index: usize,
@@ -614,54 +616,121 @@ impl<T: PipeSample> PcmPipe<T> {
     ) -> Result<Self, DecodeError> {
         let bin =
             ffmpeg_bin().ok_or_else(|| DecodeError::FfmpegMissing("ffmpeg not found".into()))?;
-        let mut cmd = command(bin);
-        cmd.args(["-v", "error", "-hide_banner"]);
-        let header = probe_json(path)
+        let header: Option<serde_json::Value> = probe_json(path)
             .ok()
             .and_then(|raw| serde_json::from_slice(&raw).ok());
-        let gapless = header.as_ref().and_then(|h| apple_gapless(path, h));
+        let header = header.as_ref();
+        let format = header.map(|h| &h["format"]);
+        let stream = header.and_then(|h| h["streams"].as_array()).and_then(|s| {
+            s.iter()
+                .filter(|s| s["codec_type"] == "audio")
+                .nth(stream_index)
+        });
+        let starts = stream
+            .and_then(|s| num(&s["start_time"]))
+            .zip(format.and_then(|f| num(&f["start_time"])));
+        let gapless = header.and_then(|h| apple_gapless(path, h));
         let window = if let Some(audio) = gapless {
-            cmd.args(["-flags2", "+skip_manual", "-copyts"]);
-            let (start, duration) = window.unwrap_or((0., audio.duration));
+            let (start, length) = window.unwrap_or((0., audio.duration));
             let start = start.max(0.);
             Some((
                 start + audio.lead,
-                duration.min((audio.duration - start).max(0.)),
+                length.min((audio.duration - start).max(0.)),
             ))
         } else {
             window
         };
-        cmd.arg("-i").arg(path);
-        if let Some((start, duration)) = window {
-            cmd.args([
-                "-ss",
-                &start.max(0.0).to_string(),
-                "-t",
-                &duration.to_string(),
-            ]);
-        }
-        cmd.args(["-map", &format!("0:a:{stream_index}"), "-vn"])
-            .args([
-                "-f",
-                T::FORMAT,
-                "-acodec",
-                T::CODEC,
-                "-ac",
-                &channels.to_string(),
-                "pipe:1",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+        // A selected track may begin after the file's presentation origin.
+        // Preserve that timestamp instead of labelling its first sample as zero.
+        let late_by = if gapless.is_some() {
+            0.
+        } else {
+            let requested = window.map_or(0., |(start, _)| start.max(0.));
+            starts.map_or(0., |(s, f)| (s - f - requested).max(0.))
+        };
+        let make_command = |seek: Option<f64>| {
+            let mut cmd = command(&bin);
+            cmd.args(["-v", "error", "-hide_banner"]);
+            if gapless.is_some() {
+                cmd.args(["-flags2", "+skip_manual", "-copyts"]);
+            } else if seek.is_some() {
+                cmd.args(["-copyts", "-start_at_zero"]);
+            }
+            if let Some(seek) = seek {
+                cmd.arg("-ss").arg(seek.to_string());
+            }
+            cmd.arg("-i").arg(path);
+            if let Some((start, duration)) = window {
+                cmd.arg("-ss")
+                    .arg(start.max(0.).to_string())
+                    .arg("-t")
+                    .arg(duration.to_string());
+            }
+            cmd.args(["-map", &format!("0:a:{stream_index}"), "-vn"])
+                .args([
+                    "-f",
+                    T::FORMAT,
+                    "-acodec",
+                    T::CODEC,
+                    "-ac",
+                    &channels.to_string(),
+                    "pipe:1",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            cmd
+        };
+        let sparse = window.and_then(|(start, duration)| {
+            // Small windows can be validated in full before emitting anything.
+            // Keep large exports streaming, including unbounded ranges.
+            let rate = num(&stream?["sample_rate"])?;
+            let bytes = ((duration * rate).round() as usize)
+                .checked_mul(channels)?
+                .checked_mul(4)?;
+            if start < 4. || !(1..=4 * 1024 * 1024).contains(&bytes) || !path.is_file() {
+                return None;
+            }
+            let format_name = format?["format_name"].as_str()?;
+            let regular = matches!(format_name, "mpegts" | "mxf")
+                || (format_name.split(',').any(|n| n == "mov")
+                    && crate::isobmff::shared_movie(path).is_some());
+            let (_, format_start) = starts?;
+            // Input -ss is relative to format start. Tagged Apple AAC uses
+            // original packet timestamps for its output trim.
+            let input = start - if gapless.is_some() { format_start } else { 0. };
+            (regular && input >= 4.).then_some((input - 3., bytes))
+        });
+        let retry = sparse.map(|(_, bytes)| (make_command(None), bytes));
+        Self::start(
+            make_command(sparse.map(|(seek, _)| seek)),
+            channels,
+            retry,
+            late_by,
+        )
+    }
+
+    fn start(
+        mut cmd: Command,
+        channels: usize,
+        retry: Option<(Command, usize)>,
+        late_by: f64,
+    ) -> Result<Self, DecodeError> {
         let mut child = cmd.spawn().map_err(DecodeError::Io)?;
         let stdout = child.stdout.take().ok_or(DecodeError::UnsupportedOutput)?;
         Ok(Self {
             child,
-            stdout,
+            late_by,
+            retry,
+            stdout: Box::new(stdout),
             channels,
             leftover: Vec::new(),
             sample: std::marker::PhantomData,
         })
+    }
+
+    pub(crate) fn actual_start(&self, requested: f64) -> f64 {
+        requested.max(0.) + self.late_by
     }
 
     /// Pump stdout through `consume` as interleaved native frames until EOF.
@@ -670,6 +739,24 @@ impl<T: PipeSample> PcmPipe<T> {
         &mut self,
         consume: &mut dyn FnMut(&[T]) -> Result<(), DecodeError>,
     ) -> Result<bool, DecodeError> {
+        if let Some((fallback, expected)) = self.retry.take() {
+            let mut candidate = Vec::with_capacity(expected);
+            let complete = self
+                .stdout
+                .by_ref()
+                .take(expected as u64 + 1)
+                .read_to_end(&mut candidate)
+                .is_ok()
+                && candidate.len() == expected
+                && self.child.wait().is_ok_and(|status| status.success());
+            if complete {
+                self.stdout = Box::new(std::io::Cursor::new(candidate));
+            } else {
+                // EOF, a failed demuxer seek or insufficient preroll. No
+                // consumer has seen the speculative bytes. Drop reaps the child.
+                *self = Self::start(fallback, self.channels, None, self.late_by)?;
+            }
+        }
         let mut chunk = vec![0u8; 65536];
         let mut frames = Vec::<T>::with_capacity(16384);
         loop {
@@ -801,7 +888,7 @@ pub fn decode_window(
         )));
     }
     mono.finish()?;
-    Ok((actual_start, samples))
+    Ok((pipe.actual_start(actual_start), samples))
 }
 
 /// Write stereo 48 kHz AC-3 in MPEG-TS, silent except for a 2 ms click at

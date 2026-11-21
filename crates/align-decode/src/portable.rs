@@ -75,7 +75,7 @@ impl PortableBackend {
                 path.display()
             )));
         }
-        Ok(actual)
+        Ok(pipe.actual_start(actual))
     }
 }
 
