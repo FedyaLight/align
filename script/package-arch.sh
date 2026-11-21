@@ -19,6 +19,7 @@ for notice in LICENSE THIRD_PARTY_NOTICES.txt FFMPEG-LICENSE.txt; do
 done
 test -s "$STAGE/ThirdPartyLicenses/BUILD-MANIFEST.json"
 test -d "$STAGE/AAF-Licenses"
+test -s "$STAGE/align-aaf-runtime/base_library.zip"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/input/payload" "$TMP/input/integration" "$TMP/build"

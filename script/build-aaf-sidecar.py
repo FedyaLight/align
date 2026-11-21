@@ -103,8 +103,7 @@ def collect_native_sources(sources, licenses, python_archive, python_version, bu
     return {name: version for name, version, _ in components}
 
 
-# Windows ships the frozen runtime in this folder next to align-aaf.exe.
-WINDOWS_RUNTIME = 'align-aaf-runtime'
+RUNTIME = 'align-aaf-runtime'
 
 
 def windows_version_info(root):
@@ -148,7 +147,8 @@ def main():
     with tempfile.TemporaryDirectory(prefix='align-aaf-build-') as temporary:
         command = [
             sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean',
-            '--name', 'align-aaf',
+            '--name', 'align-aaf', '--onedir', '--contents-directory', RUNTIME,
+            '--distpath', str(Path(temporary) / 'dist'),
             '--workpath', str(Path(temporary) / 'work'), '--specpath', temporary,
             # aaf2 registers classes on import. Its model tables are modules,
             # so shipping another set of their .py files as data is redundant.
@@ -165,19 +165,29 @@ def main():
             # version details like Align's own executables.
             version_file = Path(temporary) / 'version.txt'
             version_file.write_text(windows_version_info(root), encoding='utf-8')
-            command += ['--onedir', '--contents-directory', WINDOWS_RUNTIME,
-                        '--distpath', str(Path(temporary) / 'dist'),
-                        '--version-file', str(version_file)]
-        else:
-            command += ['--onefile', '--distpath', str(output)]
+            command += ['--version-file', str(version_file)]
         subprocess.run(command + [str(root / 'Support/aaf/bridge.py')], check=True)
-        if windows:
-            built = Path(temporary) / 'dist' / 'align-aaf'
-            runtime = output / WINDOWS_RUNTIME
-            if runtime.exists():
-                shutil.rmtree(runtime)
-            shutil.move(built / WINDOWS_RUNTIME, runtime)
-            shutil.copy2(built / 'align-aaf.exe', output / 'align-aaf.exe')
+        built = Path(temporary) / 'dist' / 'align-aaf'
+        exe_name = 'align-aaf.exe' if windows else 'align-aaf'
+        if sys.platform == 'darwin':
+            # Freeze signatures before generating the shipped file inventory.
+            # PyInstaller signs individual Mach-O files, but the framework
+            # also needs its resource seal before the enclosing app is signed.
+            for framework in (built / RUNTIME).rglob('*.framework'):
+                subprocess.run(['codesign', '--force', '--sign', '-', framework], check=True)
+            for binary in [built / exe_name, *(built / RUNTIME).rglob('*')]:
+                if binary.is_symlink() or not binary.is_file():
+                    continue
+                with binary.open('rb') as stream:
+                    magic = int.from_bytes(stream.read(4), 'big')
+                if magic in (0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe,
+                             0xcafebabe, 0xbebafeca, 0xcafebabf, 0xbfbafeca):
+                    subprocess.run(['codesign', '--verify', '--strict', binary], check=True)
+        runtime = output / RUNTIME
+        if runtime.exists():
+            shutil.rmtree(runtime)
+        shutil.move(built / RUNTIME, runtime)
+        shutil.copy2(built / exe_name, output / exe_name)
         analysis = ast.literal_eval((Path(temporary) / 'work/align-aaf/Analysis-00.toc').read_text(encoding="utf-8"))
         for section in analysis:
             if not isinstance(section, list):

@@ -35,6 +35,7 @@ if [[ -z "$AAF_DIR" ]]; then
   AAF_DIR="$AAF_BUILD_DIR/dist"
 fi
 test -x "$AAF_DIR/align-aaf"
+test -s "$AAF_DIR/align-aaf-runtime/base_library.zip"
 test -d "$AAF_DIR/AAF-Licenses"
 if [[ -n "$RELEASE_LICENSES" ]]; then
   test -f "$RELEASE_LICENSES/BUILD-MANIFEST.json"
@@ -95,8 +96,14 @@ ln -s Align "$APP_MACOS/align-cli"
 cp "$ROOT_DIR/THIRD_PARTY_NOTICES.txt" "$OUT_DIR/THIRD_PARTY_NOTICES.txt"
 cp "$ROOT_DIR/LICENSE" "$OUT_DIR/LICENSE"
 chmod +x "$OUT_DIR/align-cli" "$APP_MACOS/align-cli"
-cp "$AAF_DIR/align-aaf" "$APP_MACOS/align-aaf"
-cp "$AAF_DIR/align-aaf" "$OUT_DIR/align-aaf"
+# A PyInstaller executable physically in Contents/MacOS looks in Frameworks.
+# Keep its frozen directory intact, and expose the adjacent entry point to the CLI.
+mkdir "$RESOURCES/AAF"
+cp -p "$AAF_DIR/align-aaf" "$RESOURCES/AAF/"
+cp -a "$AAF_DIR/align-aaf-runtime" "$RESOURCES/AAF/"
+ln -s ../Resources/AAF/align-aaf "$APP_MACOS/align-aaf"
+ln -s Align.app/Contents/MacOS/align-aaf "$OUT_DIR/align-aaf"
+ln -s Align.app/Contents/Resources/AAF/align-aaf-runtime "$OUT_DIR/align-aaf-runtime"
 cp -R "$AAF_DIR/AAF-Licenses" "$RESOURCES/AAF-Licenses"
 cp -R "$AAF_DIR/AAF-Licenses" "$OUT_DIR/AAF-Licenses"
 chmod +x "$APP_MACOS/align-aaf" "$OUT_DIR/align-aaf"
@@ -176,7 +183,7 @@ Ad-hoc signed for local use. Distribution signing and notarization are not inclu
 README
 
 echo "==> ad-hoc sign + verify"
-codesign --force --deep --sign - "$APP_BUNDLE" >/dev/null
+codesign --force --sign - "$APP_BUNDLE" >/dev/null
 plutil -lint "$APP_CONTENTS/Info.plist"
 plutil -lint "$RESOURCES/PrivacyInfo.xcprivacy"
 codesign --verify --deep --strict "$APP_BUNDLE"
@@ -184,6 +191,7 @@ codesign -dv --verbose=2 "$APP_BUNDLE" 2>&1 | head -5
 
 echo "==> smoke test"
 "$OUT_DIR/align-cli" --help >/dev/null
+python3 "$ROOT_DIR/script/check-frozen-aaf.py" "$APP_MACOS/align-aaf"
 if [[ "$ALIGN_SKIP_LAUNCH_CHECK" != "1" ]]; then
   "$APP_MACOS/$APP_NAME" >"$AAF_BUILD_DIR/launch.log" 2>&1 &
   launch_pid=$!

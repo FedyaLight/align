@@ -232,10 +232,8 @@ jobs:
             ln -s align dist-bundle/align-cli
           fi
           cp "target/release/align-aaf$exe" dist-bundle/
-          # Windows ships the AAF module's Python runtime as a folder.
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            cp -R target/release/align-aaf-runtime dist-bundle/
-          fi
+          cp -a target/release/align-aaf-runtime dist-bundle/
+          python script/check-frozen-aaf.py "dist-bundle/align-aaf$exe"
           cp -R target/release/AAF-Licenses dist-bundle/
           cp LICENSE THIRD_PARTY_NOTICES.txt dist-bundle/
           cp "target/ffmpeg-minimal/ffmpeg$exe" "target/ffmpeg-minimal/ffprobe$exe" dist-bundle/

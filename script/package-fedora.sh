@@ -14,6 +14,7 @@ for notice in LICENSE THIRD_PARTY_NOTICES.txt FFMPEG-LICENSE.txt; do
   test -s "$STAGE/$notice"
 done
 test -d "$STAGE/AAF-Licenses"
+test -s "$STAGE/align-aaf-runtime/base_library.zip"
 test -d "$STAGE/ThirdPartyLicenses"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT

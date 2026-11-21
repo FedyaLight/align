@@ -134,3 +134,8 @@ the remaining reputation warnings. It includes the Python, pyaaf2, and
 PyInstaller license texts, including PyInstaller's distribution exception.
 The source bundle records matching native library versions and includes their
 licenses. A failure to identify a required version stops source preparation.
+
+The Unix AAF helper loads its adjacent frozen runtime directly. Linux packages
+install both in `/opt/align`. On macOS the signed app carries the pair in
+`Contents/Resources/AAF`, with a relative helper link in `Contents/MacOS`.
+The corresponding source manifest records runtime files and symlink targets.
