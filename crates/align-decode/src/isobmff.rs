@@ -590,7 +590,7 @@ pub fn ama_metadata(path: &Path) -> Option<serde_json::Value> {
     if !is_candidate(path) {
         return None;
     }
-    let movie = read(path)?;
+    let movie = shared_movie(path)?;
     let mut streams = Vec::new();
     for track in &movie.tracks {
         match track.kind {
@@ -1083,6 +1083,16 @@ fn aac_config(sample_entry: &[u8]) -> Option<&[u8]> {
     let extensions = match entry.body.get(8..10)? {
         [0, 0] => entry.body.get(28..)?,
         [0, 1] => entry.body.get(44..)?,
+        [0, 2] => {
+            // QuickTime SoundDescriptionV2.sizeOfStructOnly is measured
+            // from the start of the sample entry, including its atom header.
+            let size = u32::from_be_bytes(entry.body.get(28..32)?.try_into().ok()?) as usize;
+            let header = entry.raw.len() - entry.body.len();
+            if size < header + 64 {
+                return None;
+            }
+            entry.raw.get(size..)?
+        }
         _ => return None,
     };
     let esds =
@@ -1318,6 +1328,15 @@ mod tests {
                 "stale camera header after replacement"
             );
         }
+    }
+
+    #[test]
+    fn quicktime_v2_he_aac_uses_the_full_decoder() {
+        // Six-channel Core Audio HE-AAC, stream copied by FFmpeg 9 to MOV.
+        let clip = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/he-aac-v2.mov");
+        assert!(has_sbr_audio(&clip));
+        let metadata = ama_metadata(&clip).unwrap();
+        assert_eq!(metadata["streams"][0]["channels"], 6);
     }
 
     #[test]

@@ -35,7 +35,7 @@ fn pooled(rates: (usize, usize)) -> bool {
 
 fn resampler(rates: (usize, usize)) -> Result<FftFixedIn<f32>, DecodeError> {
     if pooled(rates) {
-        let mut idle = IDLE_FFT.lock().unwrap();
+        let mut idle = crate::lock_idle(&IDLE_FFT);
         if let Some(i) = idle.iter().rposition(|entry| entry.rates == rates) {
             return Ok(idle.swap_remove(i).fft);
         }
@@ -86,11 +86,12 @@ impl<F> Drop for MonoPipe<F> {
             self.source_rate.round() as usize,
             self.target_rate.round() as usize,
         );
-        if pooled(rates)
+        if !std::thread::panicking()
+            && pooled(rates)
             && let Some(mut fft) = self.resampler.take()
         {
             fft.reset();
-            let mut idle = IDLE_FFT.lock().unwrap();
+            let mut idle = crate::lock_idle(&IDLE_FFT);
             if idle.len() == 12 {
                 idle.remove(0);
             }
@@ -389,6 +390,25 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resampling_survives_a_poisoned_pool() {
+        let pipe = MonoPipe::new(48000., 8000., 1, None, false, |_| Ok(())).unwrap();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = IDLE_FFT.lock().unwrap();
+            panic!("interrupted pool update");
+        });
+        drop(pipe);
+        let mut count = 0;
+        let mut next = MonoPipe::new(48000., 8000., 1, None, false, |samples| {
+            count += samples.len();
+            Ok(())
+        })
+        .unwrap();
+        next.push_interleaved(&[0.0; CHUNK]).unwrap();
+        next.finish().unwrap();
+        assert_eq!(count, CHUNK / 6);
+    }
 
     #[test]
     fn passthrough_is_exact() {

@@ -391,10 +391,7 @@ fn main() {
                     }),
                     ..Default::default()
                 },
-                {
-                    let view = view.clone();
-                    move |_, _| view
-                },
+                move |_, _| view,
             ) {
                 Ok(window) => window,
                 Err(_) => {
@@ -402,7 +399,6 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            cx.set_global(AppView(view));
             // Initial keyboard focus: without it system shortcuts stay dead
             // until the user clicks something focusable (of which we have none).
             window

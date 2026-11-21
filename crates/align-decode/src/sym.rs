@@ -539,7 +539,7 @@ pub(crate) fn window_with_readers(
     let index = source.stream_index();
     let revision = readers.and_then(|_| align_core::cache::media_revision(path).ok());
     let cached = revision.as_ref().and_then(|rev| {
-        let mut idle = readers?.0.lock().unwrap();
+        let mut idle = crate::lock_idle(&readers?.0);
         let pos = idle
             .iter()
             .position(|c| c.path == path && c.index == index && c.revision == *rev)?;
@@ -575,7 +575,7 @@ pub(crate) fn window_with_readers(
         && stream.timing_checked
         && align_core::cache::media_revision(path).ok().as_ref() == Some(&revision)
     {
-        let mut idle = readers.0.lock().unwrap();
+        let mut idle = crate::lock_idle(&readers.0);
         if idle.len() == 4 {
             idle.pop_front();
         }
