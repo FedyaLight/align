@@ -335,7 +335,7 @@ fn open_stream(path: &Path, stream_index: usize) -> Result<Stream, DecodeError> 
         .then(|| crate::isobmff::shared_movie(path))
         .flatten();
     let movie_track = movie.as_ref().and_then(|m| m.tracks.get(track.id as usize));
-    if movie_track.is_some_and(|t| t.signals_sbr()) {
+    if movie_track.is_some_and(|t| t.needs_sbr_decoder(path, stream_index)) {
         return Err(DecodeError::Symphonia(
             "AAC spectral band replication requires a full decoder".into(),
         ));
@@ -1340,7 +1340,7 @@ mod damaged_packet_tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn core_rate_he_aac_is_rejected_before_emitting_any_audio() {
+    fn apple_he_aac_keeps_the_source_sample_clock() {
         let dir = tempfile::tempdir().unwrap();
         let pcm = dir.path().join("source.wav");
         let mut writer = hound::WavWriter::create(
@@ -1353,8 +1353,14 @@ mod damaged_packet_tests {
             },
         )
         .unwrap();
-        for i in 0..88200 {
-            writer.write_sample((i % 2048) as i16).unwrap();
+        for i in 0..(2 * 44100 * 2) {
+            writer
+                .write_sample(if (66150..66240).contains(&(i / 2)) {
+                    28000_i16
+                } else {
+                    0
+                })
+                .unwrap();
         }
         writer.finalize().unwrap();
         let encoded = dir.path().join("core-rate.m4a");
@@ -1369,7 +1375,43 @@ mod damaged_packet_tests {
         );
         // 1024 samples at the core rate fit the packet duration. Only the
         // AudioSpecificConfig signals the higher-rate output and SBR.
-        assert!(!can_decode(&encoded, 0));
+        use crate::backend::MediaBackend;
+        let backend = crate::portable::PortableBackend;
+        let source = AudioAnalysisSource::default();
+        let mut bytes = std::fs::read(&encoded).unwrap();
+        for implicit in [false, true] {
+            if implicit {
+                // Remove only the ASC sync extension. The encoded AAC packets
+                // still carry SBR and the media timescale still counts core ticks.
+                let pos = bytes
+                    .windows(5)
+                    .position(|asc| asc == [0x13, 0x90, 0x56, 0xe5, 0xa0])
+                    .unwrap();
+                bytes[pos + 2..pos + 5].fill(0);
+                std::fs::write(&encoded, &bytes).unwrap();
+            }
+            assert!(!can_decode(&encoded, 0));
+            let mut mono = Vec::new();
+            backend
+                .decode_mono_8k(&encoded, source, &mut |s| {
+                    mono.extend_from_slice(s);
+                    Ok(())
+                })
+                .unwrap();
+            assert!(crate::ff::click_at(&mono).abs_diff(12000) <= 2);
+            let (start, window) = backend.decode_window_16k(&encoded, 1., 1., source).unwrap();
+            assert_eq!(start, 1.);
+            assert!(crate::ff::click_at(&window).abs_diff(8000) <= 3);
+            let mut native = Vec::new();
+            backend
+                .decode_native(&encoded, 0, None, &mut |b| {
+                    native.extend_from_slice(&b.frames[0]);
+                    Ok(())
+                })
+                .unwrap();
+            assert!(crate::ff::click_at(&native).abs_diff(66150) <= 4);
+            assert_eq!(native.len(), 88200);
+        }
     }
 
     /// Symphonia's AIFF reader can record a couple more frames for the final

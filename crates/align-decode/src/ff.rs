@@ -155,8 +155,80 @@ fn run_probe(path: &Path) -> Result<Vec<u8>, DecodeError> {
 
 /// Header-only inspect. No sample data is read (audio-only invariant).
 pub fn inspect(path: &Path) -> Result<ProbeReport, DecodeError> {
-    parse_ffprobe_json(&probe_json(path)?)
-        .ok_or_else(|| DecodeError::Incomplete(format!("ffprobe JSON for {}", path.display())))
+    let json = probe_json(path)?;
+    let header = serde_json::from_slice(&json)
+        .map_err(|_| DecodeError::Incomplete(format!("ffprobe JSON for {}", path.display())))?;
+    let mut report = parse_header(&header)
+        .ok_or_else(|| DecodeError::Incomplete(format!("ffprobe JSON for {}", path.display())))?;
+    if let Some(audio) = apple_gapless(path, &header) {
+        report.duration_seconds = audio.duration;
+        report.audio_streams[0].end_seconds = None;
+    }
+    Ok(report)
+}
+
+pub(crate) fn probed_sbr(path: &Path, index: usize) -> Option<bool> {
+    let header: serde_json::Value = serde_json::from_slice(&probe_json(path).ok()?).ok()?;
+    let stream = header["streams"]
+        .as_array()?
+        .iter()
+        .filter(|s| s["codec_type"] == "audio")
+        .nth(index)?;
+    match stream["profile"].as_str()? {
+        "HE-AAC" | "HE-AACv2" => Some(true),
+        "LC" => Some(false),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GaplessAudio {
+    lead: f64,
+    duration: f64,
+}
+
+/// Apple's single-track dual-rate HE-AAC stores the gapless counts in core
+/// samples. FFmpeg 7 and 9 trim different counts automatically. For this
+/// specific layout use the raw packet clock and trim exactly once.
+fn apple_gapless(path: &Path, header: &serde_json::Value) -> Option<GaplessAudio> {
+    let tag = header["format"]["tags"]["iTunSMPB"].as_str()?;
+    let [stream] = header["streams"].as_array()?.as_slice() else {
+        return None;
+    };
+    if stream["profile"] != "HE-AAC" {
+        return None;
+    }
+    let movie = crate::isobmff::shared_movie(path)?;
+    let [track] = movie.tracks.as_slice() else {
+        return None;
+    };
+    let rate = num(&stream["sample_rate"])?;
+    if track.edited_duration.is_some()
+        || track.timescale == 0
+        || rate != f64::from(track.timescale) * 2.0
+    {
+        return None;
+    }
+    let mut counts = tag
+        .split_ascii_whitespace()
+        .skip(1)
+        .map(|s| u64::from_str_radix(s, 16).ok());
+    let (priming, padding, valid) = (counts.next()??, counts.next()??, counts.next()??);
+    if priming == 0
+        || valid == 0
+        || priming.checked_add(valid)?.checked_add(padding)? != track.media_duration
+        || track.sample_count().checked_mul(1024)? != track.media_duration
+    {
+        return None;
+    }
+    // The Apple counts describe the core. Dual-rate SBR synthesis adds 481
+    // core samples (ISO/IEC TR 14496-24). Edit lists and other encoders may
+    // already include it, which is why they don't enter this path.
+    let core_rate = f64::from(track.timescale);
+    Some(GaplessAudio {
+        lead: (priming as f64 + 481.) / core_rate,
+        duration: valid as f64 / core_rate,
+    })
 }
 
 fn num(value: &serde_json::Value) -> Option<f64> {
@@ -173,7 +245,10 @@ const EARLY_AUDIO_END: f64 = 0.1;
 
 /// Pure parser (unit-tested without a binary on disk).
 pub fn parse_ffprobe_json(json: &[u8]) -> Option<ProbeReport> {
-    let v: serde_json::Value = serde_json::from_slice(json).ok()?;
+    parse_header(&serde_json::from_slice(json).ok()?)
+}
+
+fn parse_header(v: &serde_json::Value) -> Option<ProbeReport> {
     let streams = v.get("streams")?.as_array()?;
     // MPEG-TS records no edit list, so FFmpeg's output keeps AC-3's codec
     // delay; in MP4 and MOV FFmpeg trims it through the edit list.
@@ -540,7 +615,23 @@ impl<T: PipeSample> PcmPipe<T> {
         let bin =
             ffmpeg_bin().ok_or_else(|| DecodeError::FfmpegMissing("ffmpeg not found".into()))?;
         let mut cmd = command(bin);
-        cmd.args(["-v", "error", "-hide_banner", "-i"]).arg(path);
+        cmd.args(["-v", "error", "-hide_banner"]);
+        let header = probe_json(path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice(&raw).ok());
+        let gapless = header.as_ref().and_then(|h| apple_gapless(path, h));
+        let window = if let Some(audio) = gapless {
+            cmd.args(["-flags2", "+skip_manual", "-copyts"]);
+            let (start, duration) = window.unwrap_or((0., audio.duration));
+            let start = start.max(0.);
+            Some((
+                start + audio.lead,
+                duration.min((audio.duration - start).max(0.)),
+            ))
+        } else {
+            window
+        };
+        cmd.arg("-i").arg(path);
         if let Some((start, duration)) = window {
             cmd.args([
                 "-ss",

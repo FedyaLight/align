@@ -619,7 +619,7 @@ impl Pipeline {
 
     fn decoder_cache(&self, path: &Path) -> Option<FingerprintCache> {
         (self.backend.kind() == BackendKind::Portable && crate::isobmff::has_sbr_audio(path))
-            .then(|| self.cache.decoder_variant("full-sbr"))
+            .then(|| self.cache.decoder_variant("full-sbr-clock2"))
     }
 
     fn decode_worker_cap<'a>(&self, mut paths: impl Iterator<Item = &'a Path>) -> usize {

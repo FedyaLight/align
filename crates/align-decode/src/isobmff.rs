@@ -213,11 +213,27 @@ impl SampleSizes {
 }
 
 impl Track {
-    pub(crate) fn signals_sbr(&self) -> bool {
+    pub(crate) fn needs_sbr_decoder(&self, path: &Path, audio_index: usize) -> bool {
         if &self.codec != b"mp4a" {
             return false;
         }
-        aac_config(&self.sample_entry).is_some_and(|config| signals_sbr(config).unwrap_or(false))
+        let Some(config) = aac_config(&self.sample_entry) else {
+            return false;
+        };
+        if signals_sbr(config).unwrap_or(false) {
+            return true;
+        }
+        // A low-rate LC core without an ASC extension can carry SBR in its
+        // packets. Probe the selected stream before handing audio to a consumer.
+        let mut bits = symphonia::core::io::BitReaderLtr::new(config);
+        use symphonia::core::io::ReadBitsLtr;
+        let low_rate_core = bits.read_bits_leq32(5).ok() == Some(2)
+            && match bits.read_bits_leq32(4) {
+                Ok(6..=12) => true, // 24 kHz down to 7.35 kHz
+                Ok(15) => bits.read_bits_leq32(24).is_ok_and(|r| r <= 24000),
+                _ => false,
+            };
+        low_rate_core && crate::ff::probed_sbr(path, audio_index).unwrap_or(true)
     }
 
     pub fn sample_count(&self) -> u64 {
@@ -559,7 +575,11 @@ pub(crate) fn has_sbr_audio(path: &Path) -> bool {
         || path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("m4a")))
-        && shared_movie(path).is_some_and(|m| m.audio().any(Track::signals_sbr))
+        && shared_movie(path).is_some_and(|m| {
+            m.audio()
+                .enumerate()
+                .any(|(i, t)| t.needs_sbr_decoder(path, i))
+        })
 }
 
 /// Header probe for the portable backend; `None` means "ask FFmpeg".
