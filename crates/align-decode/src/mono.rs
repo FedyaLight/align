@@ -20,6 +20,29 @@ use crate::DecodeError;
 /// dominated analysis time.
 const CHUNK: usize = 4608;
 
+// All FFTs here process one already selected/mixed channel, CHUNK frames
+// and two sub-chunks. Only retain common analysis geometries, so media with
+// unusual rates cannot leave oversized FFT plans in a long-lived process.
+struct IdleResampler {
+    rates: (usize, usize),
+    fft: FftFixedIn<f32>,
+}
+static IDLE_FFT: std::sync::Mutex<Vec<IdleResampler>> = std::sync::Mutex::new(Vec::new());
+
+fn pooled(rates: (usize, usize)) -> bool {
+    matches!(rates, (44_100 | 48_000 | 96_000, 8_000 | 16_000))
+}
+
+fn resampler(rates: (usize, usize)) -> Result<FftFixedIn<f32>, DecodeError> {
+    if pooled(rates) {
+        let mut idle = IDLE_FFT.lock().unwrap();
+        if let Some(i) = idle.iter().rposition(|entry| entry.rates == rates) {
+            return Ok(idle.swap_remove(i).fft);
+        }
+    }
+    FftFixedIn::new(rates.0, rates.1, CHUNK, 2, 1).map_err(|e| DecodeError::Resample(e.to_string()))
+}
+
 /// Interleaved → planar (render path; decode chains stay interleaved for
 /// zero-copy streaming).
 pub(crate) fn deinterleave_f32(frames: &[f32], channels: usize) -> Vec<Vec<f32>> {
@@ -57,6 +80,25 @@ pub struct MonoPipe<F> {
     consume: F,
 }
 
+impl<F> Drop for MonoPipe<F> {
+    fn drop(&mut self) {
+        let rates = (
+            self.source_rate.round() as usize,
+            self.target_rate.round() as usize,
+        );
+        if pooled(rates)
+            && let Some(mut fft) = self.resampler.take()
+        {
+            fft.reset();
+            let mut idle = IDLE_FFT.lock().unwrap();
+            if idle.len() == 12 {
+                idle.remove(0);
+            }
+            idle.push(IdleResampler { rates, fft });
+        }
+    }
+}
+
 impl<F> MonoPipe<F>
 where
     F: FnMut(&[f32]) -> Result<(), DecodeError>,
@@ -86,16 +128,10 @@ where
         let resampler = if (source_rate - target_rate).abs() < 0.001 {
             None
         } else {
-            Some(
-                FftFixedIn::new(
-                    source_rate.round() as usize,
-                    target_rate.round() as usize,
-                    CHUNK,
-                    2,
-                    1,
-                )
-                .map_err(|e| DecodeError::Resample(e.to_string()))?,
-            )
+            Some(resampler((
+                source_rate.round() as usize,
+                target_rate.round() as usize,
+            ))?)
         };
         let skip = resampler.as_ref().map(|r| r.output_delay()).unwrap_or(0);
         let resampled = resampler
@@ -481,6 +517,29 @@ mod tests {
     fn explicit_channel_validated() {
         assert!(MonoPipe::new(8000.0, 8000.0, 2, Some(2), false, |_: &[f32]| Ok(())).is_err());
         assert!(MonoPipe::new(8000.0, 8000.0, 0, None, false, |_: &[f32]| Ok(())).is_err());
+    }
+
+    #[test]
+    fn cancelled_resampling_cannot_leave_audio_in_the_next_clip() {
+        let mut loud = MonoPipe::new(48000., 16000., 1, None, false, |_| {
+            Err(DecodeError::Cancelled)
+        })
+        .unwrap();
+        assert!(matches!(
+            loud.push_planar(&[&[1.0; CHUNK * 2]]),
+            Err(DecodeError::Cancelled)
+        ));
+        drop(loud);
+        let mut frames = 0;
+        let mut quiet = MonoPipe::new(48000., 16000., 1, None, false, |samples| {
+            assert!(samples.iter().all(|&s| s == 0.));
+            frames += samples.len();
+            Ok(())
+        })
+        .unwrap();
+        quiet.push_planar(&[&[0.; 48000]]).unwrap();
+        quiet.finish().unwrap();
+        assert!(frames >= 16000);
     }
 
     #[test]
