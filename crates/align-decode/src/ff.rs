@@ -614,6 +614,16 @@ impl<T: PipeSample> PcmPipe<T> {
         window: Option<(f64, f64)>,
         channels: usize,
     ) -> Result<Self, DecodeError> {
+        Self::presented(path, stream_index, window, channels, 0.)
+    }
+
+    pub(crate) fn presented(
+        path: &Path,
+        stream_index: usize,
+        window: Option<(f64, f64)>,
+        channels: usize,
+        decoder_delay: f64,
+    ) -> Result<Self, DecodeError> {
         let bin =
             ffmpeg_bin().ok_or_else(|| DecodeError::FfmpegMissing("ffmpeg not found".into()))?;
         let header: Option<serde_json::Value> = probe_json(path)
@@ -630,29 +640,45 @@ impl<T: PipeSample> PcmPipe<T> {
             .and_then(|s| num(&s["start_time"]))
             .zip(format.and_then(|f| num(&f["start_time"])));
         let gapless = header.and_then(|h| apple_gapless(path, h));
+        // A TS demuxer may rebase on the *mapped* track after stream
+        // selection. Preserve original packet timestamps and explicitly trim
+        // on the container clock instead of relying on that shifting origin.
+        let absolute = format
+            .and_then(|f| f["format_name"].as_str())
+            .is_some_and(|n| matches!(n, "mpegts" | "mxf"))
+            && starts.is_some();
+        let requested = window.map_or(0., |(s, _)| s.max(0.));
+        let late_by = if absolute {
+            starts.map_or(0., |(stream, format)| (stream - format - requested).max(0.))
+        } else {
+            0.
+        };
         let window = if let Some(audio) = gapless {
-            let (start, length) = window.unwrap_or((0., audio.duration));
-            let start = start.max(0.);
+            let length = window.map_or(audio.duration, |(_, length)| length);
             Some((
-                start + audio.lead,
-                length.min((audio.duration - start).max(0.)),
+                requested + audio.lead,
+                length.min((audio.duration - requested).max(0.)),
+            ))
+        } else if window.is_some() || decoder_delay > 0. {
+            let origin = if absolute {
+                starts.map_or(0., |(_, f)| f)
+            } else {
+                0.
+            };
+            Some((
+                origin + requested + late_by + decoder_delay,
+                (window.map_or(WHOLE_FILE, |(_, d)| d) - late_by).max(0.),
             ))
         } else {
-            window
-        };
-        // A selected track may begin after the file's presentation origin.
-        // Preserve that timestamp instead of labelling its first sample as zero.
-        let late_by = if gapless.is_some() {
-            0.
-        } else {
-            let requested = window.map_or(0., |(start, _)| start.max(0.));
-            starts.map_or(0., |(s, f)| (s - f - requested).max(0.))
+            None
         };
         let make_command = |seek: Option<f64>| {
             let mut cmd = command(&bin);
             cmd.args(["-v", "error", "-hide_banner"]);
             if gapless.is_some() {
                 cmd.args(["-flags2", "+skip_manual", "-copyts"]);
+            } else if absolute {
+                cmd.arg("-copyts");
             } else if seek.is_some() {
                 cmd.args(["-copyts", "-start_at_zero"]);
             }
@@ -662,7 +688,7 @@ impl<T: PipeSample> PcmPipe<T> {
             cmd.arg("-i").arg(path);
             if let Some((start, duration)) = window {
                 cmd.arg("-ss")
-                    .arg(start.max(0.).to_string())
+                    .arg(start.to_string())
                     .arg("-t")
                     .arg(duration.to_string());
             }
@@ -698,7 +724,12 @@ impl<T: PipeSample> PcmPipe<T> {
             let (_, format_start) = starts?;
             // Input -ss is relative to format start. Tagged Apple AAC uses
             // original packet timestamps for its output trim.
-            let input = start - if gapless.is_some() { format_start } else { 0. };
+            let input = start
+                - if gapless.is_some() || absolute {
+                    format_start
+                } else {
+                    0.
+                };
             (regular && input >= 4.).then_some((input - 3., bytes))
         });
         let retry = sparse.map(|(_, bytes)| (make_command(None), bytes));
@@ -825,8 +856,7 @@ pub fn decode_mono_8k(
     if sample_rate <= 0.0 {
         return Err(DecodeError::InvalidPcm);
     }
-    let window = (delay > 0.0).then_some((delay, WHOLE_FILE));
-    let mut pipe = AudioPipe::spawn(path, stream_index, window, channels)?;
+    let mut pipe = AudioPipe::presented(path, stream_index, None, channels, delay)?;
     let mut mono = crate::mono::MonoPipe::new(
         sample_rate,
         8000.0,
@@ -864,11 +894,12 @@ pub fn decode_window(
     }
     let actual_start = start.max(0.0);
     let mut samples = Vec::new();
-    let mut pipe = AudioPipe::spawn(
+    let mut pipe = AudioPipe::presented(
         path,
         stream_index,
-        Some((actual_start + delay, duration)),
+        Some((actual_start, duration)),
         channels,
+        delay,
     )?;
     let mut mono = crate::mono::MonoPipe::new(
         sample_rate,
@@ -950,6 +981,104 @@ mod tests {
             .unwrap();
         let at = window_start * 1000.0 + click_at(&window) as f64 / 16.0;
         assert!((at - 1500.0).abs() < 0.3, "window click at {at} ms");
+    }
+
+    #[test]
+    fn delayed_transport_stream_reports_first_pcm_time_and_seeks_late_click() {
+        use crate::backend::MediaBackend;
+        let Some(ffmpeg) = test_ffmpeg() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("two.mts");
+        assert!(
+            command(ffmpeg)
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=r=48000:cl=mono:d=22",
+                    "-itsoffset",
+                    "2",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "aevalsrc='if(between(t,16.5,16.502),0.85,0)':s=48000:d=18",
+                    "-map",
+                    "0:a",
+                    "-map",
+                    "1:a",
+                    "-c:a",
+                    "ac3",
+                    "-f",
+                    "mpegts"
+                ])
+                .arg(&clip)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let backend = crate::portable::PortableBackend;
+        for (start, length) in [(0., 20.), (18., 1.)] {
+            let mut samples = Vec::new();
+            let actual = backend
+                .decode_native(&clip, 1, Some((start, Some(length))), &mut |block| {
+                    samples.extend_from_slice(&block.frames[0]);
+                    Ok(())
+                })
+                .unwrap();
+            let click = (actual * 48000.).round() as usize + click_at(&samples);
+            assert!(
+                click.abs_diff(888000) <= 2,
+                "from {actual}: click at {click}"
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_pcm_mxf_window_and_short_eof_match_continuous_i32() {
+        let Some(ffmpeg) = test_ffmpeg() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("pcm.mxf");
+        assert!(
+            command(ffmpeg)
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anoisesrc=duration=10:sample_rate=48000:seed=73",
+                    "-ac",
+                    "1",
+                    "-c:a",
+                    "pcm_s24le",
+                    "-f",
+                    "mxf_opatom"
+                ])
+                .arg(&clip)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let decode = |window| {
+            let mut output = Vec::new();
+            let mut pipe = AudioPipeI32::spawn(&clip, 0, window, 1).unwrap();
+            assert!(
+                pipe.pump(&mut |samples| {
+                    output.extend_from_slice(samples);
+                    Ok(())
+                })
+                .unwrap()
+            );
+            output
+        };
+        let reference = decode(None);
+        for (start, length) in [(8., 0.25), (9.75, 1.)] {
+            let first = (start * 48000.) as usize;
+            let end = (first + (length * 48000.) as usize).min(reference.len());
+            assert_eq!(decode(Some((start, length))), reference[first..end]);
+        }
     }
 
     #[test]

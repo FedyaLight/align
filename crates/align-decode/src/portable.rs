@@ -59,14 +59,12 @@ impl PortableBackend {
             return Err(DecodeError::InvalidPcm);
         }
         let actual = start.max(0.0);
-        let mut pipe = crate::ff::PcmPipe::<T>::spawn(
+        let mut pipe = crate::ff::PcmPipe::<T>::presented(
             path,
             stream_index,
-            Some((
-                actual + stream.decoder_delay,
-                duration.unwrap_or(crate::ff::WHOLE_FILE),
-            )),
+            Some((actual, duration.unwrap_or(crate::ff::WHOLE_FILE))),
             channels,
+            stream.decoder_delay,
         )?;
         let ok = pipe.pump(&mut |frames| consume(sample_rate, channels, frames))?;
         if !ok {
