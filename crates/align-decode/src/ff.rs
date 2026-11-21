@@ -710,7 +710,7 @@ impl<T: PipeSample> PcmPipe<T> {
             let bytes = ((duration * rate).round() as usize)
                 .checked_mul(channels)?
                 .checked_mul(4)?;
-            if start < 4. || !(1..=4 * 1024 * 1024).contains(&bytes) || !path.is_file() {
+            if start < 4. || !(1..=16 * 1024 * 1024).contains(&bytes) || !path.is_file() {
                 return None;
             }
             let format_name = format?["format_name"].as_str()?;
@@ -767,16 +767,23 @@ impl<T: PipeSample> PcmPipe<T> {
         consume: &mut dyn FnMut(&[T]) -> Result<(), DecodeError>,
     ) -> Result<bool, DecodeError> {
         if let Some((fallback, expected)) = self.retry.take() {
-            let mut candidate = Vec::with_capacity(expected);
+            let frame_bytes = self.channels * 4;
+            // One byte beyond the tolerance distinguishes EOF from a long
+            // producer. Only wait once the entire accepted output was read.
+            let read_limit = expected + frame_bytes + 1;
+            let mut candidate = Vec::with_capacity(read_limit);
             let complete = self
                 .stdout
                 .by_ref()
-                .take(expected as u64 + 1)
+                .take(read_limit as u64)
                 .read_to_end(&mut candidate)
                 .is_ok()
-                && candidate.len() == expected
+                && !candidate.is_empty()
+                && candidate.len().is_multiple_of(frame_bytes)
+                && candidate.len().abs_diff(expected) <= frame_bytes
                 && self.child.wait().is_ok_and(|status| status.success());
             if complete {
+                candidate.truncate(expected);
                 self.stdout = Box::new(std::io::Cursor::new(candidate));
             } else {
                 // EOF, a failed demuxer seek or insufficient preroll. No
@@ -1074,6 +1081,66 @@ mod tests {
             let first = (start * 48000.) as usize;
             let end = (first + (length * 48000.) as usize).min(reference.len());
             assert_eq!(decode(Some((start, length))), reference[first..end]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sparse_pipe_accepts_one_whole_frame_of_rounding_before_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let seek = dir.path().join("seek.pcm");
+        let full = dir.path().join("full.pcm");
+        let channels = 4;
+        let frame_bytes = channels * 4;
+        let samples: Vec<i32> = (1..=12).collect();
+        let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let fallback = [99_i32; 8];
+        std::fs::write(&full, 99_i32.to_le_bytes().repeat(fallback.len())).unwrap();
+
+        // The second producer has distinguishable PCM so a fallback, or
+        // delivery of any unvalidated prefix, is observable at the callback.
+        let cat = |path: &Path| {
+            let mut cmd = Command::new("cat");
+            cmd.arg(path).stdout(Stdio::piped()).stderr(Stdio::null());
+            cmd
+        };
+        for (wanted, received, success, expected) in [
+            (2, frame_bytes, true, &samples[..4]),
+            (2, 2 * frame_bytes, true, &samples[..8]),
+            (2, 3 * frame_bytes, true, &samples[..8]),
+            (1, 0, true, &fallback[..]),
+            (3, frame_bytes, true, &fallback[..]),
+            (2, frame_bytes + 4, true, &fallback[..]),
+            (2, 3 * frame_bytes + 1, true, &fallback[..]),
+            (2, 1 << 20, true, &fallback[..]),
+            (2, 2 * frame_bytes, false, &fallback[..]),
+        ] {
+            let mut input = bytes.clone();
+            input.resize(received, 0);
+            std::fs::write(&seek, input).unwrap();
+            let mut candidate = cat(&seek);
+            if !success {
+                candidate.arg(dir.path().join("missing"));
+            }
+            let mut pipe = AudioPipeI32::start(
+                candidate,
+                channels,
+                Some((cat(&full), wanted * frame_bytes)),
+                0.,
+            )
+            .unwrap();
+            let mut got = Vec::new();
+            assert!(
+                pipe.pump(&mut |block| {
+                    got.extend_from_slice(block);
+                    Ok(())
+                })
+                .unwrap()
+            );
+            assert_eq!(
+                got, expected,
+                "wanted {wanted} frames, received {received} bytes, success {success}"
+            );
         }
     }
 

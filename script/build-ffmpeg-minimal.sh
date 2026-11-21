@@ -122,6 +122,10 @@ cp ffbuild/config.mak "$OUT_DIR/Sources/config.mak"
 printf '%s\n' "$FFMPEG_VERSION" > "$OUT_DIR/Sources/version.txt"
 strip "$OUT_DIR/ffmpeg$EXE" "$OUT_DIR/ffprobe$EXE" 2>/dev/null || true
 
+if [[ "$(uname -s)" == Darwin ]]; then
+  codesign --force --sign - "$OUT_DIR/ffmpeg" "$OUT_DIR/ffprobe"
+fi
+
 for tool in ffmpeg ffprobe; do
   "$OUT_DIR/$tool$EXE" -hide_banner -version >/dev/null
 done

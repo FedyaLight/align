@@ -183,6 +183,14 @@ Ad-hoc signed for local use. Distribution signing and notarization are not inclu
 README
 
 echo "==> ad-hoc sign + verify"
+# Leave the PyInstaller signatures in Resources/AAF intact.
+if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
+  for lib in ${dylibs[@]+"${dylibs[@]}"}; do
+    codesign --force --sign - "$APP_MACOS/${lib##*/}"
+  done
+  codesign --force --sign - "$APP_MACOS/ffmpeg" "$APP_MACOS/ffprobe"
+fi
+codesign --force --sign - "$APP_MACOS/$APP_NAME"
 codesign --force --sign - "$APP_BUNDLE" >/dev/null
 plutil -lint "$APP_CONTENTS/Info.plist"
 plutil -lint "$RESOURCES/PrivacyInfo.xcprivacy"
