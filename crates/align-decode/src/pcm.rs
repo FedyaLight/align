@@ -36,6 +36,7 @@ pub struct PcmTrack {
     /// (file offset, first frame, frame count) per chunk.
     chunks: Vec<(u64, u64, u64)>,
     total: u64,
+    complete: bool,
 }
 
 impl PcmTrack {
@@ -48,7 +49,8 @@ impl PcmTrack {
         if !isobmff::is_candidate(path) {
             return None;
         }
-        let movie = isobmff::shared_movie(path)?;
+        let mut file = File::open(path).ok()?;
+        let movie = isobmff::shared_movie_for_file(path, &mut file)?;
         let track = movie
             .tracks
             .iter()
@@ -57,12 +59,29 @@ impl PcmTrack {
         let audio = track.audio.as_ref()?;
         let (bits, float) = (audio.bit_depth?, audio.is_float?);
         if !matches!((bits, float), (16 | 24 | 32, false) | (32 | 64, true))
-            || !one_frame_per_sample(&track.sample_entry)
+            || !track.linear_pcm_layout
+            || audio.channels > 64
+            || !track.composition_offsets.is_empty()
+            || audio.sample_rate != f64::from(track.timescale)
+            || track.time_to_sample.iter().any(|&(_, delta)| delta != 1)
+            || !one_frame_per_sample(&track.sample_entry, audio.channels, bits, float)
             || audio.sample_rate.fract() != 0.0
         {
             return None;
         }
         let bytes_per_frame = audio.channels as u64 * bits as u64 / 8;
+        let matching_sizes = match &track.sample_sizes {
+            isobmff::SampleSizes::Constant { size, .. } => u64::from(*size) == bytes_per_frame,
+            isobmff::SampleSizes::Table(sizes) => {
+                sizes.iter().all(|&size| u64::from(size) == bytes_per_frame)
+            }
+        };
+        if !matching_sizes
+            || track.media_duration != track.sample_count()
+            || track.media_duration != track.sample_sizes.count() as u64
+        {
+            return None;
+        }
         let mut chunks = Vec::with_capacity(track.chunk_offsets.len());
         let mut frame = 0u64;
         for chunk in track.chunk_layout() {
@@ -71,7 +90,6 @@ impl PcmTrack {
             chunks.push((offset, frame, frames));
             frame += frames;
         }
-        let file = File::open(path).ok()?;
         let length = file.metadata().ok()?.len();
         // Every chunk must lie inside the file; anything else is not a
         // layout this reader understands.
@@ -83,11 +101,6 @@ impl PcmTrack {
         {
             return None;
         }
-        let lead = if track.timescale > 0 {
-            (track.media_start as f64 * audio.sample_rate / track.timescale as f64).round() as u64
-        } else {
-            0
-        };
         Some(Self {
             file,
             sample_rate: audio.sample_rate,
@@ -95,9 +108,10 @@ impl PcmTrack {
             bits,
             float,
             big_endian: audio.big_endian,
-            lead,
+            lead: 0,
             chunks,
             total: frame,
+            complete: true,
         })
     }
 
@@ -140,19 +154,31 @@ impl PcmTrack {
                     let fmt = format?;
                     let field = |at: usize| u16::from_le_bytes([fmt[at], fmt[at + 1]]);
                     let mut tag = field(0);
-                    if tag == 0xfffe && fmt.len() >= 26 {
-                        tag = field(24); // SubFormat GUID starts with the tag
+                    if tag == 0xfffe {
+                        if fmt.len() < 40
+                            || field(16) < 22
+                            || field(18) != field(14)
+                            || fmt[26..40]
+                                != [0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71]
+                        {
+                            return None;
+                        }
+                        tag = field(24);
                     }
                     let channels = field(2) as usize;
                     let sample_rate = u32::from_le_bytes(fmt[4..8].try_into().ok()?);
                     let block_align = field(12) as u64;
                     if channels == 0
+                        || channels > 64
                         || sample_rate == 0
                         || !block_align.is_multiple_of(channels as u64)
                     {
                         return None;
                     }
                     let bits = (block_align / channels as u64 * 8) as u32;
+                    if bits != u32::from(field(14)) {
+                        return None;
+                    }
                     let float = match (tag, bits) {
                         (1, 16 | 24 | 32) => false,
                         (3, 32 | 64) => true,
@@ -174,6 +200,7 @@ impl PcmTrack {
                         lead: 0,
                         chunks: vec![(body, 0, frames)],
                         total: frames,
+                        complete: frames * block_align == declared,
                     });
                 }
                 _ => {}
@@ -185,6 +212,101 @@ impl PcmTrack {
             offset = body + size + (size & 1);
         }
         None
+    }
+
+    /// Decode one whole physical track in chunk order. Keep the source clock
+    /// through channel selection, including windows crossing chunk boundaries.
+    pub(crate) fn fingerprint(
+        &mut self,
+        source: align_core::AudioAnalysisSource,
+        consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
+    ) -> Result<(), DecodeError> {
+        if !self.complete {
+            return Err(DecodeError::InvalidPcm);
+        }
+        let selected = source.selected_channel();
+        if selected.is_some_and(|channel| channel >= self.channels) {
+            return Err(DecodeError::InvalidPcm);
+        }
+        let width = (self.bits / 8) as usize;
+        let stride = self.channels * width;
+        let native_float =
+            cfg!(target_endian = "little") && self.float && self.bits == 32 && !self.big_endian;
+        let single = selected.is_some() && !native_float;
+        let mut pipe = crate::mono::MonoPipe::new(
+            self.sample_rate,
+            8000.,
+            if single { 1 } else { self.channels },
+            if single { Some(0) } else { selected },
+            source.mixes_channels(),
+            consume,
+        )?;
+        let mut samples = Vec::<f32>::new();
+        let mut bytes = Vec::new();
+        let convert: fn(&[u8]) -> f32 = match (self.bits, self.float, self.big_endian) {
+            (16, false, false) => scaled::<2, false>,
+            (16, false, true) => scaled::<2, true>,
+            (24, false, false) => scaled::<3, false>,
+            (24, false, true) => scaled::<3, true>,
+            (32, false, false) => scaled::<4, false>,
+            (32, false, true) => scaled::<4, true>,
+            (_, true, true) => |b| float(b, true) as f32,
+            (_, true, false) => |b| float(b, false) as f32,
+            _ => return Err(DecodeError::InvalidPcm),
+        };
+        for (index, &(offset, _, count)) in self.chunks.iter().enumerate() {
+            #[cfg(target_os = "macos")]
+            if self.chunks.len() > 1 && index % 32 == 0 {
+                use std::os::fd::AsRawFd;
+                for &(pos, _, frames) in self.chunks.iter().skip(index).take(32) {
+                    let hint = libc::radvisory {
+                        ra_offset: pos as i64,
+                        ra_count: (frames * stride as u64).min(i32::MAX as u64) as i32,
+                    };
+                    // SAFETY: valid descriptor and read-only advisory structure.
+                    // Failure only disables this kernel prefetch hint.
+                    unsafe {
+                        libc::fcntl(self.file.as_raw_fd(), libc::F_RDADVISE, &hint);
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = index;
+            self.file.seek(SeekFrom::Start(offset))?;
+            let mut remaining = count;
+            while remaining > 0 {
+                let n = remaining.min(32768.min((1024 * 1024 / stride) as u64)) as usize;
+                if native_float {
+                    samples.resize(n * self.channels, 0.);
+                    // SAFETY: initialized, exclusively borrowed, aligned f32 storage.
+                    // Every native f32 bit pattern is valid, even on a short read.
+                    let dest = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            samples.as_mut_ptr().cast::<u8>(),
+                            n * stride,
+                        )
+                    };
+                    self.file.read_exact(dest)?;
+                } else {
+                    bytes.resize(n * stride, 0);
+                    self.file.read_exact(&mut bytes)?;
+                    samples.clear();
+                    if let Some(channel) = selected {
+                        let at = channel * width;
+                        samples.extend(
+                            bytes
+                                .chunks_exact(stride)
+                                .map(|f| convert(&f[at..at + width])),
+                        );
+                    } else {
+                        samples.extend(bytes.chunks_exact(width).map(convert));
+                    }
+                }
+                pipe.push_interleaved(&samples)?;
+                remaining -= n as u64;
+            }
+        }
+        pipe.finish()
     }
 
     /// Stream format and duration without decoding.
@@ -315,7 +437,7 @@ impl PcmTrack {
 }
 
 /// QuickTime v1/v2 sound descriptions must describe one frame per sample.
-fn one_frame_per_sample(entry: &[u8]) -> bool {
+fn one_frame_per_sample(entry: &[u8], channels: usize, bits: u32, float: bool) -> bool {
     let body = entry.get(8..).unwrap_or_default();
     let field = |at: usize| {
         body.get(at..at + 4)
@@ -324,9 +446,22 @@ fn one_frame_per_sample(entry: &[u8]) -> bool {
     match body.get(8..10).map(|v| u16::from_be_bytes([v[0], v[1]])) {
         Some(0) => true,
         Some(1) => field(28) == Some(1),
-        Some(2) => field(60) == Some(1),
+        Some(2) => {
+            field(60) == Some(1)
+                && field(56) == Some(channels as u32 * (bits / 8))
+                && field(52).is_some_and(|flags| {
+                    // Packed, interleaved signed integer or floating point. Only
+                    // byte order may vary; reject aligned-high, planar, etc.
+                    flags & !2 == if float { 9 } else { 12 }
+                })
+        }
         _ => false,
     }
+}
+
+#[inline]
+fn scaled<const W: usize, const BIG: bool>(sample: &[u8]) -> f32 {
+    integer::<W, BIG>(sample) as f32 * (1.0 / 2_147_483_648.0)
 }
 
 /// Signed `W`-byte integer sample widened to the top of an i32.
@@ -385,7 +520,7 @@ mod tests {
             fmt.extend_from_slice(&24u16.to_le_bytes());
             fmt.extend_from_slice(&3u32.to_le_bytes());
             fmt.extend_from_slice(&1u16.to_le_bytes());
-            fmt.extend_from_slice(&[0; 14]);
+            fmt.extend_from_slice(&[0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71]);
         }
         let mut out = Vec::new();
         out.extend_from_slice(if large { b"RF64" } else { b"RIFF" });

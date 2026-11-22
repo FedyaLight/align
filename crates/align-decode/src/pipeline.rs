@@ -1073,13 +1073,35 @@ impl Pipeline {
                 _ => Ok(variants),
             }
         };
-        // Variants of one clip stay sequential.
-        let outcomes: Vec<Result<Vec<Variant>, PipelineError>> = align_core::par_map(
-            clips,
-            align_core::parallel::worker_limit(
-                self.decode_worker_cap(clips.iter().map(|c| c.url.as_path())),
-            ),
-            |clip| {
+        // Issue the longest reads first so the last worker does not inherit
+        // a whole camera reel while all other workers are already idle.
+        let mut jobs: Vec<_> = clips.iter().enumerate().collect();
+        jobs.sort_by(|a, b| {
+            b.1.duration
+                .as_seconds()
+                .total_cmp(&a.1.duration.as_seconds())
+        });
+        let cap = if self.backend.kind() == BackendKind::AppleNative
+            && clips.iter().all(|clip| {
+                !clip.audio.is_empty()
+                    && clip
+                        .audio
+                        .iter()
+                        .all(|a| a.is_float.is_some() && a.bit_depth.is_some())
+                    && (crate::isobmff::is_candidate(&clip.url)
+                        || clip
+                            .url
+                            .extension()
+                            .is_some_and(|e| e.eq_ignore_ascii_case("wav")))
+            }) {
+            8
+        } else {
+            self.decode_worker_cap(clips.iter().map(|c| c.url.as_path()))
+        };
+        let mut outcomes = align_core::par_map(
+            &jobs,
+            align_core::parallel::worker_limit(cap),
+            |&(index, clip)| {
                 let outcome = analyse(clip);
                 if let Some(p) = &progress
                     && !outcome.as_ref().is_err_and(|error| self.ends_run(error))
@@ -1107,14 +1129,15 @@ impl Pipeline {
                     event.completed = *done;
                     p(event);
                 }
-                outcome
+                (index, outcome)
             },
         );
+        outcomes.sort_unstable_by_key(|(index, _)| *index);
         // One unreadable file is reported and left unmatched; the others
         // still synchronize. Results stay in input order.
         let mut analysed = Vec::with_capacity(clips.len());
         let mut warnings = Vec::new();
-        for (clip, outcome) in clips.iter().zip(outcomes) {
+        for (clip, (_, outcome)) in clips.iter().zip(outcomes) {
             match outcome {
                 Ok(variants) => analysed.push((*clip, variants)),
                 Err(error) if self.ends_run(&error) => return Err(error),

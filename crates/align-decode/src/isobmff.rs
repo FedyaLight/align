@@ -169,6 +169,8 @@ pub struct Track {
     /// First sample description: its four-character code and full bytes.
     pub codec: [u8; 4],
     pub sample_entry: Vec<u8>,
+    /// All chunks use a single local description and an unmodified timeline.
+    pub(crate) linear_pcm_layout: bool,
     pub timescale: u32,
     pub media_duration: u64,
     /// Presented duration from the edit list, in the movie timescale.
@@ -514,6 +516,11 @@ fn read_movie(file: &mut File, moov: &[u8]) -> Option<Movie> {
 /// Share parsed tables across windows without holding media handles. The
 /// budget covers parsed table allocations, including expanded chunk offsets.
 pub(crate) fn shared_movie(path: &Path) -> Option<std::sync::Arc<Movie>> {
+    let mut file = File::open(path).ok()?;
+    shared_movie_for_file(path, &mut file)
+}
+
+pub(crate) fn shared_movie_for_file(path: &Path, file: &mut File) -> Option<std::sync::Arc<Movie>> {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     const TABLE_BUDGET: usize = 32 * 1024 * 1024;
@@ -524,7 +531,7 @@ pub(crate) fn shared_movie(path: &Path) -> Option<std::sync::Arc<Movie>> {
         bytes: usize,
     }
     static CACHE: Mutex<VecDeque<Entry>> = Mutex::new(VecDeque::new());
-    let revision = align_core::cache::media_revision(path).ok();
+    let revision = align_core::cache::opened_media_revision(file).ok();
     let cache = || {
         CACHE
             .lock()
@@ -542,10 +549,8 @@ pub(crate) fn shared_movie(path: &Path) -> Option<std::sync::Arc<Movie>> {
             return Some(movie);
         }
     }
-    let mut file = File::open(path).ok()?;
-    let revision = align_core::cache::opened_media_revision(&file).ok();
-    let moov = read_moov(&mut file)?;
-    let movie = Arc::new(read_movie(&mut file, &moov)?);
+    let moov = read_moov(file)?;
+    let movie = Arc::new(read_movie(file, &moov)?);
     let bytes = movie.retained_bytes()
         + path.as_os_str().len()
         + size_of::<Entry>()
@@ -897,7 +902,7 @@ pub(crate) fn parse_moov(moov: &[u8]) -> Option<Movie> {
     };
     let tracks = atoms(moov)
         .filter(|a| &a.kind == b"trak")
-        .map(|trak| parse_trak(trak.body))
+        .map(|trak| parse_trak(trak.body, timescale))
         .collect::<Option<Vec<_>>>()?;
     Some(Movie {
         header_bytes: moov.len(),
@@ -908,7 +913,7 @@ pub(crate) fn parse_moov(moov: &[u8]) -> Option<Movie> {
     })
 }
 
-fn parse_trak(trak: &[u8]) -> Option<Track> {
+fn parse_trak(trak: &[u8], movie_timescale: u32) -> Option<Track> {
     let (version, mut tkhd) = full_box(child(trak, b"tkhd")?.body)?;
     tkhd.skip(if version == 1 { 16 } else { 8 })?;
     let id = tkhd.u32()?;
@@ -935,13 +940,24 @@ fn parse_trak(trak: &[u8]) -> Option<Track> {
         _ => TrackKind::Other,
     };
     let stbl = path(mdia, &[b"minf", b"stbl"])?.body;
-    let entry = {
+    let (entry, mut linear_pcm_layout) = {
         let (_, mut stsd) = full_box(child(stbl, b"stsd")?.body)?;
         let count = stsd.u32()?;
         (count > 0).then_some(())?;
         let rest = &stsd.data[stsd.pos..];
-        atoms(rest).next()?
+        (atoms(rest).next()?, count == 1)
     };
+    let local_reference = path(mdia, &[b"minf", b"dinf", b"dref"]).and_then(|dref| {
+        let (_, mut b) = full_box(dref.body)?;
+        let count = b.u32()?;
+        let reference = atoms(&b.data[b.pos..]).next()?;
+        Some(
+            count == 1
+                && matches!(&reference.kind, b"alis" | b"url ")
+                && reference.body == [0, 0, 0, 1],
+        )
+    });
+    linear_pcm_layout &= local_reference == Some(true) && entry.body.get(6..8) == Some(&[0, 1]);
     let audio = if kind == TrackKind::Audio {
         Some(parse_audio_entry(entry)?)
     } else {
@@ -998,7 +1014,7 @@ fn parse_trak(trak: &[u8]) -> Option<Track> {
         .map(|_| {
             let first_chunk = stsc.u32()?;
             let samples_per_chunk = stsc.u32()?;
-            stsc.skip(4)?;
+            linear_pcm_layout &= stsc.u32()? == 1 && samples_per_chunk > 0;
             Some(ChunkRun {
                 first_chunk,
                 samples_per_chunk,
@@ -1040,7 +1056,14 @@ fn parse_trak(trak: &[u8]) -> Option<Track> {
             } else {
                 (b.u32()? as u64, b.u32()? as i32 as i64)
             };
-            b.skip(4)?; // media rate
+            let rate = b.u32()?;
+            linear_pcm_layout &= version <= 1
+                && entries == 1
+                && media_time == 0
+                && rate == 65536
+                && movie_timescale != 0
+                && u128::from(duration) * u128::from(timescale)
+                    == u128::from(media_duration) * u128::from(movie_timescale);
             presentation = presentation.checked_add(duration)?;
             if media_time >= 0 {
                 total = total.checked_add(duration)?;
@@ -1049,6 +1072,8 @@ fn parse_trak(trak: &[u8]) -> Option<Track> {
         }
         Some((total, start.unwrap_or(0), presentation))
     });
+    linear_pcm_layout &=
+        child(trak, b"edts").is_none() || edits.is_some_and(|(_, _, duration)| duration > 0);
     let edited_duration = edits.map(|(total, _, _)| total);
     let media_start = edits.map_or(0, |(_, start, _)| start);
     let presentation_duration = edits.map(|(_, _, presentation)| presentation);
@@ -1061,6 +1086,7 @@ fn parse_trak(trak: &[u8]) -> Option<Track> {
         media_start,
         codec: entry.kind,
         sample_entry: entry.raw.to_vec(),
+        linear_pcm_layout,
         timescale,
         media_duration,
         width,

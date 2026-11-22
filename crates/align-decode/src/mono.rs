@@ -235,7 +235,7 @@ where
         if self.explicit.is_none() && channels > 1 {
             return self.push_adaptive(&frames[..n * channels]);
         }
-        let channel = self.pick_channel_interleaved(frames, n);
+        let channel = self.pick_channel_interleaved(frames);
         self.push_mono((0..n).map(move |i| frames[i * channels + channel]))
     }
 
@@ -245,6 +245,12 @@ where
         let quantum = 512 * self.channels;
         let mut remaining = frames;
         while !remaining.is_empty() {
+            if self.adaptive_pending.is_empty() && remaining.len() >= quantum {
+                let (window, rest) = remaining.split_at(quantum);
+                self.adaptive_window(window)?;
+                remaining = rest;
+                continue;
+            }
             let take = (quantum - self.adaptive_pending.len()).min(remaining.len());
             self.adaptive_pending.extend_from_slice(&remaining[..take]);
             remaining = &remaining[take..];
@@ -260,25 +266,37 @@ where
             return Ok(());
         }
         let block = std::mem::take(&mut self.adaptive_pending);
-        let channels = self.channels;
-        let n = block.len() / channels;
-        let channel = self.pick_channel_interleaved(&block, n);
-        self.push_mono((0..n).map(|i| block[i * channels + channel]))?;
+        self.adaptive_window(&block)?;
         self.adaptive_pending = block;
         self.adaptive_pending.clear();
         Ok(())
     }
 
-    fn pick_channel_interleaved(&mut self, frames: &[f32], n: usize) -> usize {
+    fn adaptive_window(&mut self, block: &[f32]) -> Result<(), DecodeError> {
+        let channels = self.channels;
+        let n = block.len() / channels;
+        let channel = self.pick_channel_interleaved(block);
+        self.push_mono((0..n).map(|i| block[i * channels + channel]))
+    }
+
+    fn pick_channel_interleaved(&mut self, frames: &[f32]) -> usize {
         if let Some(ch) = self.explicit {
             self.selected = Some(ch);
             return ch;
         }
-        self.energies.fill(0.0);
-        for i in 0..n {
-            for ch in 0..self.channels {
-                let v = frames[i * self.channels + ch] as f64;
-                self.energies[ch] += v * v;
+        if self.channels == 2 {
+            let (mut left, mut right) = (0.0, 0.0);
+            for &[l, r] in frames.as_chunks::<2>().0 {
+                left += f64::from(l) * f64::from(l);
+                right += f64::from(r) * f64::from(r);
+            }
+            self.energies.copy_from_slice(&[left, right]);
+        } else {
+            self.energies.fill(0.);
+            for frame in frames.chunks_exact(self.channels) {
+                for (energy, &sample) in self.energies.iter_mut().zip(frame) {
+                    *energy += f64::from(sample) * f64::from(sample);
+                }
             }
         }
         let selected = align_core::select_mono_channel(&self.energies, self.selected);

@@ -7,7 +7,7 @@
 
 use realfft::{RealFftPlanner, RealToComplex};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Search work budget: more spectral bands generate more candidate landmarks.
 /// Match confidence, repeated-take rejection and fine waveform validation
@@ -89,7 +89,7 @@ pub struct FingerprintExtractor {
     spectrum: Vec<num_complex::Complex32>,
     fft_scratch: Vec<num_complex::Complex32>,
     magnitudes: Vec<f32>,
-    window: Vec<f32>,
+    window: &'static [f32],
     scratch: Vec<f32>,
     pending: Vec<f32>,
     consumed: usize,
@@ -109,17 +109,22 @@ impl FingerprintExtractor {
     }
 
     pub fn with_accuracy(accuracy: SearchAccuracy) -> Self {
-        let mut planner = RealFftPlanner::<f32>::new();
-        let forward = planner.plan_fft_forward(FRAME_SIZE);
+        static PLAN: OnceLock<Arc<dyn RealToComplex<f32>>> = OnceLock::new();
+        static WINDOW: OnceLock<Vec<f32>> = OnceLock::new();
+        let forward =
+            Arc::clone(PLAN.get_or_init(|| RealFftPlanner::new().plan_fft_forward(FRAME_SIZE)));
         let spectrum = forward.make_output_vec();
         let fft_scratch = forward.make_scratch_vec();
         // vDSP_HANN_NORM equivalent: 0.5 * (1 - cos(2*pi*n/(N-1))).
         // Relative peak picking is insensitive to the NORM scale factor.
-        let window: Vec<f32> = (0..FRAME_SIZE)
-            .map(|n| {
-                0.5 - 0.5 * (2.0 * std::f32::consts::PI * n as f32 / (FRAME_SIZE - 1) as f32).cos()
-            })
-            .collect();
+        let window = WINDOW.get_or_init(|| {
+            (0..FRAME_SIZE)
+                .map(|n| {
+                    0.5 - 0.5
+                        * (2.0 * std::f32::consts::PI * n as f32 / (FRAME_SIZE - 1) as f32).cos()
+                })
+                .collect()
+        });
         let pending = Vec::with_capacity(FRAME_SIZE * 16);
         Self {
             accuracy,

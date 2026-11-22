@@ -471,16 +471,7 @@ impl AudioReader {
     ) -> Result<(), DecodeError> {
         let mut stream = match self.0 {
             Reader::Pcm(mut track) => {
-                let mut pipe = crate::mono::MonoPipe::new(
-                    track.sample_rate,
-                    8000.0,
-                    track.channels,
-                    source.selected_channel(),
-                    source.mixes_channels(),
-                    consume,
-                )?;
-                track.read_f32(0, None, &mut |planes| pipe.push_owned(planes))?;
-                return pipe.finish();
+                return track.fingerprint(source, consume);
             }
             Reader::Codec(stream) => stream,
         };

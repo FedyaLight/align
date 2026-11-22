@@ -82,6 +82,7 @@ dependencies = [
  "block2",
  "dirs 6.0.0",
  "hound",
+ "libc",
  "ltc",
  "objc2",
  "objc2-av-foundation",

@@ -410,19 +410,16 @@ fn check_completed(reader: &AVAssetReader, path: &Path) -> Result<(), DecodeErro
     ))
 }
 
-/// Next data buffer: owned bytes; the first buffer's PTS (captured even
-/// from marker-only buffers) flows through
-/// `first_pts`. Marker-only buffers are skipped inside the loop. Owned
-/// copy only — one memcpy per buffer is noise next to decode cost, and a
-/// single path means fewer unsafe blocks than a zero-copy fast lane.
+/// Copy the framework block directly into aligned reusable f32 storage.
 fn next_buffer(
-    output: &AVAssetReaderTrackOutput,
+    session: &Reader,
     first_pts: &mut Option<f64>,
-) -> Result<Option<Vec<u8>>, DecodeError> {
+    samples: &mut Vec<f32>,
+) -> Result<bool, DecodeError> {
     loop {
         // SAFETY: output is reading; every taken buffer is invalidated below.
-        let Some(sbuf) = (unsafe { output.copyNextSampleBuffer() }) else {
-            return Ok(None);
+        let Some(sbuf) = (unsafe { session.output.copyNextSampleBuffer() }) else {
+            return Ok(false);
         };
         if first_pts.is_none() {
             // SAFETY: plain-data getter on a live buffer.
@@ -433,30 +430,33 @@ fn next_buffer(
         }
         let data = unsafe { sbuf.data_buffer() };
         // None = marker-only buffer (skipped below); InvalidPcm = corrupt.
-        let result: Result<Option<Vec<u8>>, DecodeError> = (|| {
+        let result: Result<bool, DecodeError> = (|| {
             let Some(block) = data.as_deref() else {
-                return Ok(None);
+                return Ok(false);
             };
             // SAFETY: plain getter on a live buffer.
             let total = unsafe { block.data_length() };
             if total == 0 {
-                return Ok(None);
+                return Ok(false);
             }
-            let mut owned = vec![0u8; total];
+            if !total.is_multiple_of(4 * session.channels) {
+                return Err(DecodeError::InvalidPcm);
+            }
+            samples.resize(total / 4, 0.0);
             let dest = unsafe {
-                std::ptr::NonNull::new_unchecked(owned.as_mut_ptr() as *mut std::ffi::c_void)
+                std::ptr::NonNull::new_unchecked(samples.as_mut_ptr() as *mut std::ffi::c_void)
             };
             // SAFETY: dest is a valid writable allocation of total bytes.
             let status = unsafe { block.copy_data_bytes(0, total, dest) };
             if status != 0 {
                 return Err(DecodeError::InvalidPcm);
             }
-            Ok(Some(owned))
+            Ok(true)
         })();
         unsafe { sbuf.invalidate() };
         match result {
-            Ok(Some(bytes)) => return Ok(Some(bytes)),
-            Ok(None) => continue, // marker-only buffer
+            Ok(true) => return Ok(true),
+            Ok(false) => continue, // marker-only buffer
             Err(e) => return Err(e),
         }
     }
@@ -592,11 +592,9 @@ fn avfoundation_window(
     )?;
     // Read presentation timestamps from the sample buffers.
     let mut actual_start = None::<f64>;
-    while samples.borrow().len() < want {
-        let Some(bytes) = next_buffer(&session.output, &mut actual_start)? else {
-            break;
-        };
-        pipe.push_interleaved(&bytes_to_f32(&bytes, session.channels)?)?;
+    let mut block = Vec::new();
+    while samples.borrow().len() < want && next_buffer(&session, &mut actual_start, &mut block)? {
+        pipe.push_interleaved(&block)?;
     }
     check_completed(&session.reader, path)?;
     pipe.finish()?;
@@ -682,6 +680,9 @@ impl MediaBackend for AppleNativeBackend {
             let stream_count = self.inspect(path)?.audio_streams.len();
             return crate::mix::decode_all_streams_mono_8k(self, path, stream_count, consume);
         }
+        if let Some(mut pcm) = crate::pcm::PcmTrack::open(path, source.stream_index()) {
+            return pcm.fingerprint(source, consume);
+        }
         let (session, sample_rate) = open_reader(path, source.stream_index(), None)?;
         let mut pipe = crate::mono::MonoPipe::new(
             sample_rate,
@@ -692,8 +693,9 @@ impl MediaBackend for AppleNativeBackend {
             consume,
         )?;
         let mut pts = None;
-        while let Some(bytes) = next_buffer(&session.output, &mut pts)? {
-            pipe.push_interleaved(&bytes_to_f32(&bytes, session.channels)?)?;
+        let mut block = Vec::new();
+        while next_buffer(&session, &mut pts, &mut block)? {
+            pipe.push_interleaved(&block)?;
         }
         check_completed(&session.reader, path)?;
         pipe.finish()
@@ -777,8 +779,8 @@ impl MediaBackend for AppleNativeBackend {
         let window = range.map(|(start, duration)| (start, duration.unwrap_or(1e9)));
         let (session, sample_rate) = open_reader(path, stream_index, window)?;
         let mut actual = None;
-        while let Some(bytes) = next_buffer(&session.output, &mut actual)? {
-            let floats = bytes_to_f32(&bytes, session.channels)?;
+        let mut floats = Vec::new();
+        while next_buffer(&session, &mut actual, &mut floats)? {
             consume(crate::backend::NativeBlock {
                 sample_rate,
                 channels: session.channels,
@@ -801,22 +803,6 @@ impl MediaBackend for AppleNativeBackend {
         crate::portable::PortableBackend.decode_native_i32(path, stream_index, range, consume)
     }
 }
-
-/// Little-endian f32 frames from an interleaved PCM block.
-fn bytes_to_f32(bytes: &[u8], channels: usize) -> Result<Vec<f32>, DecodeError> {
-    if !bytes.len().is_multiple_of(4 * channels) || bytes.is_empty() {
-        return Err(DecodeError::InvalidPcm);
-    }
-    Ok(bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|b| f32::from_le_bytes(*b))
-        .collect())
-}
-
-// ------------------------------------------------------------ traits used above
-// (MonoPipe takes planar *or* interleaved; the reader vends interleaved.)
 
 #[cfg(test)]
 mod tests {
