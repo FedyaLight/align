@@ -113,6 +113,8 @@ pub type WindowDecoder<'a> = Box<
         + 'a,
 >;
 
+pub type TrackConsumer<'a> = &'a mut dyn FnMut(usize, &[f32]) -> Result<(), DecodeError>;
+
 /// The single seam between shared algorithms and OS media stacks.
 /// Both backends must honor the same contracts:
 /// 8 kHz mono stream / 16 kHz windows, adaptive-mono hysteresis 0.9,
@@ -128,6 +130,17 @@ pub trait MediaBackend: Send + Sync {
         source: AudioAnalysisSource,
         consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
     ) -> Result<(), DecodeError>;
+
+    /// Batched PCM variants in callback-slot order. Return None only before
+    /// emitting anything. On error the caller discards the partial state.
+    fn fingerprint_tracks(
+        &self,
+        _path: &Path,
+        _sources: &[AudioAnalysisSource],
+        _consume: crate::backend::TrackConsumer<'_>,
+    ) -> Option<Result<(), DecodeError>> {
+        None
+    }
 
     fn decode_window_16k(
         &self,

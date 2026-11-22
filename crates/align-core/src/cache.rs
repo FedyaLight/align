@@ -479,6 +479,13 @@ impl LtcEntry {
 }
 
 impl FingerprintEntry<'_> {
+    pub fn exists(&self) -> bool {
+        self.path.is_file()
+            || self
+                .cache
+                .path_for_version(self.sample, self.variant, LEGACY_CACHE_VERSION)
+                .is_file()
+    }
     pub fn load(&self) -> Option<Vec<Fingerprint>> {
         if let Ok(bytes) = std::fs::read(&self.path)
             && let Ok(payload) = bincode::deserialize::<Payload>(&bytes)

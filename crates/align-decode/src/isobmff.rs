@@ -340,6 +340,7 @@ fn decode_time_mode(timescale: u32, runs: &[(u32, u32)]) -> align_core::VideoFra
 #[derive(Clone, Debug)]
 pub struct Movie {
     header_bytes: usize,
+    pub(crate) media_ranges: Vec<std::ops::Range<u64>>,
     pub timescale: u32,
     pub duration: u64,
     pub tracks: Vec<Track>,
@@ -353,6 +354,7 @@ impl Movie {
     }
     fn retained_bytes(&self) -> usize {
         size_of::<Movie>()
+            + self.media_ranges.capacity() * size_of::<std::ops::Range<u64>>()
             + self.tracks.capacity() * size_of::<Track>()
             + self
                 .tracks
@@ -458,26 +460,31 @@ impl Movie {
 
 // ------------------------------------------------------------ file access
 
+fn atom_header(file: &mut File, offset: u64, length: u64) -> Option<([u8; 4], u64, u64)> {
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut header = [0u8; 16];
+    file.read_exact(&mut header[..8]).ok()?;
+    let kind: [u8; 4] = header[4..8].try_into().ok()?;
+    let (size, header_len) = match u32::from_be_bytes(header[..4].try_into().ok()?) {
+        0 => (length - offset, 8),
+        1 => {
+            file.read_exact(&mut header[8..]).ok()?;
+            (u64::from_be_bytes(header[8..].try_into().ok()?), 16)
+        }
+        n => (n as u64, 8),
+    };
+    if size < header_len || offset.checked_add(size)? > length {
+        return None;
+    }
+    Some((kind, size, header_len))
+}
+
 /// Locate and load the top-level `moov` box without reading media data.
 pub(crate) fn read_moov(file: &mut File) -> Option<Vec<u8>> {
     let length = file.metadata().ok()?.len();
     let mut offset = 0u64;
     while offset + 8 <= length {
-        file.seek(SeekFrom::Start(offset)).ok()?;
-        let mut header = [0u8; 16];
-        file.read_exact(&mut header[..8]).ok()?;
-        let kind: [u8; 4] = header[4..8].try_into().ok()?;
-        let (size, header_len) = match u32::from_be_bytes(header[..4].try_into().ok()?) {
-            0 => (length - offset, 8),
-            1 => {
-                file.read_exact(&mut header[8..]).ok()?;
-                (u64::from_be_bytes(header[8..].try_into().ok()?), 16)
-            }
-            n => (n as u64, 8),
-        };
-        if size < header_len || offset.checked_add(size)? > length {
-            return None;
-        }
+        let (kind, size, _) = atom_header(file, offset, length)?;
         if &kind == b"moov" {
             if size > MAX_MOOV_BYTES {
                 return None;
@@ -501,6 +508,30 @@ pub fn read(path: &Path) -> Option<Movie> {
 fn read_movie(file: &mut File, moov: &[u8]) -> Option<Movie> {
     let body = atoms(moov).next()?.body;
     let mut movie = parse_moov(body)?;
+    if movie
+        .audio()
+        .any(|t| t.audio.as_ref().is_some_and(|a| a.is_float.is_some()))
+    {
+        // Check top-level payload extents once per parsed header. Refuse
+        // the direct reader if the rest of the container is malformed.
+        let length = file.metadata().ok()?.len();
+        let mut pos = 0;
+        for _ in 0..65536 {
+            let Some((kind, size, header)) = atom_header(file, pos, length) else {
+                break;
+            };
+            if &kind == b"mdat" {
+                movie.media_ranges.push(pos + header..pos + size);
+            }
+            pos += size;
+            if pos == length {
+                break;
+            }
+        }
+        if pos != length {
+            movie.media_ranges.clear();
+        }
+    }
     if let Some(track) = movie.tracks.iter().find(|t| t.kind == TrackKind::Timecode) {
         let (offset, length, _) = *track.chunks()?.first()?;
         if length >= 4 {
@@ -906,6 +937,7 @@ pub(crate) fn parse_moov(moov: &[u8]) -> Option<Movie> {
         .collect::<Option<Vec<_>>>()?;
     Some(Movie {
         header_bytes: moov.len(),
+        media_ranges: Vec::new(),
         timescale,
         duration,
         tracks,

@@ -186,6 +186,15 @@ impl MediaBackend for PortableBackend {
         }
     }
 
+    fn fingerprint_tracks(
+        &self,
+        path: &Path,
+        sources: &[AudioAnalysisSource],
+        consume: crate::backend::TrackConsumer<'_>,
+    ) -> Option<Result<(), DecodeError>> {
+        crate::pcm::fingerprint_tracks(path, sources, consume)
+    }
+
     fn decode_mono_8k(
         &self,
         path: &Path,

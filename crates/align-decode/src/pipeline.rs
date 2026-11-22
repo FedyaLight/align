@@ -1040,7 +1040,37 @@ impl Pipeline {
                         preview.consume(block);
                     }
                 };
+            let mut batched = Vec::new();
+            // A warm or partly warm movie only decodes the variants it needs.
+            let cold = (2..=16).contains(&sources.len())
+                && sources.iter().all(|source| {
+                    sample.as_ref().is_none_or(|sample| {
+                        !cache
+                            .entry(sample, &accuracy.cache_key(&source.cache_key()))
+                            .exists()
+                    })
+                });
+            if cold {
+                let mut states: Vec<_> = sources.iter().map(|_| start()).collect();
+                match self
+                    .backend
+                    .fingerprint_tracks(&clip.url, &sources, &mut |index, block| {
+                        if cancelled(cancel) {
+                            return Err(crate::DecodeError::Cancelled);
+                        }
+                        feed(&mut states[index], block);
+                        Ok(())
+                    }) {
+                    Some(Ok(())) => batched = states,
+                    Some(Err(crate::DecodeError::Cancelled)) => {
+                        return Err(PipelineError::Cancelled);
+                    }
+                    _ => {}
+                }
+            }
+            let mut batched = batched.into_iter();
             for source in sources {
+                let state = batched.next();
                 let variant = (|| -> Result<Variant, PipelineError> {
                     let cache_key = accuracy.cache_key(&source.cache_key());
                     let entry = sample.as_ref().map(|s| cache.entry(s, &cache_key));
@@ -1080,8 +1110,10 @@ impl Pipeline {
                             waveform,
                         });
                     }
-                    let (mut extractor, preview) =
-                        self.decode_mono_8k_into(clip, source, cancel, start, feed)?;
+                    let (mut extractor, preview) = match state {
+                        Some(state) => state,
+                        None => self.decode_mono_8k_into(clip, source, cancel, start, feed)?,
+                    };
                     if cancelled(cancel) {
                         return Err(PipelineError::Cancelled);
                     }
