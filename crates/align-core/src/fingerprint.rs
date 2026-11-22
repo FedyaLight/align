@@ -83,7 +83,14 @@ struct Peak {
     bin: u16,
 }
 
+// ~8.9 hours at one byte per 64 ms hop. Longer recordings still get
+// complete landmarks; never search a truncated envelope as a whole clip.
+pub const MAX_FLUX_HOPS: usize = 500_000;
+
 pub struct FingerprintExtractor {
+    flux_limit: usize,
+    previous_spectrum: Vec<f32>,
+    flux: Vec<u8>,
     accuracy: SearchAccuracy,
     forward: Arc<dyn RealToComplex<f32>>,
     spectrum: Vec<num_complex::Complex32>,
@@ -127,6 +134,9 @@ impl FingerprintExtractor {
         });
         let pending = Vec::with_capacity(FRAME_SIZE * 16);
         Self {
+            flux_limit: 0,
+            previous_spectrum: Vec::new(),
+            flux: Vec::new(),
             accuracy,
             forward,
             spectrum,
@@ -139,6 +149,41 @@ impl FingerprintExtractor {
             frame_number: 0,
             peaks: Vec::new(),
         }
+    }
+
+    pub fn enable_flux(&mut self, limit: usize) {
+        self.flux_limit = limit.min(MAX_FLUX_HOPS);
+        self.previous_spectrum.resize(476, 0.);
+    }
+
+    pub fn take_flux(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.flux)
+    }
+
+    fn record_flux(&mut self) {
+        if self.flux.len() == self.flux_limit {
+            self.flux = Vec::new();
+            self.previous_spectrum.clear();
+            return;
+        }
+        let magnitudes = &self.magnitudes[10..486];
+        let mut current = [0.0; 476];
+        for (out, power) in current.iter_mut().zip(magnitudes) {
+            *out = power.sqrt();
+        }
+        let sum: f32 = current.iter().sum();
+        let scale = if sum.is_finite() && sum > 1e-5 {
+            sum.recip()
+        } else {
+            0.
+        };
+        let mut flux = 0.;
+        for (old, magnitude) in self.previous_spectrum.iter_mut().zip(current) {
+            let v = if scale > 0. { magnitude * scale } else { 0. };
+            flux += (v - *old).max(0.);
+            *old = v;
+        }
+        self.flux.push((flux * 255.).round() as u8);
     }
 
     /// Streaming ingest. Bounded memory: the pending buffer is compacted
@@ -165,6 +210,9 @@ impl FingerprintExtractor {
             for (i, c) in self.spectrum.iter().take(HALF).enumerate() {
                 // vDSP_zvmags = squared magnitude.
                 self.magnitudes[i] = c.re * c.re + c.im * c.im;
+            }
+            if !self.previous_spectrum.is_empty() {
+                self.record_flux();
             }
             self.analyze_frame();
             self.consumed += HOP_SIZE;

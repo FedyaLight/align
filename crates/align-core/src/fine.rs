@@ -25,6 +25,9 @@ use crate::matcher::{MatchPolicy, PairAlignmentPoint, PairwiseMatch};
 use crate::model::{AudioAnalysisSource, ClipId, MatchEvidence};
 use crate::piecewise::PiecewiseTimeMapping;
 
+mod flux;
+pub use flux::recover_short_takes;
+
 pub const FINE_SAMPLE_RATE: f64 = 16_000.0;
 /// Rate gate shared with the coarse matcher policy.
 pub const RATE_SPAN_SECONDS: f64 = 600.0;
@@ -697,6 +700,44 @@ mod tests {
         };
         let durations = [(id("a"), 130.0), (id("b"), 130.0)].into_iter().collect();
         (provider, durations)
+    }
+
+    #[test]
+    fn flux_rescue_requires_unique_envelope_and_independent_waveform_agreement() {
+        let rate = 16_000;
+        let q = noise(12 * rate, 17);
+        let mut r = noise(42 * rate, 91);
+        let start = 20 * rate + 512;
+        r[start..start + q.len()].copy_from_slice(&q);
+        let mut provider = SynthProvider {
+            clips: [(id("q"), q), (id("r"), r)].into_iter().collect(),
+            sample_rate: rate as f64,
+        };
+        let env: Vec<u8> = noise(185, 123)
+            .iter()
+            .map(|v| (128. + 120. * v) as u8)
+            .collect();
+        let mut reference = vec![33; 650];
+        reference[313..313 + 185].copy_from_slice(&env);
+        let search = |r: &[u8], provider: &SynthProvider| {
+            recover_short_takes(
+                &[(id("q"), env.clone()), (id("r"), r.to_vec())],
+                &[],
+                &[],
+                &Default::default(),
+                &Default::default(),
+                provider,
+                &Default::default(),
+            )
+        };
+        let result = search(&reference, &provider);
+        assert_eq!(result.len(), 1);
+        assert!((result[0].offset - 20.032).abs() < 0.0001);
+        let mut repeated = reference.clone();
+        repeated[20..205].copy_from_slice(&env);
+        assert!(search(&repeated, &provider).is_empty());
+        provider.clips.insert(id("r"), noise(42 * rate, 87));
+        assert!(search(&reference, &provider).is_empty());
     }
 
     #[test]

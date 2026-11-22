@@ -199,9 +199,9 @@ impl FingerprintCache {
             }
             st.file_count += 1;
             st.total_bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
-            st.total_bytes += std::fs::metadata(p.with_extension("waveform"))
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
+            for ext in ["waveform", "flux1"] {
+                st.total_bytes += std::fs::metadata(p.with_extension(ext)).map_or(0, |m| m.len());
+            }
         }
         st
     }
@@ -250,11 +250,13 @@ impl FingerprintCache {
             if media.contains(&normalized_path(&media_path)) && std::fs::remove_file(path).is_ok() {
                 removed.file_count += 1;
                 removed.total_bytes += metadata.len();
-                let waveform = entry.path().with_extension("waveform");
-                if let Ok(metadata) = std::fs::metadata(&waveform)
-                    && std::fs::remove_file(waveform).is_ok()
-                {
-                    removed.total_bytes += metadata.len();
+                for ext in ["waveform", "flux1"] {
+                    let sidecar = entry.path().with_extension(ext);
+                    if let Ok(metadata) = std::fs::metadata(&sidecar)
+                        && std::fs::remove_file(sidecar).is_ok()
+                    {
+                        removed.total_bytes += metadata.len();
+                    }
                 }
             }
         }
@@ -289,11 +291,13 @@ impl FingerprintCache {
             if expired && std::fs::remove_file(path).is_ok() {
                 removed.file_count += 1;
                 removed.total_bytes += metadata.len();
-                let waveform = entry.path().with_extension("waveform");
-                if let Ok(metadata) = std::fs::metadata(&waveform)
-                    && std::fs::remove_file(waveform).is_ok()
-                {
-                    removed.total_bytes += metadata.len();
+                for ext in ["waveform", "flux1"] {
+                    let sidecar = entry.path().with_extension(ext);
+                    if let Ok(metadata) = std::fs::metadata(&sidecar)
+                        && std::fs::remove_file(sidecar).is_ok()
+                    {
+                        removed.total_bytes += metadata.len();
+                    }
                 }
             }
         }
@@ -516,6 +520,27 @@ impl FingerprintEntry<'_> {
             return;
         };
         let _ = crate::staged::write(&self.path, &bytes);
+    }
+
+    pub fn load_flux(&self, limit: usize) -> Option<Vec<u8>> {
+        use std::io::Read;
+        let file = std::fs::File::open(self.path.with_extension("flux1")).ok()?;
+        let limit = limit.min(crate::fingerprint::MAX_FLUX_HOPS);
+        if file.metadata().ok()?.len() > limit as u64 {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        file.take(limit as u64 + 1).read_to_end(&mut bytes).ok()?;
+        (bytes.len() <= limit).then_some(bytes)
+    }
+
+    pub fn save_flux(&self, bytes: &[u8]) {
+        if bytes.len() <= crate::fingerprint::MAX_FLUX_HOPS
+            && self.path.is_file()
+            && self.sample.is_current()
+        {
+            let _ = crate::staged::write(&self.path.with_extension("flux1"), bytes);
+        }
     }
 
     /// Load the compact amplitude envelope stored beside a fingerprint entry.

@@ -128,6 +128,7 @@ impl WaveformPreview {
 }
 
 struct FingerprintRun {
+    envelopes: Vec<(ClipId, Vec<u8>)>,
     features: Vec<align_core::ClipFingerprints>,
     selected_sources: HashMap<ClipId, AudioAnalysisSource>,
     /// Clips left out because their audio could not be read.
@@ -422,6 +423,7 @@ impl Pipeline {
                 .or_insert(options.audio_source);
         }
         let FingerprintRun {
+            envelopes,
             features,
             selected_sources,
             warnings: unreadable,
@@ -523,7 +525,7 @@ impl Pipeline {
                     p(out);
                 }) as Box<dyn Fn(align_core::RefineEvent) + Send + Sync>
             });
-        let refined = refine_forest(
+        let mut refined = refine_forest(
             &durations,
             &candidates,
             &options.match_policy,
@@ -533,6 +535,20 @@ impl Pipeline {
             refine_progress.as_deref(),
         );
 
+        if cancelled(cancel) {
+            return Err(PipelineError::Cancelled);
+        }
+
+        let rescue = align_core::fine::recover_short_takes(
+            &envelopes,
+            &refined,
+            constraints,
+            &options.match_policy,
+            &source_map,
+            &provider,
+            cancel,
+        );
+        refined.extend(rescue);
         if cancelled(cancel) {
             return Err(PipelineError::Cancelled);
         }
@@ -954,6 +970,7 @@ impl Pipeline {
     ) -> Result<FingerprintRun, PipelineError> {
         use align_core::Fingerprint;
         struct Variant {
+            flux: Vec<u8>,
             source: AudioAnalysisSource,
             fingerprints: Vec<Fingerprint>,
             waveform: Option<Vec<f32>>,
@@ -968,6 +985,18 @@ impl Pipeline {
         if let Some(p) = &progress {
             p(PipelineProgress::basic(Phase::Fingerprint, 0, total, None));
         }
+        // Bound project-wide envelope memory, including multiple audio variants.
+        let flux_limit =
+            |clip: &Clip| ((clip.duration.as_seconds() / 0.064).ceil() as usize).saturating_add(2);
+        let mut flux_hops = 0usize;
+        let flux_enabled = clips.iter().all(|clip| {
+            let hops = flux_limit(clip);
+            flux_hops = flux_hops.saturating_add(hops.saturating_mul(clip.audio.len()));
+            flux_hops <= 8 * 1024 * 1024
+        }) && clips.len() <= 256
+            && clips
+                .iter()
+                .any(|c| (5.0..=32.).contains(&c.duration.as_seconds()));
         let analyse = |clip: &&Clip| -> Result<Vec<Variant>, PipelineError> {
             if cancelled(cancel) {
                 return Err(PipelineError::Cancelled);
@@ -993,12 +1022,39 @@ impl Pipeline {
             let decoder_cache = self.decoder_cache(&clip.url);
             let cache = decoder_cache.as_ref().unwrap_or(&self.cache);
             let sample = align_core::cache::MediaSample::read(&clip.url).ok();
+            let want_flux = flux_enabled && accuracy.is_balanced();
+            let start = || {
+                let mut extractor = FingerprintExtractor::with_accuracy(accuracy);
+                if want_flux {
+                    extractor.enable_flux(flux_limit(clip));
+                }
+                let preview = generate_waveform_previews
+                    .then(|| WaveformPreview::new(clip.duration.as_seconds()));
+                (extractor, preview)
+            };
+            let feed =
+                |(extractor, preview): &mut (FingerprintExtractor, Option<WaveformPreview>),
+                 block: &[f32]| {
+                    extractor.consume(block);
+                    if let Some(preview) = preview {
+                        preview.consume(block);
+                    }
+                };
             for source in sources {
                 let variant = (|| -> Result<Variant, PipelineError> {
                     let cache_key = accuracy.cache_key(&source.cache_key());
                     let entry = sample.as_ref().map(|s| cache.entry(s, &cache_key));
-                    if let Some((entry, cached)) = entry.as_ref().and_then(|e| Some((e, e.load()?)))
-                    {
+                    if let Some((entry, cached, flux)) = entry.as_ref().and_then(|e| {
+                        Some((
+                            e,
+                            e.load()?,
+                            if want_flux {
+                                e.load_flux(flux_limit(clip))?
+                            } else {
+                                Vec::new()
+                            },
+                        ))
+                    }) {
                         let waveform = if generate_waveform_previews {
                             if let Some(waveform) = entry.load_waveform() {
                                 Some(waveform)
@@ -1020,39 +1076,29 @@ impl Pipeline {
                         return Ok(Variant {
                             source,
                             fingerprints: cached,
+                            flux,
                             waveform,
                         });
                     }
-                    let (extractor, preview) = self.decode_mono_8k_into(
-                        clip,
-                        source,
-                        cancel,
-                        || {
-                            (
-                                FingerprintExtractor::with_accuracy(accuracy),
-                                generate_waveform_previews
-                                    .then(|| WaveformPreview::new(clip.duration.as_seconds())),
-                            )
-                        },
-                        |(extractor, preview), block| {
-                            extractor.consume(block);
-                            if let Some(preview) = preview {
-                                preview.consume(block);
-                            }
-                        },
-                    )?;
+                    let (mut extractor, preview) =
+                        self.decode_mono_8k_into(clip, source, cancel, start, feed)?;
                     if cancelled(cancel) {
                         return Err(PipelineError::Cancelled);
                     }
+                    let flux = extractor.take_flux();
                     let fingerprints = extractor.finish();
                     if let Some(entry) = &entry {
                         entry.save(&fingerprints);
+                        if want_flux {
+                            entry.save_flux(&flux);
+                        }
                     }
                     let waveform = preview.map(WaveformPreview::finish);
                     if let (Some(waveform), Some(entry)) = (&waveform, &entry) {
                         entry.save_waveform(waveform);
                     }
                     Ok(Variant {
+                        flux,
                         source,
                         fingerprints,
                         waveform,
@@ -1167,6 +1213,7 @@ impl Pipeline {
                 .copied()
                 .unwrap_or(AudioAnalysisSource::Automatic)
         };
+        let mut envelopes = Vec::new();
         if analysed.iter().all(|(_, variants)| variants.len() == 1) {
             let mut selected = HashMap::new();
             let mut features = Vec::with_capacity(analysed.len());
@@ -1175,12 +1222,16 @@ impl Pipeline {
                 if variant.source != requested_source(clip) {
                     selected.insert(clip.id.clone(), variant.source);
                 }
+                if !variant.flux.is_empty() {
+                    envelopes.push((clip.id.clone(), variant.flux));
+                }
                 features.push(align_core::ClipFingerprints {
                     clip_id: clip.id.clone(),
                     fingerprints: variant.fingerprints,
                 });
             }
             return Ok(FingerprintRun {
+                envelopes,
                 features,
                 selected_sources: selected,
                 warnings,
@@ -1228,6 +1279,9 @@ impl Pipeline {
                 if v.source != requested_source(clip) {
                     selected.insert(clip.id.clone(), v.source);
                 }
+                if !v.flux.is_empty() {
+                    envelopes.push((clip.id.clone(), v.flux));
+                }
                 features.push(align_core::ClipFingerprints {
                     clip_id: clip.id.clone(),
                     fingerprints: v.fingerprints,
@@ -1235,6 +1289,7 @@ impl Pipeline {
             }
         }
         Ok(FingerprintRun {
+            envelopes,
             features,
             selected_sources: selected,
             warnings,
