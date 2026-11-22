@@ -1155,11 +1155,16 @@ impl Pipeline {
             let decoder_cache = self.decoder_cache(&clip.url);
             let cache = decoder_cache.as_ref().unwrap_or(&self.cache);
             let sample = align_core::cache::MediaSample::read(&clip.url).ok();
-            let want_flux = flux_enabled && accuracy.is_balanced();
+            // Producing a sidecar during a cold decode is independent of whether
+            // this project has a short take that can use it right now.
+            let hops = flux_limit(clip);
+            let cache_flux = accuracy.is_balanced()
+                && hops.saturating_sub(2) <= align_core::fingerprint::MAX_FLUX_HOPS;
+            let use_flux = flux_enabled && cache_flux;
             let start = || {
                 let mut extractor = FingerprintExtractor::with_accuracy(accuracy);
-                if want_flux {
-                    extractor.enable_flux(flux_limit(clip));
+                if cache_flux {
+                    extractor.enable_flux(hops);
                 }
                 let preview = generate_waveform_previews
                     .then(|| WaveformPreview::new(clip.duration.as_seconds()));
@@ -1207,17 +1212,15 @@ impl Pipeline {
                 let variant = (|| -> Result<Variant, PipelineError> {
                     let cache_key = accuracy.cache_key(&source.cache_key());
                     let entry = sample.as_ref().map(|s| cache.entry(s, &cache_key));
-                    if let Some((entry, cached, flux)) = entry.as_ref().and_then(|e| {
-                        Some((
-                            e,
-                            e.load()?,
-                            if want_flux {
-                                e.load_flux(flux_limit(clip))?
-                            } else {
-                                Vec::new()
-                            },
-                        ))
-                    }) {
+                    if let Some(entry) = &entry
+                        && let Some(cached) = entry.load()
+                    {
+                        // Older Balanced entries may have only landmarks.
+                        let flux = if use_flux {
+                            entry.load_flux(hops).unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
                         let waveform = if generate_waveform_previews {
                             if let Some(waveform) = entry.load_waveform() {
                                 Some(waveform)
@@ -1257,7 +1260,7 @@ impl Pipeline {
                     let fingerprints = extractor.finish();
                     if let Some(entry) = &entry {
                         entry.save(&fingerprints);
-                        if want_flux {
+                        if cache_flux && !flux.is_empty() {
                             entry.save_flux(&flux);
                         }
                     }
@@ -1266,7 +1269,7 @@ impl Pipeline {
                         entry.save_waveform(waveform);
                     }
                     Ok(Variant {
-                        flux,
+                        flux: if use_flux { flux } else { Vec::new() },
                         source,
                         fingerprints,
                         waveform,
@@ -3080,6 +3083,56 @@ mod tests {
             assert_eq!(count, usize::from(clock_rate != 1.0), "{tag}: sidecars");
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn adding_short_take_reuses_long_fingerprints_even_without_legacy_flux() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = noise(40 * 44100, 0xBEEF);
+        write_delayed_wav(dir.path(), "long-a.wav", &body, 0.0);
+        write_delayed_wav(dir.path(), "long-b.wav", &body, 1.024);
+        let inputs = [PipelineInput::Media(dir.path().to_owned())];
+        let sync = |fails: fn(&Path, AudioAnalysisSource) -> Option<crate::DecodeError>| {
+            faulty_pipeline(
+                dir.path(),
+                FaultyAnalysis {
+                    native_reads: Default::default(),
+                    fails,
+                    windows_fail: false,
+                },
+            )
+            .synchronize(
+                &inputs,
+                &[],
+                &PipelineOptions::default(),
+                None,
+                &Default::default(),
+            )
+            .unwrap()
+        };
+        assert_eq!(sync(|_, _| None).matches.len(), 1);
+        let envelopes: Vec<_> = std::fs::read_dir(dir.path().join(".cache"))
+            .unwrap()
+            .map(|file| file.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "flux1"))
+            .collect();
+        assert_eq!(
+            envelopes.len(),
+            2,
+            "cold Balanced writes envelopes for long clips"
+        );
+        assert!(
+            envelopes
+                .iter()
+                .all(|p| std::fs::metadata(p).unwrap().len() > 0)
+        );
+        // Simulate one entry from a release that only saved landmarks.
+        std::fs::remove_file(&envelopes[0]).unwrap();
+        write_delayed_wav(dir.path(), "short.wav", &body[44100..16 * 44100], 0.0);
+        let warm =
+            sync(|path, _| (!named(path, "short.wav")).then_some(crate::DecodeError::Cancelled));
+        assert_eq!(warm.project.clips.len(), 3);
+        assert!(warm.unmatched.is_empty());
     }
 
     #[test]
