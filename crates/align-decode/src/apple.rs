@@ -105,7 +105,7 @@ fn audio_tracks(asset: &AVURLAsset) -> Result<Vec<Retained<AVAssetTrack>>, Decod
 /// `AVSampleCursor` duration/PTS walk feeding the shared classifier.
 /// Mirrors `VideoTimingInspector.inspect` (same thresholds, same early
 /// evidence rules). Returns `None` when the asset has no video track.
-fn video_probe(asset: &AVURLAsset) -> Result<Option<VideoProbe>, DecodeError> {
+fn video_probe(asset: &AVURLAsset, path: &Path) -> Result<Option<VideoProbe>, DecodeError> {
     use align_core::{RangeAccumulator, VideoFrameRateMode, canonical_frame_duration};
 
     let mt_opt = unsafe { AVMediaTypeVideo };
@@ -127,9 +127,14 @@ fn video_probe(asset: &AVURLAsset) -> Result<Option<VideoProbe>, DecodeError> {
     let mode = if unsafe { track.canProvideSampleCursors() } {
         // SAFETY: cursor walk over plain-data CMTime getters.
         let range = unsafe { track.timeRange() };
-        match unsafe { track.makeSampleCursorWithPresentationTimeStamp(range.start) } {
-            None => VideoFrameRateMode::Unknown,
-            Some(cursor) => unsafe {
+        let table_mode = table_frame_rate_mode(path, track, range);
+        match (
+            unsafe { track.makeSampleCursorWithPresentationTimeStamp(range.start) },
+            table_mode,
+        ) {
+            (None, _) => VideoFrameRateMode::Unknown,
+            (Some(_), Some(mode)) => mode,
+            (Some(cursor), None) => unsafe {
                 let mut durations = RangeAccumulator::new();
                 let mut deltas = RangeAccumulator::new();
                 let mut previous: Option<CMTime> = None;
@@ -175,6 +180,66 @@ fn video_probe(asset: &AVURLAsset) -> Result<Option<VideoProbe>, DecodeError> {
         // Standard timecode track first (Sony tail enriches in pipeline).
         source_timecode: standard_timecode(asset),
     }))
+}
+
+// With no reordering or edits, every positive PTS spacing is also an stts
+// duration. Use the native classifier on its extrema, after checking that
+// the table covers exactly the selected track on AVFoundation's timeline.
+fn table_frame_rate_mode(
+    path: &Path,
+    track: &AVAssetTrack,
+    range: CMTimeRange,
+) -> Option<align_core::VideoFrameRateMode> {
+    use align_core::{RangeAccumulator, VideoFrameRateMode};
+    if !crate::isobmff::is_candidate(path)
+        || !is_numeric(range.start)
+        || range.start.value != 0
+        || !is_numeric(range.duration)
+        || range.duration.value <= 0
+    {
+        return None;
+    }
+    let movie = crate::isobmff::shared_movie(path)?;
+    let id = u32::try_from(unsafe { track.trackID() }).ok()?;
+    let mut tracks = movie.tracks.iter().filter(|t| t.id == id);
+    let t = tracks.next()?;
+    if tracks.next().is_some()
+        || t.kind != crate::isobmff::TrackKind::Video
+        || !t.linear_pcm_layout
+        || !t.composition_offsets.is_empty()
+        || t.timescale == 0
+        || !(2..=4_000_000).contains(&t.sample_sizes.count())
+        || t.sample_count() != t.sample_sizes.count() as u64
+        || i128::from(range.duration.value) * i128::from(t.timescale)
+            != i128::from(range.duration.timescale) * i128::from(t.media_duration)
+    {
+        return None;
+    }
+    let mut durations = RangeAccumulator::new();
+    let mut duration = 0_u64;
+    for &(count, delta) in &t.time_to_sample {
+        if count == 0 || delta == 0 {
+            return None;
+        }
+        duration = duration.checked_add(u64::from(count) * u64::from(delta))?;
+        durations.observe(f64::from(delta) / f64::from(t.timescale));
+    }
+    if duration != t.media_duration
+        || !t.chunks()?.into_iter().all(|(offset, size, _)| {
+            let i = movie.media_ranges.partition_point(|r| r.end <= offset);
+            size > 0
+                && movie.media_ranges.get(i).is_some_and(|r| {
+                    r.contains(&offset) && offset.checked_add(size).is_some_and(|end| end <= r.end)
+                })
+        })
+    {
+        return None;
+    }
+    Some(if durations.is_variable() {
+        VideoFrameRateMode::Variable
+    } else {
+        VideoFrameRateMode::Constant
+    })
 }
 
 /// Standard timecode track read: each tmcd sample is a big-endian frame
@@ -349,10 +414,18 @@ fn open_reader(
     let track = tracks
         .get(stream_index)
         .ok_or_else(|| DecodeError::NoAudio(path.display().to_string()))?;
+    reader_for_track(&asset, track, window)
+}
+
+fn reader_for_track(
+    asset: &AVURLAsset,
+    track: &AVAssetTrack,
+    window: Option<(f64, f64)>,
+) -> Result<(Reader, f64), DecodeError> {
     let (sample_rate, channels, _, _) = stream_format(track)?;
     let settings = pcm_settings(sample_rate, channels);
     // SAFETY: objects valid; reader creation copies settings.
-    let reader = unsafe { AVAssetReader::assetReaderWithAsset_error(&asset) }
+    let reader = unsafe { AVAssetReader::assetReaderWithAsset_error(asset) }
         .map_err(|e| apple_error("AVAssetReader", Some(e)))?;
     // SAFETY: track belongs to reader's asset; settings dict well-formed.
     let output = unsafe {
@@ -603,6 +676,49 @@ fn avfoundation_window(
     Ok((actual_start.unwrap_or(start_seconds.max(0.0)), samples))
 }
 
+fn fingerprint_reader(
+    path: &Path,
+    session: Reader,
+    sample_rate: f64,
+    source: AudioAnalysisSource,
+    consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
+) -> Result<(), DecodeError> {
+    let mut pipe = crate::mono::MonoPipe::new(
+        sample_rate,
+        8000.0,
+        session.channels,
+        source.selected_channel(),
+        source.mixes_channels(),
+        consume,
+    )?;
+    let mut pts = None;
+    let mut block = Vec::new();
+    while next_buffer(&session, &mut pts, &mut block)? {
+        pipe.push_interleaved(&block)?;
+    }
+    check_completed(&session.reader, path)?;
+    pipe.finish()
+}
+
+fn native_blocks(
+    path: &Path,
+    session: Reader,
+    sample_rate: f64,
+    consume: &mut dyn FnMut(crate::backend::NativeBlock) -> Result<(), DecodeError>,
+) -> Result<Option<f64>, DecodeError> {
+    let mut actual = None;
+    let mut floats = Vec::new();
+    while next_buffer(&session, &mut actual, &mut floats)? {
+        consume(crate::backend::NativeBlock {
+            sample_rate,
+            channels: session.channels,
+            frames: crate::mono::deinterleave_f32(&floats, session.channels),
+        })?;
+    }
+    check_completed(&session.reader, path)?;
+    Ok(actual)
+}
+
 // ------------------------------------------------------------ backend
 
 pub struct AppleNativeBackend;
@@ -620,9 +736,54 @@ impl MediaBackend for AppleNativeBackend {
     }
 
     fn inspect(&self, path: &Path) -> Result<ProbeReport, DecodeError> {
+        self.inspect_for_import(path, None)
+            .map(|inspection| inspection.report)
+    }
+
+    fn local_inspection<'a>(&'a self, path: &'a Path) -> Option<crate::backend::Inspection<'a>> {
+        use crate::backend::{Inspection, NativeBlock};
+        let mut wave = crate::pcm::PcmTrack::inspection_wave(path)?;
+        let report = wave.probe();
+        let sample_rate = wave.sample_rate;
+        let channels = wave.channels;
+        Some(Inspection {
+            report,
+            opening_audio: Box::new(move |index, consume| {
+                if index != 0 {
+                    return Err(DecodeError::InvalidPcm);
+                }
+                wave.read_f32(0, Some((3. * sample_rate) as u64), &mut |planes| {
+                    consume(NativeBlock {
+                        sample_rate,
+                        channels,
+                        frames: std::mem::take(planes),
+                    })
+                })
+            }),
+        })
+    }
+    fn local_mono_8k(
+        &self,
+        path: &Path,
+        source: AudioAnalysisSource,
+        consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
+    ) -> Option<Result<(), DecodeError>> {
+        let mut pcm = crate::pcm::PcmTrack::open(path, source.stream_index())?;
+        Some(pcm.fingerprint(source, consume))
+    }
+    fn inspect_for_import<'a>(
+        &'a self,
+        path: &'a Path,
+        prepared: Option<&'a crate::backend::PreparedAudio>,
+    ) -> Result<crate::backend::Inspection<'a>, DecodeError> {
+        use crate::backend::Inspection;
         if is_mxf(path) {
-            return crate::portable::PortableBackend.inspect(path);
+            return crate::portable::PortableBackend.inspect_for_import(path, None);
         }
+        if let Some(inspection) = self.local_inspection(path) {
+            return Ok(inspection);
+        }
+        let revision = prepared.and_then(|_| align_core::cache::media_revision(path).ok());
         let asset = open_asset(path)?;
         // SAFETY: plain-data property getter.
         let duration = unsafe { asset.duration() };
@@ -635,12 +796,9 @@ impl MediaBackend for AppleNativeBackend {
             return Err(DecodeError::InvalidPcm);
         }
         let audio = audio_tracks(&asset)?;
-        if audio.is_empty() {
-            // A file with neither audio nor video is inaccessible.
-            let no_video = video_probe(&asset)?.is_none();
-            if no_video {
-                return Err(DecodeError::NoAudio(path.display().to_string()));
-            }
+        let video = video_probe(&asset, path)?;
+        if audio.is_empty() && video.is_none() {
+            return Err(DecodeError::NoAudio(path.display().to_string()));
         }
         let mut audio_streams = Vec::with_capacity(audio.len());
         for track in &audio {
@@ -658,12 +816,39 @@ impl MediaBackend for AppleNativeBackend {
                     .filter(|end| end.is_finite() && *end > 0.0),
             });
         }
-        let video = video_probe(&asset)?;
-        Ok(ProbeReport {
+
+        let mut reusable =
+            revision.filter(|_| audio_streams.len() == 1 && audio_streams[0].is_float.is_none());
+        let report = ProbeReport {
             duration_seconds: seconds,
             audio_streams,
             has_video: video.is_some(),
             video,
+        };
+        Ok(Inspection {
+            report,
+            opening_audio: Box::new(move |index, consume| {
+                let track = audio.get(index).ok_or(DecodeError::InvalidPcm)?;
+                let (session, rate) = reader_for_track(&asset, track, Some((0., 3.)))?;
+                native_blocks(path, session, rate, consume)?;
+                if let (Some(prepared), Some(stamp)) = (prepared, reusable.take()) {
+                    let asset = asset.clone();
+                    let file = path.to_owned();
+                    prepared.remember(
+                        path,
+                        stamp,
+                        Box::new(move |source, sink| {
+                            let tracks = audio_tracks(&asset)?;
+                            let track = tracks
+                                .get(source.stream_index())
+                                .ok_or(DecodeError::InvalidPcm)?;
+                            let (reader, rate) = reader_for_track(&asset, track, None)?;
+                            fingerprint_reader(&file, reader, rate, source, sink)
+                        }),
+                    );
+                }
+                Ok(())
+            }),
         })
     }
 
@@ -689,25 +874,11 @@ impl MediaBackend for AppleNativeBackend {
             let stream_count = self.inspect(path)?.audio_streams.len();
             return crate::mix::decode_all_streams_mono_8k(self, path, stream_count, consume);
         }
-        if let Some(mut pcm) = crate::pcm::PcmTrack::open(path, source.stream_index()) {
-            return pcm.fingerprint(source, consume);
+        if let Some(result) = self.local_mono_8k(path, source, consume) {
+            return result;
         }
         let (session, sample_rate) = open_reader(path, source.stream_index(), None)?;
-        let mut pipe = crate::mono::MonoPipe::new(
-            sample_rate,
-            8000.0,
-            session.channels,
-            source.selected_channel(),
-            source.mixes_channels(),
-            consume,
-        )?;
-        let mut pts = None;
-        let mut block = Vec::new();
-        while next_buffer(&session, &mut pts, &mut block)? {
-            pipe.push_interleaved(&block)?;
-        }
-        check_completed(&session.reader, path)?;
-        pipe.finish()
+        fingerprint_reader(path, session, sample_rate, source, consume)
     }
 
     fn decode_window_16k(
@@ -787,17 +958,8 @@ impl MediaBackend for AppleNativeBackend {
         }
         let window = range.map(|(start, duration)| (start, duration.unwrap_or(1e9)));
         let (session, sample_rate) = open_reader(path, stream_index, window)?;
-        let mut actual = None;
-        let mut floats = Vec::new();
-        while next_buffer(&session, &mut actual, &mut floats)? {
-            consume(crate::backend::NativeBlock {
-                sample_rate,
-                channels: session.channels,
-                frames: crate::mono::deinterleave_f32(&floats, session.channels),
-            })?;
-        }
-        check_completed(&session.reader, path)?;
-        Ok(actual.unwrap_or(range.map_or(0.0, |(s, _)| s.max(0.0))))
+        Ok(native_blocks(path, session, sample_rate, consume)?
+            .unwrap_or(range.map_or(0.0, |(s, _)| s.max(0.0))))
     }
 
     fn decode_native_i32(

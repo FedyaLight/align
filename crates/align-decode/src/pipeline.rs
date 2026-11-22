@@ -27,10 +27,66 @@ use sha2::{Digest, Sha256};
 use crate::backend::{BackendKind, MediaBackend, default_backend};
 use crate::provider::BackendWindowProvider;
 
-/// Files inspected at once. Inspection waits on ffprobe processes and header
-/// reads, and the first time it sees an MXF or MTS file it reads the whole
-/// file to classify frame timing. Limit concurrent full-file scans.
 const INSPECT_WORKERS: usize = 4;
+
+/// Four workers can start costly native/sidecar reads. All workers can
+/// drain the local queue. A speculative local job can yield to the normal
+/// backend before publishing, including after a decoder failure mid-file.
+fn map_media<T: Sync + Send, R: Send>(
+    items: &[T],
+    likely_local: impl Fn(&T) -> bool,
+    run: impl Fn(&T, bool) -> Option<R> + Sync + Send,
+) -> Vec<R> {
+    use align_core::parallel::{par_map, worker_limit};
+    use std::sync::Mutex;
+    let limit = worker_limit(8).min(items.len());
+    let normal = |item: &T| run(item, false).expect("the unrestricted route returns an outcome");
+    if limit <= INSPECT_WORKERS {
+        return par_map(items, limit, normal);
+    }
+    let (local, restricted): (Vec<_>, Vec<_>) =
+        (0..items.len()).partition(|&i| likely_local(&items[i]));
+    let reserved = INSPECT_WORKERS.min(restricted.len());
+    let workers = limit.min(reserved + local.len());
+    let local = Mutex::new(local.into_iter());
+    let restricted = Mutex::new(restricted.into_iter());
+    let mut outcomes = Vec::with_capacity(items.len());
+    let mut retry = Vec::new();
+    for batch in par_map(&(0..workers).collect::<Vec<_>>(), workers, |&worker| {
+        let mut batch = Vec::new();
+        loop {
+            let next = if worker < reserved {
+                restricted.lock().unwrap().next()
+            } else {
+                None
+            };
+            if let Some(i) = next {
+                batch.push((i, Some(normal(&items[i]))));
+            } else if let Some(i) = {
+                let mut queue = local.lock().unwrap();
+                queue.next()
+            } {
+                batch.push((i, run(&items[i], true)));
+            } else {
+                break;
+            }
+        }
+        batch
+    }) {
+        for (i, result) in batch {
+            if let Some(result) = result {
+                outcomes.push((i, result));
+            } else {
+                retry.push(i);
+            }
+        }
+    }
+    outcomes.extend(par_map(&retry, INSPECT_WORKERS, |&i| {
+        (i, normal(&items[i]))
+    }));
+    outcomes.sort_unstable_by_key(|(i, _)| *i);
+    outcomes.into_iter().map(|(_, r)| r).collect()
+}
 
 // ------------------------------------------------------------ types
 
@@ -135,7 +191,14 @@ struct FingerprintRun {
     warnings: Vec<SyncWarning>,
 }
 
+#[derive(Clone, Copy)]
+enum DecodeRoute<'a> {
+    Local,
+    Normal(&'a crate::backend::PreparedAudio),
+}
+
 struct FingerprintRunOptions<'a> {
+    prepared: &'a crate::backend::PreparedAudio,
     accuracy: align_core::SearchAccuracy,
     overrides: &'a HashMap<ClipId, align_core::SearchAccuracy>,
     generate_waveform_previews: bool,
@@ -307,7 +370,12 @@ impl Pipeline {
             load_inputs(inputs, options, &std::sync::atomic::AtomicBool::new(false))?;
         let mut clips = Vec::new();
         let mut warnings = Vec::new();
-        let inspected = self.inspect_all(&urls, None, &std::sync::atomic::AtomicBool::new(false));
+        let inspected = self.inspect_all(
+            &urls,
+            None,
+            &std::sync::atomic::AtomicBool::new(false),
+            None,
+        );
         for (url, outcome) in urls.iter().zip(inspected) {
             match outcome {
                 Ok(clip) => clips.push(clip),
@@ -371,7 +439,8 @@ impl Pipeline {
         // ---- inspect
         let mut clips = Vec::new();
         let mut warnings = Vec::new();
-        let inspected = self.inspect_all(&urls, progress, cancel);
+        let prepared = crate::backend::PreparedAudio::default();
+        let inspected = self.inspect_all(&urls, progress, cancel, Some(&prepared));
         // Files already being inspected finish (or fail) after a
         // cancellation; it must not turn into a missing-media error.
         if cancelled(cancel) {
@@ -431,6 +500,7 @@ impl Pipeline {
             &usable,
             &audio_sources,
             FingerprintRunOptions {
+                prepared: &prepared,
                 accuracy: options.search_accuracy,
                 overrides: &search_overrides,
                 generate_waveform_previews: options.generate_waveform_previews,
@@ -438,6 +508,7 @@ impl Pipeline {
             progress,
             cancel,
         )?;
+        drop(prepared);
         warnings.extend(unreadable);
         let mut source_map = audio_sources;
         source_map.extend(selected_sources);
@@ -676,6 +747,7 @@ impl Pipeline {
         urls: &[PathBuf],
         progress: Option<&(dyn Fn(PipelineProgress) + Send + Sync)>,
         cancel: &std::sync::atomic::AtomicBool,
+        prepared: Option<&crate::backend::PreparedAudio>,
     ) -> Vec<Result<Clip, PipelineError>> {
         // Counting and publishing under one lock keeps the completed count
         // monotonic for listeners such as the progress bar.
@@ -689,23 +761,39 @@ impl Pipeline {
             event.discovered = discovered;
             p(event);
         };
-        align_core::par_map(
+        map_media(
             urls,
-            align_core::parallel::worker_limit(INSPECT_WORKERS),
             |url| {
+                url.extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+            },
+            |url, local_only| {
                 if cancelled(cancel) {
-                    return Err(PipelineError::Cancelled);
+                    return Some(Err(PipelineError::Cancelled));
                 }
-                publish(false, url, None);
-                let outcome = self.inspect_one(url);
+                let inspection = if local_only {
+                    let inspection = self.backend.local_inspection(url)?;
+                    publish(false, url, None);
+                    Ok(inspection)
+                } else {
+                    publish(false, url, None);
+                    self.backend.inspect_for_import(url, prepared)
+                };
+                let outcome = inspection
+                    .map_err(PipelineError::Decode)
+                    .and_then(|i| self.inspect_one(url, i));
                 publish(true, url, outcome.as_ref().ok().cloned());
-                outcome
+                Some(outcome)
             },
         )
     }
 
-    fn inspect_one(&self, url: &Path) -> Result<Clip, PipelineError> {
-        let probe = self.backend.inspect(url).map_err(PipelineError::Decode)?;
+    fn inspect_one(
+        &self,
+        url: &Path,
+        mut inspection: crate::backend::Inspection<'_>,
+    ) -> Result<Clip, PipelineError> {
+        let probe = inspection.report;
         let micros = (probe.duration_seconds * 1_000_000.0).round() as i64;
         if micros <= 0 {
             return Err(PipelineError::Decode(crate::DecodeError::InvalidPcm));
@@ -810,7 +898,8 @@ impl Pipeline {
                 .and_then(|e| e.load())
                 .filter(|hit| hit.as_ref().is_none_or(|(index, _)| *index < audio.len()));
             let detection = cached.unwrap_or_else(|| {
-                let (detection, complete) = self.detect_ltc(url, &probe.audio_streams);
+                let (detection, complete) =
+                    Self::detect_ltc(&mut inspection.opening_audio, &probe.audio_streams);
                 // Retry incomplete reads, including failures before a later
                 // stream supplied a clock.
                 if complete && let Some(entry) = &entry {
@@ -868,6 +957,7 @@ impl Pipeline {
         clip: &Clip,
         source: AudioAnalysisSource,
         cancel: &std::sync::atomic::AtomicBool,
+        route: DecodeRoute<'_>,
         start: impl Fn() -> S,
         feed: impl Fn(&mut S, &[f32]),
     ) -> Result<S, PipelineError> {
@@ -884,7 +974,26 @@ impl Pipeline {
             })
             .map(|()| state)
         };
-        let error = match run(&|consume| self.backend.decode_mono_8k(&clip.url, source, consume)) {
+        if let DecodeRoute::Local = route {
+            return run(&|consume| {
+                self.backend
+                    .local_mono_8k(&clip.url, source, consume)
+                    .unwrap_or(Err(DecodeError::UnsupportedOutput))
+            })
+            .map_err(PipelineError::Decode);
+        }
+        let DecodeRoute::Normal(prepared) = route else {
+            unreachable!()
+        };
+        let decoded = if source != AudioAnalysisSource::AllMixed
+            && source.stream_index() == 0
+            && let Some(decode) = prepared.take(&clip.url)
+        {
+            run(&|consume| decode(source, consume))
+        } else {
+            run(&|consume| self.backend.decode_mono_8k(&clip.url, source, consume))
+        };
+        let error = match decoded {
             Ok(state) => return Ok(state),
             Err(error @ (DecodeError::Symphonia(_) | DecodeError::Apple(_))) => error,
             Err(DecodeError::Cancelled) => return Err(PipelineError::Cancelled),
@@ -935,30 +1044,32 @@ impl Pipeline {
     }
 
     fn detect_ltc(
-        &self,
-        url: &Path,
+        read: &mut crate::backend::OpeningAudio<'_>,
         streams: &[crate::backend::AudioStreamProbe],
     ) -> (Option<(usize, align_core::SourceTimecode)>, bool) {
         let mut complete = true;
         for (stream_index, stream) in streams.iter().enumerate() {
             let mut sample_rate = stream.sample_rate;
             let mut channels = vec![Vec::new(); stream.channels];
-            let decoded = self.backend.decode_native(
-                url,
-                stream_index,
-                Some((0.0, Some(3.0))),
-                &mut |block| {
-                    sample_rate = block.sample_rate;
-                    for (output, input) in channels.iter_mut().zip(&block.frames) {
-                        output.extend_from_slice(input);
-                    }
-                    Ok(())
-                },
-            );
+            let decoded = read(stream_index, &mut |block| {
+                sample_rate = block.sample_rate;
+                for (output, input) in channels.iter_mut().zip(&block.frames) {
+                    output.extend_from_slice(input);
+                }
+                Ok(())
+            });
             if decoded.is_err() {
                 complete = false;
                 continue;
             }
+            // Some demuxers return success after a short/incomplete window.
+            // Keep any positive observation, but retry incomplete clocks.
+            let expected =
+                (stream.end_seconds.unwrap_or(3.).min(3.) * sample_rate).floor() as usize;
+            complete &= !channels.is_empty()
+                && channels
+                    .iter()
+                    .all(|s| !s.is_empty() && s.len().saturating_add(1) >= expected);
             for samples in &channels {
                 if let Some(timecode) = crate::ltc::detect(samples, sample_rate) {
                     return (
@@ -1014,10 +1125,15 @@ impl Pipeline {
             && clips
                 .iter()
                 .any(|c| (5.0..=32.).contains(&c.duration.as_seconds()));
-        let analyse = |clip: &&Clip| -> Result<Vec<Variant>, PipelineError> {
+        let analyse = |clip: &&Clip, local_only: bool| -> Result<Vec<Variant>, PipelineError> {
             if cancelled(cancel) {
                 return Err(PipelineError::Cancelled);
             }
+            let route = if local_only {
+                DecodeRoute::Local
+            } else {
+                DecodeRoute::Normal(options.prepared)
+            };
             let accuracy = overrides.get(&clip.id).copied().unwrap_or(accuracy);
             let req = requested
                 .get(&clip.id)
@@ -1110,6 +1226,7 @@ impl Pipeline {
                                     clip,
                                     source,
                                     cancel,
+                                    route,
                                     || WaveformPreview::new(clip.duration.as_seconds()),
                                     |preview, block| preview.consume(block),
                                 )?;
@@ -1129,7 +1246,9 @@ impl Pipeline {
                     }
                     let (mut extractor, preview) = match state {
                         Some(state) => state,
-                        None => self.decode_mono_8k_into(clip, source, cancel, start, feed)?,
+                        None => {
+                            self.decode_mono_8k_into(clip, source, cancel, route, start, feed)?
+                        }
                     };
                     if cancelled(cancel) {
                         return Err(PipelineError::Cancelled);
@@ -1157,7 +1276,7 @@ impl Pipeline {
                 // clip fails only when none of its streams can be read.
                 match variant {
                     Ok(variant) => variants.push(variant),
-                    Err(error) if self.ends_run(&error) => return Err(error),
+                    Err(error) if local_only || self.ends_run(&error) => return Err(error),
                     Err(error) => {
                         failure.get_or_insert(error);
                     }
@@ -1176,28 +1295,51 @@ impl Pipeline {
                 .as_seconds()
                 .total_cmp(&a.1.duration.as_seconds())
         });
-        let cap = if self.backend.kind() == BackendKind::AppleNative
-            && clips.iter().all(|clip| {
-                !clip.audio.is_empty()
-                    && clip
-                        .audio
-                        .iter()
-                        .all(|a| a.is_float.is_some() && a.bit_depth.is_some())
+        let mut outcomes = map_media(
+            &jobs,
+            |&(_, clip)| {
+                if clip.audio.is_empty()
+                    || requested.get(&clip.id) == Some(&AudioAnalysisSource::AllMixed)
+                {
+                    return false;
+                }
+                let pcm = clip.audio.iter().all(|a| a.is_float.is_some())
                     && (crate::isobmff::is_candidate(&clip.url)
                         || clip
                             .url
                             .extension()
-                            .is_some_and(|e| e.eq_ignore_ascii_case("wav")))
-            }) {
-            8
-        } else {
-            self.decode_worker_cap(clips.iter().map(|c| c.url.as_path()))
-        };
-        let mut outcomes = align_core::par_map(
-            &jobs,
-            align_core::parallel::worker_limit(cap),
-            |&(index, clip)| {
-                let outcome = analyse(clip);
+                            .is_some_and(|e| e.eq_ignore_ascii_case("wav")));
+                let simple_audio = clip.url.extension().is_some_and(|e| {
+                    ["mp3", "aif", "aiff"]
+                        .iter()
+                        .any(|s| e.eq_ignore_ascii_case(s))
+                });
+                if self.backend.kind() == BackendKind::AppleNative {
+                    return pcm;
+                }
+                if simple_audio
+                    || clip
+                        .url
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+                {
+                    return true;
+                }
+                // Header-only classification. Low-rate AAC cores may require
+                // a sidecar probe even when the sample description says LC.
+                (crate::isobmff::is_candidate(&clip.url)
+                    || clip
+                        .url
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("m4a")))
+                    && crate::isobmff::shared_movie(&clip.url)
+                        .is_some_and(|m| m.audio().all(|t| t.sbr_from_header() == Some(false)))
+            },
+            |&(index, clip), local_only| {
+                let outcome = analyse(clip, local_only);
+                if local_only && outcome.is_err() && !cancelled(cancel) {
+                    return None;
+                }
                 if let Some(p) = &progress
                     && !outcome.as_ref().is_err_and(|error| self.ends_run(error))
                 {
@@ -1224,7 +1366,7 @@ impl Pipeline {
                     event.completed = *done;
                     p(event);
                 }
-                (index, outcome)
+                Some((index, outcome))
             },
         );
         outcomes.sort_unstable_by_key(|(index, _)| *index);
@@ -2009,6 +2151,29 @@ mod tests {
             cache: FingerprintCache::with_backend(Some(dir.join(".cache")), "failing-inspect"),
         };
         (dir, pipe)
+    }
+
+    #[test]
+    fn mixed_queue_limits_native_jobs_and_retries_in_source_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let jobs: Vec<_> = (0..72).collect();
+        let active = AtomicUsize::new(0);
+        let results = map_media(
+            &jobs,
+            |i| i % 3 != 0,
+            |i, local_only| {
+                if local_only && i % 5 == 0 {
+                    return None;
+                }
+                if !local_only {
+                    assert!(active.fetch_add(1, Ordering::SeqCst) < 4);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }
+                Some(*i)
+            },
+        );
+        assert_eq!(results, jobs);
     }
 
     /// Cancelling while every worker is busy used to end as "no media" once

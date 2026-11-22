@@ -186,6 +186,53 @@ impl MediaBackend for PortableBackend {
         }
     }
 
+    fn local_inspection<'a>(&'a self, path: &'a Path) -> Option<crate::backend::Inspection<'a>> {
+        // Keep the same probe priority and opening-window length as the
+        // ordinary portable route. This path owns its already opened PCM
+        // reader and cannot launch FFmpeg if validation declines.
+        let mut wave = crate::pcm::PcmTrack::inspection_wave(path)?;
+        let report = match crate::sym::inspect(path) {
+            Ok(probe) if probe.duration_seconds.is_some() => ProbeReport {
+                duration_seconds: probe.duration_seconds?,
+                audio_streams: probe.streams,
+                has_video: false,
+                video: None,
+            },
+            _ => wave.probe(),
+        };
+        let sample_rate = wave.sample_rate;
+        let channels = wave.channels;
+        Some(crate::backend::Inspection {
+            report,
+            opening_audio: Box::new(move |index, consume| {
+                if index != 0 {
+                    return Err(DecodeError::InvalidPcm);
+                }
+                wave.read_f32(
+                    0,
+                    Some((3. * sample_rate).ceil() as u64 + 64),
+                    &mut |frames| {
+                        consume(crate::backend::NativeBlock {
+                            sample_rate,
+                            channels,
+                            frames: std::mem::take(frames),
+                        })
+                    },
+                )
+            }),
+        })
+    }
+
+    fn local_mono_8k(
+        &self,
+        path: &Path,
+        source: AudioAnalysisSource,
+        consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
+    ) -> Option<Result<(), DecodeError>> {
+        let reader = crate::sym::AudioReader::validated(path, source.stream_index()).ok()?;
+        Some(reader.decode_mono_8k(source, consume))
+    }
+
     fn fingerprint_tracks(
         &self,
         path: &Path,
@@ -205,8 +252,8 @@ impl MediaBackend for PortableBackend {
             let stream_count = self.inspect(path)?.audio_streams.len();
             return crate::mix::decode_all_streams_mono_8k(self, path, stream_count, consume);
         }
-        if let Ok(reader) = crate::sym::AudioReader::validated(path, source.stream_index()) {
-            return reader.decode_mono_8k(source, consume);
+        if let Some(result) = self.local_mono_8k(path, source, consume) {
+            return result;
         }
         // Symphonia cannot demux this container: FFmpeg pipe with
         // the probed discrete channel count (stereo guess only when

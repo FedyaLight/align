@@ -115,6 +115,44 @@ pub type WindowDecoder<'a> = Box<
 
 pub type TrackConsumer<'a> = &'a mut dyn FnMut(usize, &[f32]) -> Result<(), DecodeError>;
 
+/// Inspection and a lazy opening-window reader. Both live on the inspecting
+/// worker so a native asset and its track enumeration can be reused for LTC.
+pub type OpeningAudio<'a> = dyn FnMut(usize, &mut dyn FnMut(NativeBlock) -> Result<(), DecodeError>) -> Result<(), DecodeError>
+    + 'a;
+pub struct Inspection<'a> {
+    pub report: ProbeReport,
+    pub opening_audio: Box<OpeningAudio<'a>>,
+}
+
+type PreparedDecode = Box<
+    dyn Fn(
+            AudioAnalysisSource,
+            &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
+        ) -> Result<(), DecodeError>
+        + Send,
+>;
+
+/// Inspected assets retained until this sync reaches fingerprinting. Native
+/// readers are created on demand, never parked between phases.
+#[derive(Default)]
+pub struct PreparedAudio(
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (String, PreparedDecode)>>,
+);
+
+impl PreparedAudio {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn remember(&self, path: &Path, revision: String, decode: PreparedDecode) {
+        let mut entries = self.0.lock().unwrap();
+        if entries.len() < 4 {
+            entries.insert(path.to_owned(), (revision, decode));
+        }
+    }
+    pub(crate) fn take(&self, path: &Path) -> Option<PreparedDecode> {
+        let (revision, decode) = self.0.lock().unwrap().remove(path)?;
+        (align_core::cache::media_revision(path).ok()? == revision).then_some(decode)
+    }
+}
+
 /// The single seam between shared algorithms and OS media stacks.
 /// Both backends must honor the same contracts:
 /// 8 kHz mono stream / 16 kHz windows, adaptive-mono hysteresis 0.9,
@@ -123,6 +161,35 @@ pub trait MediaBackend: Send + Sync {
     fn kind(&self) -> BackendKind;
 
     fn inspect(&self, path: &Path) -> Result<ProbeReport, DecodeError>;
+
+    /// Routes which may run outside the native/sidecar limit. None defers
+    /// to the normal backend. Never start an external decoder here.
+    fn local_inspection<'a>(&'a self, _path: &'a Path) -> Option<Inspection<'a>> {
+        None
+    }
+
+    fn local_mono_8k(
+        &self,
+        _path: &Path,
+        _source: AudioAnalysisSource,
+        _consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
+    ) -> Option<Result<(), DecodeError>> {
+        None
+    }
+
+    fn inspect_for_import<'a>(
+        &'a self,
+        path: &'a Path,
+        _prepared: Option<&'a PreparedAudio>,
+    ) -> Result<Inspection<'a>, DecodeError> {
+        Ok(Inspection {
+            report: self.inspect(path)?,
+            opening_audio: Box::new(move |index, consume| {
+                self.decode_native(path, index, Some((0., Some(3.))), consume)
+                    .map(|_| ())
+            }),
+        })
+    }
 
     fn decode_mono_8k(
         &self,

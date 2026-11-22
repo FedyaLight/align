@@ -216,14 +216,20 @@ impl SampleSizes {
 
 impl Track {
     pub(crate) fn needs_sbr_decoder(&self, path: &Path, audio_index: usize) -> bool {
+        self.sbr_from_header()
+            .unwrap_or_else(|| crate::ff::probed_sbr(path, audio_index).unwrap_or(true))
+    }
+
+    /// None requires a packet probe before selecting the decoder.
+    pub(crate) fn sbr_from_header(&self) -> Option<bool> {
         if &self.codec != b"mp4a" {
-            return false;
+            return Some(false);
         }
         let Some(config) = aac_config(&self.sample_entry) else {
-            return false;
+            return Some(false);
         };
         if signals_sbr(config).unwrap_or(false) {
-            return true;
+            return Some(true);
         }
         // A low-rate LC core without an ASC extension can carry SBR in its
         // packets. Probe the selected stream before handing audio to a consumer.
@@ -235,7 +241,7 @@ impl Track {
                 Ok(15) => bits.read_bits_leq32(24).is_ok_and(|r| r <= 24000),
                 _ => false,
             };
-        low_rate_core && crate::ff::probed_sbr(path, audio_index).unwrap_or(true)
+        (!low_rate_core).then_some(false)
     }
 
     pub fn sample_count(&self) -> u64 {

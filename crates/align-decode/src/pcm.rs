@@ -107,7 +107,7 @@ impl PcmTrack {
     /// `None` when the stream is not plain interleaved PCM in a WAVE,
     /// QuickTime or MP4 file (callers then use the general decoder).
     pub fn open(path: &Path, stream_index: usize) -> Option<Self> {
-        if let Some(wave) = Self::open_wave(path) {
+        if let Some(wave) = Self::open_wave(path, false) {
             return (stream_index == 0).then_some(wave);
         }
         if !isobmff::is_candidate(path) {
@@ -187,9 +187,17 @@ impl PcmTrack {
         })
     }
 
+    /// Only canonical, complete WAVE files can replace a native media probe.
+    pub(crate) fn inspection_wave(path: &Path) -> Option<Self> {
+        path.extension()?
+            .eq_ignore_ascii_case("wav")
+            .then_some(())?;
+        Self::open_wave(path, true)
+    }
+
     /// RIFF/RF64/BW64 WAVE with 16/24/32-bit integer or 32/64-bit float
     /// samples (`WAVE_FORMAT_EXTENSIBLE` included).
-    fn open_wave(path: &Path) -> Option<Self> {
+    fn open_wave(path: &Path, strict: bool) -> Option<Self> {
         let mut file = File::open(path).ok()?;
         let length = file.metadata().ok()?.len();
         let mut header = [0u8; 12];
@@ -202,6 +210,15 @@ impl PcmTrack {
         if &header[8..] != b"WAVE" {
             return None;
         }
+        if strict
+            && (large && &header[..4] != b"RF64"
+                || !large
+                    && u64::from(u32::from_le_bytes(header[4..8].try_into().ok()?)) + 8 != length)
+        {
+            return None;
+        }
+        let mut declared_frames = None;
+        let mut fact = None;
         let mut ds64_data = None;
         let mut format = None;
         let mut offset = 12u64;
@@ -215,12 +232,43 @@ impl PcmTrack {
                 b"ds64" if large && size >= 24 => {
                     let mut sizes = [0u8; 16];
                     file.read_exact(&mut sizes).ok()?;
+                    if strict {
+                        if offset != 12
+                            || size != 28
+                            || header[4..8] != [255; 4]
+                            || u64::from_le_bytes(sizes[..8].try_into().ok()?).checked_add(8)?
+                                != length
+                        {
+                            return None;
+                        }
+                        let mut counts = [0; 12];
+                        file.read_exact(&mut counts).ok()?;
+                        if counts[8..] != [0; 4] {
+                            return None;
+                        }
+                        declared_frames = Some(u64::from_le_bytes(counts[..8].try_into().ok()?));
+                    }
                     ds64_data = Some(u64::from_le_bytes(sizes[8..].try_into().ok()?));
                 }
                 b"fmt " if size >= 16 => {
+                    if strict && (format.is_some() || !matches!(size, 16 | 18 | 40)) {
+                        return None;
+                    }
                     let mut fmt = vec![0u8; size.min(40) as usize];
                     file.read_exact(&mut fmt).ok()?;
                     format = Some(fmt);
+                }
+                b"fact" if strict && size == 4 && fact.is_none() => {
+                    let mut bytes = [0; 4];
+                    file.read_exact(&mut bytes).ok()?;
+                    fact = Some(u64::from(u32::from_le_bytes(bytes)));
+                }
+                b"LIST" if strict => {
+                    let mut kind = [0; 4];
+                    file.read_exact(&mut kind).ok()?;
+                    if size < 4 || &kind != b"INFO" {
+                        return None;
+                    }
                 }
                 b"data" => {
                     let fmt = format?;
@@ -262,6 +310,31 @@ impl PcmTrack {
                     };
                     // Interrupted recordings keep a header larger than the file.
                     let frames = declared.min(length.saturating_sub(body)) / block_align;
+                    if strict
+                        && (frames == 0
+                            || frames * block_align != declared
+                            || body.checked_add(declared)?.checked_add(declared & 1)? != length
+                            || large && (size != u64::from(u32::MAX) || ds64_data.is_none())
+                            || declared_frames.is_some_and(|n| n != frames)
+                            || fact.is_some_and(|n| n != frames)
+                            || u64::from(u32::from_le_bytes(fmt[8..12].try_into().ok()?))
+                                != u64::from(sample_rate) * block_align
+                            || !matches!(
+                                sample_rate,
+                                8000 | 16000
+                                    | 22050
+                                    | 24000
+                                    | 32000
+                                    | 44100
+                                    | 48000
+                                    | 88200
+                                    | 96000
+                                    | 192000
+                            )
+                            || channels > 8)
+                    {
+                        return None;
+                    }
                     return Some(Self {
                         file,
                         sample_rate: sample_rate as f64,
@@ -274,6 +347,8 @@ impl PcmTrack {
                         complete: frames * block_align == declared,
                     });
                 }
+                b"bext" | b"iXML" | b"JUNK" | b"PAD " => {}
+                _ if strict => return None,
                 _ => {}
             }
             let size = match (&chunk[..4], large, size) {
