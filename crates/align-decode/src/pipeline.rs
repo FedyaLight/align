@@ -634,8 +634,25 @@ impl Pipeline {
     }
 
     fn decoder_cache(&self, path: &Path) -> Option<FingerprintCache> {
-        (self.backend.kind() == BackendKind::Portable && crate::isobmff::has_sbr_audio(path))
-            .then(|| self.cache.decoder_variant("full-sbr-clock2"))
+        if self.backend.kind() != BackendKind::Portable {
+            return None;
+        }
+        if crate::isobmff::has_sbr_audio(path) {
+            return Some(self.cache.decoder_variant("full-sbr-clock2"));
+        }
+        // Older portable builds could ignore PCM edit rates and switched
+        // sample descriptions. Invalidate just the affected movie variants.
+        if crate::isobmff::is_candidate(path)
+            && crate::isobmff::shared_movie(path).is_some_and(|movie| {
+                movie.audio().enumerate().any(|(i, t)| {
+                    t.audio.as_ref().is_some_and(|a| a.is_float.is_some())
+                        && crate::pcm::PcmTrack::open(path, i).is_none()
+                })
+            })
+        {
+            return Some(self.cache.decoder_variant("pcm-presentation-v1"));
+        }
+        None
     }
 
     fn decode_worker_cap<'a>(&self, mut paths: impl Iterator<Item = &'a Path>) -> usize {

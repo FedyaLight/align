@@ -363,6 +363,13 @@ fn open_stream(path: &Path, stream_index: usize) -> Result<Stream, DecodeError> 
     let is_pcm = symphonia::default::get_codecs()
         .get_codec(track.codec_params.codec)
         .is_some_and(|codec| codec.short_name.starts_with("pcm"));
+    // Direct PCM has already declined this layout. Symphonia ignores
+    // MP4 edits and cannot safely approximate a presentation clock here.
+    if is_pcm && is_iso_media(path) {
+        return Err(DecodeError::Symphonia(
+            "PCM movie requires the container timeline decoder".into(),
+        ));
+    }
     let preroll = if is_pcm { 0 } else { 4 * 1024 };
     if sample_rate == 0 || channels == 0 {
         return Err(DecodeError::Symphonia("unknown audio format".into()));
