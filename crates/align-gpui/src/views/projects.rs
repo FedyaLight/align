@@ -8,7 +8,7 @@ use std::{
 use futures::{FutureExt, future::Shared};
 
 use super::{AlignApp, Context, Operation, PathPromptOptions};
-use crate::project::{self, Destination, Placements, Preferences, Writer};
+use crate::project::{self, Destination, Placements, Preferences, SaveMode, Writer};
 
 type Checkpoint = Shared<futures::channel::oneshot::Receiver<Result<(), String>>>;
 
@@ -94,7 +94,11 @@ impl AlignApp {
                 destination.clone(),
                 session,
                 self.projects.placements.clone(),
-                immediate,
+                if immediate {
+                    SaveMode::Replace
+                } else {
+                    SaveMode::Coalesced
+                },
             )
             .shared();
         self.projects.pending = Some((revision, receipt.clone()));
@@ -219,7 +223,7 @@ impl AlignApp {
         .detach();
     }
 
-    fn project_command_available(&self) -> bool {
+    pub(super) fn project_command_available(&self) -> bool {
         !self.projects.busy
             && !self.data.importing()
             && !matches!(
@@ -331,11 +335,14 @@ impl AlignApp {
         .detach();
     }
 
+    pub(super) fn can_save_project(&self) -> bool {
+        self.project_command_available()
+            && !self.data.inputs.is_empty()
+            && self.data.sequence_pickers.is_empty()
+    }
+
     pub(crate) fn save_project(&mut self, save_as: bool, cx: &mut Context<Self>) {
-        if !self.project_command_available()
-            || self.data.inputs.is_empty()
-            || !self.data.sequence_pickers.is_empty()
-        {
+        if !self.can_save_project() {
             return;
         }
         if !save_as
@@ -362,11 +369,7 @@ impl AlignApp {
             let _ = view.update(cx, |this, cx| {
                 this.projects.busy = false;
                 if let Ok(Ok(Some(path))) = selected {
-                    if project::is_project(&path) {
-                        this.write_manual_project(path, cx);
-                    } else {
-                        this.data.error = Some("Project filenames must end in .align.".into());
-                    }
+                    this.write_manual_project(path, cx);
                 }
                 cx.notify();
             });
@@ -383,13 +386,19 @@ impl AlignApp {
         let title = session.title();
         cx.spawn(async move |view, cx| {
             let task = cx.background_executor().spawn(async move {
+                // The picker can only confirm overwriting the name it showed.
+                let mode = if project::is_project(&path) {
+                    SaveMode::Replace
+                } else {
+                    SaveMode::Create
+                };
                 let path = project::manual_path(&path).map_err(|error| error.to_string())?;
                 let destination = Destination {
                     path,
                     managed: false,
                 };
                 writer
-                    .submit(destination.clone(), session, placements, true)
+                    .submit(destination.clone(), session, placements, mode)
                     .await
                     .map_err(|error| error.to_string())??;
                 Ok::<_, String>(destination)

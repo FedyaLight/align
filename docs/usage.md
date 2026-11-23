@@ -43,6 +43,7 @@ Documents folder. At startup, Align removes its autosaves that have gone seven
 days without an update.
 
 Use **File → Recent Projects** or **Open Project…** to reopen a `.align` file.
+The Windows installer registers Align to open these files in Explorer.
 **Save As…** creates a project you can name and keep. **Save Project** saves to
 that file even when autosave is off.
 

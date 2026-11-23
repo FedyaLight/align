@@ -58,21 +58,40 @@ pub(super) fn slide_in<E: IntoElement + Styled + 'static>(
     )
 }
 
+pub(super) enum SidebarEdge {
+    Left,
+    Right,
+}
+
 pub(super) fn sidebar_reveal<E: IntoElement + Styled + 'static>(
     child: E,
     id: impl Into<gpui::ElementId>,
-    distance: f32,
+    width: f32,
+    edge: SidebarEdge,
     closing: bool,
 ) -> impl IntoElement {
     let reduced = crate::motion::reduced_motion();
+    // Anchor the full panel to the inner edge of the clipped viewport.
+    // With the left panel, shrinking the viewport moves the panel left.
+    let panel = div()
+        .absolute()
+        .top(px(0.))
+        .w(px(width))
+        .h_full()
+        .child(child);
+    let panel = match edge {
+        SidebarEdge::Left => panel.right(px(0.)),
+        SidebarEdge::Right => panel.left(px(0.)),
+    };
     div()
+        .relative()
         .h_full()
         .flex_shrink_0()
         .overflow_hidden()
         // Put the shadow on the animated viewport. A shadow on the panel
         // itself is clipped by this viewport and never reaches the timeline.
         .shadow_md()
-        .child(child)
+        .child(panel)
         .with_animation(
             id,
             entrance(if closing { SIDEBAR_CLOSE_MS } else { 280 }),
@@ -83,7 +102,7 @@ pub(super) fn sidebar_reveal<E: IntoElement + Styled + 'static>(
                 } else {
                     visible
                 };
-                el.w(px(distance * visible))
+                el.w(px(width * visible))
             },
         )
 }

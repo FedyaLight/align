@@ -5,7 +5,7 @@ use gpui::{Action, OwnedMenu, OwnedMenuItem};
 
 use crate::theme::AppearancePreference;
 
-use super::animation::{entrance, sidebar_reveal};
+use super::animation::{SidebarEdge, entrance, sidebar_reveal};
 use super::controls::{button, modal_header};
 use super::export::check_row;
 use super::{
@@ -22,6 +22,7 @@ pub(super) enum AppMenuPage {
     Main,
     Submenu(OwnedMenu),
     AnalysisCache(CachePage),
+    ProjectAutosave,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -125,6 +126,7 @@ pub(super) fn app_menu_sidebar(
         AppMenuPage::Main => "Menu".into(),
         AppMenuPage::Submenu(menu) => menu.name.clone(),
         AppMenuPage::AnalysisCache(_) => "Analysis Cache".into(),
+        AppMenuPage::ProjectAutosave => "Project Autosave".into(),
     };
     let header = div()
         .flex()
@@ -182,6 +184,7 @@ pub(super) fn app_menu_sidebar(
         }
         AppMenuPage::Submenu(menu) => body.child(menu_items(cx, theme, app, menu.clone())),
         AppMenuPage::AnalysisCache(page) => body.child(cache_settings(cx, theme, app, page)),
+        AppMenuPage::ProjectAutosave => body.child(project_autosave_settings(cx, theme, app)),
     };
     let panel = div()
         .w(px(WIDTH))
@@ -213,6 +216,7 @@ pub(super) fn app_menu_sidebar(
                 "app-menu-slide-in"
             },
             WIDTH,
+            SidebarEdge::Left,
             closing,
         ));
     if app.app_menu_select.is_some() {
@@ -228,6 +232,13 @@ pub(super) fn app_menu_sidebar(
                 .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.dismiss_app_menu(cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
                     cx.listener(|this, _, _, cx| {
                         this.dismiss_app_menu(cx);
                         cx.stop_propagation();
@@ -249,7 +260,7 @@ fn section_title(theme: &Theme, label: impl Into<SharedString>) -> Div {
 
 fn menu_items(cx: &mut Context<AlignApp>, theme: &Theme, app: &AlignApp, menu: OwnedMenu) -> Div {
     let mut group = div().flex().flex_col();
-    let busy = app.data.has_active_job();
+    let busy = app.projects.busy || app.data.has_active_job();
     for (index, item) in menu.items.into_iter().enumerate() {
         let id = SharedString::from(format!("app-menu-{}-{index}", menu.name));
         match item {
@@ -257,6 +268,10 @@ fn menu_items(cx: &mut Context<AlignApp>, theme: &Theme, app: &AlignApp, menu: O
                 let action_type = action.as_any();
                 if action_type.is::<crate::ExportTimeline>()
                     || (action_type.is::<crate::AddMedia>() && busy)
+                    || (action_type.is::<crate::OpenProject>() && !app.project_command_available())
+                    || ((action_type.is::<crate::SaveProject>()
+                        || action_type.is::<crate::SaveProjectAs>())
+                        && !app.can_save_project())
                     || (action_type.is::<crate::ReloadAndSynchronize>() && !app.data.can_run_sync())
                     || (action_type.is::<crate::OpenPathFixer>()
                         && (busy || app.data.path_repair_source().is_none()))
@@ -288,6 +303,12 @@ fn menu_items(cx: &mut Context<AlignApp>, theme: &Theme, app: &AlignApp, menu: O
                 group = group.child(appearance_select(cx, theme, app));
             }
             OwnedMenuItem::Submenu(submenu) => {
+                if submenu.items.is_empty()
+                    || (submenu.name.as_ref() == "Recent Projects"
+                        && !app.project_command_available())
+                {
+                    continue;
+                }
                 group = group.child(sidebar_row(
                     cx,
                     theme,
@@ -295,13 +316,13 @@ fn menu_items(cx: &mut Context<AlignApp>, theme: &Theme, app: &AlignApp, menu: O
                     submenu.name.clone(),
                     Some("icons/chevron-right.svg"),
                     move |this, _, _, cx| {
-                        this.app_menu = Some(if submenu.name.as_ref() == "Analysis Cache" {
-                            AppMenuPage::AnalysisCache(CachePage {
+                        this.app_menu = Some(match submenu.name.as_ref() {
+                            "Analysis Cache" => AppMenuPage::AnalysisCache(CachePage {
                                 settings: CacheSettings::load(),
                                 ..Default::default()
-                            })
-                        } else {
-                            AppMenuPage::Submenu(submenu.clone())
+                            }),
+                            "Project Autosave" => AppMenuPage::ProjectAutosave,
+                            _ => AppMenuPage::Submenu(submenu.clone()),
                         });
                         cx.notify();
                     },
@@ -442,6 +463,42 @@ fn cache_settings(
             .text_color(rgb(theme.dim))
             .child(status.clone())
     }))
+}
+
+fn project_autosave_settings(cx: &mut Context<AlignApp>, theme: &Theme, app: &AlignApp) -> Div {
+    let enabled = !app.projects.preferences.disabled;
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(check_row(
+            cx,
+            theme,
+            "app-autosave-enabled",
+            enabled,
+            "Save projects automatically".into(),
+            !app.projects.busy,
+            move |this, _, _, cx| this.set_autosave(!enabled, cx),
+        ))
+        .child(section_title(theme, "Folder"))
+        .child(
+            div()
+                .px_2()
+                .text_size(px(12.))
+                .text_color(rgb(theme.text))
+                .child(app.projects.preferences.autosave_folder().map_or_else(
+                    || "No folder selected".into(),
+                    |folder| folder.display().to_string(),
+                )),
+        )
+        .child(sidebar_row(
+            cx,
+            theme,
+            "app-autosave-folder",
+            "Choose Folder…",
+            None,
+            |this, _, _, cx| this.choose_autosave_folder(cx),
+        ))
 }
 
 fn sidebar_select(

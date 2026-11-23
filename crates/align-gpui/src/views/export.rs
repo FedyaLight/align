@@ -756,6 +756,7 @@ pub(super) fn export_sidebar(
             "export-sidebar-slide-in"
         },
         440.,
+        super::animation::SidebarEdge::Right,
         closing,
     )
 }

@@ -519,6 +519,10 @@ impl Focusable for AlignApp {
 }
 
 impl AlignApp {
+    pub(crate) fn project_busy(&self) -> bool {
+        self.projects.busy
+    }
+
     pub fn new(
         projects: crate::project::Preferences,
         writer: crate::project::Writer,

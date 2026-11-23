@@ -36,34 +36,49 @@ impl AppData {
             path.file_name()
                 .is_some_and(|name| name.eq_ignore_ascii_case(filename))
         });
-        let Some(old) = missing.next() else { return };
+        let Some(old) = missing.next().cloned() else {
+            return;
+        };
         if missing.next().is_some() || old == replacement {
             return;
         }
-        let folder = self.folder_inputs.contains(old) && !self.timeline_inputs.contains(old);
-        if (folder || align_decode::timeline::is_bundle(old)) != replacement.is_dir() {
+        let folder = self.folder_inputs.contains(&old) && !self.timeline_inputs.contains(&old);
+        if (folder || align_decode::timeline::is_bundle(&old)) != replacement.is_dir() {
             return;
         }
-        let replacement = replacement.to_path_buf();
-        if let Some(input) = self.inputs.iter_mut().find(|input| *input == old) {
+        let Ok(replacement) = align_core::model::canonical_path(replacement) else {
+            return;
+        };
+        if let Some(input) = self.inputs.iter_mut().find(|input| **input == old) {
             input.clone_from(&replacement);
+        } else if !old.exists()
+            && self
+                .folder_inputs
+                .iter()
+                .any(|folder| old.starts_with(folder))
+        {
+            // A folder scan can no longer discover this child. Keep the
+            // folder for its remaining media and add the relocated file.
+            if !self.inputs.contains(&replacement) {
+                self.inputs.push(replacement.clone());
+            }
         }
-        if self.timeline_inputs.remove(old) {
+        if self.timeline_inputs.remove(&old) {
             self.timeline_inputs.insert(replacement.clone());
         }
-        if self.folder_inputs.remove(old) {
+        if self.folder_inputs.remove(&old) {
             self.folder_inputs.insert(replacement.clone());
         }
-        if let Some(choices) = self.timeline_choices.remove(old) {
+        if let Some(choices) = self.timeline_choices.remove(&old) {
             self.timeline_choices.insert(replacement.clone(), choices);
         }
         for (position, result) in self.sequence_results.iter().enumerate() {
             let sequence = self.sequence_key_for_position(position);
             for clip in &result.project.clips {
-                let destination = if &clip.url == old {
+                let destination = if clip.url == old {
                     replacement.clone()
                 } else if folder {
-                    let Ok(relative) = clip.url.strip_prefix(old) else {
+                    let Ok(relative) = clip.url.strip_prefix(&old) else {
                         continue;
                     };
                     replacement.join(relative)
@@ -134,10 +149,6 @@ impl AppData {
                 result.select_stage(stage);
             }
         }
-        if !results.is_empty() {
-            self.active_sequence_result = session.active_sequence;
-            self.apply_results(results);
-        }
         self.inputs = session.inputs;
         self.timeline_inputs = session.timeline_inputs;
         self.folder_inputs = session.folders;
@@ -149,6 +160,10 @@ impl AppData {
         self.manual_relinks = session.manual_relinks;
         self.omit_extensions = session.omit_extensions;
         self.prefer_proxies = session.prefer_proxies;
+        if !results.is_empty() {
+            self.active_sequence_result = session.active_sequence;
+            self.apply_results(results);
+        }
         self.sync_dirty = session.dirty || !changed.is_empty() || embedded_unavailable;
         self.quality_only_dirty =
             session.quality_only_dirty && changed.is_empty() && !embedded_unavailable;
@@ -169,9 +184,21 @@ impl AppData {
             );
         }
         if self.result.is_none() || self.sync_dirty {
-            let known: HashSet<_> = self.clips.iter().map(|row| row.url.clone()).collect();
+            let known: HashSet<_> = self
+                .sequence_results
+                .iter()
+                .flat_map(|result| &result.project.clips)
+                .map(|clip| &clip.url)
+                .collect();
             for path in &self.inputs {
-                if !known.contains(path) {
+                let expanded_folder = self.folder_inputs.contains(path)
+                    && known.iter().any(|clip| clip.starts_with(path));
+                let imported_timeline = self.timeline_inputs.contains(path)
+                    && self
+                        .sequence_results
+                        .iter()
+                        .any(|result| result.project.imported_timeline.is_some());
+                if !known.contains(path) && !expanded_folder && !imported_timeline {
                     self.clips.push(ClipRow {
                         clip_id: None,
                         url: path.clone(),

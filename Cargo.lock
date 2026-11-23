@@ -123,6 +123,7 @@ dependencies = [
  "usvg",
  "velopack",
  "windows-sys 0.59.0",
+ "winreg",
 ]
 
 [[package]]

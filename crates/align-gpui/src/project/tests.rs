@@ -20,7 +20,7 @@ fn save(writer: &Writer, path: &Destination, data: &AppData, placements: Option<
         path.clone(),
         data.project_session(),
         placements,
-        true,
+        SaveMode::Replace,
     ))
     .unwrap()
     .unwrap();
@@ -216,7 +216,12 @@ fn repeated_checkpoints_keep_the_latest_sequence_settings_after_reopen() {
     ] {
         data.settings_scope = SettingsScope::CurrentSequence;
         assert!(data.set_scoped_search_accuracy(Some(accuracy)));
-        drop(writer.submit(destination.clone(), data.project_session(), None, false));
+        drop(writer.submit(
+            destination.clone(),
+            data.project_session(),
+            None,
+            SaveMode::Coalesced,
+        ));
     }
     writer.flush();
 
@@ -263,7 +268,7 @@ fn startup_expiry_keeps_manual_documents_copies_and_non_project_files() {
         },
         data.project_session(),
         None,
-        true,
+        SaveMode::Replace,
     );
     assert!(futures::executor::block_on(failed).unwrap().is_err());
     let copy = root.join(expired.path.file_name().unwrap());
@@ -434,4 +439,115 @@ fn embedded_aaf_project_reextracts_same_media_or_keeps_a_safe_stale_result() {
     assert!(stale.can_synchronize());
     assert_eq!(stale.result.unwrap().project.clips[0].id, id);
     align_decode::media_assets::cleanup();
+}
+
+#[test]
+fn dirty_folder_project_relinks_an_individually_moved_recording() {
+    let (_temp, root) = fixture();
+    let folder = root.join("shoot");
+    fs::create_dir(&folder).unwrap();
+    let (first, second) = write_takes(&folder);
+    let writer = Writer::default();
+    let destination = Destination::autosave(&root.join("projects"));
+
+    let mut data = AppData::default();
+    let pending = data.begin_import(vec![folder.clone()]);
+    let token = data.import_cancel.clone();
+    data.finish_import(
+        &token,
+        pending
+            .into_iter()
+            .map(|path| crate::state::InputPath::inspect(path, &token))
+            .collect(),
+    );
+    let pipeline = Pipeline::new_in(BackendKind::Portable, Some(root.join("cache")));
+    let cancel = AtomicBool::new(false);
+    let result = pipeline
+        .synchronize(
+            &data.pipeline_input_sets()[0],
+            &[],
+            &PipelineOptions::default(),
+            None,
+            &cancel,
+        )
+        .unwrap();
+    assert_eq!(result.matches.len(), 1);
+    let mut revisions = Revisions::new();
+    for path in [&first, &second] {
+        record_revision(&mut revisions, path);
+    }
+    let placements = Placements::from_run(std::slice::from_ref(&result), revisions);
+    data.apply_result(result);
+    data.mark_sync_dirty();
+    save(&writer, &destination, &data, Some(Arc::new(placements)));
+
+    let moved = root.join("second.wav");
+    fs::rename(second, &moved).unwrap();
+    let mut restored = restore(&destination.path);
+    let adds_folder_row = restored.clips.iter().any(|row| row.url == folder);
+    assert!(restored.can_relink_media());
+    assert_eq!(restored.add_manual_relinks(vec![moved.clone()]), 1);
+    let result = pipeline
+        .synchronize(
+            &restored.pipeline_input_sets()[0],
+            &[],
+            &restored.pipeline_options_for_sequence(0),
+            None,
+            &cancel,
+        )
+        .unwrap();
+    let has_moved_clip = result.project.clips.iter().any(|clip| clip.url == moved);
+    assert!(
+        !adds_folder_row && has_moved_clip,
+        "folder added as a clip: {adds_folder_row}; relocated recording found: {has_moved_clip}"
+    );
+    assert_eq!(result.matches.len(), 1);
+}
+
+#[test]
+fn startup_skips_expiry_while_another_writer_holds_the_lock() {
+    let (_temp, root) = fixture();
+    let destination = Destination::autosave(&root);
+    save(&Writer::default(), &destination, &AppData::default(), None);
+    let lock = ManagedDirectory::open(&root).unwrap().lock(true).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let future = SystemTime::now() + RETENTION + Duration::from_secs(60);
+        let _ = tx.send(managed_projects(&root, future));
+    });
+    let result = rx.recv_timeout(Duration::from_secs(2));
+    drop(lock);
+    worker.join().unwrap();
+    assert!(
+        result
+            .expect("startup must not wait for a writer")
+            .is_empty()
+    );
+    assert!(destination.path.is_file());
+}
+
+#[test]
+fn manually_saved_project_can_be_resaved_after_json_reformatting() {
+    let (_temp, root) = fixture();
+    let destination = Destination {
+        path: root.join("Wedding.align"),
+        managed: false,
+    };
+    let writer = Writer::default();
+    let mut data = AppData::default();
+    save(&writer, &destination, &data, None);
+    let value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&destination.path).unwrap()).unwrap();
+    fs::write(
+        &destination.path,
+        serde_json::to_vec_pretty(&value).unwrap(),
+    )
+    .unwrap();
+
+    data.common_settings.search_accuracy = SearchAccuracy::Deep;
+    save(&writer, &destination, &data, None);
+    assert_eq!(
+        restore(&destination.path).common_settings.search_accuracy,
+        SearchAccuracy::Deep
+    );
 }

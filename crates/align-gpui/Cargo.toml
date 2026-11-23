@@ -35,10 +35,14 @@ align-cli = { path = "../align-cli" }
 
 [target.'cfg(windows)'.dependencies]
 velopack = "1.2.0"
+winreg = "0.55"
 windows-sys = { version = "0.59", features = [
     "Wdk_System_SystemServices",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
     "Win32_System_SystemInformation",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
 ] }
 
 [target.'cfg(windows)'.build-dependencies]

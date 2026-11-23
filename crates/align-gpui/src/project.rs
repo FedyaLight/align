@@ -306,13 +306,7 @@ pub fn open(path: &Path) -> io::Result<Opened> {
         ));
     }
     let mut file = File::open(&path)?;
-    if read_header(&file).is_some_and(|header| !header.supported()) {
-        return Err(io::Error::other(
-            "This Align project format is unsupported.",
-        ));
-    }
-    file.rewind()?;
-    let document: Document = serde_json::from_reader(BufReader::new(file.take(MAX_BYTES)))?;
+    let document = read_document(&mut file)?;
     if !document.header.supported() {
         return Err(io::Error::other(
             "This Align project format is unsupported.",
@@ -373,6 +367,10 @@ pub fn manual_path(path: &Path) -> io::Result<PathBuf> {
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::other("Choose a project filename."))?;
+    let mut name = name.to_os_string();
+    if !is_project(path) {
+        name.push(".align");
+    }
     Ok(align_core::model::canonical_path(parent)?.join(name))
 }
 
@@ -416,7 +414,19 @@ fn read_header(file: &File) -> Option<Header> {
     serde_json::from_slice(json).ok()
 }
 
-fn write(destination: &Destination, snapshot: &Snapshot) -> io::Result<()> {
+fn read_document(file: &mut File) -> io::Result<Document> {
+    if file.metadata()?.len() > MAX_BYTES {
+        return Err(io::Error::other(
+            "The project exceeds the supported file size.",
+        ));
+    }
+    file.rewind()?;
+    Ok(serde_json::from_reader(BufReader::new(
+        file.take(MAX_BYTES),
+    ))?)
+}
+
+fn write(destination: &Destination, snapshot: &Snapshot, mode: SaveMode) -> io::Result<()> {
     let path = &destination.path;
     let parent = path
         .parent()
@@ -434,29 +444,43 @@ fn write(destination: &Destination, snapshot: &Snapshot) -> io::Result<()> {
     let managed_dir = managed_name(path)
         .then(|| ManagedDirectory::open(parent))
         .transpose()?;
-    let _lock = managed_dir
-        .as_ref()
-        .map(ManagedDirectory::lock)
-        .transpose()?;
-    let existing = match fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_file() => Some(File::open(path)?),
-        Ok(_) => {
-            return Err(io::Error::other(
-                "The project destination is not a regular file.",
-            ));
+    let _lock = managed_dir.as_ref().map(|dir| dir.lock(true)).transpose()?;
+    let replacing = if mode == SaveMode::Create {
+        false
+    } else {
+        let existing = if let Some(dir) = &managed_dir {
+            dir.open_file(path.file_name().expect("project filename"))
+        } else {
+            fs::symlink_metadata(path).and_then(|metadata| {
+                if metadata.is_file() {
+                    File::open(path)
+                } else {
+                    Err(io::Error::other(
+                        "The project destination is not a regular file.",
+                    ))
+                }
+            })
+        };
+        match existing {
+            Ok(mut file) => {
+                let header = read_header(&file).or_else(|| {
+                    read_document(&mut file)
+                        .ok()
+                        .map(|document| document.header)
+                });
+                if destination.managed {
+                    if !header.is_some_and(|header| header.owns(path)) {
+                        return Err(io::Error::other("The autosave location is already in use."));
+                    }
+                } else if !header.is_some_and(|header| header.supported()) {
+                    return Err(io::Error::other("The destination is not an Align project."));
+                }
+                true
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
     };
-    if let Some(file) = &existing {
-        let header = read_header(file);
-        if destination.managed && !header.as_ref().is_some_and(|header| header.owns(path)) {
-            return Err(io::Error::other("The autosave location is already in use."));
-        }
-        if !destination.managed && !header.is_some_and(|header| header.supported()) {
-            return Err(io::Error::other("The destination is not an Align project."));
-        }
-    }
     let header = Header {
         format: FORMAT.into(),
         version: VERSION,
@@ -483,7 +507,7 @@ fn write(destination: &Destination, snapshot: &Snapshot) -> io::Result<()> {
         ));
     }
     temp.as_file().sync_all()?;
-    if existing.is_some() {
+    if replacing {
         temp.persist(path).map_err(|error| error.error)?;
     } else {
         temp.persist_noclobber(path).map_err(|error| error.error)?;
@@ -495,7 +519,7 @@ fn managed_projects(root: &Path, now: SystemTime) -> Vec<(SystemTime, Recent)> {
     let Ok(dir) = ManagedDirectory::open(root) else {
         return Vec::new();
     };
-    let Ok(_lock) = dir.lock() else {
+    let Ok(_lock) = dir.lock(false) else {
         return Vec::new();
     };
     dir.names()
@@ -564,15 +588,14 @@ impl ManagedDirectory {
         Ok(Self { fd })
     }
 
-    fn lock(&self) -> io::Result<File> {
+    fn open_lock(&self) -> io::Result<File> {
         use rustix::fs::{Mode, OFlags, openat};
-        let file = File::from(openat(
+        Ok(File::from(openat(
             &self.fd,
             ".align-autosaves.lock",
             OFlags::CREATE | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::RUSR | Mode::WUSR,
-        )?);
-        lock(file)
+        )?))
     }
 
     fn names(&self) -> Vec<std::ffi::OsString> {
@@ -611,17 +634,22 @@ impl ManagedDirectory {
             return Err(io::Error::other("Invalid autosave folder."));
         }
         use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
         let mut parents: Vec<_> = path.ancestors().collect();
         parents.reverse();
         let mut handles = Vec::with_capacity(parents.len());
         for ancestor in parents {
             let directory = fs::OpenOptions::new()
                 .read(true)
-                .share_mode(0x3) // FILE_SHARE_READ | FILE_SHARE_WRITE
-                .custom_flags(0x02200000) // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+                // Pin the ancestors while expiry and atomic replacement still
+                // use their paths. Allowing delete sharing also allows renames.
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(ancestor)?;
-            let meta = directory.metadata()?;
-            if is_reparse_point(&meta) || !meta.is_dir() {
+            if !directory.metadata()?.is_dir() || !is_local_or_cloud_entry(&directory)? {
                 return Err(io::Error::other("Invalid autosave folder."));
             }
             handles.push(directory);
@@ -632,16 +660,22 @@ impl ManagedDirectory {
         })
     }
 
-    fn lock(&self) -> io::Result<File> {
+    fn open_lock(&self) -> io::Result<File> {
         use std::os::windows::fs::OpenOptionsExt;
-        lock(
-            fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .custom_flags(0x00200000) // FILE_FLAG_OPEN_REPARSE_POINT
-                .open(self.path.join(".align-autosaves.lock"))?,
-        )
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(self.path.join(".align-autosaves.lock"))?;
+        if !is_local_or_cloud_entry(&file)? {
+            return Err(io::Error::other("Invalid autosave lock."));
+        }
+        Ok(file)
     }
 
     fn names(&self) -> Vec<std::ffi::OsString> {
@@ -655,15 +689,12 @@ impl ManagedDirectory {
 
     fn open_file(&self, name: &std::ffi::OsStr) -> io::Result<File> {
         use std::os::windows::fs::OpenOptionsExt;
-        let path = self.path.join(name);
-        if is_reparse_point(&fs::symlink_metadata(&path)?) {
-            return Err(io::Error::other("Invalid autosave file."));
-        }
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
         let file = fs::OpenOptions::new()
             .read(true)
-            .custom_flags(0x00200000) // FILE_FLAG_OPEN_REPARSE_POINT
-            .open(path)?;
-        if is_reparse_point(&file.metadata()?) {
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(self.path.join(name))?;
+        if !is_local_or_cloud_entry(&file)? {
             return Err(io::Error::other("Invalid autosave file."));
         }
         Ok(file)
@@ -675,17 +706,60 @@ impl ManagedDirectory {
 }
 
 #[cfg(windows)]
-fn is_reparse_point(meta: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    meta.file_attributes() & 0x400 != 0
+fn is_local_or_cloud_entry(file: &File) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{
+        Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FileAttributeTagInfo,
+            GetFileInformationByHandleEx,
+        },
+        System::SystemServices::{
+            IO_REPARSE_TAG_CLOUD, IO_REPARSE_TAG_CLOUD_MASK, IO_REPARSE_TAG_ONEDRIVE,
+        },
+    };
+
+    let mut info = FILE_ATTRIBUTE_TAG_INFO {
+        FileAttributes: 0,
+        ReparseTag: 0,
+    };
+    // The file owns the handle for the duration of the call and the buffer
+    // points to a properly sized FILE_ATTRIBUTE_TAG_INFO.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileAttributeTagInfo,
+            (&raw mut info).cast(),
+            std::mem::size_of_val(&info) as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        || info.ReparseTag & !IO_REPARSE_TAG_CLOUD_MASK == IO_REPARSE_TAG_CLOUD
+        || info.ReparseTag == IO_REPARSE_TAG_ONEDRIVE)
 }
 
-fn lock(file: File) -> io::Result<File> {
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::other("Invalid autosave lock."));
+impl ManagedDirectory {
+    fn lock(&self, blocking: bool) -> io::Result<File> {
+        let file = self.open_lock()?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("Invalid autosave lock."));
+        }
+        if blocking {
+            file.lock()?;
+        } else {
+            file.try_lock()?;
+        }
+        Ok(file)
     }
-    file.lock()?;
-    Ok(file)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SaveMode {
+    Coalesced,
+    Replace,
+    Create,
 }
 
 type SaveReceipt = oneshot::Receiver<Result<(), String>>;
@@ -693,6 +767,7 @@ type SaveReceipt = oneshot::Receiver<Result<(), String>>;
 struct SaveJob {
     destination: Destination,
     snapshot: Snapshot,
+    mode: SaveMode,
     deadline: Instant,
     receipts: Vec<oneshot::Sender<Result<(), String>>>,
     autosave_receipt: Option<oneshot::Sender<Result<(), String>>>,
@@ -713,7 +788,7 @@ impl Writer {
         destination: Destination,
         session: ProjectSession,
         placements: Option<Arc<Placements>>,
-        immediate: bool,
+        mode: SaveMode,
     ) -> SaveReceipt {
         let (tx, rx) = oneshot::channel();
         let (queue, signal) = &*self.0;
@@ -728,7 +803,8 @@ impl Writer {
             .find(|job| job.destination == destination)
         {
             job.snapshot = snapshot;
-            if immediate {
+            if mode != SaveMode::Coalesced {
+                job.mode = mode;
                 job.deadline = Instant::now();
                 job.receipts.push(tx);
             } else {
@@ -745,11 +821,12 @@ impl Writer {
             let mut job = SaveJob {
                 destination,
                 snapshot,
+                mode,
                 deadline: now,
                 receipts: Vec::new(),
                 autosave_receipt: None,
             };
-            if immediate {
+            if mode != SaveMode::Coalesced {
                 job.receipts.push(tx);
             } else {
                 job.deadline += Duration::from_millis(250);
@@ -767,6 +844,7 @@ impl Writer {
     }
 
     fn work(&self) {
+        let _worker = WriterGuard(self);
         let (queue, signal) = &*self.0;
         let mut state = queue.lock().unwrap();
         loop {
@@ -782,7 +860,8 @@ impl Writer {
             }
             let job = state.jobs.pop_front().unwrap();
             drop(state);
-            let result = write(&job.destination, &job.snapshot).map_err(|error| error.to_string());
+            let result =
+                write(&job.destination, &job.snapshot, job.mode).map_err(|error| error.to_string());
             for receipt in job.receipts.into_iter().chain(job.autosave_receipt) {
                 let _ = receipt.send(result.clone());
             }
@@ -797,7 +876,33 @@ impl Writer {
             job.deadline = Instant::now();
         }
         signal.notify_all();
-        drop(signal.wait_while(queue, |queue| queue.running).unwrap());
+        drop(
+            signal
+                .wait_while(queue, |queue| queue.running)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    }
+}
+
+struct WriterGuard<'a>(&'a Writer);
+
+impl Drop for WriterGuard<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let Writer(inner) = self.0;
+            let (queue, signal) = &**inner;
+            let mut state = queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.running = false;
+            for job in state.jobs.drain(..) {
+                for receipt in job.receipts.into_iter().chain(job.autosave_receipt) {
+                    let _ = receipt.send(Err("The project writer stopped unexpectedly.".into()));
+                }
+            }
+            queue.clear_poison();
+            signal.notify_all();
+        }
     }
 }
 

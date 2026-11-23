@@ -58,6 +58,11 @@ impl Render for AlignApp {
             // Focusable root: without a focused view GPUI key dispatch
             // never reaches the app-level system shortcuts (Cmd+Q etc.).
             .track_focus(&self.focus_handle)
+            .capture_key_down(cx.listener(|this, _, _, cx| {
+                if this.projects.busy {
+                    cx.stop_propagation();
+                }
+            }))
             // Window actions run here (not in app-level handlers): menu and
             // key dispatch already hold the window checked out, so a nested
             // update_window would fail with "window not found".
@@ -223,6 +228,18 @@ impl Render for AlignApp {
             content = content.child(sidebar_scrim(&theme, self.export_sidebar_exit.is_active()));
         }
         root = root.child(content);
+        if self.projects.busy {
+            return root.child(
+                div()
+                    .id("project-busy")
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(0.))
+                    .size_full()
+                    .occlude()
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation()),
+            );
+        }
         if self.data.show_export {
             root = root
                 .child(export_sidebar(
@@ -248,7 +265,7 @@ impl Render for AlignApp {
         }
         // The problem report temporarily replaces the open modal, keeping a
         // single dim layer; that modal returns when the report closes.
-        let modals_visible = !self.projects.busy && !self.show_problem_report;
+        let modals_visible = !self.show_problem_report;
         if let (true, Some(picker)) = (modals_visible, self.data.sequence_pickers.front()) {
             root = root.child(overlay(
                 &theme,

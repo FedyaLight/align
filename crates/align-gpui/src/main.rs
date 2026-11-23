@@ -17,6 +17,8 @@ mod text_input;
 mod theme;
 mod updater;
 mod views;
+#[cfg(windows)]
+mod windows_association;
 
 use align_core::CacheSettings;
 use gpui::{
@@ -75,10 +77,7 @@ struct AppView(Entity<views::AlignApp>);
 impl Global for AppView {}
 
 fn show_about(cx: &mut App) {
-    let Some(view) = cx.try_global::<AppView>().map(|app| app.0.clone()) else {
-        return;
-    };
-    view.update(cx, |this, cx| {
+    update_view(cx, |this, cx| {
         this.data.show_about = true;
         cx.notify();
     });
@@ -99,10 +98,7 @@ fn show_agent_setup(cx: &mut App) {
 }
 
 fn clear_analysis_cache(cx: &mut App) {
-    let Some(view) = cx.try_global::<AppView>().map(|app| app.0.clone()) else {
-        return;
-    };
-    view.update(cx, |this, cx| {
+    update_view(cx, |this, cx| {
         if this.data.has_active_job() {
             this.set_analysis_cache_status(
                 "Wait for the current operation before clearing the cache.".into(),
@@ -155,30 +151,30 @@ fn clear_current_analysis_cache(cx: &mut App) {
 }
 
 fn set_cache_retention(days: Option<u64>, cx: &mut App) {
-    let mut settings = CacheSettings::load();
-    settings.retention_days = days;
-    let status = match settings.save() {
-        Ok(()) => match days {
-            Some(days) => format!("Analysis cache retention set to {days} days."),
-            None => "Analysis cache retention set to Keep Until Cleared.".into(),
-        },
-        Err(error) => format!("Could not save analysis cache settings: {error}"),
-    };
     update_view(cx, |this, cx| {
+        let mut settings = CacheSettings::load();
+        settings.retention_days = days;
+        let status = match settings.save() {
+            Ok(()) => match days {
+                Some(days) => format!("Analysis cache retention set to {days} days."),
+                None => "Analysis cache retention set to Keep Until Cleared.".into(),
+            },
+            Err(error) => format!("Could not save analysis cache settings: {error}"),
+        };
         this.refresh_project_menus(cx);
         this.set_analysis_cache_status(status, cx);
     });
 }
 
 fn toggle_analysis_cache(cx: &mut App) {
-    let mut settings = CacheSettings::load();
-    settings.enabled = !settings.enabled;
-    let status = match settings.save() {
-        Ok(()) if settings.enabled => "On-disk analysis cache enabled for new runs.".into(),
-        Ok(()) => "On-disk analysis cache disabled for new runs.".into(),
-        Err(error) => format!("Could not save analysis cache settings: {error}"),
-    };
     update_view(cx, |this, cx| {
+        let mut settings = CacheSettings::load();
+        settings.enabled = !settings.enabled;
+        let status = match settings.save() {
+            Ok(()) if settings.enabled => "On-disk analysis cache enabled for new runs.".into(),
+            Ok(()) => "On-disk analysis cache disabled for new runs.".into(),
+            Err(error) => format!("Could not save analysis cache settings: {error}"),
+        };
         this.refresh_project_menus(cx);
         this.set_analysis_cache_status(status, cx);
     });
@@ -191,12 +187,16 @@ fn update_view(
     let Some(view) = cx.try_global::<AppView>().map(|app| app.0.clone()) else {
         return;
     };
-    view.update(cx, update);
+    view.update(cx, |view, cx| {
+        if !view.project_busy() {
+            update(view, cx);
+        }
+    });
 }
 
 fn set_appearance(appearance: theme::AppearancePreference, cx: &mut App) {
-    appearance.save();
     update_view(cx, |this, cx| {
+        appearance.save();
         this.data.appearance = appearance;
         this.refresh_project_menus(cx);
         cx.notify();
@@ -292,10 +292,38 @@ fn app_menus(
                         MenuItem::action("Clear Current Project", ClearCurrentAnalysisCache),
                         MenuItem::action("Clear All", ClearAnalysisCache),
                         MenuItem::separator(),
-                        MenuItem::action(if cache.retention_days == Some(7) { "✓ Keep for 7 Days" } else { "Keep for 7 Days" }, KeepAnalysisCache7Days),
-                        MenuItem::action(if cache.retention_days == Some(30) { "✓ Keep for 30 Days" } else { "Keep for 30 Days" }, KeepAnalysisCache30Days),
-                        MenuItem::action(if cache.retention_days == Some(90) { "✓ Keep for 90 Days" } else { "Keep for 90 Days" }, KeepAnalysisCache90Days),
-                        MenuItem::action(if cache.retention_days == None { "✓ Keep Until Cleared" } else { "Keep Until Cleared" }, KeepAnalysisCacheForever),
+                        MenuItem::action(
+                            if cache.retention_days == Some(7) {
+                                "✓ Keep for 7 Days"
+                            } else {
+                                "Keep for 7 Days"
+                            },
+                            KeepAnalysisCache7Days,
+                        ),
+                        MenuItem::action(
+                            if cache.retention_days == Some(30) {
+                                "✓ Keep for 30 Days"
+                            } else {
+                                "Keep for 30 Days"
+                            },
+                            KeepAnalysisCache30Days,
+                        ),
+                        MenuItem::action(
+                            if cache.retention_days == Some(90) {
+                                "✓ Keep for 90 Days"
+                            } else {
+                                "Keep for 90 Days"
+                            },
+                            KeepAnalysisCache90Days,
+                        ),
+                        MenuItem::action(
+                            if cache.retention_days.is_none() {
+                                "✓ Keep Until Cleared"
+                            } else {
+                                "Keep Until Cleared"
+                            },
+                            KeepAnalysisCacheForever,
+                        ),
                     ],
                 }),
             ],
@@ -346,7 +374,7 @@ fn main() {
         align_cli::main_entry();
     }
     #[cfg(windows)]
-    velopack::VelopackApp::build().run();
+    windows_association::run_installer_hooks();
 
     struct SessionCleanup;
     impl Drop for SessionCleanup {
