@@ -1725,6 +1725,61 @@ mod tests {
         assert!(!resolve.contains("subframeoffset"));
     }
 
+    #[test]
+    fn replacement_audio_source_in_uses_estimated_clip_timeline_mapping() {
+        use crate::{MediaTime, model::MappingPoint};
+
+        let mut timeline = fixture_timeline();
+        let island = &mut timeline.islands[0];
+        let camera = island
+            .clips
+            .iter_mut()
+            .find(|item| item.clip.id.0 == "cam")
+            .expect("camera clip");
+        camera.start = 112.0;
+        camera.timeline_duration = 8.0;
+        camera.estimated = true;
+        camera.mapping_points = vec![
+            MappingPoint {
+                source: MediaTime::seconds(0.0),
+                island: MediaTime::seconds(112.0),
+            },
+            MappingPoint {
+                source: MediaTime::seconds(8.0),
+                island: MediaTime::seconds(120.0),
+            },
+        ];
+        let recorder = island
+            .clips
+            .iter_mut()
+            .find(|item| item.clip.id.0 == "rec")
+            .expect("recorder clip");
+        recorder.start = 107.0;
+        recorder.mapping_points = vec![
+            MappingPoint {
+                source: MediaTime::seconds(0.0),
+                island: MediaTime::seconds(107.0),
+            },
+            MappingPoint {
+                source: MediaTime::seconds(12.0),
+                island: MediaTime::seconds(119.0),
+            },
+        ];
+
+        let xml = write(
+            &timeline,
+            TimelineExportFormat::PremiereXML,
+            PremiereOptions {
+                replaced_sequence: true,
+                ..Default::default()
+            },
+        );
+        let replacement_at = xml.find("id=\"sequence-2\"").expect("replacement sequence");
+        let replacement = &xml[replacement_at..];
+        assert!(replacement.contains("<in>125</in>"), "{replacement}");
+        assert!(!replacement.contains("<in>375</in>"), "{replacement}");
+    }
+
     /// The source range moves with the start's rounding: a start 0.49 of a
     /// frame past frame 25 with a source in 0.51 past frame 12 plays within
     /// a fiftieth of a frame, where rounding each alone was a frame off.

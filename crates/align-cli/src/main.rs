@@ -106,6 +106,9 @@ struct ExportOptions {
     /// Placement policy for clips without a synchronization match.
     #[arg(long, value_enum, default_value_t = Unmatched::OrderTime)]
     unmatched: Unmatched,
+    /// Explicitly apply unconfirmed same-device timestamp estimates to exports.
+    #[arg(long)]
+    apply_estimated_placements: bool,
     /// Place independent synchronization groups without overlaps.
     #[arg(long)]
     prevent_group_overlaps: bool,
@@ -926,6 +929,7 @@ mod tests {
             "--media-bins",
             "--no-fcpxml-multicam",
             "--export-media",
+            "--apply-estimated-placements",
             "--label-synced",
             "--label-unmatched",
             "--synced-symbol",
@@ -951,6 +955,7 @@ mod tests {
                     no_fcpxml_timeline,
                     no_fcpxml_multicam,
                     export_media,
+                    apply_estimated_placements,
                     label_synced,
                     label_unmatched,
                     assign,
@@ -994,6 +999,7 @@ mod tests {
         assert!(!no_fcpxml_timeline);
         assert!(no_fcpxml_multicam);
         assert!(export_media);
+        assert!(apply_estimated_placements);
         assert!(label_synced);
         assert!(label_unmatched);
         assert_eq!(assign.synced_symbol.as_deref(), Some("✓"));

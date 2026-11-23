@@ -18,9 +18,9 @@ use std::path::{Path, PathBuf};
 
 use align_core::{
     AudioAnalysisSource, AudioSummary, Clip, ClipId, ClipPlacement, ClipTimingHints,
-    EstimatedPlacement, FingerprintCache, FingerprintExtractor, MappingPoint, MatchSummary,
-    MediaKind, MediaTime, RecordingTimestampSource, SyncConstraint, SyncIsland, SyncProject,
-    SyncWarning, TimeMap, match_fingerprints, refine_forest, solve_graph,
+    FingerprintCache, FingerprintExtractor, MappingPoint, MatchSummary, MediaKind, MediaTime,
+    RecordingTimestampSource, SyncConstraint, SyncIsland, SyncProject, SyncWarning, TimeMap,
+    match_fingerprints, refine_forest, solve_graph,
 };
 use sha2::{Digest, Sha256};
 
@@ -577,7 +577,12 @@ impl Pipeline {
             .iter()
             .find(|stage| stage.kind == align_core::SyncStageKind::Waveform);
         let estimated_placements = waveform_stage.map_or_else(Vec::new, |stage| {
-            estimate_unmatched_by_device_timestamp(&clips, &stage.islands, &chosen.unmatched)
+            align_core::estimate_unmatched_by_device_timestamp(
+                &clips,
+                &stage.islands,
+                &chosen.islands,
+                &chosen.unmatched,
+            )
         });
         // One-stage results retain legacy JSON, with no redundant history.
         let selected_stage = (stages.len() > 1).then_some(selected);
@@ -1133,60 +1138,6 @@ impl Pipeline {
     }
 }
 
-/// Estimate only clips still unmatched in the selected result, using an
-/// explicitly identified, waveform-matched clip from the same device. The
-/// closest timestamp anchor minimizes accumulated timestamp error. Embedded
-/// timestamps only: filesystem timestamps are not recording clocks.
-fn estimate_unmatched_by_device_timestamp(
-    clips: &[Clip],
-    waveform_islands: &[SyncIsland],
-    unmatched: &[ClipId],
-) -> Vec<EstimatedPlacement> {
-    let by_id: HashMap<&ClipId, &Clip> = clips.iter().map(|clip| (&clip.id, clip)).collect();
-    let anchors: Vec<_> = waveform_islands
-        .iter()
-        .flat_map(|island| &island.placements)
-        .filter_map(|placement| {
-            let clip = by_id.get(&placement.clip_id).copied()?;
-            let source = clip.source_identifier.as_ref()?;
-            let timestamp = clip.recorded_at.filter(|_| {
-                clip.recorded_at_source == Some(RecordingTimestampSource::EmbeddedMetadata)
-            })?;
-            let start = placement.mapping.points.first()?.island.as_seconds();
-            Some((clip, source, timestamp, start))
-        })
-        .collect();
-    let mut estimates = Vec::new();
-    for clip_id in unmatched {
-        let Some(clip) = by_id.get(clip_id).copied() else {
-            continue;
-        };
-        let (Some(source), Some(timestamp)) = (
-            clip.source_identifier.as_ref(),
-            clip.recorded_at.filter(|_| {
-                clip.recorded_at_source == Some(RecordingTimestampSource::EmbeddedMetadata)
-            }),
-        ) else {
-            continue;
-        };
-        let anchor = anchors
-            .iter()
-            .filter(|(_, anchor_source, _, _)| *anchor_source == source)
-            .min_by_key(|(_, _, anchor_timestamp, _)| timestamp.abs_diff(*anchor_timestamp));
-        let Some((anchor_clip, _, anchor_timestamp, anchor_start)) = anchor else {
-            continue;
-        };
-        let delta = timestamp.saturating_sub(*anchor_timestamp);
-        estimates.push(EstimatedPlacement {
-            clip_id: clip_id.clone(),
-            anchor_clip_id: anchor_clip.id.clone(),
-            timeline_start: MediaTime::seconds(*anchor_start + delta as f64),
-            timestamp_delta: MediaTime::seconds(delta as f64),
-        });
-    }
-    estimates
-}
-
 /// Solves each evidence stage that changes the matches (waveform, then file
 /// spans, then timecode) and selects the one placing the most clips; equal
 /// counts retain the later stage. Cancellation keeps the stages solved so
@@ -1641,13 +1592,86 @@ mod tests {
         }];
         let unmatched = vec![ClipId::new("c0033")];
 
-        let estimates = estimate_unmatched_by_device_timestamp(&clips, &islands, &unmatched);
+        let estimates = align_core::estimate_unmatched_by_device_timestamp(
+            &clips, &islands, &islands, &unmatched,
+        );
 
         assert_eq!(estimates.len(), 1);
         assert_eq!(estimates[0].anchor_clip_id, ClipId::new("c0032"));
         assert_eq!(estimates[0].timestamp_delta.as_seconds(), 4800.0);
         assert_eq!(estimates[0].timeline_start.as_seconds(), 4925.0);
         assert_eq!(unmatched, vec![ClipId::new("c0033")]);
+    }
+
+    #[test]
+    fn timestamp_estimate_uses_the_anchor_position_on_the_selected_stage() {
+        let timestamp = 1_700_000_000;
+        let clips = vec![
+            timestamped_video("anchor", "device:cam-a", timestamp),
+            timestamped_video("later", "device:cam-a", timestamp + 10),
+        ];
+        let waveform = vec![SyncIsland {
+            id: 0,
+            placements: vec![timestamp_anchor("anchor", 2.0)],
+        }];
+        let selected = vec![SyncIsland {
+            id: 0,
+            placements: vec![timestamp_anchor("anchor", 102.0)],
+        }];
+
+        let estimates = align_core::estimate_unmatched_by_device_timestamp(
+            &clips,
+            &waveform,
+            &selected,
+            &[ClipId::new("later")],
+        );
+
+        assert_eq!(estimates.len(), 1);
+        assert_eq!(estimates[0].timeline_start.as_seconds(), 112.0);
+    }
+
+    #[test]
+    fn timestamp_estimate_stays_unmatched_when_waveform_anchor_is_absent_on_selected_stage() {
+        let timestamp = 1_700_000_000;
+        let clips = vec![
+            timestamped_video("anchor", "device:cam-a", timestamp),
+            timestamped_video("later", "device:cam-a", timestamp + 10),
+        ];
+        let waveform = vec![SyncIsland {
+            id: 0,
+            placements: vec![timestamp_anchor("anchor", 2.0)],
+        }];
+
+        let estimates = align_core::estimate_unmatched_by_device_timestamp(
+            &clips,
+            &waveform,
+            &[],
+            &[ClipId::new("later")],
+        );
+
+        assert!(estimates.is_empty());
+    }
+
+    #[test]
+    fn timestamp_estimate_rejects_deltas_over_six_hours() {
+        let timestamp = 1_700_000_000;
+        let clips = vec![
+            timestamped_video("anchor", "device:cam-a", timestamp),
+            timestamped_video("later", "device:cam-a", timestamp + 6 * 60 * 60 + 1),
+        ];
+        let islands = vec![SyncIsland {
+            id: 0,
+            placements: vec![timestamp_anchor("anchor", 2.0)],
+        }];
+
+        let estimates = align_core::estimate_unmatched_by_device_timestamp(
+            &clips,
+            &islands,
+            &islands,
+            &[ClipId::new("later")],
+        );
+
+        assert!(estimates.is_empty());
     }
 
     #[test]
@@ -1663,8 +1687,9 @@ mod tests {
         }];
 
         assert!(
-            estimate_unmatched_by_device_timestamp(
+            align_core::estimate_unmatched_by_device_timestamp(
                 &[anchor.clone(), other_device.clone()],
+                &islands,
                 &islands,
                 &[other_device.id.clone()],
             )
@@ -1672,8 +1697,9 @@ mod tests {
         );
         other_device.source_identifier = anchor.source_identifier.clone();
         assert!(
-            estimate_unmatched_by_device_timestamp(
+            align_core::estimate_unmatched_by_device_timestamp(
                 &[anchor, filesystem.clone()],
+                &islands,
                 &islands,
                 &[filesystem.id],
             )

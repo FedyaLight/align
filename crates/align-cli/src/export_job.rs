@@ -54,6 +54,7 @@ impl ExportOptions {
             no_fcpxml_multicam,
             export_media,
             unmatched,
+            apply_estimated_placements,
             prevent_group_overlaps,
             disable_unmatched,
             label_synced,
@@ -68,6 +69,7 @@ impl ExportOptions {
                 result,
                 align_core::export_model::ExportAssemblyOptions {
                     unmatched: unmatched.core(),
+                    apply_estimated_placements,
                     prevent_group_overlaps,
                     disable_unmatched,
                     label_synced,

@@ -514,6 +514,9 @@ pub enum UnmatchedPlacement {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExportAssemblyOptions {
     pub unmatched: UnmatchedPlacement,
+    /// Apply same-device timestamp estimates to the export timeline. Estimates
+    /// remain unconfirmed, so this is deliberately opt-in.
+    pub apply_estimated_placements: bool,
     pub prevent_group_overlaps: bool,
     pub disable_unmatched: bool,
     pub label_synced: bool,
@@ -939,6 +942,9 @@ fn unmatched_item(clip: &Clip, options: &ExportAssemblyOptions) -> ExportItem {
 fn estimated_item(clip: &Clip, start: f64, options: &ExportAssemblyOptions) -> ExportItem {
     let mut item = unmatched_item(clip, options);
     item.start = start;
+    for point in &mut item.mapping_points {
+        point.island = MediaTime::seconds(point.island.as_seconds() + start);
+    }
     item.display_name = Some(format!("[ESTIMATED] {}", file_name(&clip.url)));
     item.estimated = true;
     item
@@ -1268,37 +1274,36 @@ impl ExportTimeline {
 
         let mut order_only_islands = HashSet::new();
         if options.unmatched != UnmatchedPlacement::Remove {
-            let estimated_ids: HashSet<&ClipId> = result
-                .estimated_placements
-                .iter()
-                .map(|placement| &placement.clip_id)
-                .collect();
-            for placement in &result.estimated_placements {
-                let Some(clip) = clips_by_id.get(&placement.clip_id) else {
-                    continue;
-                };
-                let Some(island) = groups.iter_mut().find(|island| {
-                    island
-                        .clips
-                        .iter()
-                        .any(|item| item.clip.id == placement.anchor_clip_id)
-                }) else {
-                    continue;
-                };
-                island.clips.push(estimated_item(
-                    clip,
-                    placement.timeline_start.as_seconds(),
-                    &options,
-                ));
-                island.duration = island
-                    .duration
-                    .max(placement.timeline_start.as_seconds() + clip.duration.as_seconds());
+            let mut applied_estimate_ids = HashSet::new();
+            if options.apply_estimated_placements {
+                for placement in &result.estimated_placements {
+                    let Some(clip) = clips_by_id.get(&placement.clip_id) else {
+                        continue;
+                    };
+                    let Some(island) = groups.iter_mut().find(|island| {
+                        island
+                            .clips
+                            .iter()
+                            .any(|item| item.clip.id == placement.anchor_clip_id)
+                    }) else {
+                        continue;
+                    };
+                    applied_estimate_ids.insert(placement.clip_id.clone());
+                    island.clips.push(estimated_item(
+                        clip,
+                        placement.timeline_start.as_seconds(),
+                        &options,
+                    ));
+                    island.duration = island
+                        .duration
+                        .max(placement.timeline_start.as_seconds() + clip.duration.as_seconds());
+                }
             }
             let next_id = groups.iter().map(|g| g.id as i64).max().unwrap_or(-1) + 1;
             for (index, clip_id) in result
                 .unmatched
                 .iter()
-                .filter(|clip_id| !estimated_ids.contains(clip_id))
+                .filter(|clip_id| !applied_estimate_ids.contains(*clip_id))
                 .enumerate()
             {
                 let Some(clip) = clips_by_id.get(clip_id) else {
@@ -1356,6 +1361,12 @@ impl ExportTimeline {
         combined_base.order_only_islands = order_only_islands;
         let combined = combined_base.combined_island(1.0);
         let base_by_id = combined.clips.iter().map(|i| (&i.clip.id, i)).collect();
+        let estimated_ids: HashSet<&ClipId> = combined
+            .clips
+            .iter()
+            .filter(|item| item.estimated)
+            .map(|item| &item.clip.id)
+            .collect();
         let assembly = ImportedAssembly {
             result,
             options: &options,
@@ -1371,11 +1382,7 @@ impl ExportTimeline {
                 })
                 .collect(),
             unmatched_ids: result.unmatched.iter().collect(),
-            estimated_ids: result
-                .estimated_placements
-                .iter()
-                .map(|placement| &placement.clip_id)
-                .collect(),
+            estimated_ids,
         };
         let imported_clip_ids: HashSet<&ClipId> =
             imported.edits.iter().map(|edit| &edit.clip_id).collect();
@@ -1388,12 +1395,17 @@ impl ExportTimeline {
         // timeline. Estimates without an imported edit still need to appear
         // alongside the imported sequence at their inferred synchronized
         // position, rather than disappearing during the edit reconstruction.
-        for placement in &result.estimated_placements {
-            if imported_clip_ids.contains(&placement.clip_id) {
-                continue;
-            }
-            if let Some(item) = assembly.base_by_id.get(&placement.clip_id) {
-                imported_items.push((**item).clone());
+        if options.apply_estimated_placements {
+            for placement in &result.estimated_placements {
+                if !assembly.estimated_ids.contains(&placement.clip_id) {
+                    continue;
+                }
+                if imported_clip_ids.contains(&placement.clip_id) {
+                    continue;
+                }
+                if let Some(item) = assembly.base_by_id.get(&placement.clip_id) {
+                    imported_items.push((**item).clone());
+                }
             }
         }
         if imported_items.is_empty() {
@@ -2535,7 +2547,14 @@ mod tests {
                 timestamp_delta: MediaTime::seconds(80.0),
             });
 
-        let timeline = ExportTimeline::from_result(&result, true).expect("estimated timeline");
+        let timeline = ExportTimeline::from_result_with_options(
+            &result,
+            ExportAssemblyOptions {
+                apply_estimated_placements: true,
+                ..Default::default()
+            },
+        )
+        .expect("estimated timeline");
         let unmatched: HashSet<ClipId> = result.unmatched.iter().cloned().collect();
         let item = timeline
             .preview_items(&unmatched)
@@ -2546,6 +2565,14 @@ mod tests {
         assert!(!item.matched);
         assert!(item.estimated);
         assert!(item.name.starts_with("[ESTIMATED]"));
+        let mapped_item = timeline
+            .combined_island(1.0)
+            .clips
+            .into_iter()
+            .find(|item| item.clip.id == estimated_id)
+            .expect("estimated source mapping");
+        assert_eq!(mapped_item.mapping_points[0].island.as_seconds(), 80.0);
+        assert_eq!(mapped_item.mapping_points[1].island.as_seconds(), 88.0);
         let anchor = timeline
             .preview_items(&unmatched)
             .into_iter()
@@ -2589,8 +2616,14 @@ mod tests {
                 linked_audio_edit: None,
             }],
         });
-        let imported_timeline =
-            ExportTimeline::from_result(&result, true).expect("estimated imported timeline");
+        let imported_timeline = ExportTimeline::from_result_with_options(
+            &result,
+            ExportAssemblyOptions {
+                apply_estimated_placements: true,
+                ..Default::default()
+            },
+        )
+        .expect("estimated imported timeline");
         let imported_preview = imported_timeline.preview_items(&unmatched);
         let imported_estimate = imported_preview
             .iter()
@@ -2600,6 +2633,68 @@ mod tests {
         assert!(!imported_estimate.matched);
         assert!(imported_estimate.estimated);
         assert!(imported_estimate.name.starts_with("[ESTIMATED]"));
+    }
+
+    #[test]
+    fn estimated_placements_are_not_applied_without_explicit_opt_in() {
+        let mut result = synced_result();
+        let estimated = placed_clip("camera-take.mov", true, 0.0, 8.0);
+        let estimated_id = estimated.clip.id.clone();
+        result.project.clips.push(estimated.clip);
+        result.unmatched.push(estimated_id.clone());
+        result
+            .estimated_placements
+            .push(crate::model::EstimatedPlacement {
+                clip_id: estimated_id.clone(),
+                anchor_clip_id: result.islands[0].placements[0].clip_id.clone(),
+                timeline_start: MediaTime::seconds(80.0),
+                timestamp_delta: MediaTime::seconds(80.0),
+            });
+
+        let timeline = ExportTimeline::from_result(&result, true).expect("timeline");
+        let unmatched: HashSet<ClipId> = result.unmatched.iter().cloned().collect();
+        let item = timeline
+            .preview_items(&unmatched)
+            .into_iter()
+            .find(|item| item.clip_id == estimated_id)
+            .expect("unmatched clip remains in normal export handling");
+        assert_eq!(item.start, 11.0);
+        assert!(!item.estimated);
+        assert!(!item.name.starts_with("[ESTIMATED]"));
+    }
+
+    #[test]
+    fn estimate_without_anchor_on_selected_stage_remains_unmatched_in_export() {
+        let mut result = synced_result();
+        let estimated = placed_clip("camera-take.mov", true, 0.0, 8.0);
+        let estimated_id = estimated.clip.id.clone();
+        result.project.clips.push(estimated.clip);
+        result.unmatched.push(estimated_id.clone());
+        result
+            .estimated_placements
+            .push(crate::model::EstimatedPlacement {
+                clip_id: estimated_id.clone(),
+                anchor_clip_id: ClipId::new("anchor-not-on-selected-stage"),
+                timeline_start: MediaTime::seconds(80.0),
+                timestamp_delta: MediaTime::seconds(80.0),
+            });
+
+        let timeline = ExportTimeline::from_result_with_options(
+            &result,
+            ExportAssemblyOptions {
+                apply_estimated_placements: true,
+                ..Default::default()
+            },
+        )
+        .expect("timeline");
+        let unmatched: HashSet<ClipId> = result.unmatched.iter().cloned().collect();
+        let item = timeline
+            .preview_items(&unmatched)
+            .into_iter()
+            .find(|item| item.clip_id == estimated_id)
+            .expect("unapplied estimate remains unmatched");
+        assert_eq!(item.start, 11.0);
+        assert!(!item.estimated);
     }
 
     #[test]

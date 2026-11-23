@@ -3,7 +3,7 @@
 //! Serialized field names are part of the saved-result and CLI JSON contracts.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------- Clip IDs
@@ -651,12 +651,85 @@ impl SyncResult {
         };
         self.islands = stage.islands.clone();
         self.unmatched = stage.unmatched.clone();
-        self.estimated_placements
-            .retain(|placement| self.unmatched.contains(&placement.clip_id));
+        let waveform_islands = self
+            .stages
+            .iter()
+            .find(|candidate| candidate.kind == SyncStageKind::Waveform)
+            .map(|candidate| candidate.islands.as_slice())
+            .unwrap_or(&self.islands);
+        self.estimated_placements = estimate_unmatched_by_device_timestamp(
+            &self.project.clips,
+            waveform_islands,
+            &self.islands,
+            &self.unmatched,
+        );
         self.matches = stage.matches.clone();
         self.selected_stage = Some(index);
         true
     }
+}
+
+/// Estimate unmatched clips from embedded timestamps, anchored only to a
+/// waveform-matched clip from the same source. Positions come from the
+/// selected stage; large clock gaps are deliberately left unplaced.
+pub fn estimate_unmatched_by_device_timestamp(
+    clips: &[Clip],
+    waveform_islands: &[SyncIsland],
+    selected_islands: &[SyncIsland],
+    unmatched: &[ClipId],
+) -> Vec<EstimatedPlacement> {
+    let by_id: HashMap<&ClipId, &Clip> = clips.iter().map(|clip| (&clip.id, clip)).collect();
+    let waveform_matched: HashSet<&ClipId> = waveform_islands
+        .iter()
+        .flat_map(|island| &island.placements)
+        .map(|placement| &placement.clip_id)
+        .collect();
+    let anchors: Vec<_> = selected_islands
+        .iter()
+        .flat_map(|island| &island.placements)
+        .filter(|placement| waveform_matched.contains(&placement.clip_id))
+        .filter_map(|placement| {
+            let clip = by_id.get(&placement.clip_id).copied()?;
+            let source = clip.source_identifier.as_ref()?;
+            let timestamp = clip.recorded_at.filter(|_| {
+                clip.recorded_at_source == Some(RecordingTimestampSource::EmbeddedMetadata)
+            })?;
+            let start = placement.mapping.points.first()?.island.as_seconds();
+            Some((clip, source, timestamp, start))
+        })
+        .collect();
+    let mut estimates = Vec::new();
+    for clip_id in unmatched {
+        let Some(clip) = by_id.get(clip_id).copied() else {
+            continue;
+        };
+        let (Some(source), Some(timestamp)) = (
+            clip.source_identifier.as_ref(),
+            clip.recorded_at.filter(|_| {
+                clip.recorded_at_source == Some(RecordingTimestampSource::EmbeddedMetadata)
+            }),
+        ) else {
+            continue;
+        };
+        let anchor = anchors
+            .iter()
+            .filter(|(_, anchor_source, _, _)| *anchor_source == source)
+            .min_by_key(|(_, _, anchor_timestamp, _)| timestamp.abs_diff(*anchor_timestamp));
+        let Some((anchor_clip, _, anchor_timestamp, anchor_start)) = anchor else {
+            continue;
+        };
+        let delta = i128::from(timestamp) - i128::from(*anchor_timestamp);
+        if delta.unsigned_abs() > 6 * 60 * 60 {
+            continue;
+        }
+        estimates.push(EstimatedPlacement {
+            clip_id: clip_id.clone(),
+            anchor_clip_id: anchor_clip.id.clone(),
+            timeline_start: MediaTime::seconds(*anchor_start + delta as f64),
+            timestamp_delta: MediaTime::seconds(delta as f64),
+        });
+    }
+    estimates
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1097,6 +1170,76 @@ mod tests {
         assert!(SourceTimecode::from_samples(100, 0.0, MediaTime::new(1, 25), false).is_none());
         assert!(
             SourceTimecode::from_samples(100, 48_000.0, MediaTime::new(0, 25), false).is_none()
+        );
+    }
+
+    #[test]
+    fn selecting_stage_reanchors_unconfirmed_timestamp_estimates() {
+        use std::path::PathBuf;
+        let clip = |id: &str, timestamp: i64| Clip {
+            id: ClipId::new(id),
+            url: PathBuf::from(format!("/{id}.mov")),
+            kind: MediaKind::Video,
+            duration: MediaTime::seconds(10.0),
+            audio: Vec::new(),
+            video: None,
+            recorded_at: Some(timestamp),
+            recorded_at_source: Some(RecordingTimestampSource::EmbeddedMetadata),
+            source_identifier: Some("camera-a".into()),
+            media_span: None,
+        };
+        let anchor_id = ClipId::new("anchor");
+        let unmatched_id = ClipId::new("later");
+        let placement = |start: f64| ClipPlacement {
+            clip_id: anchor_id.clone(),
+            mapping: TimeMap {
+                points: vec![MappingPoint {
+                    source: MediaTime::seconds(0.0),
+                    island: MediaTime::seconds(start),
+                }],
+            },
+            confidence: 1.0,
+        };
+        let stage = |kind, start| SyncStage {
+            kind,
+            islands: vec![SyncIsland {
+                id: 0,
+                placements: vec![placement(start)],
+            }],
+            unmatched: vec![unmatched_id.clone()],
+            matches: Vec::new(),
+        };
+        let waveform_stage = stage(SyncStageKind::Waveform, 2.0);
+        let selected_stage = stage(SyncStageKind::FileSpans, 102.0);
+        let mut result = SyncResult {
+            search_overrides: HashMap::new(),
+            stopped: false,
+            stages: vec![waveform_stage.clone(), selected_stage],
+            selected_stage: Some(0),
+            search_accuracy: crate::SearchAccuracy::default(),
+            preserve_editing_tracks: Default::default(),
+            project: SyncProject {
+                clips: vec![clip("anchor", 100), clip("later", 110)],
+                warnings: Vec::new(),
+                imported_timeline: None,
+            },
+            islands: waveform_stage.islands,
+            unmatched: vec![unmatched_id.clone()],
+            estimated_placements: vec![EstimatedPlacement {
+                clip_id: unmatched_id.clone(),
+                anchor_clip_id: anchor_id,
+                timeline_start: MediaTime::seconds(12.0),
+                timestamp_delta: MediaTime::seconds(10.0),
+            }],
+            matches: Vec::new(),
+            temporal_policy: TemporalPolicy::default(),
+        };
+
+        assert!(result.select_stage(1));
+        assert_eq!(result.estimated_placements.len(), 1);
+        assert_eq!(
+            result.estimated_placements[0].timeline_start.as_seconds(),
+            112.0
         );
     }
 

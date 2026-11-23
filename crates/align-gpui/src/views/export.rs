@@ -1611,6 +1611,19 @@ fn export_unmatched_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> 
         92.,
         menu,
     ));
+    group = group.child(check_row(
+        cx,
+        theme,
+        "exp-apply-estimates",
+        data.export_apply_estimates,
+        "Apply unconfirmed timestamp estimates to exports".to_string(),
+        !busy,
+        |this, _, _, cx| {
+            this.update_export_options(cx, |data| {
+                data.export_apply_estimates = !data.export_apply_estimates;
+            });
+        },
+    ));
     if reveals.unmatched_kept || reveals_closing.contains_key("export-unmatched-kept") {
         group = group.child(export_reveal(
             export_dependent_options(

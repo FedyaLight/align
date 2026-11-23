@@ -1583,6 +1583,7 @@ impl AlignApp {
         for (index, result) in results.iter().enumerate() {
             let options = ExportAssemblyOptions {
                 unmatched: self.data.export_unmatched,
+                apply_estimated_placements: self.data.export_apply_estimates,
                 prevent_group_overlaps: self.data.export_prevent_overlaps,
                 disable_unmatched: self.data.export_disable_unmatched,
                 label_synced: self.data.export_label_synced,

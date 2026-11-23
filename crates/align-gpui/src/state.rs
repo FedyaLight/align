@@ -131,6 +131,7 @@ pub struct ExportSettings {
     pub aaf_frame_duration: Option<align_core::MediaTime>,
     pub media_files: bool,
     pub unmatched: UnmatchedPlacement,
+    pub apply_estimated_placements: bool,
     pub prevent_group_overlaps: bool,
     pub disable_unmatched: bool,
     pub label_synced: bool,
@@ -171,6 +172,7 @@ impl Default for ExportSettings {
             aaf_frame_duration: None,
             media_files: false,
             unmatched: UnmatchedPlacement::ByOrderAndTime,
+            apply_estimated_placements: false,
             prevent_group_overlaps: false,
             disable_unmatched: false,
             label_synced: false,
@@ -388,6 +390,7 @@ pub struct AppData {
     pub export_aaf_frame_duration: Option<align_core::MediaTime>,
     pub export_media: bool,
     pub export_unmatched: UnmatchedPlacement,
+    pub export_apply_estimates: bool,
     pub export_prevent_overlaps: bool,
     pub export_disable_unmatched: bool,
     pub export_label_synced: bool,
@@ -478,6 +481,7 @@ impl Default for AppData {
             export_aaf_frame_duration: None,
             export_media: false,
             export_unmatched: UnmatchedPlacement::ByOrderAndTime,
+            export_apply_estimates: false,
             export_prevent_overlaps: false,
             export_disable_unmatched: false,
             export_label_synced: false,
@@ -949,6 +953,7 @@ impl AppData {
             aaf_frame_duration: self.export_aaf_frame_duration,
             media_files: self.export_media,
             unmatched: self.export_unmatched,
+            apply_estimated_placements: self.export_apply_estimates,
             prevent_group_overlaps: self.export_prevent_overlaps,
             disable_unmatched: self.export_disable_unmatched,
             label_synced: self.export_label_synced,
@@ -976,6 +981,7 @@ impl AppData {
         self.export_aaf_frame_duration = settings.aaf_frame_duration;
         self.export_media = settings.media_files;
         self.export_unmatched = settings.unmatched;
+        self.export_apply_estimates = settings.apply_estimated_placements;
         self.export_prevent_overlaps = settings.prevent_group_overlaps;
         self.export_disable_unmatched = settings.disable_unmatched;
         self.export_label_synced = settings.label_synced;
