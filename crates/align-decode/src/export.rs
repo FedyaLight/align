@@ -21,13 +21,14 @@ use align_core::export::model::{
 };
 use align_core::export::premiere::PremiereOptions;
 use align_core::model::file_name;
+use align_core::staged::StagedFile;
 use align_core::{MediaKind, MediaTime};
 
 use crate::aaf::AafError;
 use crate::backend::MediaBackend;
 use crate::process::WaitError;
 use crate::render::{
-    ChannelStems, RenderError, render_channels_cancellable, render_drift_cancellable,
+    ChannelStems, RenderError, render_channels_with_commit, render_drift_with_commit,
 };
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -102,6 +103,14 @@ pub enum ExportError {
     },
     #[error("Cannot write export files: {0}")]
     Write(#[source] io::Error),
+    #[error("The export folder “{}” is unavailable: {source}. Choose another destination.", path.display())]
+    DestinationUnavailable {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("An export path already exists: {}. Choose another destination or move the existing file before trying again.", .0.display())]
+    Conflict(PathBuf),
     #[error("Cannot build the timeline document: {0}")]
     Document(String),
     #[error(transparent)]
@@ -173,6 +182,79 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), ExportError> {
     }
 }
 
+/// Check a selected directory without recreating it if it has disappeared.
+pub fn check_export_directory(path: &Path) -> Result<(), ExportError> {
+    tempfile::tempfile_in(path)
+        .map(drop)
+        .map_err(|source| ExportError::DestinationUnavailable {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputPolicy {
+    Replace,
+    Protect,
+}
+
+impl OutputPolicy {
+    fn check(self, path: &Path) -> Result<(), ExportError> {
+        if self == Self::Replace {
+            return Ok(());
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => Err(ExportError::Conflict(path.to_path_buf())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(ExportError::Write(error)),
+        }
+    }
+
+    fn commit(self, staged: StagedFile) -> Result<(), ExportError> {
+        if self == Self::Replace {
+            return staged.commit().map_err(ExportError::Write);
+        }
+        let path = staged.destination().to_path_buf();
+        staged.commit_new().map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                ExportError::Conflict(path)
+            } else {
+                ExportError::Write(error)
+            }
+        })
+    }
+
+    fn commit_sidecar(self, staged: StagedFile) -> io::Result<()> {
+        if self == Self::Replace {
+            return staged.commit();
+        }
+        let path = staged.destination().to_path_buf();
+        match staged.commit_new() {
+            // Another export finished rendering the same content-addressed file.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_file() => Ok(()),
+            result => result,
+        }
+    }
+
+    fn write(
+        self,
+        path: &Path,
+        contents: impl AsRef<[u8]>,
+        executable: bool,
+    ) -> Result<(), ExportError> {
+        let staged = StagedFile::new(path).map_err(ExportError::Write)?;
+        std::fs::write(staged.path(), contents).map_err(ExportError::Write)?;
+        #[cfg(unix)]
+        if executable {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(staged.path(), std::fs::Permissions::from_mode(0o755));
+        }
+        #[cfg(not(unix))]
+        let _ = executable;
+        self.commit(staged)
+    }
+}
+
 /// What an export produces, independent of the timeline and media engine.
 #[derive(Clone, Debug)]
 pub struct ExportOptions {
@@ -235,7 +317,60 @@ pub struct ExportBatchRequest<'a> {
 
 pub fn export_prepared_many(
     request: ExportBatchRequest<'_>,
+    progress: Option<&mut dyn FnMut(ExportJobProgress)>,
+) -> Result<Vec<ExportArtifact>, ExportError> {
+    export_batch(request, progress, OutputPolicy::Replace)
+}
+
+/// Exports to an existing folder without replacing any previous deliverables.
+pub fn export_prepared_many_new(
+    request: ExportBatchRequest<'_>,
+    progress: Option<&mut dyn FnMut(ExportJobProgress)>,
+) -> Result<Vec<ExportArtifact>, ExportError> {
+    let cancel = request.cancel;
+    check_export_directory(request.directory)?;
+    let artifacts = export_batch(request, progress, OutputPolicy::Protect)?;
+    check_cancel(cancel)?;
+    Ok(artifacts)
+}
+
+#[derive(Default)]
+struct BatchDocuments {
+    premiere: Vec<(String, String)>,
+    final_cut: Vec<String>,
+    aaf: Vec<serde_json::Value>,
+}
+
+fn is_batch_document(format: TimelineExportFormat) -> bool {
+    matches!(
+        format,
+        TimelineExportFormat::PremiereXML
+            | TimelineExportFormat::FinalCutProXML
+            | TimelineExportFormat::Aaf
+    )
+}
+
+fn document_path(directory: &Path, format: TimelineExportFormat) -> PathBuf {
+    let application = match format {
+        TimelineExportFormat::Aaf => return directory.join("Align.aaf"),
+        TimelineExportFormat::PremiereXML => "Adobe Premiere Pro",
+        TimelineExportFormat::FinalCutProXML => "Final Cut Pro",
+        _ => "DaVinci Resolve",
+    };
+    directory.join(format!("Align – {application}.{}", format.file_extension()))
+}
+
+fn document_artifact(directory: &Path, format: TimelineExportFormat) -> ExportArtifact {
+    ExportArtifact {
+        format: format.into(),
+        url: document_path(directory, format),
+    }
+}
+
+fn export_batch(
+    request: ExportBatchRequest<'_>,
     mut progress: Option<&mut dyn FnMut(ExportJobProgress)>,
+    policy: OutputPolicy,
 ) -> Result<Vec<ExportArtifact>, ExportError> {
     let ExportBatchRequest {
         backend,
@@ -245,7 +380,7 @@ pub fn export_prepared_many(
         cancel,
     } = request;
     if let [timeline] = timelines {
-        return export_prepared(
+        return SequenceExport::prepare(
             ExportRequest {
                 backend,
                 timeline,
@@ -253,84 +388,85 @@ pub fn export_prepared_many(
                 options,
                 cancel,
             },
-            progress,
-        );
+            false,
+            policy,
+        )?
+        .write(progress, None);
     }
     if timelines.is_empty() {
         return Err(TimelineExportError::NoSynchronizedIslands.into());
     }
 
     std::fs::create_dir_all(directory).map_err(ExportError::Write)?;
-    let mut artifacts = Vec::new();
-    let mut premiere_documents = Vec::new();
-    let mut fcpxml_documents = Vec::new();
-    let mut aaf_manifests = Vec::new();
-    for (index, timeline) in timelines.iter().enumerate() {
-        check_cancel(cancel)?;
-        let sequence_dir = directory.join(sequence_folder(index, &timeline.name));
-        let (sequence_artifacts, aaf_manifest) = export_prepared_internal(
-            ExportRequest {
-                backend,
-                timeline,
-                directory: &sequence_dir,
-                options,
-                cancel,
-            },
-            progress
-                .as_mut()
-                .map(|report| &mut **report as &mut dyn FnMut(ExportJobProgress)),
-            true,
-        )?;
-        aaf_manifests.extend(aaf_manifest);
-        for artifact in sequence_artifacts {
-            if !matches!(
-                artifact.format,
-                ExportArtifactFormat::PremiereXML | ExportArtifactFormat::FinalCutProXML
-            ) {
-                artifacts.push(artifact);
-                continue;
-            }
-            let document =
-                std::fs::read_to_string(&artifact.url).map_err(ExportError::read(&artifact.url))?;
-            let _ = std::fs::remove_file(&artifact.url);
-            if artifact.format == ExportArtifactFormat::PremiereXML {
-                premiere_documents.push((timeline.name.clone(), document));
-            } else {
-                fcpxml_documents.push(document);
-            }
-        }
+    for &format in options
+        .formats
+        .iter()
+        .filter(|&&format| is_batch_document(format))
+    {
+        policy.check(&document_path(directory, format))?;
     }
-    if !premiere_documents.is_empty() {
+    let sequence_dirs: Vec<_> = timelines
+        .iter()
+        .enumerate()
+        .map(|(index, timeline)| directory.join(sequence_folder(index, &timeline.name)))
+        .collect();
+    let plans = timelines
+        .iter()
+        .zip(&sequence_dirs)
+        .map(|(timeline, directory)| {
+            SequenceExport::prepare(
+                ExportRequest {
+                    backend,
+                    timeline,
+                    directory,
+                    options,
+                    cancel,
+                },
+                true,
+                policy,
+            )
+        });
+    // For protected exports, check every sequence before writing deliverables.
+    // CLI exports keep their existing one-sequence-at-a-time preparation.
+    let plans: Box<dyn Iterator<Item = Result<_, _>>> = if policy == OutputPolicy::Protect {
+        Box::new(plans.collect::<Result<Vec<_>, _>>()?.into_iter().map(Ok))
+    } else {
+        Box::new(plans)
+    };
+    let mut artifacts = Vec::new();
+    let mut batch = BatchDocuments::default();
+    for plan in plans {
+        artifacts.extend(
+            plan?.write(
+                progress
+                    .as_mut()
+                    .map(|report| &mut **report as &mut dyn FnMut(ExportJobProgress)),
+                Some(&mut batch),
+            )?,
+        );
+    }
+    if !batch.premiere.is_empty() {
         let xml = align_core::export::premiere::combine_project_documents(
-            &premiere_documents,
+            &batch.premiere,
             options.media_bins,
         )
         .map_err(ExportError::Document)?;
-        let url = directory.join("Align – Adobe Premiere Pro.xml");
-        align_core::staged::write(&url, xml.as_bytes()).map_err(ExportError::Write)?;
-        artifacts.push(ExportArtifact {
-            format: ExportArtifactFormat::PremiereXML,
-            url,
-        });
+        let artifact = document_artifact(directory, TimelineExportFormat::PremiereXML);
+        policy.write(&artifact.url, &xml, false)?;
+        artifacts.push(artifact);
     }
-    if !fcpxml_documents.is_empty() {
-        let xml = align_core::export::fcpxml::combine_documents(&fcpxml_documents)
+    if !batch.final_cut.is_empty() {
+        let xml = align_core::export::fcpxml::combine_documents(&batch.final_cut)
             .map_err(ExportError::Document)?;
-        let url = directory.join("Align – Final Cut Pro.fcpxml");
-        align_core::staged::write(&url, xml.as_bytes()).map_err(ExportError::Write)?;
-        artifacts.push(ExportArtifact {
-            format: ExportArtifactFormat::FinalCutProXML,
-            url,
-        });
+        let artifact = document_artifact(directory, TimelineExportFormat::FinalCutProXML);
+        policy.write(&artifact.url, &xml, false)?;
+        artifacts.push(artifact);
     }
-    if !aaf_manifests.is_empty() {
-        let manifest = serde_json::json!({"version": 3, "sequences": aaf_manifests});
-        let url = directory.join("Align.aaf");
-        write_aaf_manifest(&manifest, directory, &url, cancel)?;
-        artifacts.push(ExportArtifact {
-            format: ExportArtifactFormat::Aaf,
-            url,
-        });
+    if !batch.aaf.is_empty() {
+        let manifest = serde_json::json!({"version": 3, "sequences": batch.aaf});
+        let artifact = document_artifact(directory, TimelineExportFormat::Aaf);
+        write_aaf_manifest(&manifest, &artifact.url, cancel, policy)?;
+        artifacts.push(artifact);
     }
     Ok(artifacts)
 }
@@ -356,116 +492,160 @@ pub fn export_prepared(
     request: ExportRequest<'_>,
     progress: Option<&mut dyn FnMut(ExportJobProgress)>,
 ) -> Result<Vec<ExportArtifact>, ExportError> {
-    export_prepared_internal(request, progress, false).map(|(artifacts, _)| artifacts)
+    SequenceExport::prepare(request, false, OutputPolicy::Replace)?.write(progress, None)
 }
 
-/// Prepares audio and writes every requested artifact. With `defer_aaf`, the
-/// AAF manifest is returned for a batch to combine instead of being written.
-fn export_prepared_internal(
-    request: ExportRequest<'_>,
-    progress: Option<&mut dyn FnMut(ExportJobProgress)>,
-    defer_aaf: bool,
-) -> Result<(Vec<ExportArtifact>, Option<serde_json::Value>), ExportError> {
-    let ExportRequest {
-        backend,
-        timeline,
-        directory,
-        options,
-        cancel,
-    } = request;
-    timeline.validate_audio_source_channels()?;
-    if options.wants(TimelineExportFormat::Aaf) && options.include_replaced_sequence {
-        return Err(ExportError::Unsupported(
-            "AAF replaced sequence export is not implemented.",
-        ));
-    }
-    std::fs::create_dir_all(directory).map_err(ExportError::Write)?;
-    // Combine up front, so the plan sees the starts the writers round.
-    // Re-combining inside write_artifacts is a no-op shift afterwards.
-    // Drift mappings are shift-invariant (relative source/island coords).
-    let mut combined = timeline.combined();
-    crate::media_assets::preserve_export(&mut combined, directory, cancel)
+struct SequenceExport<'a> {
+    request: ExportRequest<'a>,
+    policy: OutputPolicy,
+    audio: AudioPlan,
+    media: Vec<MediaFilePlan>,
+}
+
+impl<'a> SequenceExport<'a> {
+    fn prepare(
+        request: ExportRequest<'a>,
+        batch: bool,
+        policy: OutputPolicy,
+    ) -> Result<Self, ExportError> {
+        let ExportRequest {
+            timeline,
+            directory,
+            options,
+            cancel,
+            ..
+        } = request;
+        check_cancel(cancel)?;
+        timeline.validate_audio_source_channels()?;
+        if options.wants(TimelineExportFormat::Aaf) && options.include_replaced_sequence {
+            return Err(ExportError::Unsupported(
+                "AAF replaced sequence export is not implemented.",
+            ));
+        }
+        for &format in options
+            .formats
+            .iter()
+            .filter(|&&format| !batch || !is_batch_document(format))
+        {
+            policy.check(&document_path(directory, format))?;
+        }
+        std::fs::create_dir_all(directory).map_err(ExportError::Write)?;
+        // Combine up front, so the plan sees the starts the writers round.
+        // Drift mappings are shift-invariant (relative source/island coords).
+        let mut combined = timeline.combined();
+        crate::media_assets::preserve_export(
+            &mut combined,
+            directory,
+            cancel,
+            policy == OutputPolicy::Protect,
+        )
         .map_err(ExportError::write_or_cancelled)?;
 
-    let plan = AudioPlan::new(&combined, options, directory, cancel)?;
-    let media_dir = directory.join("Media Files");
-    let media_plans = if options.include_media_files {
-        media_file_plans(&plan.timeline, &media_dir)
-    } else {
-        Vec::new()
-    };
-    let mut progress = Progress {
-        report: progress,
-        completed: 0,
-        total: plan.jobs.len() + media_plans.len(),
-    };
-    // A stem may read a corrected file. Finish every drift writer before
-    // opening stem inputs. The planner has already deduplicated destinations.
-    let (drift, stems): (Vec<_>, Vec<_>) = plan
-        .jobs
-        .iter()
-        .partition(|job| matches!(job.kind, AudioJobKind::Drift { .. }));
-    for phase in [drift, stems] {
-        for pair in phase.chunks(2) {
-            check_cancel(cancel)?;
-            for job in pair {
-                progress.report(&job.media, ExportJobKind::Audio);
+        let audio = AudioPlan::new(&combined, options, directory, cancel)?;
+        let media = if options.include_media_files {
+            let plans = media_file_plans(&audio.timeline, &directory.join("Media Files"));
+            for plan in &plans {
+                policy.check(&plan.url)?;
             }
-            if let [first, second] = pair {
-                std::thread::scope(|scope| {
-                    let other = scope.spawn(|| second.render(backend, cancel));
-                    let first_result = first.render(backend, cancel);
-                    let second_result = other.join().expect("audio render worker panicked");
-                    first_result?;
-                    progress.complete(&first.media, ExportJobKind::Audio);
-                    second_result?;
-                    progress.complete(&second.media, ExportJobKind::Audio);
-                    Ok::<_, ExportError>(())
-                })?;
-            } else {
-                pair[0].render(backend, cancel)?;
-                progress.complete(&pair[0].media, ExportJobKind::Audio);
+            plans
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            request,
+            policy,
+            audio,
+            media,
+        })
+    }
+
+    fn write(
+        self,
+        progress: Option<&mut dyn FnMut(ExportJobProgress)>,
+        mut batch: Option<&mut BatchDocuments>,
+    ) -> Result<Vec<ExportArtifact>, ExportError> {
+        let Self {
+            request,
+            policy,
+            audio: plan,
+            media: media_plans,
+        } = self;
+        let ExportRequest {
+            backend,
+            directory,
+            options,
+            cancel,
+            ..
+        } = request;
+        let mut progress = Progress {
+            report: progress,
+            completed: 0,
+            total: plan.jobs.len() + media_plans.len(),
+        };
+        // A stem may read a corrected file. Finish every drift writer before
+        // opening stem inputs. The planner has already deduplicated destinations.
+        let (drift, stems): (Vec<_>, Vec<_>) = plan
+            .jobs
+            .iter()
+            .partition(|job| matches!(job.kind, AudioJobKind::Drift { .. }));
+        for phase in [drift, stems] {
+            for pair in phase.chunks(2) {
+                check_cancel(cancel)?;
+                for job in pair {
+                    progress.report(&job.media, ExportJobKind::Audio);
+                }
+                if let [first, second] = pair {
+                    std::thread::scope(|scope| {
+                        let other = scope.spawn(|| second.render(backend, cancel, policy));
+                        let first_result = first.render(backend, cancel, policy);
+                        let second_result = other.join().expect("audio render worker panicked");
+                        first_result?;
+                        progress.complete(&first.media, ExportJobKind::Audio);
+                        second_result?;
+                        progress.complete(&second.media, ExportJobKind::Audio);
+                        Ok::<_, ExportError>(())
+                    })?;
+                } else {
+                    pair[0].render(backend, cancel, policy)?;
+                    progress.complete(&pair[0].media, ExportJobKind::Audio);
+                }
             }
         }
-    }
-    check_cancel(cancel)?;
+        check_cancel(cancel)?;
 
-    let prepared = &plan.timeline;
-    let mut artifacts = write_artifacts(prepared, directory, options)?;
-    let mut deferred_aaf = None;
-    if options.wants(TimelineExportFormat::Aaf) {
-        let manifest = crate::aaf::timeline_manifest_with_frame_rate(
-            prepared,
-            options.aaf_frame_duration,
-            cancel,
-        )?;
-        if defer_aaf {
-            deferred_aaf = Some(manifest);
-        } else {
-            let url = directory.join("Align.aaf");
-            write_aaf_manifest(&manifest, directory, &url, cancel)?;
+        let prepared = &plan.timeline;
+        let mut artifacts =
+            write_artifacts(prepared, directory, options, policy, batch.as_deref_mut())?;
+        if options.wants(TimelineExportFormat::Aaf) {
+            let manifest = crate::aaf::timeline_manifest_with_frame_rate(
+                prepared,
+                options.aaf_frame_duration,
+                cancel,
+            )?;
+            if let Some(batch) = batch {
+                batch.aaf.push(manifest);
+            } else {
+                let artifact = document_artifact(directory, TimelineExportFormat::Aaf);
+                write_aaf_manifest(&manifest, &artifact.url, cancel, policy)?;
+                artifacts.push(artifact);
+            }
+        }
+        if options.include_media_files {
+            std::fs::create_dir_all(directory.join("Media Files")).map_err(ExportError::Write)?;
+        }
+        for plan in &media_plans {
+            progress.report(&plan.video_url, ExportJobKind::Media);
+            let file = export_media_file(backend, plan, cancel, policy)?;
+            progress.complete(&plan.video_url, ExportJobKind::Media);
             artifacts.push(ExportArtifact {
-                format: ExportArtifactFormat::Aaf,
-                url,
+                format: ExportArtifactFormat::MediaFile,
+                url: file,
             });
         }
+        Ok(artifacts)
     }
-    if options.include_media_files {
-        std::fs::create_dir_all(&media_dir).map_err(ExportError::Write)?;
-    }
-    for plan in &media_plans {
-        progress.report(&plan.video_url, ExportJobKind::Media);
-        let file = export_media_file(backend, plan, cancel)?;
-        progress.complete(&plan.video_url, ExportJobKind::Media);
-        artifacts.push(ExportArtifact {
-            format: ExportArtifactFormat::MediaFile,
-            url: file,
-        });
-    }
-    Ok((artifacts, deferred_aaf))
 }
 
-/// Counts completed export jobs for an optional progress callback.
 struct Progress<'a> {
     report: Option<&'a mut dyn FnMut(ExportJobProgress)>,
     completed: usize,
@@ -736,11 +916,17 @@ impl AudioPlan {
 
 impl AudioJob {
     /// Renders the files this job still lacks; existing files are reused.
-    fn render(&self, backend: &dyn MediaBackend, cancel: &AtomicBool) -> Result<(), ExportError> {
+    fn render(
+        &self,
+        backend: &dyn MediaBackend,
+        cancel: &AtomicBool,
+        policy: OutputPolicy,
+    ) -> Result<(), ExportError> {
         let create_parent = |path: &Path| match path.parent() {
             Some(parent) => std::fs::create_dir_all(parent).map_err(ExportError::Write),
             None => Ok(()),
         };
+        let commit = |staged| policy.commit_sidecar(staged);
         match &self.kind {
             AudioJobKind::Drift {
                 destination,
@@ -749,8 +935,9 @@ impl AudioJob {
                 if destination.is_file() {
                     return Ok(());
                 }
+                policy.check(destination)?;
                 create_parent(destination)?;
-                render_drift_cancellable(backend, &self.media, destination, points, cancel)
+                render_drift_with_commit(backend, &self.media, destination, points, cancel, commit)
                     .map_err(|e| ExportError::audio(&self.media, "drift-corrected", e))
             }
             AudioJobKind::Stems {
@@ -767,10 +954,15 @@ impl AudioJob {
                     .filter(|(_, path)| !path.is_file())
                     .map(|(channel, path)| (channel, path.as_path()))
                     .collect();
+                for (_, path) in &missing {
+                    if !path.is_file() {
+                        policy.check(path)?;
+                    }
+                }
                 if let Some((_, first)) = missing.first() {
                     create_parent(first)?;
                 }
-                render_channels_cancellable(
+                render_channels_with_commit(
                     backend,
                     source,
                     &ChannelStems {
@@ -781,6 +973,7 @@ impl AudioJob {
                         duration: *duration,
                     },
                     cancel,
+                    commit,
                 )
                 .map_err(|e| ExportError::audio(&self.media, "channel-stem", e))
             }
@@ -790,21 +983,27 @@ impl AudioJob {
 
 fn write_aaf_manifest(
     manifest: &serde_json::Value,
-    directory: &Path,
     url: &Path,
     cancel: &AtomicBool,
+    policy: OutputPolicy,
 ) -> Result<(), ExportError> {
     let bytes = serde_json::to_vec(manifest).map_err(|e| ExportError::Document(e.to_string()))?;
     // Removed when dropped, after the AAF module has read it.
     let manifest_path = tempfile::Builder::new()
         .prefix(".align-aaf-")
         .suffix(".json")
-        .tempfile_in(directory)
+        .tempfile_in(url.parent().unwrap_or_else(|| Path::new(".")))
         .map_err(ExportError::Write)?
         .into_temp_path();
     std::fs::write(&manifest_path, bytes).map_err(ExportError::Write)?;
-    crate::aaf::write_audio(&manifest_path, url, cancel)?;
-    Ok(())
+    if policy == OutputPolicy::Replace {
+        crate::aaf::write_audio(&manifest_path, url, cancel)?;
+        return Ok(());
+    }
+    let staged = StagedFile::new(url).map_err(ExportError::Write)?;
+    crate::aaf::write_audio(&manifest_path, staged.path(), cancel)?;
+    check_cancel(cancel)?;
+    policy.commit(staged)
 }
 
 #[derive(Clone, Debug)]
@@ -927,9 +1126,10 @@ fn export_media_file(
     backend: &dyn MediaBackend,
     plan: &MediaFilePlan,
     cancel: &AtomicBool,
+    policy: OutputPolicy,
 ) -> Result<PathBuf, ExportError> {
     check_cancel(cancel)?;
-    let staged = align_core::staged::StagedFile::new(&plan.url).map_err(ExportError::Write)?;
+    let staged = StagedFile::new(&plan.url).map_err(ExportError::Write)?;
     let audio = crate::remux::ReplacementAudio {
         backend,
         source: &plan.recorder_url,
@@ -940,7 +1140,8 @@ fn export_media_file(
     };
     match crate::remux::replace_audio(&plan.video_url, staged.path(), &audio, cancel) {
         Ok(()) => {
-            staged.commit().map_err(ExportError::Write)?;
+            check_cancel(cancel)?;
+            policy.commit(staged)?;
             return Ok(plan.url.clone());
         }
         Err(crate::remux::RemuxError::Unsupported(_)) => {}
@@ -990,7 +1191,8 @@ fn export_media_file(
             format!("FFmpeg failed ({status})."),
         ));
     }
-    staged.commit().map_err(ExportError::Write)?;
+    check_cancel(cancel)?;
+    policy.commit(staged)?;
     Ok(plan.url.clone())
 }
 
@@ -1000,6 +1202,8 @@ fn write_artifacts(
     timeline: &ExportTimeline,
     directory: &Path,
     options: &ExportOptions,
+    policy: OutputPolicy,
+    mut batch: Option<&mut BatchDocuments>,
 ) -> Result<Vec<ExportArtifact>, ExportError> {
     let combined = timeline.combined();
     let media_bins = options.media_bins;
@@ -1013,16 +1217,7 @@ fn write_artifacts(
     };
     let mut artifacts = Vec::with_capacity(options.formats.len());
     for &format in &options.formats {
-        let application = match format {
-            TimelineExportFormat::Aaf => continue,
-            TimelineExportFormat::PremiereXML => "Adobe Premiere Pro",
-            TimelineExportFormat::FinalCutProXML => "Final Cut Pro",
-            TimelineExportFormat::ResolveOTIO
-            | TimelineExportFormat::ResolveScript
-            | TimelineExportFormat::ResolveXML => "DaVinci Resolve",
-        };
-        let url = directory.join(format!("Align – {application}.{}", format.file_extension()));
-        let bytes: Vec<u8> = match format {
+        let bytes = match format {
             TimelineExportFormat::Aaf => continue,
             TimelineExportFormat::ResolveOTIO => {
                 align_core::export::otio::data(&combined, media_bins)
@@ -1032,22 +1227,31 @@ fn write_artifacts(
                 align_core::export::script::write().as_bytes().to_vec()
             }
             TimelineExportFormat::ResolveXML | TimelineExportFormat::PremiereXML => {
-                align_core::export::premiere::write(&combined, format, premiere).into_bytes()
+                let xml = align_core::export::premiere::write(&combined, format, premiere);
+                if format == TimelineExportFormat::PremiereXML
+                    && let Some(batch) = batch.as_deref_mut()
+                {
+                    batch.premiere.push((timeline.name.clone(), xml));
+                    continue;
+                }
+                xml.into_bytes()
             }
             TimelineExportFormat::FinalCutProXML => {
-                align_core::export::fcpxml::write(&combined, fcpxml).into_bytes()
+                let xml = align_core::export::fcpxml::write(&combined, fcpxml);
+                if let Some(batch) = batch.as_deref_mut() {
+                    batch.final_cut.push(xml);
+                    continue;
+                }
+                xml.into_bytes()
             }
         };
-        align_core::staged::write(&url, &bytes).map_err(ExportError::Write)?;
-        #[cfg(unix)]
-        if format == TimelineExportFormat::ResolveScript {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&url, std::fs::Permissions::from_mode(0o755));
-        }
-        artifacts.push(ExportArtifact {
-            format: format.into(),
-            url,
-        });
+        let artifact = document_artifact(directory, format);
+        policy.write(
+            &artifact.url,
+            bytes,
+            format == TimelineExportFormat::ResolveScript,
+        )?;
+        artifacts.push(artifact);
     }
     Ok(artifacts)
 }
@@ -1260,6 +1464,83 @@ mod tests {
     }
 
     #[test]
+    fn protected_batch_preserves_existing_deliverables_before_writing_new_ones() {
+        use TimelineExportFormat::{PremiereXML, ResolveOTIO, ResolveScript};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut camera = item("camera", MediaKind::Video, 0.0, 1.0);
+        camera.clip.url = dir.path().join("camera.mov");
+        let timelines = [
+            ExportTimeline::new(
+                vec![ExportIsland {
+                    id: 0,
+                    clips: vec![item("first", MediaKind::Video, 0.0, 1.0)],
+                    duration: 1.0,
+                }],
+                MediaTime::new(1, 25),
+                "First cut",
+            ),
+            ExportTimeline::new(
+                vec![ExportIsland {
+                    id: 0,
+                    clips: vec![camera, item("recorder", MediaKind::Audio, 0.0, 1.0)],
+                    duration: 1.0,
+                }],
+                MediaTime::new(1, 25),
+                "Second cut",
+            ),
+        ];
+        let options = ExportOptions {
+            formats: vec![PremiereXML, ResolveOTIO, ResolveScript],
+            correct_drift: false,
+            include_media_files: true,
+            ..ExportOptions::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let request = || ExportBatchRequest {
+            backend: &crate::portable::PortableBackend,
+            timelines: &timelines,
+            directory: dir.path(),
+            options: &options,
+            cancel: &cancel,
+        };
+        let first = dir
+            .path()
+            .join("Sequence 01 – First cut/Align – DaVinci Resolve.otio");
+        let second = dir.path().join("Sequence 02 – Second cut");
+        let combined = dir.path().join("Align – Adobe Premiere Pro.xml");
+        for previous in [
+            combined.clone(),
+            second.join("Align – DaVinci Resolve.py"),
+            second.join("Media Files/camera – clean audio – camera.mov"),
+        ] {
+            std::fs::create_dir_all(previous.parent().unwrap()).unwrap();
+            std::fs::write(&previous, b"previous export").unwrap();
+            assert!(matches!(
+                export_prepared_many_new(request(), None),
+                Err(ExportError::Conflict(path)) if path == previous
+            ));
+            assert_eq!(std::fs::read(&previous).unwrap(), b"previous export");
+            assert!(!first.exists());
+            std::fs::remove_file(previous).unwrap();
+        }
+
+        // Without an existing collision the job starts, writes XML, and then
+        // fails trying to read the absent camera. A retry protects those files.
+        assert!(matches!(
+            export_prepared_many_new(request(), None),
+            Err(ExportError::Media { .. })
+        ));
+        let previous = std::fs::read(&first).unwrap();
+        assert!(matches!(
+            export_prepared_many_new(request(), None),
+            Err(ExportError::Conflict(path)) if path == first
+        ));
+        assert_eq!(std::fs::read(first).unwrap(), previous);
+        assert!(!combined.exists());
+    }
+
+    #[test]
     /// The Resolve script and OTIO play the original stereo file, trimmed,
     /// without copies; AAF links mono stems of its selection, and a second
     /// export renders only the stems it lacks.
@@ -1357,8 +1638,12 @@ mod tests {
             )
             .unwrap();
             for job in &plan.jobs {
-                job.render(&crate::portable::PortableBackend, &cancel)
-                    .unwrap();
+                job.render(
+                    &crate::portable::PortableBackend,
+                    &cancel,
+                    OutputPolicy::Protect,
+                )
+                .unwrap();
             }
             plan.timeline.islands[0].clips[0]
                 .precision_audio_urls
@@ -1510,6 +1795,7 @@ mod tests {
             &crate::portable::PortableBackend,
             &plan,
             &std::sync::atomic::AtomicBool::new(false),
+            OutputPolicy::Replace,
         )
         .unwrap();
         let report = crate::ff::inspect(&output).unwrap();
@@ -1586,6 +1872,7 @@ mod tests {
             &crate::portable::PortableBackend,
             &plan,
             &std::sync::atomic::AtomicBool::new(false),
+            OutputPolicy::Replace,
         )
         .unwrap();
 

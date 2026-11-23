@@ -473,6 +473,24 @@ pub fn render_drift_cancellable(
     points: &[(f64, f64)],
     cancel: &AtomicBool,
 ) -> Result<(), RenderError> {
+    render_drift_with_commit(
+        backend,
+        source,
+        destination,
+        points,
+        cancel,
+        StagedFile::commit,
+    )
+}
+
+pub(crate) fn render_drift_with_commit(
+    backend: &dyn MediaBackend,
+    source: &Path,
+    destination: &Path,
+    points: &[(f64, f64)],
+    cancel: &AtomicBool,
+    commit: impl FnOnce(StagedFile) -> io::Result<()>,
+) -> Result<(), RenderError> {
     check_cancel(cancel)?;
     let model_points: Vec<align_core::MappingPoint> = points
         .iter()
@@ -525,7 +543,7 @@ pub fn render_drift_cancellable(
         "drift correction",
         0,
     )?;
-    staged.commit().map_err(RenderError::Write)
+    commit(staged).map_err(RenderError::Write)
 }
 
 /// A resampled segment decoded with real neighboring audio on both sides.
@@ -673,6 +691,16 @@ pub fn render_channels_cancellable(
     stems: &ChannelStems<'_>,
     cancel: &AtomicBool,
 ) -> Result<(), RenderError> {
+    render_channels_with_commit(backend, source, stems, cancel, StagedFile::commit)
+}
+
+pub(crate) fn render_channels_with_commit(
+    backend: &dyn MediaBackend,
+    source: &Path,
+    stems: &ChannelStems<'_>,
+    cancel: &AtomicBool,
+    commit: impl Fn(StagedFile) -> io::Result<()>,
+) -> Result<(), RenderError> {
     check_cancel(cancel)?;
     if stems.outputs.is_empty() {
         return Ok(());
@@ -761,7 +789,7 @@ pub fn render_channels_cancellable(
         }
         for staged in staged {
             check_cancel(cancel)?;
-            staged.commit().map_err(RenderError::Write)?;
+            commit(staged).map_err(RenderError::Write)?;
         }
     }
     Ok(())

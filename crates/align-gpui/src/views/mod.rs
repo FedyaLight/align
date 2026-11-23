@@ -8,7 +8,7 @@ use align_core::{
     AudioAnalysisSource, Clip, ClipId, ClipOrder, MatchPreview, MatchThreshold, MediaKind,
     SyncResult, TemporalMode, TrackContent, model::file_name,
 };
-use align_decode::export::ExportArtifact;
+use align_decode::export::{ExportArtifact, ExportError};
 use align_decode::pipeline::{Phase, Pipeline};
 use futures::StreamExt;
 use gpui::{
@@ -75,8 +75,14 @@ struct SyncProgress {
 }
 
 enum ExportMsg {
-    Progress { label: String, fraction: f32 },
-    Done(Result<Vec<ExportArtifact>, String>),
+    Progress {
+        label: String,
+        fraction: f32,
+    },
+    Done {
+        directory: PathBuf,
+        result: Result<Vec<ExportArtifact>, ExportError>,
+    },
 }
 
 enum PathRepairMsg {
@@ -1152,6 +1158,14 @@ impl AlignApp {
         if self.projects.busy || !self.data.can_export() {
             return;
         }
+        if self
+            .data
+            .export_dir
+            .as_ref()
+            .is_none_or(|path| align_decode::export::check_export_directory(path).is_err())
+        {
+            self.data.export_dir = crate::settings::last_export_directory(&crate::settings::file());
+        }
         self.data.show_export = true;
         self.export_sidebar_exit.cancel();
         self.export_reveals_closing.clear();
@@ -1653,6 +1667,7 @@ impl AlignApp {
             prompt: None,
         });
         let view = cx.entity();
+        let generation = self.data.generation;
         cx.spawn(async move |_, cx| {
             let Ok(Ok(Some(mut paths))) = receiver.await else {
                 return;
@@ -1661,6 +1676,12 @@ impl AlignApp {
                 return;
             };
             let _ = view.update(cx, |this, cx| {
+                if this.data.generation != generation
+                    || !this.data.show_export
+                    || this.data.has_active_job()
+                {
+                    return;
+                }
                 this.data.export_dir = Some(dir);
                 cx.notify();
             });
@@ -1732,6 +1753,7 @@ impl AlignApp {
             timelines.push(timeline);
         }
         self.data.operation = Operation::Exporting;
+        self.data.cancel = Default::default();
         self.data.progress = 0.0;
         self.data.export_started = true;
         self.data.error = None;
@@ -1790,7 +1812,7 @@ impl AlignApp {
                     ..Default::default()
                 },
             };
-            let out = align_decode::export::export_prepared_many(
+            let result = align_decode::export::export_prepared_many_new(
                 align_decode::export::ExportBatchRequest {
                     backend: pipeline.backend(),
                     timelines: &timelines,
@@ -1800,12 +1822,15 @@ impl AlignApp {
                 },
                 Some(&mut progress),
             );
-            let _ = tx.unbounded_send(ExportMsg::Done(out.map_err(|e| e.to_string())));
+            let _ = tx.unbounded_send(ExportMsg::Done {
+                directory: dir,
+                result,
+            });
         });
         let view = cx.entity();
         cx.spawn(async move |_, cx| {
             while let Some(msg) = rx.next().await {
-                let finished = matches!(msg, ExportMsg::Done(_));
+                let finished = matches!(msg, ExportMsg::Done { .. });
                 let _ = view.update(cx, |this, cx| {
                     if this.data.generation == generation {
                         this.apply_export_msg(msg);
@@ -1826,20 +1851,37 @@ impl AlignApp {
                 self.data.status = label;
                 self.data.progress = fraction;
             }
-            ExportMsg::Done(Ok(artifacts)) => {
+            ExportMsg::Done {
+                directory,
+                result: Ok(artifacts),
+            } => {
+                if !artifacts.is_empty()
+                    && let Err(error) = crate::settings::remember_export_directory(
+                        &crate::settings::file(),
+                        &directory,
+                    )
+                {
+                    eprintln!("Could not remember the export folder: {error}");
+                }
                 self.data.exported_files = artifacts.iter().map(|a| a.url.clone()).collect();
                 self.data.operation = Operation::Exported;
                 self.data.progress = 1.0;
                 self.data.status = "Export complete.".to_string();
             }
-            ExportMsg::Done(Err(error)) => {
-                if error == "Cancelled." {
-                    self.data.operation = Operation::Ready;
-                    self.data.status = "Export cancelled.".to_string();
-                } else {
-                    self.data.operation = Operation::Ready;
-                    self.data.error = Some(error);
-                    self.data.status = "Export failed.".to_string();
+            ExportMsg::Done {
+                result: Err(error), ..
+            } => {
+                self.data.operation = Operation::Ready;
+                self.data.export_started = false;
+                match error {
+                    ExportError::Cancelled => self.data.status = "Export cancelled.".to_string(),
+                    _ => {
+                        if matches!(error, ExportError::DestinationUnavailable { .. }) {
+                            self.data.export_dir = None;
+                        }
+                        self.data.error = Some(error.to_string());
+                        self.data.status = "Export failed.".to_string();
+                    }
                 }
             }
         }
