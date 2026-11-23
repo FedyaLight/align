@@ -25,7 +25,7 @@ trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/input/payload" "$TMP/input/integration" "$TMP/build"
 tar -C "$STAGE" --exclude=./AAF-Sources -cf - . | tar -C "$TMP/input/payload" -xf -
 cp "$ROOT/Support/Linux/com.align.app.desktop" "$ROOT/Support/Linux/com.align.app.metainfo.xml" \
-  "$ROOT/Support/AppIcon.png" "$TMP/input/integration/"
+  "$ROOT/Support/Linux/com.align.app.project.xml" "$ROOT/Support/AppIcon.png" "$TMP/input/integration/"
 tar -C "$TMP/input" -czf "$TMP/build/align-payload.tar.gz" payload integration
 HASH="$(sha256sum "$TMP/build/align-payload.tar.gz" | cut -d ' ' -f 1)"
 sed -e "s/@VERSION@/$VERSION/g" -e "s/@PAYLOAD_SHA256@/$HASH/g" \

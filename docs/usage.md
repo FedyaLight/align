@@ -34,11 +34,34 @@ For an existing edit, enable Preserve basic editing on the tracks that should
 remain fixed. This preserves their trims, duplicates, positions, and gaps while
 other tracks align to them. See [format limits](formats.md) for unsupported edits.
 
+### Save and reopen projects
+
+Align creates an autosave when synchronization starts and updates that same
+project as you work. **File → Project Autosave** can turn this off or choose a
+different folder for new projects. The default is **Align** inside your system
+Documents folder. At startup, Align removes its autosaves that have gone seven
+days without an update.
+
+Use **File → Recent Projects** or **Open Project…** to reopen a `.align` file.
+**Save As…** creates a project you can name and keep. **Save Project** saves to
+that file even when autosave is off.
+
+A project keeps the source paths, sequence choices, synchronization settings,
+relinks, corrections, and completed placements. A reopened timeline can be
+exported immediately when its result is current and its sources are unchanged.
+If sources were moved or changed, use **Relink…** as needed, then synchronize
+again. Embedded AAF audio is extracted again from the original AAF on open.
+The project does not contain the original media and works independently of the
+analysis cache.
+
 ### Keyboard shortcuts
 
 | Action | macOS | Windows and Linux |
 | --- | --- | --- |
 | Add media | Cmd+O | Ctrl+O |
+| Open project | Cmd+Shift+O | Ctrl+Shift+O |
+| Save project | Cmd+S | Ctrl+S |
+| Save project as | Cmd+Shift+S | Ctrl+Shift+S |
 | Synchronize again | Cmd+R | Ctrl+R |
 | Export | Cmd+E | Ctrl+E |
 | Zoom the timeline | Cmd or Option + scroll | Ctrl or Alt + scroll |

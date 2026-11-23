@@ -19,7 +19,7 @@ align-decode.workspace = true
 gpui.workspace = true
 futures.workspace = true
 mimalloc.workspace = true
-serde.workspace = true
+serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
 dirs.workspace = true
 tempfile.workspace = true
@@ -30,6 +30,7 @@ url = "2"
 sha2.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
 align-cli = { path = "../align-cli" }
 
 [target.'cfg(windows)'.dependencies]
@@ -44,6 +45,7 @@ windows-sys = { version = "0.59", features = [
 embed-resource = "3.0.11"
 
 [dev-dependencies]
+hound.workspace = true
 # Same renderer the GPUI sprite atlas uses: the test below parses every
 # icon exactly like `SvgRenderer::render_pixmap` does.
 usvg = "=0.45.1"

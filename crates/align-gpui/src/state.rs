@@ -12,6 +12,9 @@ use align_core::{
 use align_decode::pipeline::{PipelineInput, PipelineOptions};
 use gpui::{Point, ScrollHandle, px};
 
+mod project;
+pub(crate) use project::ProjectSession;
+
 use crate::lane::{self, BarVisual, CorrectionOption, LaneVisual, LiveClip, LiveMatch};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -261,7 +264,8 @@ impl ExportTarget {
 
 /// Concrete defaults used by every sequence unless that sequence replaces a
 /// field. Track settings then replace the effective sequence value.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SyncDefaults {
     pub search_accuracy: align_core::SearchAccuracy,
     pub audio_source: AudioAnalysisSource,
@@ -274,7 +278,8 @@ pub struct SyncDefaults {
 /// `None` means that the current sequence inherits the corresponding common
 /// value. Keeping each field optional preserves inheritance when Common is
 /// edited later.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SequenceDefaults {
     pub search_accuracy: Option<align_core::SearchAccuracy>,
     pub audio_source: Option<AudioAnalysisSource>,
@@ -304,13 +309,15 @@ pub enum SettingsScope {
     CurrentSequence,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ScopedOverride<T> {
     by_clip: HashMap<ClipId, T>,
     by_key: HashMap<String, T>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct TrackOverrides {
     search: ScopedOverride<align_core::SearchAccuracy>,
     audio: ScopedOverride<AudioAnalysisSource>,
@@ -343,6 +350,8 @@ pub struct AppData {
     pub settings_scope: SettingsScope,
     pub settings_changed: bool,
     sync_dirty: bool,
+    pub restore_warnings: Vec<String>,
+    restore_paths: Vec<PathBuf>,
     quality_only_dirty: bool,
     incremental_quality_run: bool,
     track_overrides: HashMap<usize, TrackOverrides>,
@@ -432,6 +441,8 @@ impl Default for AppData {
             settings_scope: Default::default(),
             settings_changed: false,
             sync_dirty: false,
+            restore_warnings: Vec::new(),
+            restore_paths: Vec::new(),
             quality_only_dirty: false,
             incremental_quality_run: false,
             track_overrides: HashMap::new(),
@@ -653,7 +664,8 @@ impl AppData {
     }
 
     pub fn is_stale(&self) -> bool {
-        self.result.is_some() && (self.pending_count > 0 || self.sync_dirty)
+        self.result.is_some()
+            && (self.pending_count > 0 || self.sync_dirty || self.settings_changed)
     }
 
     pub fn can_synchronize(&self) -> bool {
@@ -876,6 +888,7 @@ impl AppData {
             .sort_by(|a, b| a.url.to_string_lossy().cmp(&b.url.to_string_lossy()));
         if self.result.is_some() {
             self.pending_count += added;
+            self.mark_sync_dirty();
             self.exported_files.clear();
             self.status = format!("{} file{} added.", added, if added == 1 { "" } else { "s" });
             return;
@@ -915,6 +928,7 @@ impl AppData {
         }
         if self.result.is_some() {
             self.pending_count += selected.len();
+            self.mark_sync_dirty();
             self.exported_files.clear();
             self.status = "Selection changed.".to_string();
             return;
@@ -1363,6 +1377,8 @@ impl AppData {
         self.active_sequence_result = 0;
         self.apply_visible_result(result);
         self.sync_dirty = false;
+        self.restore_warnings.clear();
+        self.restore_paths.clear();
         self.quality_only_dirty = false;
         self.incremental_quality_run = false;
         self.report_sync_duration();
@@ -1399,6 +1415,8 @@ impl AppData {
         self.active_sequence_result = active;
         self.apply_visible_result(visible);
         self.sync_dirty = false;
+        self.restore_warnings.clear();
+        self.restore_paths.clear();
         self.quality_only_dirty = false;
         self.incremental_quality_run = false;
         if count > 1 {
@@ -1427,7 +1445,16 @@ impl AppData {
         self.active_sequence_result = index;
         self.show_sequence_results = false;
         self.exported_files.clear();
+        let pending = self.pending_count;
+        let queued = self
+            .clips
+            .iter()
+            .filter(|clip| clip.clip_id.is_none())
+            .cloned()
+            .collect::<Vec<_>>();
         self.apply_visible_result(result);
+        self.pending_count = pending;
+        self.clips.extend(queued);
         let count = self.sequence_results.len();
         let name = self
             .result
@@ -1876,10 +1903,18 @@ impl AppData {
         })
     }
 
-    pub fn can_locate_timeline_media(&self) -> bool {
-        !self.timeline_inputs.is_empty()
-            && (self.has_missing_media_warning()
-                || self.error.as_deref() == Some("No readable audio or video media was found."))
+    pub fn can_relink_media(&self) -> bool {
+        !self.restore_paths.is_empty()
+            || (!self.timeline_inputs.is_empty()
+                && (self.has_missing_media_warning()
+                    || self.error.as_deref()
+                        == Some("No readable audio or video media was found.")))
+    }
+
+    pub fn has_missing_source_folder(&self) -> bool {
+        self.restore_paths
+            .iter()
+            .any(|path| self.folder_inputs.contains(path))
     }
 
     /// Add exact file choices from the native picker. A later choice for
@@ -1895,6 +1930,9 @@ impl AppData {
             else {
                 continue;
             };
+            // A moved top-level source has no timeline edit to relink.
+            // Replace it in the inputs while retaining the chosen indices.
+            self.relink_project_source(&name, &path);
             self.manual_relinks
                 .retain(|(existing, _)| !existing.eq_ignore_ascii_case(&name));
             self.manual_relinks.push((name, path));
@@ -3167,15 +3205,15 @@ mod tests {
         data.warnings
             .push("camera.mov: Variable frame rate detected.".into());
         assert!(!data.has_missing_media_warning());
-        assert!(!data.can_locate_timeline_media());
+        assert!(!data.can_relink_media());
         data.warnings
             .push("cut.xml: Timeline media could not be opened: /old/card/A.WAV".into());
         assert!(data.has_missing_media_warning());
-        assert!(data.can_locate_timeline_media());
+        assert!(data.can_relink_media());
 
         data.warnings.clear();
         data.error = Some("No readable audio or video media was found.".into());
-        assert!(data.can_locate_timeline_media());
+        assert!(data.can_relink_media());
     }
 
     #[test]

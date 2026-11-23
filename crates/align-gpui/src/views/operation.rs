@@ -17,7 +17,7 @@ pub(super) fn warning_banner(
     theme: &Theme,
     data: &crate::state::AppData,
 ) -> impl IntoElement {
-    let n = data.warnings.len();
+    let n = data.warnings.len() + data.restore_warnings.len();
     div()
         .flex()
         .flex_row()
@@ -43,7 +43,7 @@ pub(super) fn warning_banner(
                 cx.notify();
             },
         ))
-        .when(data.can_locate_timeline_media(), |banner| {
+        .when(data.can_relink_media(), |banner| {
             banner.child(button(
                 cx,
                 theme,
@@ -69,7 +69,7 @@ pub(super) fn warning_details(theme: &Theme, data: &crate::state::AppData) -> im
         .border_1()
         .border_color(rgb(theme.orange))
         .bg(rgb(theme.panel));
-    for message in data.warnings.iter().take(50) {
+    for message in data.restore_warnings.iter().chain(&data.warnings).take(50) {
         panel = panel.child(div().text_color(rgb(theme.text)).child(message.clone()));
     }
     panel
@@ -227,6 +227,8 @@ pub(super) fn operation_bar(
                 true,
                 |this, _, _, cx| {
                     if this.data.reset_corrections() {
+                        this.data.mark_sync_dirty();
+                        this.project_changed(cx);
                         this.start_sync(cx);
                     } else {
                         cx.notify();
@@ -272,7 +274,9 @@ pub(super) fn stage_settings_panel(
                 ),
                 true,
                 move |this, _, _, cx| {
-                    this.update_timeline_layout(|data| data.select_sync_stage(index));
+                    if this.update_timeline_layout(|data| data.select_sync_stage(index)) {
+                        this.project_changed(cx);
+                    }
                     cx.notify();
                 },
             ));
@@ -331,7 +335,9 @@ pub(super) fn sequence_results_panel(
             format!("{check}{} · {name}", index + 1),
             true,
             move |this, _, _, cx| {
-                this.update_timeline_layout(|data| data.select_sequence_result(index));
+                if this.update_timeline_layout(|data| data.select_sequence_result(index)) {
+                    this.project_changed(cx);
+                }
                 cx.notify();
             },
         ));

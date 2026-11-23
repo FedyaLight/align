@@ -28,6 +28,8 @@ package() {
         "$pkgdir/usr/share/applications/com.align.app.desktop"
     install -Dm644 "$srcdir/integration/com.align.app.metainfo.xml" \
         "$pkgdir/usr/share/metainfo/com.align.app.metainfo.xml"
+    install -Dm644 "$srcdir/integration/com.align.app.project.xml" \
+        "$pkgdir/usr/share/mime/packages/com.align.app.project.xml"
     install -Dm644 "$srcdir/integration/AppIcon.png" \
         "$pkgdir/usr/share/icons/hicolor/1024x1024/apps/com.align.app.png"
     install -Dm644 "$srcdir/payload/LICENSE" "$pkgdir/usr/share/licenses/align/LICENSE"

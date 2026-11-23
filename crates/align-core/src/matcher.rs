@@ -70,7 +70,8 @@ pub struct ClipTimingHints {
     pub source_timecodes: HashMap<ClipId, f64>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum MatchThreshold {
     Permissive,
     #[default]

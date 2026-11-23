@@ -11,7 +11,8 @@ use crate::allocator::source_key_for_clip;
 use crate::matcher::PairwiseMatch;
 use crate::model::{Clip, ClipId, ImportedTimeline, MatchEvidence};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ClipOrder {
     #[default]
     Auto,
@@ -25,7 +26,8 @@ pub enum ClipOrder {
 /// Whether clips belonging to one source track may synchronize together.
 /// `Auto` follows imported NLE tracks as Linear and leaves raw media open,
 /// because raw input has no authoritative track assignment.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum TrackContent {
     #[default]
     Auto,

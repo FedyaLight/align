@@ -591,6 +591,7 @@ pub(super) fn search_quality_row(
         .on_click(cx.listener(move |this, _, _, cx| {
             if this.data.set_scoped_search_accuracy(Some(accuracy)) {
                 this.data.mark_quality_dirty();
+                this.project_changed(cx);
             }
             this.close_search_quality(cx);
         }))

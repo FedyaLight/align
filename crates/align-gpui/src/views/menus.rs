@@ -58,6 +58,7 @@ pub(super) fn sequence_picker_panel(
         true,
         |this, _, _, cx| {
             this.data.choose_all_sequences();
+            this.project_changed(cx);
             cx.notify();
         },
     ));
@@ -72,6 +73,7 @@ pub(super) fn sequence_picker_panel(
             true,
             move |this, _, _, cx| {
                 this.data.choose_sequence(index);
+                this.project_changed(cx);
                 cx.notify();
             },
         ));
@@ -455,6 +457,8 @@ pub(super) fn stream_menu_section(
                 move |this, _, _, cx| {
                     if this.data.set_lane_search_accuracy(accuracy, &lane_id) {
                         this.data.menu = None;
+                        this.data.mark_sync_dirty();
+                        this.project_changed(cx);
                         this.start_sync(cx);
                     }
                 },

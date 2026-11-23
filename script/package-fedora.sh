@@ -90,6 +90,7 @@ for executable in align align-cli; do
 done
 install -Dm644 "$ROOT/Support/Linux/com.align.app.desktop" %{buildroot}/usr/share/applications/com.align.app.desktop
 install -Dm644 "$ROOT/Support/Linux/com.align.app.metainfo.xml" %{buildroot}/usr/share/metainfo/com.align.app.metainfo.xml
+install -Dm644 "$ROOT/Support/Linux/com.align.app.project.xml" %{buildroot}/usr/share/mime/packages/com.align.app.project.xml
 install -Dm644 "$ROOT/Support/AppIcon.png" %{buildroot}/usr/share/icons/hicolor/1024x1024/apps/com.align.app.png
 
 %files
@@ -98,6 +99,7 @@ install -Dm644 "$ROOT/Support/AppIcon.png" %{buildroot}/usr/share/icons/hicolor/
 /usr/bin/align-cli
 /usr/share/applications/com.align.app.desktop
 /usr/share/metainfo/com.align.app.metainfo.xml
+/usr/share/mime/packages/com.align.app.project.xml
 /usr/share/icons/hicolor/1024x1024/apps/com.align.app.png
 SPEC
 rpmbuild --define "_topdir $TMP" "${rpm_options[@]}" -bb "$TMP/SPECS/align.spec"

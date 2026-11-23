@@ -37,6 +37,17 @@ pub fn cleanup() {
         .take();
 }
 
+/// Identifies a content-addressed WAV owned by this process's AAF extraction.
+pub fn embedded_aaf_name(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    let digest = name.strip_suffix(".wav")?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let directory = active_directory().ok().flatten()?;
+    (path.parent()? == directory).then_some(name)
+}
+
 pub fn preserve_project(project: &mut SyncProject, cancel: &AtomicBool) -> io::Result<()> {
     let Some(session) = active_directory()? else {
         return Ok(());

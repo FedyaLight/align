@@ -885,14 +885,16 @@ pub fn select_mono_channel(energies: &[f64], previous: Option<usize>) -> usize {
 
 // ------------------------------------------------------------- constraints
 
-/// Session-only matching constraints from the timeline UI. Not serialized.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Matching constraints from the timeline UI.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ConstraintKind {
     RejectedPair,
     RejectedAlignment,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SyncConstraint {
     kind: ConstraintKind,
     left: ClipId,
@@ -901,6 +903,15 @@ pub struct SyncConstraint {
 }
 
 impl SyncConstraint {
+    pub fn relink_clip(&mut self, old: &ClipId, new: &ClipId) {
+        if &self.left == old {
+            self.left.clone_from(new);
+        }
+        if &self.right == old {
+            self.right.clone_from(new);
+        }
+    }
+
     pub fn rejecting_pair(left: ClipId, right: ClipId) -> Self {
         Self {
             kind: ConstraintKind::RejectedPair,

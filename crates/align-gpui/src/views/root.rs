@@ -32,7 +32,8 @@ impl Render for AlignApp {
         // While a modal or context menu is open the content below keeps
         // its layout but loses hover/cursor feedback (clicks are already
         // swallowed by the overlay layers).
-        let content_active = !self.show_problem_report
+        let content_active = !self.projects.busy
+            && !self.show_problem_report
             && self.app_menu.is_none()
             && self.data.menu.is_none()
             && !self.data.show_path_fixer
@@ -194,11 +195,20 @@ impl Render for AlignApp {
             content_active,
             self.selection_controls_exit.is_active(),
         ));
-        if !self.data.warnings.is_empty() {
+        if !self.data.warnings.is_empty() || !self.data.restore_warnings.is_empty() {
             content = content.child(warning_banner(cx, &theme, &self.data));
             if self.data.show_warning_details {
                 content = content.child(warning_details(&theme, &self.data));
             }
+        }
+        if let Some(notice) = &self.projects.notice {
+            content = content.child(
+                div()
+                    .px_5()
+                    .py_1()
+                    .text_color(rgb(theme.dim))
+                    .child(notice.clone()),
+            );
         }
         // No bottom bar over the empty drop zone either.
         if !self.data.clips.is_empty() || self.data.importing() {
@@ -238,7 +248,7 @@ impl Render for AlignApp {
         }
         // The problem report temporarily replaces the open modal, keeping a
         // single dim layer; that modal returns when the report closes.
-        let modals_visible = !self.show_problem_report;
+        let modals_visible = !self.projects.busy && !self.show_problem_report;
         if let (true, Some(picker)) = (modals_visible, self.data.sequence_pickers.front()) {
             root = root.child(overlay(
                 &theme,

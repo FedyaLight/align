@@ -37,6 +37,7 @@ mod menu_sidebar;
 mod menus;
 mod operation;
 mod panels;
+mod projects;
 mod root;
 mod settings;
 mod sources;
@@ -53,7 +54,12 @@ enum SyncMsg {
         sequence_count: usize,
     },
     Progress(Box<SyncProgress>),
-    Done(Box<Result<Vec<SyncResult>, String>>),
+    Done(Box<Result<SyncOutput, String>>),
+}
+
+struct SyncOutput {
+    results: Vec<SyncResult>,
+    placements: std::sync::Arc<crate::project::Placements>,
 }
 
 struct SyncProgress {
@@ -471,6 +477,7 @@ impl Exit {
 
 pub struct AlignApp {
     pub(crate) data: AppData,
+    projects: projects::Projects,
     pub(crate) focus_handle: FocusHandle,
     export_inputs: ExportInputs,
     path_fixer_inputs: PathFixerInputs,
@@ -512,9 +519,14 @@ impl Focusable for AlignApp {
 }
 
 impl AlignApp {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        projects: crate::project::Preferences,
+        writer: crate::project::Writer,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let app = Self {
             data: AppData::new(),
+            projects: projects::Projects::new(projects, writer),
             focus_handle: cx.focus_handle(),
             export_inputs: ExportInputs::new(cx),
             path_fixer_inputs: PathFixerInputs::new(cx),
@@ -555,11 +567,17 @@ impl AlignApp {
     /// Clear the session, or remove the selected sources. A cleared session
     /// starts the next job from the export defaults.
     pub(crate) fn delete_or_clear(&mut self, cx: &mut Context<Self>) {
+        if self.projects.busy {
+            return;
+        }
         let clearing = self.data.selection.is_empty();
         self.data.delete_or_clear();
         if clearing {
+            self.projects.clear();
             self.export_inputs
                 .set_labels(&self.data.export_baseline().labels, cx);
+        } else {
+            self.project_changed(cx);
         }
         cx.notify();
     }
@@ -594,7 +612,19 @@ impl AlignApp {
     }
 
     pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        let paths = self.data.begin_import(paths);
+        if self.projects.busy {
+            return;
+        }
+        if let Some(project) = paths.iter().find(|path| crate::project::is_project(path)) {
+            self.open_project(project.clone(), cx);
+            return;
+        }
+        let paths = self.data.begin_import(
+            paths
+                .into_iter()
+                .filter_map(|path| std::path::absolute(path).ok())
+                .collect(),
+        );
         if paths.is_empty() {
             return;
         }
@@ -610,7 +640,11 @@ impl AlignApp {
         cx.spawn(async move |view, cx| {
             let inputs = task.await;
             let _ = view.update(cx, |this, cx| {
+                let count = this.data.inputs.len();
                 this.data.finish_import(&token, inputs);
+                if count != this.data.inputs.len() {
+                    this.project_changed(cx);
+                }
                 cx.notify();
             });
         })
@@ -625,12 +659,16 @@ impl AlignApp {
             multiple: true,
             prompt: None,
         });
+        let generation = self.data.generation;
         let view = cx.entity();
         cx.spawn(async move |_, cx| {
             let Ok(Ok(Some(paths))) = receiver.await else {
                 return;
             };
             let _ = view.update(cx, |this, cx| {
+                if this.projects.busy || this.data.generation != generation {
+                    return;
+                }
                 this.add_paths(paths, cx);
                 cx.notify();
             });
@@ -785,6 +823,9 @@ impl AlignApp {
     }
 
     pub(crate) fn start_sync(&mut self, cx: &mut Context<Self>) {
+        if self.projects.busy {
+            return;
+        }
         self.search_quality_exit.cancel();
         self.clear_export_select();
         self.clear_settings_select();
@@ -798,8 +839,10 @@ impl AlignApp {
         }
         cx.notify();
 
+        let save = self.checkpoint_before_sync(cx);
         let generation = self.data.generation;
         let cancel = self.data.cancel.clone();
+        let timelines = self.data.timeline_inputs.clone();
         let input_sets = self.data.pipeline_input_sets();
         let run_settings: Vec<_> = (0..input_sets.len())
             .map(|position| {
@@ -814,6 +857,15 @@ impl AlignApp {
             .collect();
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<SyncMsg>();
         std::thread::spawn(move || {
+            // The recovery file must reach disk before reading any media.
+            if let Some(save) = save {
+                let _ = futures::executor::block_on(save);
+            }
+            let mut revisions = crate::project::Revisions::new();
+            for path in timelines {
+                crate::project::record_revision(&mut revisions, &path);
+            }
+            let revisions = std::sync::Mutex::new(revisions);
             let pipeline = Pipeline::default_backend();
             let sequence_count = input_sets.len();
             let mut results = Vec::with_capacity(sequence_count);
@@ -825,6 +877,12 @@ impl AlignApp {
                     sequence_count,
                 });
                 let progress = |mut p: align_decode::pipeline::PipelineProgress| {
+                    if p.phase == Phase::Inspect
+                        && p.discovered.is_none()
+                        && let Some(path) = &p.current
+                    {
+                        crate::project::record_revision(&mut revisions.lock().unwrap(), path);
+                    }
                     if targets.is_some() {
                         p.discovered = None;
                         if matches!(p.phase, Phase::Inspect | Phase::Fingerprint)
@@ -862,7 +920,14 @@ impl AlignApp {
                     }
                 }
             }
-            let _ = tx.unbounded_send(SyncMsg::Done(Box::new(Ok(results))));
+            let placements = std::sync::Arc::new(crate::project::Placements::from_run(
+                &results,
+                revisions.into_inner().unwrap(),
+            ));
+            let _ = tx.unbounded_send(SyncMsg::Done(Box::new(Ok(SyncOutput {
+                results,
+                placements,
+            }))));
         });
         let view = cx.entity();
         cx.spawn(async move |_, cx| {
@@ -877,6 +942,9 @@ impl AlignApp {
                 let _ = view.update(cx, |this, cx| {
                     if this.data.generation == generation {
                         this.apply_sync_msgs(batch);
+                        if finished {
+                            this.project_changed(cx);
+                        }
                         cx.notify();
                     }
                 });
@@ -891,20 +959,32 @@ impl AlignApp {
     fn choose_missing_media(&mut self, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
-            directories: false,
+            directories: self.data.has_missing_source_folder(),
             multiple: true,
             prompt: None,
         });
+        let generation = self.data.generation;
         let view = cx.entity();
         cx.spawn(async move |_, cx| {
             let Ok(Ok(Some(paths))) = receiver.await else {
                 return;
             };
             let _ = view.update(cx, |this, cx| {
-                if this.data.add_manual_relinks(paths) == 0 {
+                if this.projects.busy || this.data.generation != generation {
+                    return;
+                }
+                if this.data.add_manual_relinks(
+                    paths
+                        .into_iter()
+                        .filter_map(|path| std::path::absolute(path).ok())
+                        .collect(),
+                ) == 0
+                {
                     return;
                 }
                 this.data.show_warning_details = false;
+                this.data.mark_sync_dirty();
+                this.project_changed(cx);
                 this.start_sync(cx);
             });
         })
@@ -1047,7 +1127,10 @@ impl AlignApp {
                 }
             }
             SyncMsg::Done(boxed) => match *boxed {
-                Ok(results) => self.data.apply_results(results),
+                Ok(output) => {
+                    self.projects.placements = Some(output.placements);
+                    self.data.apply_results(output.results);
+                }
                 Err(error) => {
                     if error == "Cancelled." {
                         self.data.restore_after_sync_cancel();
@@ -1062,7 +1145,7 @@ impl AlignApp {
     }
 
     pub(crate) fn start_export_sheet(&mut self, cx: &mut Context<Self>) {
-        if !self.data.can_export() {
+        if self.projects.busy || !self.data.can_export() {
             return;
         }
         self.data.show_export = true;
@@ -1159,6 +1242,7 @@ impl AlignApp {
         let is_dirty = self.data.common_settings != self.settings_initial_common
             || self.data.current_sequence_settings() != self.settings_initial_sequence;
         self.data.settings_changed = is_dirty;
+        self.project_changed(cx);
         let is_default = self.data.scoped_settings_are_default();
         let buttons = &mut self.settings_buttons;
         let token = buttons.restart();
@@ -1429,11 +1513,19 @@ impl AlignApp {
         cx.notify();
     }
 
-    fn apply_path_fixer_settings(&mut self, cx: &App) {
+    fn apply_path_fixer_settings(&mut self, cx: &mut Context<Self>) {
+        let previous_omits = self.data.omit_extensions.clone();
+        let previous_proxy_choice = self.data.prefer_proxies;
         let omitted = self.path_fixer_inputs.omit_extensions.read(cx).text();
         self.data.set_omit_extensions(&omitted);
         self.data.prefer_proxies = self.data.path_fixer_prefer_proxies;
         self.data.save_path_redirections();
+        if previous_omits != self.data.omit_extensions
+            || previous_proxy_choice != self.data.prefer_proxies
+        {
+            self.data.mark_sync_dirty();
+            self.project_changed(cx);
+        }
     }
 
     fn save_fixed_project_copy(&mut self, cx: &mut Context<Self>) {
@@ -1577,7 +1669,7 @@ impl AlignApp {
         else {
             return;
         };
-        if !self.data.can_begin_export() {
+        if self.projects.busy || !self.data.can_begin_export() {
             return;
         }
         let Some(result) = self.data.result.clone() else {
@@ -1766,6 +1858,8 @@ impl AlignApp {
     fn find_another(&mut self, target: &CorrectionOption, cx: &mut Context<Self>) {
         if self.data.reject_alignment(target) {
             self.data.menu = None;
+            self.data.mark_sync_dirty();
+            self.project_changed(cx);
             self.start_sync(cx);
         }
     }
@@ -1773,6 +1867,8 @@ impl AlignApp {
     fn reject_pair(&mut self, target: &CorrectionOption, cx: &mut Context<Self>) {
         if self.data.reject_pair(target) {
             self.data.menu = None;
+            self.data.mark_sync_dirty();
+            self.project_changed(cx);
             self.start_sync(cx);
         }
     }
@@ -1790,6 +1886,8 @@ impl AlignApp {
             .and_then(|menu| menu.lane_id.clone());
         if lane_id.is_some_and(|id| update(&mut self.data, value, &id)) {
             self.data.menu = None;
+            self.data.mark_sync_dirty();
+            self.project_changed(cx);
             self.start_sync(cx);
         }
     }

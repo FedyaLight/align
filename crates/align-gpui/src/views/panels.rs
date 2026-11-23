@@ -596,7 +596,7 @@ pub(super) fn error_alert(
         );
     // Recovery comes first; reporting is the fallback when it does not help.
     panel
-        .when(data.can_locate_timeline_media(), |panel| {
+        .when(data.can_relink_media(), |panel| {
             panel.child(button(
                 cx,
                 theme,

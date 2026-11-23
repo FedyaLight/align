@@ -816,7 +816,13 @@ impl Pipeline {
         if micros <= 0 {
             return Err(PipelineError::Decode(crate::DecodeError::InvalidPcm));
         }
-        let id = clip_id_for(&url.to_string_lossy(), micros);
+        // The AAF bridge names extracted WAVs by content. Temporary directory
+        // names change across launches, but project corrections must keep
+        // addressing the same embedded recording.
+        let id = match crate::media_assets::embedded_aaf_name(url) {
+            Some(name) => clip_id_for(&format!("embedded-aaf/{name}"), micros),
+            None => clip_id_for(&url.to_string_lossy(), micros),
+        };
         let mut audio: Vec<AudioSummary> = probe
             .audio_streams
             .iter()
