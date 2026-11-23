@@ -422,6 +422,12 @@ pub struct AppData {
     pub show_about: bool,
     pub show_agent_setup: bool,
     pub zoom_level: f64,
+    /// NLE-style timeline position in seconds. Playback is opt-in and starts paused.
+    pub playhead_seconds: f64,
+    pub timeline_playing: bool,
+    /// Audio lane ids toggled in the timeline mixer.
+    pub muted_audio_lanes: HashSet<String>,
+    pub soloed_audio_lanes: HashSet<String>,
     /// Scroll position of the main content (timeline panning).
     pub timeline_scroll: ScrollHandle,
     /// In-flight run coordination: `cancel` stops the worker
@@ -495,6 +501,10 @@ impl Default for AppData {
             show_about: false,
             show_agent_setup: false,
             zoom_level: 0.0,
+            playhead_seconds: 0.0,
+            timeline_playing: false,
+            muted_audio_lanes: HashSet::new(),
+            soloed_audio_lanes: HashSet::new(),
             timeline_scroll: ScrollHandle::new(),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             generation: 0,

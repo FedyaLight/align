@@ -44,6 +44,8 @@ mod sources;
 mod timeline;
 mod toolbar;
 
+use crate::playback::{PlaybackClock, PlaybackItem, PlaybackState, SharedPlayback};
+
 use animation::motion_ease;
 
 // ------------------------------------------------------------ messages
@@ -514,6 +516,10 @@ pub struct AlignApp {
     /// Error shown when the report opened, offered for copying (SharedString:
     /// the panel clones it every frame).
     feedback_error: Option<SharedString>,
+    playback: Option<SharedPlayback>,
+    playback_stream: Option<cpal::Stream>,
+    playback_generation: u64,
+    playback_loading: bool,
     /// The update card was closed; the About panel still offers the update.
     update_notice_dismissed: bool,
 }
@@ -527,6 +533,180 @@ impl Focusable for AlignApp {
 impl AlignApp {
     pub(crate) fn project_busy(&self) -> bool {
         self.projects.busy
+    }
+
+    pub(crate) fn stop_timeline_playback(&mut self) {
+        self.playback_generation = self.playback_generation.wrapping_add(1);
+        self.playback_loading = false;
+        self.playback_stream = None;
+        self.playback = None;
+        self.data.timeline_playing = false;
+    }
+
+    pub(crate) fn toggle_timeline_playback(&mut self, cx: &mut Context<Self>) {
+        if self.playback_loading {
+            self.playback_loading = false;
+            self.playback_generation = self.playback_generation.wrapping_add(1);
+            self.data.timeline_playing = false;
+            cx.notify();
+            return;
+        }
+        if let Some(playback) = &self.playback {
+            let Ok(mut playback) = playback.lock() else {
+                return;
+            };
+            if playback.clock.playing {
+                playback.clock.playing = false;
+                self.data.timeline_playing = false;
+            } else {
+                if playback.clock.position >= playback.end {
+                    playback.clock.position = 0.0;
+                    self.data.playhead_seconds = 0.0;
+                }
+                playback.clock.playing = true;
+                self.data.timeline_playing = true;
+            }
+            drop(playback);
+            self.schedule_playhead_refresh(cx);
+            cx.notify();
+            return;
+        }
+
+        use align_core::export_model::ExportTimeline;
+        let Some(result) = self.data.result.as_ref() else {
+            self.data.error = Some("Synchronize a timeline before starting playback.".into());
+            cx.notify();
+            return;
+        };
+        let Ok(timeline) = ExportTimeline::from_result(result, true) else {
+            self.data.error = Some("The current result cannot be played as a timeline.".into());
+            cx.notify();
+            return;
+        };
+        let unmatched = result.unmatched.iter().cloned().collect();
+        let items = timeline
+            .preview_items(&unmatched)
+            .into_iter()
+            .filter_map(|item| {
+                let lane_id = self
+                    .data
+                    .lanes
+                    .iter()
+                    .find(|lane| lane.clips.iter().any(|clip| clip.id == item.id))?
+                    .id
+                    .clone();
+                Some(PlaybackItem {
+                    url: item.url,
+                    lane_id,
+                    start: item.start,
+                    duration: item.duration,
+                    source_in: item.source_in,
+                    source_out: item.source_out,
+                    mapping_points: item.mapping_points,
+                })
+            })
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            self.data.error = Some("There are no playable clips in this timeline.".into());
+            cx.notify();
+            return;
+        }
+
+        self.playback_generation = self.playback_generation.wrapping_add(1);
+        let generation = self.playback_generation;
+        let position = self.data.playhead_seconds;
+        self.playback_loading = true;
+        let task = cx
+            .background_executor()
+            .spawn(async move { crate::playback::decode_items(items) });
+        cx.spawn(async move |view, cx| {
+            let decoded = task.await;
+            let _ = view.update(cx, |this, cx| {
+                if this.playback_generation != generation {
+                    return;
+                }
+                this.playback_loading = false;
+                let decoded = match decoded {
+                    Ok(decoded) if !decoded.is_empty() => decoded,
+                    Ok(_) => {
+                        this.data.error =
+                            Some("No audio streams were found in the timeline.".into());
+                        this.data.timeline_playing = false;
+                        cx.notify();
+                        return;
+                    }
+                    Err(error) => {
+                        this.data.error = Some(error);
+                        this.data.timeline_playing = false;
+                        cx.notify();
+                        return;
+                    }
+                };
+                let end = decoded
+                    .iter()
+                    .map(|item| item.item.start + item.item.duration)
+                    .fold(1.0f64, f64::max);
+                let shared = std::sync::Arc::new(std::sync::Mutex::new(PlaybackState {
+                    clock: PlaybackClock::new(position.min(end)),
+                    items: decoded,
+                    muted: this.data.muted_audio_lanes.clone(),
+                    soloed: this.data.soloed_audio_lanes.clone(),
+                    end,
+                }));
+                match crate::playback::output_stream(shared.clone()) {
+                    Ok(stream) => {
+                        if let Ok(mut state) = shared.lock() {
+                            state.clock.playing = true;
+                        }
+                        this.playback = Some(shared);
+                        this.playback_stream = Some(stream);
+                        this.data.timeline_playing = true;
+                        this.data.error = None;
+                        this.schedule_playhead_refresh(cx);
+                    }
+                    Err(error) => {
+                        this.data.error = Some(error);
+                        this.data.timeline_playing = false;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        self.data.timeline_playing = true;
+        cx.notify();
+    }
+
+    fn schedule_playhead_refresh(&self, cx: &mut Context<Self>) {
+        let Some(playback) = self.playback.clone() else {
+            return;
+        };
+        let generation = self.playback_generation;
+        cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(30))
+                    .await;
+                let mut keep_running = false;
+                let _ = view.update(cx, |this, cx| {
+                    if this.playback_generation != generation {
+                        return;
+                    }
+                    if let Ok(mut state) = playback.lock() {
+                        this.data.playhead_seconds = state.position_at(std::time::Instant::now());
+                        state.muted = this.data.muted_audio_lanes.clone();
+                        state.soloed = this.data.soloed_audio_lanes.clone();
+                        keep_running = state.clock.playing;
+                        this.data.timeline_playing = keep_running;
+                    }
+                    cx.notify();
+                });
+                if !keep_running {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     pub fn new(
@@ -565,6 +745,10 @@ impl AlignApp {
             show_problem_report: false,
             feedback_notice_pending: crate::feedback::notice_pending(),
             feedback_error: None,
+            playback: None,
+            playback_stream: None,
+            playback_generation: 0,
+            playback_loading: false,
             update_notice_dismissed: false,
         };
         app.export_inputs
@@ -844,6 +1028,10 @@ impl AlignApp {
         if !self.data.begin_sync_run() {
             return;
         }
+        // A new result can change both clip positions and source mappings. Do
+        // not keep playing decoded audio from the previous timeline while it
+        // is being replaced.
+        self.stop_timeline_playback();
         if self.data.lanes.is_empty() {
             self.timeline_transitions.clear();
         }

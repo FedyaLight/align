@@ -1588,6 +1588,9 @@ impl ExportTimeline {
                 }),
                 start: item.start,
                 duration: item.timeline_duration,
+                source_in: item.source_in,
+                source_out: item.source_out,
+                mapping_points: item.mapping_points.clone(),
                 confidence: item.confidence,
                 matched: !unmatched.contains(&item.clip.id),
             })

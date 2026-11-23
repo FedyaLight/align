@@ -335,7 +335,10 @@ pub(super) fn sequence_results_panel(
             format!("{check}{} · {name}", index + 1),
             true,
             move |this, _, _, cx| {
-                if this.update_timeline_layout(|data| data.select_sequence_result(index)) {
+                if this.data.active_sequence_result != index
+                    && this.update_timeline_layout(|data| data.select_sequence_result(index))
+                {
+                    this.stop_timeline_playback();
                     this.project_changed(cx);
                 }
                 cx.notify();
