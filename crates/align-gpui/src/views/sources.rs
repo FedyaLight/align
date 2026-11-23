@@ -1,5 +1,7 @@
 //! Main content: drop zone and the source list.
 
+use gpui::{ExternalPaths, StyleRefinement, Window};
+
 use super::animation::{selection_control_motion, slide_in};
 use super::controls::{fmt_duration, prominent_button};
 use super::export::check_row;
@@ -22,6 +24,7 @@ pub(super) fn main_content(
     active: bool,
     selection_controls_closing: bool,
 ) -> impl IntoElement {
+    let accepts_external_paths = active && !data.has_active_job();
     let mut content = div()
         .id("main")
         .flex_1()
@@ -39,7 +42,7 @@ pub(super) fn main_content(
     }
     if data.lanes.is_empty() {
         if data.clips.is_empty() {
-            content = content.child(drop_zone(cx, theme, data, active));
+            content = content.child(drop_zone(cx, theme, active, accepts_external_paths));
         } else {
             content = content.child(file_list(
                 cx,
@@ -58,6 +61,17 @@ pub(super) fn main_content(
             fit_width,
             active,
         ));
+        // Keep the scroll viewport stable as the drag style comes and goes.
+        content = content
+            .border_2()
+            .border_dashed()
+            .border_color(rgba(0x00000000))
+            .when(accepts_external_paths, |content| {
+                let accent = theme.accent;
+                content.drag_over::<ExternalPaths>(move |style, _, window, _| {
+                    external_drop_style(style, window, accent)
+                })
+            });
     }
     let screen = if !data.lanes.is_empty() {
         "screen-timeline"
@@ -74,8 +88,8 @@ pub(super) fn main_content(
 pub(super) fn drop_zone(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
-    _data: &crate::state::AppData,
     active: bool,
+    accepts_external_paths: bool,
 ) -> impl IntoElement {
     let accent = theme.accent;
     // The whole card is the drop target; it lights up while files hover.
@@ -92,10 +106,10 @@ pub(super) fn drop_zone(
         .border_2()
         .border_dashed()
         .border_color(rgb(theme.border))
-        .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| {
-            style
-                .border_color(rgb(accent))
-                .bg(rgba((accent << 8) | 0x14))
+        .when(accepts_external_paths, |panel| {
+            panel.drag_over::<ExternalPaths>(move |style, _, window, _| {
+                external_drop_style(style, window, accent)
+            })
         });
     div()
         .relative()
@@ -166,6 +180,15 @@ pub(super) fn drop_zone(
                         .child(TIMELINE_FORMATS_HINT),
                 ),
         )
+}
+
+fn external_drop_style(style: StyleRefinement, window: &Window, accent: u32) -> StyleRefinement {
+    // GPUI clears the drag on a native exit without invalidating the view.
+    // Schedule a frame only while the highlight is on screen.
+    window.request_animation_frame();
+    style
+        .border_color(rgb(accent))
+        .bg(rgba((accent << 8) | 0x14))
 }
 
 /// Shown under the empty-state call to action.

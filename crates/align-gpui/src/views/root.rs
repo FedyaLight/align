@@ -165,11 +165,12 @@ impl Render for AlignApp {
                     _ => return,
                 }
                 cx.notify();
-            }))
-            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
-                this.add_paths(paths.paths().to_vec(), cx);
-                cx.notify();
             }));
+        if content_active && !self.data.has_active_job() {
+            root = root.on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
+                this.add_paths(paths.paths().to_vec(), cx);
+            }));
+        }
         let mut content = div()
             .id("primary-content")
             .relative()

@@ -24,7 +24,7 @@ pub(super) fn timeline_preview(
     fit_width: f32,
     active: bool,
 ) -> impl IntoElement {
-    let mut root = div().flex().flex_col().bg(rgb(theme.bg)).overflow_hidden();
+    let mut root = div().flex().flex_col().overflow_hidden();
     // Lanes (the header row with zoom controls lives in the unified
     // toolbar now).
     root = root.child(timeline_lanes(
