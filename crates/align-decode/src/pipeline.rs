@@ -17,14 +17,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use align_core::{
-    AudioAnalysisSource, AudioSummary, Clip, ClipId, ClipPlacement, ClipTimingHints,
+    AudioAnalysisSource, AudioSummary, CacheSettings, Clip, ClipId, ClipPlacement, ClipTimingHints,
     FingerprintCache, FingerprintExtractor, MappingPoint, MatchSummary, MediaKind, MediaTime,
     RecordingTimestampSource, SyncConstraint, SyncIsland, SyncProject, SyncWarning, TimeMap,
     match_fingerprints, refine_forest, solve_graph,
 };
 use sha2::{Digest, Sha256};
 
-use crate::backend::{BackendKind, MediaBackend, default_backend};
+use crate::backend::{BackendKind, MediaBackend, default_backend_kind};
 use crate::provider::BackendWindowProvider;
 
 const INSPECT_WORKERS: usize = 4;
@@ -284,7 +284,7 @@ fn cancelled(flag: &std::sync::atomic::AtomicBool) -> bool {
 
 pub struct Pipeline {
     backend: Box<dyn MediaBackend>,
-    cache: FingerprintCache,
+    cache: Option<FingerprintCache>,
 }
 
 impl Pipeline {
@@ -292,23 +292,39 @@ impl Pipeline {
         Self::new_in(kind, None)
     }
 
-    /// `cache_dir`: isolated fingerprint cache (tests pass a temp dir for
-    /// hermetic runs; production uses the OS cache directory).
+    /// An explicit directory uses an isolated cache without automatic pruning.
     pub fn new_in(kind: BackendKind, cache_dir: Option<PathBuf>) -> Self {
+        let settings = if cache_dir.is_some() {
+            CacheSettings {
+                enabled: true,
+                retention_days: None,
+            }
+        } else {
+            CacheSettings::load()
+        };
+        Self::with_cache_settings(kind, cache_dir, settings)
+    }
+
+    fn with_cache_settings(
+        kind: BackendKind,
+        cache_dir: Option<PathBuf>,
+        settings: CacheSettings,
+    ) -> Self {
         let backend = crate::backend::create(kind);
-        let cache = FingerprintCache::with_backend(cache_dir, backend.kind().cache_tag());
+        let cache = settings.enabled.then(|| {
+            let cache = FingerprintCache::with_backend(cache_dir, backend.kind().cache_tag());
+            if let Some(days) = settings.retention_days {
+                cache.prune_older_than(std::time::Duration::from_secs(
+                    days.saturating_mul(24 * 60 * 60),
+                ));
+            }
+            cache
+        });
         Self { backend, cache }
     }
 
     pub fn default_backend() -> Self {
-        let backend = default_backend();
-        let cache = FingerprintCache::with_backend(None, backend.kind().cache_tag());
-        if let Some(days) = align_core::CacheSettings::load().retention_days {
-            cache.prune_older_than(std::time::Duration::from_secs(
-                days.saturating_mul(24 * 60 * 60),
-            ));
-        }
-        Self { backend, cache }
+        Self::new(default_backend_kind())
     }
 
     pub fn backend(&self) -> &dyn MediaBackend {
@@ -705,11 +721,12 @@ impl Pipeline {
     }
 
     fn decoder_cache(&self, path: &Path) -> Option<FingerprintCache> {
+        let cache = self.cache.as_ref()?;
         if self.backend.kind() != BackendKind::Portable {
             return None;
         }
         if crate::isobmff::has_sbr_audio(path) {
-            return Some(self.cache.decoder_variant("full-sbr-clock2"));
+            return Some(cache.decoder_variant("full-sbr-clock2"));
         }
         // Older portable builds could ignore PCM edit rates and switched
         // sample descriptions. Invalidate just the affected movie variants.
@@ -721,7 +738,7 @@ impl Pipeline {
                 })
             })
         {
-            return Some(self.cache.decoder_variant("pcm-presentation-v1"));
+            return Some(cache.decoder_variant("pcm-presentation-v1"));
         }
         None
     }
@@ -777,7 +794,8 @@ impl Pipeline {
                     Ok(inspection)
                 } else {
                     publish(false, url, None);
-                    self.backend.inspect_for_import(url, prepared)
+                    self.backend
+                        .inspect_for_import(url, prepared, self.cache.as_ref())
                 };
                 let outcome = inspection
                     .map_err(PipelineError::Decode)
@@ -882,17 +900,22 @@ impl Pipeline {
             .is_some()
             || audio.iter().any(|a| a.source_timecode.is_some());
         if !has_timecode && !audio.is_empty() {
-            let cache = self.decoder_cache(url).or_else(|| {
+            let base_cache = self.cache.as_ref();
+            let decoder_cache = self.decoder_cache(url).or_else(|| {
                 // These containers use the FFmpeg absolute packet clock for
                 // the opening LTC window. Earlier versions could inspect
                 // audio beyond the window when a mapped track started late.
+                let cache = base_cache?;
                 let ext = url.extension()?;
                 let external = ext.eq_ignore_ascii_case("mxf")
                     || (ext.eq_ignore_ascii_case("mts")
                         && self.backend.kind() == BackendKind::Portable);
-                external.then(|| self.cache.decoder_variant("ltc-presented"))
+                external.then(|| cache.decoder_variant("ltc-presented"))
             });
-            let entry = cache.as_ref().unwrap_or(&self.cache).ltc_entry(url);
+            let entry = decoder_cache
+                .as_ref()
+                .or(base_cache)
+                .and_then(|cache| cache.ltc_entry(url));
             let cached = entry
                 .as_ref()
                 .and_then(|e| e.load())
@@ -1153,17 +1176,20 @@ impl Pipeline {
             let mut variants = Vec::with_capacity(sources.len());
             let mut failure = None;
             let decoder_cache = self.decoder_cache(&clip.url);
-            let cache = decoder_cache.as_ref().unwrap_or(&self.cache);
-            let sample = align_core::cache::MediaSample::read(&clip.url).ok();
+            let cache = decoder_cache.as_ref().or(self.cache.as_ref());
+            let sampled = cache.and_then(|cache| {
+                let sample = align_core::cache::MediaSample::read(&clip.url).ok()?;
+                Some((cache, sample))
+            });
             // Producing a sidecar during a cold decode is independent of whether
             // this project has a short take that can use it right now.
             let hops = flux_limit(clip);
-            let cache_flux = accuracy.is_balanced()
+            let flux_cacheable = accuracy.is_balanced()
                 && hops.saturating_sub(2) <= align_core::fingerprint::MAX_FLUX_HOPS;
-            let use_flux = flux_enabled && cache_flux;
+            let use_flux = flux_enabled && flux_cacheable;
             let start = || {
                 let mut extractor = FingerprintExtractor::with_accuracy(accuracy);
-                if cache_flux {
+                if use_flux || (flux_cacheable && sampled.is_some()) {
                     extractor.enable_flux(hops);
                 }
                 let preview = generate_waveform_previews
@@ -1182,7 +1208,7 @@ impl Pipeline {
             // A warm or partly warm movie only decodes the variants it needs.
             let cold = (2..=16).contains(&sources.len())
                 && sources.iter().all(|source| {
-                    sample.as_ref().is_none_or(|sample| {
+                    sampled.as_ref().is_none_or(|(cache, sample)| {
                         !cache
                             .entry(sample, &accuracy.cache_key(&source.cache_key()))
                             .exists()
@@ -1211,7 +1237,9 @@ impl Pipeline {
                 let state = batched.next();
                 let variant = (|| -> Result<Variant, PipelineError> {
                     let cache_key = accuracy.cache_key(&source.cache_key());
-                    let entry = sample.as_ref().map(|s| cache.entry(s, &cache_key));
+                    let entry = sampled
+                        .as_ref()
+                        .map(|(cache, sample)| cache.entry(sample, &cache_key));
                     if let Some(entry) = &entry
                         && let Some(cached) = entry.load()
                     {
@@ -1260,7 +1288,7 @@ impl Pipeline {
                     let fingerprints = extractor.finish();
                     if let Some(entry) = &entry {
                         entry.save(&fingerprints);
-                        if cache_flux && !flux.is_empty() {
+                        if !flux.is_empty() {
                             entry.save_flux(&flux);
                         }
                     }
@@ -2151,7 +2179,10 @@ mod tests {
             backend: Box::new(FailingInspect {
                 delay: std::time::Duration::from_millis(delay_ms),
             }),
-            cache: FingerprintCache::with_backend(Some(dir.join(".cache")), "failing-inspect"),
+            cache: Some(FingerprintCache::with_backend(
+                Some(dir.join(".cache")),
+                "failing-inspect",
+            )),
         };
         (dir, pipe)
     }
@@ -2403,7 +2434,10 @@ mod tests {
     fn faulty_pipeline(dir: &Path, backend: FaultyAnalysis) -> Pipeline {
         Pipeline {
             backend: Box::new(backend),
-            cache: FingerprintCache::with_backend(Some(dir.join(".cache")), "faulty-test"),
+            cache: Some(FingerprintCache::with_backend(
+                Some(dir.join(".cache")),
+                "faulty-test",
+            )),
         }
     }
 
@@ -2829,6 +2863,70 @@ mod tests {
     }
 
     #[test]
+    fn disabled_disk_cache_recomputes_ffprobe_video_timing() {
+        let (Some(ffmpeg), Some(ffprobe)) = (crate::ff::test_ffmpeg(), crate::ff::test_ffprobe())
+        else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("clip.mts");
+        let status = crate::process::command(ffmpeg)
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x120:rate=25:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=1",
+                "-c:v",
+                "mpeg2video",
+                "-c:a",
+                "mp2",
+                "-f",
+                "mpegts",
+            ])
+            .arg(&media)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        use align_core::{VideoFrameRateMode, VideoTimingInspection};
+        let cache_dir = dir.path().join("cache");
+        let cache = FingerprintCache::with_backend(Some(cache_dir.clone()), "portable-timing1");
+        let ffprobe = ffprobe.canonicalize().unwrap();
+        let decoder = format!(
+            "{}:{}",
+            ffprobe.display(),
+            align_core::cache::media_revision(&ffprobe).unwrap()
+        );
+        let stale = VideoTimingInspection {
+            frame_duration: Some(MediaTime::new(1, 25)),
+            mode: VideoFrameRateMode::Variable,
+        };
+        cache.save_video_timing(&media, &decoder, stale);
+        let inputs = [PipelineInput::Media(media.clone())];
+        let inspect = |enabled| {
+            let pipe = Pipeline::with_cache_settings(
+                BackendKind::Portable,
+                Some(cache_dir.clone()),
+                CacheSettings {
+                    enabled,
+                    retention_days: None,
+                },
+            );
+            let project = pipe.open(&inputs).unwrap();
+            project.clips[0].video.as_ref().unwrap().frame_rate_mode
+        };
+        assert_eq!(inspect(true), Some(VideoFrameRateMode::Variable));
+        assert_eq!(inspect(false), Some(VideoFrameRateMode::Constant));
+        assert_eq!(cache.load_video_timing(&media, &decoder), Some(stale));
+    }
+
+    #[test]
     fn independent_groups_and_singleton_survive_export() {
         use align_core::export::{ExportTimeline, TimelineExportFormat};
         let dir = fixture_dir("independent-groups");
@@ -3136,6 +3234,79 @@ mod tests {
     }
 
     #[test]
+    fn disabled_disk_cache_recomputes_audio_analysis_and_preserves_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = noise(12 * 44100, 0xD15C);
+        let a = write_delayed_wav(dir.path(), "a.wav", &body, 0.0);
+        let b = write_delayed_wav(dir.path(), "b.wav", &body, 1.024);
+        let clock = write_mono_wav(dir.path(), "ltc.wav", &crate::ltc::synthetic_ltc(0, 40, 25));
+
+        let cache_dir = dir.path().join("cache");
+        let cache = FingerprintCache::new(Some(cache_dir.clone()));
+        let sample = align_core::cache::MediaSample::read(&a).unwrap();
+        let key = align_core::SearchAccuracy::Balanced
+            .cache_key(&AudioAnalysisSource::Automatic.cache_key());
+        let cached = cache.entry(&sample, &key);
+        cached.save(&[]);
+        cached.save_waveform(&[0.0]);
+        cached.save_flux(&[1]);
+        cache.ltc_entry(&clock).unwrap().save(None);
+
+        let payloads = || -> std::collections::BTreeMap<_, _> {
+            std::fs::read_dir(&cache_dir)
+                .unwrap()
+                .map(|file| {
+                    let file = file.unwrap();
+                    (file.file_name(), std::fs::read(file.path()).unwrap())
+                })
+                .collect()
+        };
+        let original = payloads();
+        assert_eq!(original.len(), 4);
+        let pipe = Pipeline::with_cache_settings(
+            BackendKind::Portable,
+            Some(cache_dir.clone()),
+            CacheSettings {
+                enabled: false,
+                retention_days: Some(0),
+            },
+        );
+        let waveforms = std::sync::Mutex::new(Vec::new());
+        let result = pipe
+            .synchronize(
+                &[PipelineInput::Media(a), PipelineInput::Media(b)],
+                &[],
+                &PipelineOptions {
+                    generate_waveform_previews: true,
+                    ..Default::default()
+                },
+                Some(&|event| {
+                    if let Some((_, waveform)) = event.waveform {
+                        waveforms.lock().unwrap().push(waveform);
+                    }
+                }),
+                &Default::default(),
+            )
+            .unwrap();
+        assert_eq!(result.matches.len(), 1);
+        assert!((result.matches[0].offset.as_seconds().abs() - 1.024).abs() < 0.001);
+        let waveforms = waveforms.into_inner().unwrap();
+        assert_eq!(waveforms.len(), 2);
+        assert!(
+            waveforms
+                .iter()
+                .all(|waveform| waveform.iter().any(|value| *value > 0.0))
+        );
+
+        let project = pipe.open(&[PipelineInput::Media(clock)]).unwrap();
+        assert_eq!(
+            project.clips[0].source_timecode().unwrap().text,
+            "01:02:03:00"
+        );
+        assert_eq!(payloads(), original);
+    }
+
+    #[test]
     fn per_clip_search_override_reuses_only_compatible_cache() {
         let dir = fixture_dir("search-override");
         let body = noise(12 * 44100, 0xBCAD);
@@ -3147,7 +3318,8 @@ mod tests {
         let baseline = pipe
             .synchronize(&inputs, &[], &PipelineOptions::default(), None, &cancel)
             .unwrap();
-        let baseline_entries = pipe.cache.statistics().file_count;
+        let cache = pipe.cache.as_ref().unwrap();
+        let baseline_entries = cache.statistics().file_count;
         let id = baseline.project.clips[0].id.clone();
         let options = PipelineOptions {
             search_overrides: [(id, align_core::SearchAccuracy::Exhaustive)]
@@ -3159,7 +3331,7 @@ mod tests {
             .synchronize(&inputs, &[], &options, None, &cancel)
             .unwrap();
         assert_eq!(
-            pipe.cache.statistics().file_count,
+            cache.statistics().file_count,
             baseline_entries + 1,
             "only overridden clip needs another cache entry"
         );
@@ -3232,6 +3404,7 @@ mod tests {
         let pipe = Pipeline::new_in(BackendKind::Portable, Some(dir.join(".cache")));
         let inputs = [PipelineInput::Media(a), PipelineInput::Media(b)];
         let cancel = std::sync::atomic::AtomicBool::new(false);
+        let cache = pipe.cache.as_ref().unwrap();
         for (index, accuracy) in SearchAccuracy::ALL.into_iter().enumerate() {
             let options = PipelineOptions {
                 search_accuracy: accuracy,
@@ -3250,7 +3423,7 @@ mod tests {
                 cold.matches
             );
             assert_eq!(
-                pipe.cache.statistics().file_count,
+                cache.statistics().file_count,
                 (index + 1) * 2 + 2,
                 "search levels must not reuse incompatible fingerprints"
             );

@@ -162,6 +162,15 @@ pub trait MediaBackend: Send + Sync {
 
     fn inspect(&self, path: &Path) -> Result<ProbeReport, DecodeError>;
 
+    /// Inspect with the current pipeline's disk cache, if available.
+    fn inspect_with_cache(
+        &self,
+        path: &Path,
+        _cache: Option<&align_core::FingerprintCache>,
+    ) -> Result<ProbeReport, DecodeError> {
+        self.inspect(path)
+    }
+
     /// Routes which may run outside the native/sidecar limit. None defers
     /// to the normal backend. Never start an external decoder here.
     fn local_inspection<'a>(&'a self, _path: &'a Path) -> Option<Inspection<'a>> {
@@ -181,9 +190,10 @@ pub trait MediaBackend: Send + Sync {
         &'a self,
         path: &'a Path,
         _prepared: Option<&'a PreparedAudio>,
+        cache: Option<&align_core::FingerprintCache>,
     ) -> Result<Inspection<'a>, DecodeError> {
         Ok(Inspection {
-            report: self.inspect(path)?,
+            report: self.inspect_with_cache(path, cache)?,
             opening_audio: Box::new(move |index, consume| {
                 self.decode_native(path, index, Some((0., Some(3.))), consume)
                     .map(|_| ())

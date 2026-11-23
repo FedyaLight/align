@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use align_core::AudioAnalysisSource;
+use align_core::{AudioAnalysisSource, FingerprintCache};
 
 use crate::DecodeError;
 use crate::backend::{AudioStreamProbe, BackendKind, MediaBackend, ProbeReport};
@@ -140,50 +140,15 @@ impl MediaBackend for PortableBackend {
     }
 
     fn inspect(&self, path: &Path) -> Result<ProbeReport, DecodeError> {
-        // The sample entry can describe the AAC core alone. Ask the full
-        // decoder for the output channel layout and rate (also used by LTC).
-        if crate::isobmff::has_sbr_audio(path) {
-            let mut probe = crate::ff::inspect(path)?;
-            if is_video_container(path) {
-                if let Some(header) = crate::isobmff::inspect(path) {
-                    probe.video = header.video;
-                } else {
-                    return crate::ff::inspect_full(path);
-                }
-            }
-            return Ok(probe);
-        }
-        if is_video_container(path) {
-            // QuickTime/MP4 headers natively; other containers through
-            // ffprobe (headers + packet-timing walk + timecode tag).
-            return crate::isobmff::inspect(path).map_or_else(|| crate::ff::inspect_full(path), Ok);
-        }
-        match crate::sym::inspect(path) {
-            Ok(probe) if probe.duration_seconds.is_some() => Ok(ProbeReport {
-                duration_seconds: probe.duration_seconds.unwrap_or(0.0),
-                audio_streams: probe.streams,
-                has_video: false,
-                video: None,
-            }),
-            // RF64/BW64 and other WAVE layouts Symphonia rejects.
-            _ => match crate::pcm::PcmTrack::open(path, 0) {
-                Some(track) => Ok(track.probe()),
-                None => crate::ff::inspect(path).or_else(|ff_err| {
-                    // No ffprobe binary? A Symphonia probe with streams but no
-                    // duration is still usable for decode (duration estimated
-                    // from decode). Prefer partial truth over failure.
-                    match crate::sym::inspect(path) {
-                        Ok(probe) if !probe.streams.is_empty() => Ok(ProbeReport {
-                            duration_seconds: probe.duration_seconds.unwrap_or(0.0),
-                            audio_streams: probe.streams,
-                            has_video: false,
-                            video: None,
-                        }),
-                        _ => Err(ff_err),
-                    }
-                }),
-            },
-        }
+        Self::inspect_media(path, crate::ff::inspect_full)
+    }
+
+    fn inspect_with_cache(
+        &self,
+        path: &Path,
+        cache: Option<&FingerprintCache>,
+    ) -> Result<ProbeReport, DecodeError> {
+        Self::inspect_media(path, |path| crate::ff::inspect_full_with_cache(path, cache))
     }
 
     fn local_inspection<'a>(&'a self, path: &'a Path) -> Option<crate::backend::Inspection<'a>> {
@@ -249,7 +214,7 @@ impl MediaBackend for PortableBackend {
         consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
     ) -> Result<(), DecodeError> {
         if source == AudioAnalysisSource::AllMixed {
-            let stream_count = self.inspect(path)?.audio_streams.len();
+            let stream_count = self.audio_probe(path)?.audio_streams.len();
             return crate::mix::decode_all_streams_mono_8k(self, path, stream_count, consume);
         }
         if let Some(result) = self.local_mono_8k(path, source, consume) {
@@ -296,6 +261,56 @@ impl MediaBackend for PortableBackend {
 }
 
 impl PortableBackend {
+    fn inspect_media(
+        path: &Path,
+        inspect_full: impl Fn(&Path) -> Result<ProbeReport, DecodeError>,
+    ) -> Result<ProbeReport, DecodeError> {
+        // The sample entry can describe the AAC core alone. Ask the full
+        // decoder for the output channel layout and rate (also used by LTC).
+        if crate::isobmff::has_sbr_audio(path) {
+            let mut probe = crate::ff::inspect(path)?;
+            if is_video_container(path) {
+                if let Some(header) = crate::isobmff::inspect(path) {
+                    probe.video = header.video;
+                } else {
+                    return inspect_full(path);
+                }
+            }
+            return Ok(probe);
+        }
+        if is_video_container(path) {
+            // QuickTime/MP4 headers natively; other containers through
+            // ffprobe (headers + packet-timing walk + timecode tag).
+            return crate::isobmff::inspect(path).map_or_else(|| inspect_full(path), Ok);
+        }
+        match crate::sym::inspect(path) {
+            Ok(probe) if probe.duration_seconds.is_some() => Ok(ProbeReport {
+                duration_seconds: probe.duration_seconds.unwrap_or(0.0),
+                audio_streams: probe.streams,
+                has_video: false,
+                video: None,
+            }),
+            // RF64/BW64 and other WAVE layouts Symphonia rejects.
+            _ => match crate::pcm::PcmTrack::open(path, 0) {
+                Some(track) => Ok(track.probe()),
+                None => crate::ff::inspect(path).or_else(|ff_err| {
+                    // No ffprobe binary? A Symphonia probe with streams but no
+                    // duration is still usable for decode (duration estimated
+                    // from decode). Prefer partial truth over failure.
+                    match crate::sym::inspect(path) {
+                        Ok(probe) if !probe.streams.is_empty() => Ok(ProbeReport {
+                            duration_seconds: probe.duration_seconds.unwrap_or(0.0),
+                            audio_streams: probe.streams,
+                            has_video: false,
+                            video: None,
+                        }),
+                        _ => Err(ff_err),
+                    }
+                }),
+            },
+        }
+    }
+
     fn window(
         &self,
         readers: Option<&crate::sym::WindowReaders>,
@@ -305,7 +320,7 @@ impl PortableBackend {
         source: AudioAnalysisSource,
     ) -> Result<(f64, Vec<f32>), DecodeError> {
         if source == AudioAnalysisSource::AllMixed {
-            let stream_count = self.inspect(path)?.audio_streams.len();
+            let stream_count = self.audio_probe(path)?.audio_streams.len();
             return crate::mix::decode_all_streams_window_16k(
                 self,
                 path,

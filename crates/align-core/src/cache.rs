@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const CACHE_VERSION: u32 = 6;
-pub const CACHE_MAX_AGE_DAYS: u64 = 30;
+pub const CACHE_MAX_AGE_DAYS: u64 = 7;
 const LEGACY_CACHE_VERSION: u32 = 5;
 const HEAD_TAIL_BYTES: u64 = 1_048_576;
 
@@ -110,7 +110,9 @@ struct LegacyPayload {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CacheSettings {
+    pub enabled: bool,
     /// `None` keeps cached analysis until the user clears it.
     pub retention_days: Option<u64>,
 }
@@ -118,6 +120,7 @@ pub struct CacheSettings {
 impl Default for CacheSettings {
     fn default() -> Self {
         Self {
+            enabled: true,
             retention_days: Some(CACHE_MAX_AGE_DAYS),
         }
     }
@@ -128,8 +131,8 @@ impl CacheSettings {
         Self::load_from(&settings_file())
     }
 
-    pub fn save(self) {
-        self.save_to(&settings_file());
+    pub fn save(self) -> std::io::Result<()> {
+        self.save_to(&settings_file())
     }
 
     pub fn load_from(path: &Path) -> Self {
@@ -139,13 +142,11 @@ impl CacheSettings {
             .unwrap_or_default()
     }
 
-    pub fn save_to(self, path: &Path) {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+    pub fn save_to(self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
         }
-        if let Ok(bytes) = serde_json::to_vec_pretty(&self) {
-            let _ = std::fs::write(path, bytes);
-        }
+        crate::staged::write(path, &serde_json::to_vec_pretty(&self)?)
     }
 }
 
@@ -178,9 +179,14 @@ impl FingerprintCache {
 
     /// Keep unaffected generations readable when a decoder changes for one codec.
     pub fn decoder_variant(&self, variant: &str) -> Self {
+        self.for_backend(format!("{}:{variant}", self.backend_tag))
+    }
+
+    /// Use another analysis namespace in the same cache directory.
+    pub fn for_backend(&self, backend_tag: impl Into<String>) -> Self {
         Self {
             dir: self.dir.clone(),
-            backend_tag: format!("{}:{variant}", self.backend_tag),
+            backend_tag: backend_tag.into(),
         }
     }
 
@@ -799,22 +805,34 @@ mod tests {
 
     #[test]
     fn cache_settings_roundtrip_and_default() {
-        let dir =
-            std::env::temp_dir().join(format!("align-cache-settings-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("cache.json");
-        assert_eq!(CacheSettings::load_from(&path), CacheSettings::default());
-        CacheSettings {
-            retention_days: None,
-        }
-        .save_to(&path);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
         assert_eq!(
             CacheSettings::load_from(&path),
             CacheSettings {
-                retention_days: None
+                enabled: true,
+                retention_days: Some(7),
             }
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        for (legacy, retention_days) in [
+            (r#"{"retention_days": 7}"#, Some(7)),
+            (r#"{"retention_days": 30}"#, Some(30)),
+            (r#"{"retention_days": 90}"#, Some(90)),
+            (r#"{"retention_days": null}"#, None),
+        ] {
+            std::fs::write(&path, legacy).unwrap();
+            let mut settings = CacheSettings::load_from(&path);
+            assert!(settings.enabled);
+            assert_eq!(settings.retention_days, retention_days);
+
+            for enabled in [false, true] {
+                settings.enabled = enabled;
+                settings.save_to(&path).unwrap();
+                settings = CacheSettings::load_from(&path);
+                assert_eq!(settings.enabled, enabled);
+                assert_eq!(settings.retention_days, retention_days);
+            }
+        }
     }
 
     #[test]

@@ -17,6 +17,7 @@ mod theme;
 mod updater;
 mod views;
 
+use align_core::CacheSettings;
 use gpui::{
     App, AppContext, Application, Bounds, Entity, Global, KeyBinding, Menu, MenuItem,
     SystemMenuType, TitlebarOptions, WindowBounds, WindowOptions, actions, px, size,
@@ -38,6 +39,7 @@ actions!(
         OpenPathFixer,
         ClearCurrentAnalysisCache,
         ClearAnalysisCache,
+        ToggleAnalysisCache,
         KeepAnalysisCache7Days,
         KeepAnalysisCache30Days,
         KeepAnalysisCache90Days,
@@ -148,15 +150,32 @@ fn clear_current_analysis_cache(cx: &mut App) {
 }
 
 fn set_cache_retention(days: Option<u64>, cx: &mut App) {
-    align_core::CacheSettings {
-        retention_days: days,
-    }
-    .save();
+    let mut settings = CacheSettings::load();
+    settings.retention_days = days;
+    let status = match settings.save() {
+        Ok(()) => match days {
+            Some(days) => format!("Analysis cache retention set to {days} days."),
+            None => "Analysis cache retention set to Keep Until Cleared.".into(),
+        },
+        Err(error) => format!("Could not save analysis cache settings: {error}"),
+    };
     update_view(cx, |this, cx| {
-        this.data.status = match days {
-            Some(days) => format!("Cached analysis will be removed after {days} days."),
-            None => "Cached analysis will be kept until you clear it.".into(),
-        };
+        this.data.status = status;
+        cx.notify();
+    });
+}
+
+fn toggle_analysis_cache(cx: &mut App) {
+    let mut settings = CacheSettings::load();
+    settings.enabled = !settings.enabled;
+    let status = match settings.save() {
+        Ok(()) if settings.enabled => "On-disk analysis cache enabled for new runs.".into(),
+        Ok(()) => "On-disk analysis cache disabled for new runs.".into(),
+        Err(error) => format!("Could not save analysis cache settings: {error}"),
+    };
+    update_view(cx, |this, cx| {
+        cx.set_menus(app_menus(this.data.appearance));
+        this.data.status = status;
         cx.notify();
     });
 }
@@ -197,6 +216,11 @@ fn appearance_label(
 }
 
 fn app_menus(appearance: theme::AppearancePreference) -> Vec<Menu> {
+    let toggle_cache = if CacheSettings::load().enabled {
+        "Disable On-Disk Analysis Cache"
+    } else {
+        "Enable On-Disk Analysis Cache"
+    };
     vec![
         Menu {
             name: "Align".into(),
@@ -227,6 +251,8 @@ fn app_menus(appearance: theme::AppearancePreference) -> Vec<Menu> {
                 MenuItem::submenu(Menu {
                     name: "Analysis Cache".into(),
                     items: vec![
+                        MenuItem::action(toggle_cache, ToggleAnalysisCache),
+                        MenuItem::separator(),
                         MenuItem::action("Clear Current Project", ClearCurrentAnalysisCache),
                         MenuItem::action("Clear All", ClearAnalysisCache),
                         MenuItem::separator(),
@@ -331,6 +357,7 @@ fn main() {
             });
             cx.on_action(|_: &ClearAnalysisCache, cx| clear_analysis_cache(cx));
             cx.on_action(|_: &ClearCurrentAnalysisCache, cx| clear_current_analysis_cache(cx));
+            cx.on_action(|_: &ToggleAnalysisCache, cx| toggle_analysis_cache(cx));
             cx.on_action(|_: &KeepAnalysisCache7Days, cx| set_cache_retention(Some(7), cx));
             cx.on_action(|_: &KeepAnalysisCache30Days, cx| set_cache_retention(Some(30), cx));
             cx.on_action(|_: &KeepAnalysisCache90Days, cx| set_cache_retention(Some(90), cx));

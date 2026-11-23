@@ -334,15 +334,25 @@ fn parse_header(v: &serde_json::Value) -> Option<ProbeReport> {
 /// Header inspect + video timing walk. Pure-header fast path when the
 /// container has no video track.
 pub fn inspect_full(path: &Path) -> Result<ProbeReport, DecodeError> {
+    let cache = align_core::CacheSettings::load()
+        .enabled
+        .then(|| align_core::FingerprintCache::new(None));
+    inspect_full_with_cache(path, cache.as_ref())
+}
+
+pub(crate) fn inspect_full_with_cache(
+    path: &Path,
+    cache: Option<&align_core::FingerprintCache>,
+) -> Result<ProbeReport, DecodeError> {
     // Taken before the header is read: the cached timing walk includes the
     // header's frame rate.
-    let revision = media_revision(path);
+    let revision = cache.and_then(|_| media_revision(path));
     let json = probe_json(path)?;
     let mut report = parse_ffprobe_json(&json)
         .ok_or_else(|| DecodeError::Incomplete(format!("ffprobe JSON for {}", path.display())))?;
     if report.has_video {
-        report.video =
-            parse_video_stream(&json).and_then(|header| video_probe(path, &header, revision));
+        report.video = parse_video_stream(&json)
+            .and_then(|header| video_probe(path, &header, revision, cache));
     }
     Ok(report)
 }
@@ -451,19 +461,18 @@ fn media_revision(path: &Path) -> Option<String> {
 fn cached_video_timing(
     path: &Path,
     revision: Option<String>,
+    cache: Option<&align_core::FingerprintCache>,
     frame_duration: impl FnOnce(&Path) -> Result<Option<align_core::MediaTime>, DecodeError>,
 ) -> Result<align_core::VideoTimingInspection, DecodeError> {
     let bin =
         ffprobe_bin().ok_or_else(|| DecodeError::FfmpegMissing("ffprobe not found".into()))?;
-    let decoder = bin.canonicalize().ok().and_then(|bin| {
-        Some(format!(
-            "{}:{}",
-            bin.display(),
-            align_core::cache::media_revision(&bin).ok()?
-        ))
+    let entry = cache.and_then(|cache| {
+        let bin = bin.canonicalize().ok()?;
+        let decoder = format!("{}:{}", bin.display(), media_revision(&bin)?);
+        cache
+            .for_backend("portable-timing1")
+            .video_timing_entry(path, &decoder)
     });
-    let cache = align_core::FingerprintCache::with_backend(None, "portable-timing1");
-    let entry = decoder.and_then(|id| cache.video_timing_entry(path, &id));
     if let Some(timing) = entry.as_ref().and_then(|e| e.load()) {
         return Ok(timing);
     }
@@ -545,8 +554,10 @@ fn video_probe(
     path: &Path,
     header: &FfVideoStream,
     revision: Option<String>,
+    cache: Option<&align_core::FingerprintCache>,
 ) -> Option<VideoProbe> {
-    let timing = cached_video_timing(path, revision, |_| Ok(header_frame_duration(header))).ok()?;
+    let timing =
+        cached_video_timing(path, revision, cache, |_| Ok(header_frame_duration(header))).ok()?;
     Some(VideoProbe {
         width: header.width,
         height: header.height,

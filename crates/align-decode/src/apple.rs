@@ -736,7 +736,10 @@ impl MediaBackend for AppleNativeBackend {
     }
 
     fn inspect(&self, path: &Path) -> Result<ProbeReport, DecodeError> {
-        self.inspect_for_import(path, None)
+        if is_mxf(path) {
+            return crate::portable::PortableBackend.inspect(path);
+        }
+        self.inspect_for_import(path, None, None)
             .map(|inspection| inspection.report)
     }
 
@@ -775,10 +778,11 @@ impl MediaBackend for AppleNativeBackend {
         &'a self,
         path: &'a Path,
         prepared: Option<&'a crate::backend::PreparedAudio>,
+        cache: Option<&align_core::FingerprintCache>,
     ) -> Result<crate::backend::Inspection<'a>, DecodeError> {
         use crate::backend::Inspection;
         if is_mxf(path) {
-            return crate::portable::PortableBackend.inspect_for_import(path, None);
+            return crate::portable::PortableBackend.inspect_for_import(path, None, cache);
         }
         if let Some(inspection) = self.local_inspection(path) {
             return Ok(inspection);

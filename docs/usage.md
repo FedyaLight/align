@@ -223,9 +223,16 @@ align-cli clear-cache
 align-cli clear-cache --older-than-days 30
 ```
 
-The analysis cache contains fingerprints and portable video-timing inspections.
-Clearing it causes later runs to repeat that work. Desktop cache controls also
-support clearing the current media and changing retention.
+The on-disk analysis cache stores fingerprints, waveform previews, spectral
+flux, LTC detections, and portable video timing. Align keeps entries for 7 days
+by default. Use **File → Analysis Cache** to change retention, clear entries for
+the current project, or clear all entries.
+
+Choose **Disable On-Disk Analysis Cache** to skip reading and writing the cache
+on new desktop and CLI runs. Existing entries stay on disk and can still be
+cleared. Choose **Enable On-Disk Analysis Cache** to resume caching with your
+selected retention. **Keep Until Cleared** sets retention with no automatic
+expiration.
 
 Embedded AAF audio retained for saved JSON is application data, not cache.
 Do not delete it while those results are needed. See
