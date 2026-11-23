@@ -199,6 +199,8 @@ static READ: std::sync::LazyLock<std::sync::Mutex<ReadTimelines>> =
 type ReadTimelines = std::collections::HashMap<(PathBuf, String, PathBuf), Vec<u8>>;
 /// Responses kept at most; a long session starts over past it.
 const READ_LIMIT: usize = 64;
+const MAX_AAF_RESPONSE: usize = 64 << 20;
+const MAX_AAF_CACHE_BYTES: usize = 64 << 20;
 
 pub fn read_timeline(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, AafError> {
     if cancel.load(Ordering::Relaxed) {
@@ -237,7 +239,8 @@ pub fn read_timeline(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, 
     };
     if let Some(key) = key.filter(unchanged) {
         let mut read = lock();
-        if read.len() >= READ_LIMIT {
+        let cached_bytes: usize = read.values().map(Vec::len).sum();
+        if read.len() >= READ_LIMIT || cached_bytes + json.len() > MAX_AAF_CACHE_BYTES {
             read.clear();
         }
         read.insert(key, json);
@@ -268,22 +271,39 @@ fn run_read_timeline(
     // A file avoids stdout pipe deadlocks on large compositions while retaining
     // cancellable process supervision and automatic temporary-file cleanup.
     let mut output = tempfile::tempfile()?;
+    let mut errors = tempfile::tempfile()?;
     let mut child = crate::process::command(executable)
         .arg("read-timeline")
         .arg(path)
         .arg(directory)
         .stdin(Stdio::null())
         .stdout(Stdio::from(output.try_clone()?))
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::from(errors.try_clone()?))
         .spawn()?;
     let status = crate::process::wait_cancellable(&mut child, cancel)?;
+    use std::io::{Read, Seek};
     if !status.success() {
-        return Err(AafError::Writer(status.to_string()));
+        errors.rewind()?;
+        let mut details = Vec::new();
+        errors.take(8192).read_to_end(&mut details)?;
+        let details = String::from_utf8_lossy(&details);
+        let details = details.trim();
+        return Err(AafError::Writer(if details.is_empty() {
+            status.to_string()
+        } else {
+            details.to_owned()
+        }));
     }
-    use std::io::{Read, Seek, SeekFrom};
-    output.seek(SeekFrom::Start(0))?;
+    output.rewind()?;
     let mut json = Vec::new();
-    output.read_to_end(&mut json)?;
+    output
+        .take(MAX_AAF_RESPONSE as u64 + 1)
+        .read_to_end(&mut json)?;
+    if json.len() > MAX_AAF_RESPONSE {
+        return Err(AafError::Writer(
+            "AAF timeline response is too large".into(),
+        ));
+    }
     Ok(json)
 }
 

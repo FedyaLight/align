@@ -90,26 +90,50 @@ pub fn bytes<const N: usize>(data: &[u8]) -> Result<[u8; N]> {
     data.try_into().context("Invalid AAF property size")
 }
 
-pub fn read_stream<F: Read + Seek>(
-    file: &mut CompoundFile<F>,
-    path: &Path,
-    limit: u64,
-) -> Result<Vec<u8>> {
-    let mut stream = file
-        .open_stream(path)
-        .with_context(|| format!("AAF stream {}", path.display()))?;
-    ensure!(stream.len() <= limit, "AAF metadata stream is too large");
-    let mut data = Vec::new();
-    stream.read_to_end(&mut data)?;
-    Ok(data)
+/// Bounds metadata work across the whole document, including repeated visits
+/// to the same source. Embedded audio is read as a stream outside this budget.
+pub struct MetadataReader<F> {
+    pub inner: CompoundFile<F>,
+    remaining: u64,
+}
+
+impl<F: Read + Seek> MetadataReader<F> {
+    pub fn new(file: CompoundFile<F>) -> Self {
+        Self {
+            inner: file,
+            remaining: 256 << 20,
+        }
+    }
+
+    fn charge(&mut self, cost: u64) -> Result<()> {
+        self.remaining = self
+            .remaining
+            .checked_sub(cost)
+            .context("AAF document exceeds the metadata processing limit")?;
+        Ok(())
+    }
+
+    fn read_stream(&mut self, path: &Path, limit: u64) -> Result<Vec<u8>> {
+        let mut stream = self
+            .inner
+            .open_stream(path)
+            .with_context(|| format!("AAF stream {}", path.display()))?;
+        let length = stream.len();
+        ensure!(length <= limit, "AAF metadata stream is too large");
+        // Even tiny streams incur object lookup and allocation work.
+        self.charge(length + 256)?;
+        let mut data = Vec::new();
+        stream.read_to_end(&mut data)?;
+        Ok(data)
+    }
 }
 
 #[derive(Default)]
 pub struct Props(BTreeMap<u16, (u16, Vec<u8>)>);
 
 impl Props {
-    pub fn load<F: Read + Seek>(file: &mut CompoundFile<F>, path: &Path) -> Result<Self> {
-        let data = read_stream(file, &path.join("properties"), 16 << 20)?;
+    pub fn load<F: Read + Seek>(file: &mut MetadataReader<F>, path: &Path) -> Result<Self> {
+        let data = file.read_stream(&path.join("properties"), 16 << 20)?;
         let [order, _, low, high, ..] = data.as_slice() else {
             bail!("Truncated AAF property stream");
         };
@@ -118,6 +142,7 @@ impl Props {
         let (table, mut values) = data[4..]
             .split_at_checked(count * 6)
             .context("Truncated AAF property table")?;
+        file.charge(count as u64 * 32)?;
         let mut props = Self::default();
         for entry in table.as_chunks::<6>().0 {
             let pid = u16::from_le_bytes(bytes(&entry[..2])?);
@@ -206,7 +231,7 @@ impl Props {
 
     pub fn vector<F: Read + Seek>(
         &self,
-        file: &mut CompoundFile<F>,
+        file: &mut MetadataReader<F>,
         path: &Path,
         pid: u16,
     ) -> Result<Vec<PathBuf>> {
@@ -229,7 +254,7 @@ impl Props {
 
     pub fn set_members<F: Read + Seek>(
         &self,
-        file: &mut CompoundFile<F>,
+        file: &mut MetadataReader<F>,
         path: &Path,
         pid: u16,
     ) -> Result<Vec<([u8; 32], PathBuf)>> {
@@ -255,24 +280,61 @@ impl Props {
 }
 
 fn index_data<F: Read + Seek>(
-    file: &mut CompoundFile<F>,
+    file: &mut MetadataReader<F>,
     path: &Path,
     name: &str,
     header: usize,
     stride: usize,
 ) -> Result<Vec<u8>> {
-    let data = read_stream(file, &path.join(format!("{name} index")), 32 << 20)?;
+    let data = file.read_stream(&path.join(format!("{name} index")), 32 << 20)?;
     ensure!(data.len() >= header, "Truncated AAF reference index");
     let count = u32::from_le_bytes(bytes(&data[..4])?) as usize;
     ensure!(
-        data.len() - header == count * stride,
+        count.checked_mul(stride) == Some(data.len() - header),
         "Invalid AAF reference index"
     );
+    // Account for the paths allocated for each reference before building them.
+    file.charge(count as u64 * 128)?;
     Ok(data[header..].to_vec())
 }
 
-pub fn content_path<F: Read + Seek>(file: &mut CompoundFile<F>) -> Result<PathBuf> {
+pub fn content_path<F: Read + Seek>(file: &mut MetadataReader<F>) -> Result<PathBuf> {
     let root = Path::new("/");
     let header = Props::load(file, root)?.child(root, 0x0002, REF)?;
     Props::load(file, &header)?.child(&header, 0x3b03, REF)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn property_reads_share_a_document_budget() -> Result<()> {
+        let mut file = CompoundFile::create(Cursor::new(Vec::new()))?;
+        let first = Path::new("/first");
+        let second = Path::new("/second");
+        for path in [first, second] {
+            file.create_storage(path)?;
+            let mut props = Props::default();
+            props.string(MOB_NAME, "Take");
+            props.save(&mut file, path)?;
+        }
+        let mut metadata = MetadataReader::new(file);
+        metadata.remaining = 400;
+        assert_eq!(
+            Props::load(&mut metadata, first)?
+                .text(MOB_NAME)?
+                .as_deref(),
+            Some("Take")
+        );
+        let error = Props::load(&mut metadata, second)
+            .err()
+            .context("Second read exceeded the document budget")?;
+        assert_eq!(
+            error.to_string(),
+            "AAF document exceeds the metadata processing limit"
+        );
+        Ok(())
+    }
 }

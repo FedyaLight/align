@@ -1075,7 +1075,7 @@ pub fn write(manifest: &Path, destination: &Path) -> Result<Value> {
             temporary,
         )?;
         temporary.rewind()?;
-        let mut file = CompoundFile::open(temporary)?;
+        let mut file = MetadataReader::new(CompoundFile::open(temporary)?);
         let header_path = Path::new("/Header-2");
         let header = Props::load(&mut file, header_path)?;
         let ident_path = header
@@ -1086,7 +1086,7 @@ pub fn write(manifest: &Path, destination: &Path) -> Result<Value> {
         ident.string(0x3c04, env!("CARGO_PKG_VERSION"));
         ident.string(0x3c08, &crate::platform());
         ident.data(0x3c09, Uuid::new_v4().to_bytes_le());
-        ident.save(&mut file, &ident_path)?;
+        ident.save(&mut file.inner, &ident_path)?;
         let mut graph = Graph {
             mobs: Vec::new(),
             timestamp: header.require(0x3b02)?.to_vec(),
@@ -1098,7 +1098,7 @@ pub fn write(manifest: &Path, destination: &Path) -> Result<Value> {
         let mut props = Props::load(&mut file, &content)?;
         let name = "Mobs-1901";
         props.set(0x1901, SET, utf16(name));
-        props.save(&mut file, &content)?;
+        props.save(&mut file.inner, &content)?;
         let mut index = index_header(u32::try_from(graph.mobs.len())?);
         index.extend(MOB_ID.to_le_bytes());
         index.push(32);
@@ -1107,13 +1107,15 @@ pub fn write(manifest: &Path, destination: &Path) -> Result<Value> {
             index.extend(1u32.to_le_bytes());
             index.extend(mob.id);
             mob.object
-                .write(&mut file, &content.join(format!("{name}{{{i:x}}}")))?;
+                .write(&mut file.inner, &content.join(format!("{name}{{{i:x}}}")))?;
         }
-        let mut stream = file.create_stream(content.join(format!("{name} index")))?;
+        let mut stream = file
+            .inner
+            .create_stream(content.join(format!("{name} index")))?;
         stream.write_all(&index)?;
         stream.flush()?;
         drop(stream);
-        file.flush()?;
+        file.inner.flush()?;
         Ok(())
     })?;
     Ok(json!({"version": 1, "path": path}))

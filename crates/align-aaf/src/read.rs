@@ -75,7 +75,8 @@ struct Clip {
 }
 
 struct Reader<'a> {
-    file: CompoundFile<File>,
+    file: MetadataReader<File>,
+    response_remaining: usize,
     mobs: HashMap<MobId, PathBuf>,
     essence: HashMap<MobId, PathBuf>,
     slots: HashMap<SlotRef, PathBuf>,
@@ -84,10 +85,20 @@ struct Reader<'a> {
 }
 
 impl Reader<'_> {
+    fn reserve_response(&mut self, text_bytes: usize) -> Result<()> {
+        // A clip, track or composition contributes JSON fields and escaped text.
+        let cost = 224 + text_bytes.saturating_mul(6);
+        self.response_remaining = self
+            .response_remaining
+            .checked_sub(cost)
+            .context("AAF timeline exceeds the supported response size")?;
+        Ok(())
+    }
+
     fn selected(&mut self, mut path: PathBuf) -> Result<(PathBuf, Part)> {
         let mut parent = None;
         for _ in 0..96 {
-            let class = class(&self.file, &path)?;
+            let class = class(&self.file.inner, &path)?;
             let props = Props::load(&mut self.file, &path)?;
             if let Some((kind, length)) = parent {
                 ensure!(
@@ -176,14 +187,15 @@ impl Reader<'_> {
                 start = native;
             }
         }
-        let media = if class(&self.file, &mob)? == SOURCE_MOB {
+        let media = if class(&self.file.inner, &mob)? == SOURCE_MOB {
             self.source(id, &mob, &slot, kind)?
         } else {
             None
         };
-        let result = if media.is_some() {
+        let result = if let Some((path, channel)) = media {
+            self.reserve_response(path.len())?;
             vec![Clip {
-                media,
+                media: Some((path, channel)),
                 source_in: start,
                 span,
             }]
@@ -250,7 +262,7 @@ impl Reader<'_> {
             && let Some(essence) = self.essence.get(&id).cloned()
         {
             ensure!(
-                class(&self.file, &descriptor)? == PCM,
+                class(&self.file.inner, &descriptor)? == PCM,
                 "Unsupported embedded AAF audio encoding"
             );
             let channels = props.uint(CHANNELS)?;
@@ -330,7 +342,7 @@ impl Reader<'_> {
             .checked_add(36)
             .context("Embedded AAF audio exceeds WAV size")?;
         let stream_path = Props::load(&mut self.file, essence)?.child(essence, 0x2702, STREAM)?;
-        let mut stream = self.file.open_stream(stream_path)?;
+        let mut stream = self.file.inner.open_stream(stream_path)?;
         ensure!(
             stream.len() == u64::from(length),
             "WAV frame count differs from AAF descriptor"
@@ -365,6 +377,7 @@ impl Reader<'_> {
     }
 
     fn track(&mut self, name: String, kind: Kind, rate: &Clock, path: PathBuf) -> Result<Value> {
+        self.reserve_response(name.len())?;
         let mut edits = Vec::new();
         let mut cursor = Clock::zero();
         for part in self.parts(path)? {
@@ -402,9 +415,15 @@ impl Reader<'_> {
         let clock = if times().all(|time| (time * rate).is_integer()) {
             rate.clone()
         } else {
-            Clock::from_integer(
-                times().fold(rate.numer().clone(), |clock, time| clock.lcm(time.denom())),
-            )
+            let ticks = times().try_fold(rate.numer().clone(), |clock, time| {
+                let ticks = clock.lcm(time.denom());
+                ensure!(
+                    ticks.to_i32().is_some(),
+                    "AAF exact clock exceeds supported precision"
+                );
+                Ok(ticks)
+            })?;
+            Clock::from_integer(ticks)
         };
         let time_rate = Rate::from_clock(&clock)?;
         let mut clips = Vec::new();
@@ -422,12 +441,14 @@ impl Reader<'_> {
     }
 
     fn composition(&mut self, path: &Path, props: &Props) -> Result<Value> {
+        let name = props.text(MOB_NAME)?;
+        self.reserve_response(name.as_ref().map_or(0, String::len))?;
         let mut tracks = Vec::new();
         for slot in props.vector(&mut self.file, path, MOB_SLOTS)? {
             let props = Props::load(&mut self.file, &slot)?;
             let segment = props.child(&slot, SEGMENT, REF)?;
             let kind = Kind::from_props(&Props::load(&mut self.file, &segment)?)?;
-            if kind == Kind::Timecode && class(&self.file, &segment)? == TIMECODE {
+            if kind == Kind::Timecode && class(&self.file.inner, &segment)? == TIMECODE {
                 continue;
             }
             ensure!(kind != Kind::Timecode, "Unsupported AAF timecode component");
@@ -449,12 +470,12 @@ impl Reader<'_> {
                 tracks.push(self.track(name, kind, &rate, layer)?);
             }
         }
-        Ok(json!({"name": props.text(MOB_NAME)?, "tracks": tracks}))
+        Ok(json!({"name": name, "tracks": tracks}))
     }
 }
 
 pub fn timeline(path: &Path, extract_dir: Option<&Path>) -> Result<Value> {
-    let mut file = cfb::open(path)?;
+    let mut file = MetadataReader::new(cfb::open(path).context("Open AAF container")?);
     let path = content_path(&mut file)?;
     let props = Props::load(&mut file, &path)?;
     let members = props.set_members(&mut file, &path, 0x1901)?;
@@ -465,13 +486,14 @@ pub fn timeline(path: &Path, extract_dir: Option<&Path>) -> Result<Value> {
             .collect(),
         mobs: members.iter().cloned().collect(),
         file,
+        response_remaining: 32 << 20,
         slots: HashMap::new(),
         extracted: HashMap::new(),
         extract_dir,
     };
     let mut sequences = Vec::new();
     for (_, path) in members {
-        if class(&reader.file, &path)? == COMPOSITION {
+        if class(&reader.file.inner, &path)? == COMPOSITION {
             let props = Props::load(&mut reader.file, &path)?;
             if props.get(USAGE) == Some(TOP_LEVEL.to_bytes_le().as_slice()) {
                 sequences.push(reader.composition(&path, &props)?);
@@ -517,11 +539,12 @@ pub fn repair(manifest: &Path, source: &Path, destination: &Path) -> Result<Valu
     let path = staged(destination, |temporary| {
         io::copy(&mut File::open(source)?, temporary)?;
         temporary.rewind()?;
-        let mut file = CompoundFile::open(temporary)?;
+        let mut file =
+            MetadataReader::new(CompoundFile::open(temporary).context("Open AAF container")?);
         let content = content_path(&mut file)?;
         let content_props = Props::load(&mut file, &content)?;
         for (_, path) in content_props.set_members(&mut file, &content, 0x1901)? {
-            if class(&file, &path)? != SOURCE_MOB {
+            if class(&file.inner, &path)? != SOURCE_MOB {
                 continue;
             }
             let mob = Props::load(&mut file, &path)?;
@@ -537,12 +560,12 @@ pub fn repair(manifest: &Path, source: &Path, destination: &Path) -> Result<Valu
                     && let Some(new) = mappings.get(&normalized(Path::new(&old)))
                 {
                     props.string(URL, new);
-                    props.save(&mut file, &locator)?;
+                    props.save(&mut file.inner, &locator)?;
                     changed += 1;
                 }
             }
         }
-        file.flush()?;
+        file.inner.flush()?;
         Ok(())
     })?;
     Ok(json!({"version": 1, "path": path, "replacements": changed}))
