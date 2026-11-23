@@ -19,7 +19,7 @@ def main():
     parser.add_argument('cli', type=Path)
     parser.add_argument('output', type=Path)
     args = parser.parse_args()
-    cli = args.cli.resolve()
+    cli = args.cli.absolute()
     if not cli.is_file():
         parser.error(f'CLI not found: {cli}')
     for executable in ('ffmpeg', 'ffprobe'):

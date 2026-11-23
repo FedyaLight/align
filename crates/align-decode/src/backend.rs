@@ -105,6 +105,54 @@ pub struct VideoProbe {
     pub source_timecode: Option<SourceTimecode>,
 }
 
+/// Window decoder owned by one refinement pass. Dropping it releases idle readers.
+pub type WindowDecoder<'a> = Box<
+    dyn Fn(&Path, f64, f64, AudioAnalysisSource) -> Result<(f64, Vec<f32>), DecodeError>
+        + Send
+        + Sync
+        + 'a,
+>;
+
+pub type TrackConsumer<'a> = &'a mut dyn FnMut(usize, &[f32]) -> Result<(), DecodeError>;
+
+/// Inspection and a lazy opening-window reader. Both live on the inspecting
+/// worker so a native asset and its track enumeration can be reused for LTC.
+pub type OpeningAudio<'a> = dyn FnMut(usize, &mut dyn FnMut(NativeBlock) -> Result<(), DecodeError>) -> Result<(), DecodeError>
+    + 'a;
+pub struct Inspection<'a> {
+    pub report: ProbeReport,
+    pub opening_audio: Box<OpeningAudio<'a>>,
+}
+
+type PreparedDecode = Box<
+    dyn Fn(
+            AudioAnalysisSource,
+            &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
+        ) -> Result<(), DecodeError>
+        + Send,
+>;
+
+/// Inspected assets retained until this sync reaches fingerprinting. Native
+/// readers are created on demand, never parked between phases.
+#[derive(Default)]
+pub struct PreparedAudio(
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (String, PreparedDecode)>>,
+);
+
+impl PreparedAudio {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn remember(&self, path: &Path, revision: String, decode: PreparedDecode) {
+        let mut entries = self.0.lock().unwrap();
+        if entries.len() < 4 {
+            entries.insert(path.to_owned(), (revision, decode));
+        }
+    }
+    pub(crate) fn take(&self, path: &Path) -> Option<PreparedDecode> {
+        let (revision, decode) = self.0.lock().unwrap().remove(path)?;
+        (align_core::cache::media_revision(path).ok()? == revision).then_some(decode)
+    }
+}
+
 /// The single seam between shared algorithms and OS media stacks.
 /// Both backends must honor the same contracts:
 /// 8 kHz mono stream / 16 kHz windows, adaptive-mono hysteresis 0.9,
@@ -114,12 +162,62 @@ pub trait MediaBackend: Send + Sync {
 
     fn inspect(&self, path: &Path) -> Result<ProbeReport, DecodeError>;
 
+    /// Inspect with the current pipeline's disk cache, if available.
+    fn inspect_with_cache(
+        &self,
+        path: &Path,
+        _cache: Option<&align_core::FingerprintCache>,
+    ) -> Result<ProbeReport, DecodeError> {
+        self.inspect(path)
+    }
+
+    /// Routes which may run outside the native/sidecar limit. None defers
+    /// to the normal backend. Never start an external decoder here.
+    fn local_inspection<'a>(&'a self, _path: &'a Path) -> Option<Inspection<'a>> {
+        None
+    }
+
+    fn local_mono_8k(
+        &self,
+        _path: &Path,
+        _source: AudioAnalysisSource,
+        _consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
+    ) -> Option<Result<(), DecodeError>> {
+        None
+    }
+
+    fn inspect_for_import<'a>(
+        &'a self,
+        path: &'a Path,
+        _prepared: Option<&'a PreparedAudio>,
+        cache: Option<&align_core::FingerprintCache>,
+    ) -> Result<Inspection<'a>, DecodeError> {
+        Ok(Inspection {
+            report: self.inspect_with_cache(path, cache)?,
+            opening_audio: Box::new(move |index, consume| {
+                self.decode_native(path, index, Some((0., Some(3.))), consume)
+                    .map(|_| ())
+            }),
+        })
+    }
+
     fn decode_mono_8k(
         &self,
         path: &Path,
         source: AudioAnalysisSource,
         consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
     ) -> Result<(), DecodeError>;
+
+    /// Batched PCM variants in callback-slot order. Return None only before
+    /// emitting anything. On error the caller discards the partial state.
+    fn fingerprint_tracks(
+        &self,
+        _path: &Path,
+        _sources: &[AudioAnalysisSource],
+        _consume: crate::backend::TrackConsumer<'_>,
+    ) -> Option<Result<(), DecodeError>> {
+        None
+    }
 
     fn decode_window_16k(
         &self,
@@ -128,6 +226,12 @@ pub trait MediaBackend: Send + Sync {
         duration_seconds: f64,
         source: AudioAnalysisSource,
     ) -> Result<(f64, Vec<f32>), DecodeError>;
+
+    fn window_decoder(&self) -> WindowDecoder<'_> {
+        Box::new(|path, start, duration, source| {
+            self.decode_window_16k(path, start, duration, source)
+        })
+    }
 
     /// Full-rate discrete-channel streaming (render path): planar `f32`
     /// blocks at the source rate. `range`: optional (start, duration);

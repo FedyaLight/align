@@ -11,7 +11,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Stdio};
+use std::process::{Child, Command, Stdio};
 
 use crate::DecodeError;
 use crate::backend::{AudioStreamProbe, ProbeReport, VideoProbe};
@@ -155,8 +155,74 @@ fn run_probe(path: &Path) -> Result<Vec<u8>, DecodeError> {
 
 /// Header-only inspect. No sample data is read (audio-only invariant).
 pub fn inspect(path: &Path) -> Result<ProbeReport, DecodeError> {
+    // Clip IDs and source-time exports use the container's original duration.
+    // Gapless trimming belongs to decoded PCM, not to source metadata.
     parse_ffprobe_json(&probe_json(path)?)
         .ok_or_else(|| DecodeError::Incomplete(format!("ffprobe JSON for {}", path.display())))
+}
+
+pub(crate) fn probed_sbr(path: &Path, index: usize) -> Option<bool> {
+    let header: serde_json::Value = serde_json::from_slice(&probe_json(path).ok()?).ok()?;
+    let stream = header["streams"]
+        .as_array()?
+        .iter()
+        .filter(|s| s["codec_type"] == "audio")
+        .nth(index)?;
+    match stream["profile"].as_str()? {
+        "HE-AAC" | "HE-AACv2" => Some(true),
+        "LC" => Some(false),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GaplessAudio {
+    lead: f64,
+    duration: f64,
+}
+
+/// Apple's single-track dual-rate HE-AAC stores the gapless counts in core
+/// samples. FFmpeg 7 and 9 trim different counts automatically. For this
+/// specific layout use the raw packet clock and trim exactly once.
+fn apple_gapless(path: &Path, header: &serde_json::Value) -> Option<GaplessAudio> {
+    let tag = header["format"]["tags"]["iTunSMPB"].as_str()?;
+    let [stream] = header["streams"].as_array()?.as_slice() else {
+        return None;
+    };
+    if stream["profile"] != "HE-AAC" {
+        return None;
+    }
+    let movie = crate::isobmff::shared_movie(path)?;
+    let [track] = movie.tracks.as_slice() else {
+        return None;
+    };
+    let rate = num(&stream["sample_rate"])?;
+    if track.edited_duration.is_some()
+        || track.timescale == 0
+        || rate != f64::from(track.timescale) * 2.0
+    {
+        return None;
+    }
+    let mut counts = tag
+        .split_ascii_whitespace()
+        .skip(1)
+        .map(|s| u64::from_str_radix(s, 16).ok());
+    let (priming, padding, valid) = (counts.next()??, counts.next()??, counts.next()??);
+    if priming == 0
+        || valid == 0
+        || priming.checked_add(valid)?.checked_add(padding)? != track.media_duration
+        || track.sample_count().checked_mul(1024)? != track.media_duration
+    {
+        return None;
+    }
+    // The Apple counts describe the core. Dual-rate SBR synthesis adds 481
+    // core samples (ISO/IEC TR 14496-24). Edit lists and other encoders may
+    // already include it, which is why they don't enter this path.
+    let core_rate = f64::from(track.timescale);
+    Some(GaplessAudio {
+        lead: (priming as f64 + 481.) / core_rate,
+        duration: valid as f64 / core_rate,
+    })
 }
 
 fn num(value: &serde_json::Value) -> Option<f64> {
@@ -173,7 +239,10 @@ const EARLY_AUDIO_END: f64 = 0.1;
 
 /// Pure parser (unit-tested without a binary on disk).
 pub fn parse_ffprobe_json(json: &[u8]) -> Option<ProbeReport> {
-    let v: serde_json::Value = serde_json::from_slice(json).ok()?;
+    parse_header(&serde_json::from_slice(json).ok()?)
+}
+
+fn parse_header(v: &serde_json::Value) -> Option<ProbeReport> {
     let streams = v.get("streams")?.as_array()?;
     // MPEG-TS records no edit list, so FFmpeg's output keeps AC-3's codec
     // delay; in MP4 and MOV FFmpeg trims it through the edit list.
@@ -265,15 +334,25 @@ pub fn parse_ffprobe_json(json: &[u8]) -> Option<ProbeReport> {
 /// Header inspect + video timing walk. Pure-header fast path when the
 /// container has no video track.
 pub fn inspect_full(path: &Path) -> Result<ProbeReport, DecodeError> {
+    let cache = align_core::CacheSettings::load()
+        .enabled
+        .then(|| align_core::FingerprintCache::new(None));
+    inspect_full_with_cache(path, cache.as_ref())
+}
+
+pub(crate) fn inspect_full_with_cache(
+    path: &Path,
+    cache: Option<&align_core::FingerprintCache>,
+) -> Result<ProbeReport, DecodeError> {
     // Taken before the header is read: the cached timing walk includes the
     // header's frame rate.
-    let revision = media_revision(path);
+    let revision = cache.and_then(|_| media_revision(path));
     let json = probe_json(path)?;
     let mut report = parse_ffprobe_json(&json)
         .ok_or_else(|| DecodeError::Incomplete(format!("ffprobe JSON for {}", path.display())))?;
     if report.has_video {
-        report.video =
-            parse_video_stream(&json).and_then(|header| video_probe(path, &header, revision));
+        report.video = parse_video_stream(&json)
+            .and_then(|header| video_probe(path, &header, revision, cache));
     }
     Ok(report)
 }
@@ -382,30 +461,28 @@ fn media_revision(path: &Path) -> Option<String> {
 fn cached_video_timing(
     path: &Path,
     revision: Option<String>,
+    cache: Option<&align_core::FingerprintCache>,
     frame_duration: impl FnOnce(&Path) -> Result<Option<align_core::MediaTime>, DecodeError>,
 ) -> Result<align_core::VideoTimingInspection, DecodeError> {
     let bin =
         ffprobe_bin().ok_or_else(|| DecodeError::FfmpegMissing("ffprobe not found".into()))?;
-    let decoder = bin.canonicalize().ok().and_then(|bin| {
-        Some(format!(
-            "{}:{}",
-            bin.display(),
-            align_core::cache::media_revision(&bin).ok()?
-        ))
+    let entry = cache.and_then(|cache| {
+        let bin = bin.canonicalize().ok()?;
+        let decoder = format!("{}:{}", bin.display(), media_revision(&bin)?);
+        cache
+            .for_backend("portable-timing1")
+            .video_timing_entry(path, &decoder)
     });
-    let cache = align_core::FingerprintCache::with_backend(None, "portable-timing1");
-    if let Some(decoder) = &decoder
-        && let Some(timing) = cache.load_video_timing(path, decoder)
-    {
+    if let Some(timing) = entry.as_ref().and_then(|e| e.load()) {
         return Ok(timing);
     }
     let timing = video_timing_uncached(path, &bin, frame_duration(&bin)?)?;
     // A scan racing a media rewrite must not publish a cached classification.
     if revision.is_some()
         && revision == media_revision(path)
-        && let Some(decoder) = &decoder
+        && let Some(entry) = entry
     {
-        cache.save_video_timing(path, decoder, timing);
+        entry.save(timing);
     }
     Ok(timing)
 }
@@ -477,8 +554,10 @@ fn video_probe(
     path: &Path,
     header: &FfVideoStream,
     revision: Option<String>,
+    cache: Option<&align_core::FingerprintCache>,
 ) -> Option<VideoProbe> {
-    let timing = cached_video_timing(path, revision, |_| Ok(header_frame_duration(header))).ok()?;
+    let timing =
+        cached_video_timing(path, revision, cache, |_| Ok(header_frame_duration(header))).ok()?;
     Some(VideoProbe {
         width: header.width,
         height: header.height,
@@ -496,66 +575,235 @@ fn timecode_from_header(header: &FfVideoStream) -> Option<align_core::SourceTime
     let duration = header_frame_duration(header)?;
     align_core::SourceTimecode::from_label(header.timecode.as_deref()?, duration)
 }
-pub struct AudioPipe {
+
+pub type AudioPipe = PcmPipe<f32>;
+pub type AudioPipeI32 = PcmPipe<i32>;
+
+pub trait PipeSample: Sized {
+    const FORMAT: &'static str;
+    const CODEC: &'static str;
+    fn decode(bytes: [u8; 4]) -> Self;
+}
+
+impl PipeSample for f32 {
+    const FORMAT: &'static str = "f32le";
+    const CODEC: &'static str = "pcm_f32le";
+    fn decode(bytes: [u8; 4]) -> Self {
+        Self::from_le_bytes(bytes)
+    }
+}
+impl PipeSample for i32 {
+    const FORMAT: &'static str = "s32le";
+    const CODEC: &'static str = "pcm_s32le";
+    fn decode(bytes: [u8; 4]) -> Self {
+        Self::from_le_bytes(bytes)
+    }
+}
+pub struct PcmPipe<T> {
+    sample: std::marker::PhantomData<T>,
     child: Child,
-    stdout: ChildStdout,
+    stdout: Box<dyn Read + Send>,
+    retry: Option<(Command, usize)>,
+    late_by: f64,
     channels: usize,
     leftover: Vec<u8>,
 }
 
-impl AudioPipe {
-    /// Spawn `ffmpeg -i path [-ss start -t dur] -map 0:a:N -vn -f f32le …`.
-    /// Seek args go *after* `-i` (accurate, windows are short). Native rate,
-    /// discrete channels — no `-ar`, no downmix, ever.
+impl<T: PipeSample> PcmPipe<T> {
+    /// Native-rate, discrete-channel PCM. Window times are relative to the
+    /// file presentation origin (format start). A bounded sparse read may
+    /// seek the demuxer, then trim by timestamp after decoder preroll.
     pub fn spawn(
         path: &Path,
         stream_index: usize,
         window: Option<(f64, f64)>,
         channels: usize,
     ) -> Result<Self, DecodeError> {
+        Self::presented(path, stream_index, window, channels, 0.)
+    }
+
+    pub(crate) fn presented(
+        path: &Path,
+        stream_index: usize,
+        window: Option<(f64, f64)>,
+        channels: usize,
+        decoder_delay: f64,
+    ) -> Result<Self, DecodeError> {
         let bin =
             ffmpeg_bin().ok_or_else(|| DecodeError::FfmpegMissing("ffmpeg not found".into()))?;
-        let mut cmd = command(bin);
-        cmd.args(["-v", "error", "-hide_banner", "-i"]).arg(path);
-        if let Some((start, duration)) = window {
-            cmd.args([
-                "-ss",
-                &start.max(0.0).to_string(),
-                "-t",
-                &duration.to_string(),
-            ]);
-        }
-        cmd.args(["-map", &format!("0:a:{stream_index}"), "-vn"])
-            .args([
-                "-f",
-                "f32le",
-                "-acodec",
-                "pcm_f32le",
-                "-ac",
-                &channels.to_string(),
-                "pipe:1",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+        let header: Option<serde_json::Value> = path
+            .is_file()
+            .then(|| probe_json(path).ok())
+            .flatten()
+            .and_then(|raw| serde_json::from_slice(&raw).ok());
+        let header = header.as_ref();
+        let format = header.map(|h| &h["format"]);
+        let stream = header.and_then(|h| h["streams"].as_array()).and_then(|s| {
+            s.iter()
+                .filter(|s| s["codec_type"] == "audio")
+                .nth(stream_index)
+        });
+        let starts = stream
+            .and_then(|s| num(&s["start_time"]))
+            .zip(format.and_then(|f| num(&f["start_time"])));
+        let gapless = header.and_then(|h| apple_gapless(path, h));
+        // A TS demuxer may rebase on the *mapped* track after stream
+        // selection. Preserve original packet timestamps and explicitly trim
+        // on the container clock instead of relying on that shifting origin.
+        let absolute = format
+            .and_then(|f| f["format_name"].as_str())
+            .is_some_and(|n| matches!(n, "mpegts" | "mxf"))
+            && starts.is_some();
+        let requested = window.map_or(0., |(s, _)| s.max(0.));
+        let late_by = if absolute {
+            starts.map_or(0., |(stream, format)| (stream - format - requested).max(0.))
+        } else {
+            0.
+        };
+        let window = if let Some(audio) = gapless {
+            let length = window.map_or(audio.duration, |(_, length)| length);
+            Some((
+                requested + audio.lead,
+                length.min((audio.duration - requested).max(0.)),
+            ))
+        } else if window.is_some() || decoder_delay > 0. {
+            let origin = if absolute {
+                starts.map_or(0., |(_, f)| f)
+            } else {
+                0.
+            };
+            Some((
+                origin + requested + late_by + decoder_delay,
+                (window.map_or(WHOLE_FILE, |(_, d)| d) - late_by).max(0.),
+            ))
+        } else {
+            None
+        };
+        let make_command = |seek: Option<f64>| {
+            let mut cmd = command(&bin);
+            cmd.args(["-v", "error", "-hide_banner"]);
+            if gapless.is_some() {
+                cmd.args(["-flags2", "+skip_manual", "-copyts"]);
+            } else if absolute {
+                cmd.arg("-copyts");
+            } else if seek.is_some() {
+                cmd.args(["-copyts", "-start_at_zero"]);
+            }
+            if let Some(seek) = seek {
+                cmd.arg("-ss").arg(seek.to_string());
+            }
+            cmd.arg("-i").arg(path);
+            if let Some((start, duration)) = window {
+                cmd.arg("-ss")
+                    .arg(start.to_string())
+                    .arg("-t")
+                    .arg(duration.to_string());
+            }
+            cmd.args(["-map", &format!("0:a:{stream_index}"), "-vn"])
+                .args([
+                    "-f",
+                    T::FORMAT,
+                    "-acodec",
+                    T::CODEC,
+                    "-ac",
+                    &channels.to_string(),
+                    "pipe:1",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            cmd
+        };
+        let sparse = window.and_then(|(start, duration)| {
+            // Small windows can be validated in full before emitting anything.
+            // Keep large exports streaming, including unbounded ranges.
+            let rate = num(&stream?["sample_rate"])?;
+            let bytes = ((duration * rate).round() as usize)
+                .checked_mul(channels)?
+                .checked_mul(4)?;
+            if start < 4. || !(1..=16 * 1024 * 1024).contains(&bytes) || !path.is_file() {
+                return None;
+            }
+            let format_name = format?["format_name"].as_str()?;
+            let regular = matches!(format_name, "mpegts" | "mxf")
+                || (format_name.split(',').any(|n| n == "mov")
+                    && crate::isobmff::shared_movie(path).is_some());
+            let (_, format_start) = starts?;
+            // Input -ss is relative to format start. Tagged Apple AAC uses
+            // original packet timestamps for its output trim.
+            let input = start
+                - if gapless.is_some() || absolute {
+                    format_start
+                } else {
+                    0.
+                };
+            (regular && input >= 4.).then_some((input - 3., bytes))
+        });
+        let retry = sparse.map(|(_, bytes)| (make_command(None), bytes));
+        Self::start(
+            make_command(sparse.map(|(seek, _)| seek)),
+            channels,
+            retry,
+            late_by,
+        )
+    }
+
+    fn start(
+        mut cmd: Command,
+        channels: usize,
+        retry: Option<(Command, usize)>,
+        late_by: f64,
+    ) -> Result<Self, DecodeError> {
         let mut child = cmd.spawn().map_err(DecodeError::Io)?;
         let stdout = child.stdout.take().ok_or(DecodeError::UnsupportedOutput)?;
         Ok(Self {
             child,
-            stdout,
+            late_by,
+            retry,
+            stdout: Box::new(stdout),
             channels,
             leftover: Vec::new(),
+            sample: std::marker::PhantomData,
         })
     }
 
-    /// Pump stdout through `consume` as interleaved f32 frames until EOF.
+    pub(crate) fn actual_start(&self, requested: f64) -> f64 {
+        requested.max(0.) + self.late_by
+    }
+
+    /// Pump stdout through `consume` as interleaved native frames until EOF.
     /// Returns `true` when the child exited successfully.
     pub fn pump(
         &mut self,
-        consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
+        consume: &mut dyn FnMut(&[T]) -> Result<(), DecodeError>,
     ) -> Result<bool, DecodeError> {
+        if let Some((fallback, expected)) = self.retry.take() {
+            let frame_bytes = self.channels * 4;
+            // One byte beyond the tolerance distinguishes EOF from a long
+            // producer. Only wait once the entire accepted output was read.
+            let read_limit = expected + frame_bytes + 1;
+            let mut candidate = Vec::with_capacity(read_limit);
+            let complete = self
+                .stdout
+                .by_ref()
+                .take(read_limit as u64)
+                .read_to_end(&mut candidate)
+                .is_ok()
+                && !candidate.is_empty()
+                && candidate.len().is_multiple_of(frame_bytes)
+                && candidate.len().abs_diff(expected) <= frame_bytes
+                && self.child.wait().is_ok_and(|status| status.success());
+            if complete {
+                candidate.truncate(expected);
+                self.stdout = Box::new(std::io::Cursor::new(candidate));
+            } else {
+                // EOF, a failed demuxer seek or insufficient preroll. No
+                // consumer has seen the speculative bytes. Drop reaps the child.
+                *self = Self::start(fallback, self.channels, None, self.late_by)?;
+            }
+        }
         let mut chunk = vec![0u8; 65536];
-        let mut frames = Vec::<f32>::with_capacity(16384);
+        let mut frames = Vec::<T>::with_capacity(16384);
         loop {
             let n = self.stdout.read(&mut chunk).map_err(DecodeError::Io)?;
             if n == 0 {
@@ -569,7 +817,7 @@ impl AudioPipe {
                     .as_chunks::<4>()
                     .0
                     .iter()
-                    .map(|b| f32::from_le_bytes(*b)),
+                    .map(|b| T::decode(*b)),
             );
             self.leftover.drain(..usable);
             if !frames.is_empty() {
@@ -585,7 +833,7 @@ impl AudioPipe {
     }
 }
 
-impl Drop for AudioPipe {
+impl<T> Drop for PcmPipe<T> {
     fn drop(&mut self) {
         // Never leave a zombie transcoder behind (cancel path included).
         let _ = self.child.kill();
@@ -599,98 +847,6 @@ fn complete_frame_bytes(bytes: usize, channels: usize) -> Result<usize, DecodeEr
         .filter(|&n| n > 0)
         .ok_or(DecodeError::InvalidPcm)?;
     Ok(bytes / frame_bytes * frame_bytes)
-}
-
-/// s32le twin of [`AudioPipe`] for bit-exact integer stems.
-pub struct AudioPipeI32 {
-    child: Child,
-    stdout: ChildStdout,
-    channels: usize,
-    leftover: Vec<u8>,
-}
-
-impl AudioPipeI32 {
-    pub fn spawn(
-        path: &Path,
-        stream_index: usize,
-        window: Option<(f64, f64)>,
-        channels: usize,
-    ) -> Result<Self, DecodeError> {
-        let bin =
-            ffmpeg_bin().ok_or_else(|| DecodeError::FfmpegMissing("ffmpeg not found".into()))?;
-        let mut cmd = command(bin);
-        cmd.args(["-v", "error", "-hide_banner", "-i"]).arg(path);
-        if let Some((start, duration)) = window {
-            cmd.args([
-                "-ss",
-                &start.max(0.0).to_string(),
-                "-t",
-                &duration.to_string(),
-            ]);
-        }
-        cmd.args(["-map", &format!("0:a:{stream_index}"), "-vn"])
-            .args([
-                "-f",
-                "s32le",
-                "-acodec",
-                "pcm_s32le",
-                "-ac",
-                &channels.to_string(),
-                "pipe:1",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut child = cmd.spawn().map_err(DecodeError::Io)?;
-        let stdout = child.stdout.take().ok_or(DecodeError::UnsupportedOutput)?;
-        Ok(Self {
-            child,
-            stdout,
-            channels,
-            leftover: Vec::new(),
-        })
-    }
-
-    pub fn pump(
-        &mut self,
-        consume: &mut dyn FnMut(&[i32]) -> Result<(), DecodeError>,
-    ) -> Result<bool, DecodeError> {
-        let mut chunk = vec![0u8; 65536];
-        let mut frames = Vec::<i32>::with_capacity(16384);
-        loop {
-            let n = self.stdout.read(&mut chunk).map_err(DecodeError::Io)?;
-            if n == 0 {
-                break;
-            }
-            self.leftover.extend_from_slice(&chunk[..n]);
-            let usable = complete_frame_bytes(self.leftover.len(), self.channels)?;
-            frames.clear();
-            frames.extend(
-                self.leftover[..usable]
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| i32::from_le_bytes(*b)),
-            );
-            self.leftover.drain(..usable);
-            if !frames.is_empty() {
-                debug_assert_eq!(frames.len() % self.channels, 0);
-                consume(&frames)?;
-            }
-        }
-        let status = self.child.wait().map_err(DecodeError::Io)?;
-        if !self.leftover.is_empty() {
-            return Err(DecodeError::InvalidPcm);
-        }
-        Ok(status.success())
-    }
-}
-
-impl Drop for AudioPipeI32 {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 /// A window duration that reaches the end of any file.
@@ -714,8 +870,7 @@ pub fn decode_mono_8k(
     if sample_rate <= 0.0 {
         return Err(DecodeError::InvalidPcm);
     }
-    let window = (delay > 0.0).then_some((delay, WHOLE_FILE));
-    let mut pipe = AudioPipe::spawn(path, stream_index, window, channels)?;
+    let mut pipe = AudioPipe::presented(path, stream_index, None, channels, delay)?;
     let mut mono = crate::mono::MonoPipe::new(
         sample_rate,
         8000.0,
@@ -753,11 +908,12 @@ pub fn decode_window(
     }
     let actual_start = start.max(0.0);
     let mut samples = Vec::new();
-    let mut pipe = AudioPipe::spawn(
+    let mut pipe = AudioPipe::presented(
         path,
         stream_index,
-        Some((actual_start + delay, duration)),
+        Some((actual_start, duration)),
         channels,
+        delay,
     )?;
     let mut mono = crate::mono::MonoPipe::new(
         sample_rate,
@@ -777,7 +933,7 @@ pub fn decode_window(
         )));
     }
     mono.finish()?;
-    Ok((actual_start, samples))
+    Ok((pipe.actual_start(actual_start), samples))
 }
 
 /// Write stereo 48 kHz AC-3 in MPEG-TS, silent except for a 2 ms click at
@@ -839,6 +995,164 @@ mod tests {
             .unwrap();
         let at = window_start * 1000.0 + click_at(&window) as f64 / 16.0;
         assert!((at - 1500.0).abs() < 0.3, "window click at {at} ms");
+    }
+
+    #[test]
+    fn delayed_transport_stream_reports_first_pcm_time_and_seeks_late_click() {
+        use crate::backend::MediaBackend;
+        let Some(ffmpeg) = test_ffmpeg() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("two.mts");
+        assert!(
+            command(ffmpeg)
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=r=48000:cl=mono:d=22",
+                    "-itsoffset",
+                    "2",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "aevalsrc='if(between(t,16.5,16.502),0.85,0)':s=48000:d=18",
+                    "-map",
+                    "0:a",
+                    "-map",
+                    "1:a",
+                    "-c:a",
+                    "ac3",
+                    "-f",
+                    "mpegts"
+                ])
+                .arg(&clip)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let backend = crate::portable::PortableBackend;
+        for (start, length) in [(0., 20.), (18., 1.)] {
+            let mut samples = Vec::new();
+            let actual = backend
+                .decode_native(&clip, 1, Some((start, Some(length))), &mut |block| {
+                    samples.extend_from_slice(&block.frames[0]);
+                    Ok(())
+                })
+                .unwrap();
+            let click = (actual * 48000.).round() as usize + click_at(&samples);
+            assert!(
+                click.abs_diff(888000) <= 2,
+                "from {actual}: click at {click}"
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_pcm_mxf_window_and_short_eof_match_continuous_i32() {
+        let Some(ffmpeg) = test_ffmpeg() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("pcm.mxf");
+        assert!(
+            command(ffmpeg)
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anoisesrc=duration=10:sample_rate=48000:seed=73",
+                    "-ac",
+                    "1",
+                    "-c:a",
+                    "pcm_s24le",
+                    "-f",
+                    "mxf_opatom"
+                ])
+                .arg(&clip)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let decode = |window| {
+            let mut output = Vec::new();
+            let mut pipe = AudioPipeI32::spawn(&clip, 0, window, 1).unwrap();
+            assert!(
+                pipe.pump(&mut |samples| {
+                    output.extend_from_slice(samples);
+                    Ok(())
+                })
+                .unwrap()
+            );
+            output
+        };
+        let reference = decode(None);
+        for (start, length) in [(8., 0.25), (9.75, 1.)] {
+            let first = (start * 48000.) as usize;
+            let end = (first + (length * 48000.) as usize).min(reference.len());
+            assert_eq!(decode(Some((start, length))), reference[first..end]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sparse_pipe_accepts_one_whole_frame_of_rounding_before_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let seek = dir.path().join("seek.pcm");
+        let full = dir.path().join("full.pcm");
+        let channels = 4;
+        let frame_bytes = channels * 4;
+        let samples: Vec<i32> = (1..=12).collect();
+        let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let fallback = [99_i32; 8];
+        std::fs::write(&full, 99_i32.to_le_bytes().repeat(fallback.len())).unwrap();
+
+        // The second producer has distinguishable PCM so a fallback, or
+        // delivery of any unvalidated prefix, is observable at the callback.
+        let cat = |path: &Path| {
+            let mut cmd = Command::new("cat");
+            cmd.arg(path).stdout(Stdio::piped()).stderr(Stdio::null());
+            cmd
+        };
+        for (wanted, received, success, expected) in [
+            (2, frame_bytes, true, &samples[..4]),
+            (2, 2 * frame_bytes, true, &samples[..8]),
+            (2, 3 * frame_bytes, true, &samples[..8]),
+            (1, 0, true, &fallback[..]),
+            (3, frame_bytes, true, &fallback[..]),
+            (2, frame_bytes + 4, true, &fallback[..]),
+            (2, 3 * frame_bytes + 1, true, &fallback[..]),
+            (2, 1 << 20, true, &fallback[..]),
+            (2, 2 * frame_bytes, false, &fallback[..]),
+        ] {
+            let mut input = bytes.clone();
+            input.resize(received, 0);
+            std::fs::write(&seek, input).unwrap();
+            let mut candidate = cat(&seek);
+            if !success {
+                candidate.arg(dir.path().join("missing"));
+            }
+            let mut pipe = AudioPipeI32::start(
+                candidate,
+                channels,
+                Some((cat(&full), wanted * frame_bytes)),
+                0.,
+            )
+            .unwrap();
+            let mut got = Vec::new();
+            assert!(
+                pipe.pump(&mut |block| {
+                    got.extend_from_slice(block);
+                    Ok(())
+                })
+                .unwrap()
+            );
+            assert_eq!(
+                got, expected,
+                "wanted {wanted} frames, received {received} bytes, success {success}"
+            );
+        }
     }
 
     #[test]

@@ -76,3 +76,14 @@ pub fn is_supported(path: &Path) -> bool {
         .map(|e| supported_extensions().contains(&e.to_lowercase().as_str()))
         .unwrap_or(false)
 }
+
+/// These pools contain disposable decoder state. After an interrupted pool
+/// update, drop every idle entry before checkout or return.
+fn lock_idle<T: Default>(pool: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    pool.lock().unwrap_or_else(|error| {
+        let mut idle = error.into_inner();
+        *idle = T::default();
+        pool.clear_poison();
+        idle
+    })
+}

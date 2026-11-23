@@ -3,6 +3,7 @@
 //! and the Resolve import script (`script`).
 
 pub mod fcpxml;
+mod lanes;
 pub mod model;
 pub mod otio;
 pub mod premiere;

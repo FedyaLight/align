@@ -1,6 +1,12 @@
 //! Motion curves and enter/exit animations shared by the views.
 
-use super::*;
+use super::settings::QUALITY_MENU_WIDTH;
+use super::{
+    Animation, AnimationExt, ClipId, DROPDOWN_MS, Duration, ExportSelect, IntoElement,
+    ParentElement, SELECTION_CONTROL_CLOSE_MS, SETTINGS_MOTION_MS, SIDEBAR_CLOSE_MS,
+    SettingsSelect, SharedString, Styled, TIMELINE_MOVE_MS, TIMELINE_ROW_H, TimelineTransition,
+    div, px,
+};
 
 /// Strong UI ease-out: cubic-bezier(0.23, 1, 0.32, 1).
 /// Solve the time coordinate before evaluating opacity; input is not the
@@ -52,21 +58,40 @@ pub(super) fn slide_in<E: IntoElement + Styled + 'static>(
     )
 }
 
-pub(super) fn slide_in_from_right<E: IntoElement + Styled + 'static>(
+pub(super) enum SidebarEdge {
+    Left,
+    Right,
+}
+
+pub(super) fn sidebar_reveal<E: IntoElement + Styled + 'static>(
     child: E,
     id: impl Into<gpui::ElementId>,
-    distance: f32,
+    width: f32,
+    edge: SidebarEdge,
     closing: bool,
 ) -> impl IntoElement {
     let reduced = crate::motion::reduced_motion();
+    // Anchor the full panel to the inner edge of the clipped viewport.
+    // With the left panel, shrinking the viewport moves the panel left.
+    let panel = div()
+        .absolute()
+        .top(px(0.))
+        .w(px(width))
+        .h_full()
+        .child(child);
+    let panel = match edge {
+        SidebarEdge::Left => panel.right(px(0.)),
+        SidebarEdge::Right => panel.left(px(0.)),
+    };
     div()
+        .relative()
         .h_full()
         .flex_shrink_0()
         .overflow_hidden()
         // Put the shadow on the animated viewport. A shadow on the panel
         // itself is clipped by this viewport and never reaches the timeline.
         .shadow_md()
-        .child(child)
+        .child(panel)
         .with_animation(
             id,
             entrance(if closing { SIDEBAR_CLOSE_MS } else { 280 }),
@@ -77,7 +102,7 @@ pub(super) fn slide_in_from_right<E: IntoElement + Styled + 'static>(
                 } else {
                     visible
                 };
-                el.w(px(distance * visible))
+                el.w(px(width * visible))
             },
         )
 }
@@ -326,6 +351,11 @@ pub(super) fn selection_control_motion<E: IntoElement + Styled + 'static>(
 #[cfg(test)]
 mod motion_tests {
     use super::*;
+    use crate::views::controls::{ruler_ticks, waveform_columns};
+    use crate::views::{
+        AppData, ExportReveals, ExportTarget, Instant, PROGRESS_MOVE_MS, ProgressMotion,
+        TimelinePose, middle_ellipsis, poses_differ,
+    };
 
     #[test]
     fn entrance_is_bounded_monotonic_and_settles() {
@@ -350,19 +380,19 @@ mod motion_tests {
         assert!(!initial.aaf);
         assert!(!initial.synced_labels);
 
-        data.export_selected.extend([
+        data.export.targets.extend([
             ExportTarget::FinalCutPro,
             ExportTarget::Premiere,
             ExportTarget::Aaf,
         ]);
-        data.export_label_synced = true;
+        data.export.label_synced = true;
         let selected = ExportReveals::new(&data);
         assert!(selected.final_cut && selected.storylines);
         assert!(selected.premiere && selected.aaf);
         assert!(selected.synced_xml && selected.synced_final_cut);
 
-        data.export_fcpxml_timeline = false;
-        data.export_label_synced = false;
+        data.export.fcpxml_timeline = false;
+        data.export.label_synced = false;
         let disabled = ExportReveals::new(&data);
         assert!(!disabled.storylines);
         assert!(!disabled.synced_xml && !disabled.synced_final_cut);

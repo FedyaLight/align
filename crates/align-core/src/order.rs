@@ -11,7 +11,8 @@ use crate::allocator::source_key_for_clip;
 use crate::matcher::PairwiseMatch;
 use crate::model::{Clip, ClipId, ImportedTimeline, MatchEvidence};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ClipOrder {
     #[default]
     Auto,
@@ -25,7 +26,8 @@ pub enum ClipOrder {
 /// Whether clips belonging to one source track may synchronize together.
 /// `Auto` follows imported NLE tracks as Linear and leaves raw media open,
 /// because raw input has no authoritative track assignment.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum TrackContent {
     #[default]
     Auto,
@@ -379,21 +381,16 @@ mod tests {
             source_out: MediaTime::seconds(10.0),
             timeline_start: MediaTime::seconds(start),
             timeline_end: MediaTime::seconds(start + 10.0),
-            playback_rate: 1.0,
-            plays_backward: false,
-            fcp7_time_remap_xml: None,
-            fcp7_filter_xmls: Vec::new(),
-            fcp7_retime_in: None,
-            fcp7_retime_out: None,
-            fcp7_retime_duration: None,
-            fcp7_labels_xml: None,
+            retime: Default::default(),
+
+            fcp7: Default::default(),
+
             audio_source_channel: None,
             fcpxml_audio_role: None,
             track_index,
             audio_track_index: None,
-            enabled: true,
-            track_enabled: true,
-            track_locked: false,
+            flags: Default::default(),
+
             audio_enabled: None,
             audio_track_enabled: None,
             audio_track_locked: None,

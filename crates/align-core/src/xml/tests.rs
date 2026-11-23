@@ -222,20 +222,21 @@ fn fcp7_sequence_summary_and_edits() {
     assert!((a.source_out - 4.16).abs() < 1e-9);
     assert!((a.timeline_start - 0.0).abs() < 1e-9);
     assert_eq!(
-        a.fcp7_labels_xml.as_deref(),
+        a.fcp7.fcp7_labels_xml.as_deref(),
         Some("<labels><label2>Mango</label2></labels>")
     );
     // Retimed clip B keeps its graph: 100% forward.
     let b = draft.edits.iter().find(|e| e.id == "b1").expect("b1");
-    assert!((b.playback_rate - 1.0).abs() < 1e-9);
-    assert!(!b.plays_backward);
+    assert!((b.retime.playback_rate - 1.0).abs() < 1e-9);
+    assert!(!b.retime.plays_backward);
     assert!(
-        b.fcp7_time_remap_xml
+        b.fcp7
+            .fcp7_time_remap_xml
             .as_ref()
             .unwrap()
             .contains("timeremap")
     );
-    assert_eq!(b.fcp7_retime_in, Some(46));
+    assert_eq!(b.fcp7.fcp7_retime_in, Some(46));
     // Portable cross dissolve detected.
     assert_eq!(draft.transitions.len(), 1);
     assert!(draft.transitions[0].is_otio_portable);
@@ -607,13 +608,14 @@ fn reverse_retime_imports_backward_with_negative_otio_scalar() {
     let draft = read_timeline(&xml, None).expect("read");
     assert_eq!(draft.edits.len(), 1);
     let edit = &draft.edits[0];
-    assert!(edit.plays_backward);
-    assert!((edit.playback_rate - 1.0).abs() < 1e-9);
+    assert!(edit.retime.plays_backward);
+    assert!((edit.retime.playback_rate - 1.0).abs() < 1e-9);
     // Same source range as forward playback (no phase guessing).
     assert!((edit.source_in - 0.0).abs() < 1e-9);
     assert!((edit.source_out - 4.0).abs() < 1e-9);
     assert!(
-        edit.fcp7_time_remap_xml
+        edit.fcp7
+            .fcp7_time_remap_xml
             .as_ref()
             .unwrap()
             .contains("timeremap")
@@ -677,11 +679,11 @@ fn premiere_reverse_takes_its_stated_speed() {
     .unwrap();
     let draft = read_timeline(&xml, None).expect("read");
     let edit = &draft.edits[0];
-    assert!(edit.plays_backward);
+    assert!(edit.retime.plays_backward);
     assert!(
-        (edit.playback_rate - 2.0).abs() < 1e-9,
+        (edit.retime.playback_rate - 2.0).abs() < 1e-9,
         "{}",
-        edit.playback_rate
+        edit.retime.playback_rate
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -768,8 +770,8 @@ fn variable_speed_imports_as_average_rate() {
     let draft = read_timeline(&xml, None).expect("read");
     assert_eq!(draft.edits.len(), 1);
     // Average slope (100-0)/(100-0) = 1 → 100% constant.
-    assert!((draft.edits[0].playback_rate - 1.0).abs() < 1e-9);
-    assert!(!draft.edits[0].plays_backward);
+    assert!((draft.edits[0].retime.playback_rate - 1.0).abs() < 1e-9);
+    assert!(!draft.edits[0].retime.plays_backward);
     assert!(
         draft
             .warnings
@@ -832,7 +834,7 @@ fn fcp7_nested_sequence_flattens_with_window_mapping() {
     assert!((v.source_out - 5.0).abs() < 1e-9);
     assert!((v.timeline_start - 0.0).abs() < 1e-9);
     assert!((v.timeline_end - 4.0).abs() < 1e-9);
-    assert!((v.playback_rate - 1.0).abs() < 1e-9);
+    assert!((v.retime.playback_rate - 1.0).abs() < 1e-9);
     assert_eq!(v.track_index, 1);
     let a = draft
         .edits
@@ -1165,22 +1167,17 @@ fn clip_edit_to_window_maps_forward_and_backward() {
         source_out: 20.0,
         timeline_start: 0.0,
         timeline_end: 10.0,
-        playback_rate: 1.0,
-        plays_backward: false,
-        fcp7_time_remap_xml: None,
-        fcp7_filter_xmls: Vec::new(),
-        fcp7_retime_in: None,
-        fcp7_retime_out: None,
-        fcp7_retime_duration: None,
-        fcp7_labels_xml: None,
+        retime: Default::default(),
+
+        fcp7: Default::default(),
+
         time_scale: 1_000_000,
         include_embedded_audio: true,
         audio_source_channel: None,
         fcpxml_audio_role: None,
         track_index: 1,
-        enabled: true,
-        track_enabled: true,
-        track_locked: false,
+        flags: Default::default(),
+
         linked_edit_ids: HashSet::new(),
     };
     let mut fwd = base();
@@ -1192,7 +1189,7 @@ fn clip_edit_to_window_maps_forward_and_backward() {
     let mut outside = base();
     assert!(!clip_edit_to_window(&mut outside, 20.0, 30.0));
     let mut bwd = base();
-    bwd.plays_backward = true;
+    bwd.retime.plays_backward = true;
     assert!(clip_edit_to_window(&mut bwd, 2.0, 5.0));
     // Reversed: timeline 2..5 maps to source 18..15.
     assert!((bwd.source_in - 15.0).abs() < 1e-9);
@@ -1318,9 +1315,9 @@ fn draft_to_otio_timeline(draft: &TimelineDraft) -> crate::export_model::ExportT
         item.source_in = edit.source_in;
         item.source_out = edit.source_out;
         item.timeline_duration = edit.timeline_end - edit.timeline_start;
-        item.playback_rate = edit.playback_rate;
-        item.plays_backward = edit.plays_backward;
-        item.fcp7_time_remap_xml = edit.fcp7_time_remap_xml.clone();
+        item.retime.playback_rate = edit.retime.playback_rate;
+        item.retime.plays_backward = edit.retime.plays_backward;
+        item.fcp7.fcp7_time_remap_xml = edit.fcp7.fcp7_time_remap_xml.clone();
         item.transition_after = draft
             .transitions
             .iter()
@@ -1363,7 +1360,7 @@ fn byte_order_mark_keeps_verbatim_payloads_whole() {
             .unwrap()
             .edits
             .into_iter()
-            .map(|e| (e.id, e.fcp7_time_remap_xml, e.fcp7_labels_xml))
+            .map(|e| (e.id, e.fcp7.fcp7_time_remap_xml, e.fcp7.fcp7_labels_xml))
             .collect::<Vec<_>>()
     };
     let marked_payloads = payloads(&marked);

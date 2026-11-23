@@ -5,6 +5,7 @@
 //! tag. Times are reduced `MediaTime` rationals (`0s`, `100/25s`).
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 use super::model::{ExportIsland, ExportItem, ExportTimeline, xml_text};
@@ -485,15 +486,15 @@ fn write_island(
         std::iter::once((FORMAT_ID.to_string(), frame, (width, height)))
             .chain(library.formats.iter().cloned())
     {
-        xml += &format!(
-            "    <format id=\"{id}\" frameDuration=\"{}\" width=\"{width}\" height=\"{height}\"/>\n",
+        writeln!(
+            xml,
+            "    <format id=\"{id}\" frameDuration=\"{}\" width=\"{width}\" height=\"{height}\"/>",
             xml_text::fcpxml_time(duration)
-        );
+        )
+        .unwrap();
     }
-    xml += &format!(
-        "    <format id=\"{SEQUENCE_FORMAT_ID}\" frameDuration=\"{}\" width=\"{width}\" height=\"{height}\" colorSpace=\"1-1-1 (Rec. 709)\"/>\n",
-        xml_text::fcpxml_time(frame)
-    );
+    writeln!(xml, "    <format id=\"{SEQUENCE_FORMAT_ID}\" frameDuration=\"{}\" width=\"{width}\" height=\"{height}\" colorSpace=\"1-1-1 (Rec. 709)\"/>",
+        xml_text::fcpxml_time(frame)).unwrap();
     xml += &assets;
     if options.multicam {
         xml += &library.multicam_xml(island);
@@ -513,23 +514,23 @@ fn write_island(
     );
     let name = xml_text::escape(&timeline.name);
     xml += "  <library>\n";
-    xml += &format!("    <event name=\"{name}\">\n");
+    writeln!(xml, "    <event name=\"{name}\">").unwrap();
     if let Some(bins) = &bins {
         xml += &library.browser_xml(bins);
     }
     if options.timeline {
-        xml += &format!("      <project name=\"{name} – synced\">\n{sequence}");
-        xml += &format!(
-            "          <spine>\n            <gap offset=\"{sequence_start}\" duration=\"{total_duration}\" name=\"Master\">\n"
-        );
+        write!(xml, "      <project name=\"{name} – synced\">\n{sequence}").unwrap();
+        writeln!(xml, "          <spine>\n            <gap offset=\"{sequence_start}\" duration=\"{total_duration}\" name=\"Master\">").unwrap();
         xml += &library.synced_clips_xml(island, options.group_storylines);
         xml += "            </gap>\n          </spine>\n        </sequence>\n      </project>\n";
     }
     if options.multicam {
-        xml += &format!("      <project name=\"{name} – multicam\">\n{sequence}");
-        xml += &format!(
-            "          <spine>\n            <mc-clip name=\"{name} – Multicam\" ref=\"{MULTICAM_ID}\" offset=\"{sequence_start}\" duration=\"{total_duration}\"/>\n          </spine>\n        </sequence>\n      </project>\n"
-        );
+        write!(
+            xml,
+            "      <project name=\"{name} – multicam\">\n{sequence}"
+        )
+        .unwrap();
+        writeln!(xml, "          <spine>\n            <mc-clip name=\"{name} – Multicam\" ref=\"{MULTICAM_ID}\" offset=\"{sequence_start}\" duration=\"{total_duration}\"/>\n          </spine>\n        </sequence>\n      </project>").unwrap();
     }
     xml += "    </event>\n  </library>\n</fcpxml>\n";
     xml
@@ -603,15 +604,17 @@ impl Library<'_> {
         let format = clip.video.as_ref().map(|video| self.format_id(video));
         if let Some(format) = &format {
             let has_audio = audio.is_some();
-            xml += &format!(
+            write!(
+                xml,
                 " format=\"{format}\" hasVideo=\"1\" hasAudio=\"{}\"",
                 u8::from(has_audio)
-            );
+            )
+            .unwrap();
             if has_audio {
                 xml += &audio_attributes;
             }
         } else {
-            xml += &format!(" hasAudio=\"1\"{audio_attributes}");
+            write!(xml, " hasAudio=\"1\"{audio_attributes}").unwrap();
         }
         xml +=
             &format!(">\n      <media-rep kind=\"original-media\" src=\"{src}\"/>\n    </asset>\n");
@@ -668,16 +671,16 @@ impl Library<'_> {
                 .format
                 .as_ref()
                 .map_or_else(String::new, |format| format!(" format=\"{format}\""));
-            xml += &format!(
-                "      <asset-clip name=\"{name}\" ref=\"{id}\" start=\"{start}\" duration=\"{duration}\"{format}>\n        <keyword start=\"{start}\" duration=\"{duration}\" value=\"{}\"/>\n      </asset-clip>\n",
-                keyword_value(keyword)
-            );
+            writeln!(xml, "      <asset-clip name=\"{name}\" ref=\"{id}\" start=\"{start}\" duration=\"{duration}\"{format}>\n        <keyword start=\"{start}\" duration=\"{duration}\" value=\"{}\"/>\n      </asset-clip>",
+                keyword_value(keyword)).unwrap();
         }
         for keyword in keywords {
-            xml += &format!(
-                "      <keyword-collection name=\"{}\"/>\n",
+            writeln!(
+                xml,
+                "      <keyword-collection name=\"{}\"/>",
                 keyword_value(keyword)
-            );
+            )
+            .unwrap();
         }
         xml
     }
@@ -709,10 +712,12 @@ impl Library<'_> {
             let mut items = angle_groups[key].clone();
             items.sort_by(|a, b| a.start.total_cmp(&b.start));
             let angle_name = xml_text::escape(&angle_name(key, &items));
-            xml += &format!(
-                "        <mc-angle name=\"{angle_name}\" angleID=\"a{}\">\n",
+            writeln!(
+                xml,
+                "        <mc-angle name=\"{angle_name}\" angleID=\"a{}\">",
                 angle_index + 1
-            );
+            )
+            .unwrap();
             let mut clips = Vec::new();
             for item in items {
                 let side = if item.clip.video.is_some() {
@@ -1552,7 +1557,7 @@ mod tests {
         // The recorder alone, as an asset clip; no camera sound.
         assert_eq!(xml.matches("<audio ref=").count(), 0, "{xml}");
         assert_eq!(xml.matches("<asset-clip lane=").count(), 1, "{xml}");
-        timeline.islands[0].clips[0].enabled = false;
+        timeline.islands[0].clips[0].flags.enabled = false;
         let xml = write(&timeline, FcpxmlOptions::TIMELINE);
         assert!(xml.contains("enabled=\"0\""));
         assert_eq!(xml.matches("<video ref=").count(), 1);
@@ -1561,7 +1566,7 @@ mod tests {
     #[test]
     fn fcpxml_preserves_disabled_clip_state() {
         let mut timeline = fixture_timeline();
-        timeline.islands[0].clips[0].enabled = false;
+        timeline.islands[0].clips[0].flags.enabled = false;
         let xml = write(&timeline, FcpxmlOptions::TIMELINE);
         assert!(xml.contains("enabled=\"0\""));
     }

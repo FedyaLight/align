@@ -7,6 +7,12 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Size one pipeline phase against the OS CPU allowance and its I/O or
+/// memory limit. Query per phase so a changed CPU quota takes effect.
+pub fn worker_limit(cap: usize) -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get().min(cap.max(1)))
+}
+
 pub fn par_map<T, R, F>(items: &[T], limit: usize, f: F) -> Vec<R>
 where
     T: Send + Sync,
@@ -18,6 +24,9 @@ where
         return Vec::new();
     }
     let workers = limit.max(1).min(n);
+    if workers == 1 {
+        return items.iter().map(f).collect();
+    }
     let next = AtomicUsize::new(0);
     // Each slot is written exactly once, by whichever worker claims its
     // index; the lock guards only the instant of the store, so it cannot

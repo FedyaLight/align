@@ -8,19 +8,18 @@ use align_core::{
     AudioAnalysisSource, Clip, ClipId, ClipOrder, MatchPreview, MatchThreshold, MediaKind,
     SyncResult, TemporalMode, TrackContent, model::file_name,
 };
-use align_decode::export::ExportArtifact;
+use align_decode::export::{ExportArtifact, ExportError};
 use align_decode::pipeline::{Phase, Pipeline};
 use futures::StreamExt;
 use gpui::{
     AnchoredPositionMode, Animation, AnimationExt, AnyView, App, BoxShadow, ClickEvent,
     ClipboardItem, Context, Corner, Div, DragMoveEvent, Entity, FocusHandle, Focusable,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, OwnedMenu,
-    OwnedMenuItem, ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollHandle,
-    SharedString, Stateful, Styled, Window, anchored, deferred, div, img, point, prelude::*, px,
-    rgb, rgba,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
+    PathPromptOptions, Pixels, Point, Render, ScrollHandle, SharedString, Stateful, Styled, Window,
+    anchored, deferred, div, img, point, prelude::*, px, rgb, rgba,
 };
 
-use crate::icons::{icons, kind_badge, svg_icon};
+use crate::icons::{kind_badge, svg_icon};
 use crate::lane::CorrectionOption;
 use crate::state::{
     AppData, ClipState, ExportTarget, MenuTarget, Operation, SequenceDefaults, SequencePicker,
@@ -34,25 +33,18 @@ use crate::{MinimizeWindow, ToggleFullscreen, ZoomWindow};
 mod animation;
 mod controls;
 mod export;
+mod menu_sidebar;
 mod menus;
 mod operation;
 mod panels;
+mod projects;
 mod root;
 mod settings;
 mod sources;
 mod timeline;
 mod toolbar;
 
-use animation::*;
-use controls::*;
-use export::*;
-use menus::*;
-use operation::*;
-use panels::*;
-use settings::*;
-use sources::*;
-use timeline::*;
-use toolbar::*;
+use animation::motion_ease;
 
 // ------------------------------------------------------------ messages
 
@@ -62,7 +54,12 @@ enum SyncMsg {
         sequence_count: usize,
     },
     Progress(Box<SyncProgress>),
-    Done(Box<Result<Vec<SyncResult>, String>>),
+    Done(Box<Result<SyncOutput, String>>),
+}
+
+struct SyncOutput {
+    results: Vec<SyncResult>,
+    placements: std::sync::Arc<crate::project::Placements>,
 }
 
 struct SyncProgress {
@@ -78,8 +75,14 @@ struct SyncProgress {
 }
 
 enum ExportMsg {
-    Progress { label: String, fraction: f32 },
-    Done(Result<Vec<ExportArtifact>, String>),
+    Progress {
+        label: String,
+        fraction: f32,
+    },
+    Done {
+        directory: PathBuf,
+        result: Result<Vec<ExportArtifact>, ExportError>,
+    },
 }
 
 enum PathRepairMsg {
@@ -287,24 +290,24 @@ fn middle_ellipsis(value: &str, max_chars: usize) -> String {
 
 impl ExportReveals {
     fn new(data: &AppData) -> Self {
-        let final_cut = data.export_selected.contains(&ExportTarget::FinalCutPro);
-        let xml = data.export_selected.contains(&ExportTarget::Premiere)
-            || data.export_selected.contains(&ExportTarget::ResolveXml);
+        let final_cut = data.export.targets.contains(&ExportTarget::FinalCutPro);
+        let xml = data.export.targets.contains(&ExportTarget::Premiere)
+            || data.export.targets.contains(&ExportTarget::ResolveXml);
         let unmatched_kept = data.unmatched_count() > 0
-            && data.export_unmatched != align_core::export_model::UnmatchedPlacement::Remove;
+            && data.export.unmatched != align_core::export_model::UnmatchedPlacement::Remove;
         Self {
             final_cut,
-            storylines: final_cut && data.export_fcpxml_timeline,
-            premiere: data.export_selected.contains(&ExportTarget::Premiere),
-            aaf: data.export_selected.contains(&ExportTarget::Aaf),
+            storylines: final_cut && data.export.fcpxml_timeline,
+            premiere: data.export.targets.contains(&ExportTarget::Premiere),
+            aaf: data.export.targets.contains(&ExportTarget::Aaf),
             unmatched_kept,
             unmatched_label_control: unmatched_kept,
-            synced_labels: data.export_label_synced,
-            synced_xml: data.export_label_synced && xml,
-            synced_final_cut: data.export_label_synced && final_cut,
-            unmatched_labels: unmatched_kept && data.export_label_unmatched,
-            unmatched_xml: unmatched_kept && data.export_label_unmatched && xml,
-            unmatched_final_cut: unmatched_kept && data.export_label_unmatched && final_cut,
+            synced_labels: data.export.label_synced,
+            synced_xml: data.export.label_synced && xml,
+            synced_final_cut: data.export.label_synced && final_cut,
+            unmatched_labels: unmatched_kept && data.export.label_unmatched,
+            unmatched_xml: unmatched_kept && data.export.label_unmatched && xml,
+            unmatched_final_cut: unmatched_kept && data.export.label_unmatched && final_cut,
         }
     }
 
@@ -480,11 +483,14 @@ impl Exit {
 
 pub struct AlignApp {
     pub(crate) data: AppData,
+    projects: projects::Projects,
     pub(crate) focus_handle: FocusHandle,
     export_inputs: ExportInputs,
     path_fixer_inputs: PathFixerInputs,
     pan_origin: Option<Point<Pixels>>,
-    app_menu_position: Option<Point<Pixels>>,
+    app_menu: Option<menu_sidebar::AppMenuPage>,
+    app_menu_select: Option<menu_sidebar::AppMenuSelect>,
+    app_menu_exit: Exit,
     export_scroll: ScrollHandle,
     export_scroll_drag: Option<(f32, f32)>,
     export_sidebar_exit: Exit,
@@ -519,14 +525,25 @@ impl Focusable for AlignApp {
 }
 
 impl AlignApp {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub(crate) fn project_busy(&self) -> bool {
+        self.projects.busy
+    }
+
+    pub fn new(
+        projects: crate::project::Preferences,
+        writer: crate::project::Writer,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let app = Self {
             data: AppData::new(),
+            projects: projects::Projects::new(projects, writer),
             focus_handle: cx.focus_handle(),
             export_inputs: ExportInputs::new(cx),
             path_fixer_inputs: PathFixerInputs::new(cx),
             pan_origin: None,
-            app_menu_position: None,
+            app_menu: None,
+            app_menu_select: None,
+            app_menu_exit: Exit::default(),
             export_scroll: ScrollHandle::new(),
             export_scroll_drag: None,
             export_sidebar_exit: Exit::default(),
@@ -560,11 +577,17 @@ impl AlignApp {
     /// Clear the session, or remove the selected sources. A cleared session
     /// starts the next job from the export defaults.
     pub(crate) fn delete_or_clear(&mut self, cx: &mut Context<Self>) {
+        if self.projects.busy {
+            return;
+        }
         let clearing = self.data.selection.is_empty();
         self.data.delete_or_clear();
         if clearing {
+            self.projects.clear();
             self.export_inputs
                 .set_labels(&self.data.export_baseline().labels, cx);
+        } else {
+            self.project_changed(cx);
         }
         cx.notify();
     }
@@ -598,6 +621,47 @@ impl AlignApp {
         cx.notify();
     }
 
+    pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if self.projects.busy {
+            return;
+        }
+        if let Some(project) = paths.iter().find(|path| crate::project::is_project(path)) {
+            self.open_project(project.clone(), cx);
+            return;
+        }
+        let paths = self.data.begin_import(
+            paths
+                .into_iter()
+                .filter_map(|path| std::path::absolute(path).ok())
+                .collect(),
+        );
+        if paths.is_empty() {
+            return;
+        }
+        let token = self.data.import_cancel.clone();
+        let cancel = token.clone();
+        let task = cx.background_executor().spawn(async move {
+            paths
+                .into_iter()
+                .take_while(|_| !cancel.load(std::sync::atomic::Ordering::Relaxed))
+                .map(|path| crate::state::InputPath::inspect(path, &cancel))
+                .collect()
+        });
+        cx.spawn(async move |view, cx| {
+            let inputs = task.await;
+            let _ = view.update(cx, |this, cx| {
+                let count = this.data.inputs.len();
+                this.data.finish_import(&token, inputs);
+                if count != this.data.inputs.len() {
+                    this.project_changed(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     pub(crate) fn add_media(&mut self, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -605,13 +669,17 @@ impl AlignApp {
             multiple: true,
             prompt: None,
         });
+        let generation = self.data.generation;
         let view = cx.entity();
         cx.spawn(async move |_, cx| {
             let Ok(Ok(Some(paths))) = receiver.await else {
                 return;
             };
             let _ = view.update(cx, |this, cx| {
-                this.data.add_paths(paths);
+                if this.projects.busy || this.data.generation != generation {
+                    return;
+                }
+                this.add_paths(paths, cx);
                 cx.notify();
             });
         })
@@ -723,7 +791,6 @@ impl AlignApp {
         match prepared {
             #[cfg(windows)]
             updater::Prepared::Velopack { manager, asset } => {
-                crate::icons::cleanup();
                 align_decode::media_assets::cleanup();
                 if let Err(error) = manager.apply_updates_and_restart(&asset) {
                     eprintln!("Could not install the Align update: {error}");
@@ -750,7 +817,6 @@ impl AlignApp {
                     let result = rx.await.unwrap_or_else(|_| Err("cancelled".into()));
                     let _ = view.update(cx, |this, cx| match result {
                         Ok(()) => {
-                            crate::icons::cleanup();
                             align_decode::media_assets::cleanup();
                             cx.quit();
                         }
@@ -767,6 +833,9 @@ impl AlignApp {
     }
 
     pub(crate) fn start_sync(&mut self, cx: &mut Context<Self>) {
+        if self.projects.busy {
+            return;
+        }
         self.search_quality_exit.cancel();
         self.clear_export_select();
         self.clear_settings_select();
@@ -780,8 +849,10 @@ impl AlignApp {
         }
         cx.notify();
 
+        let save = self.checkpoint_before_sync(cx);
         let generation = self.data.generation;
         let cancel = self.data.cancel.clone();
+        let timelines = self.data.timeline_inputs.clone();
         let input_sets = self.data.pipeline_input_sets();
         let run_settings: Vec<_> = (0..input_sets.len())
             .map(|position| {
@@ -796,6 +867,15 @@ impl AlignApp {
             .collect();
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<SyncMsg>();
         std::thread::spawn(move || {
+            // The recovery file must reach disk before reading any media.
+            if let Some(save) = save {
+                let _ = futures::executor::block_on(save);
+            }
+            let mut revisions = crate::project::Revisions::new();
+            for path in timelines {
+                crate::project::record_revision(&mut revisions, &path);
+            }
+            let revisions = std::sync::Mutex::new(revisions);
             let pipeline = Pipeline::default_backend();
             let sequence_count = input_sets.len();
             let mut results = Vec::with_capacity(sequence_count);
@@ -807,6 +887,12 @@ impl AlignApp {
                     sequence_count,
                 });
                 let progress = |mut p: align_decode::pipeline::PipelineProgress| {
+                    if p.phase == Phase::Inspect
+                        && p.discovered.is_none()
+                        && let Some(path) = &p.current
+                    {
+                        crate::project::record_revision(&mut revisions.lock().unwrap(), path);
+                    }
                     if targets.is_some() {
                         p.discovered = None;
                         if matches!(p.phase, Phase::Inspect | Phase::Fingerprint)
@@ -844,7 +930,14 @@ impl AlignApp {
                     }
                 }
             }
-            let _ = tx.unbounded_send(SyncMsg::Done(Box::new(Ok(results))));
+            let placements = std::sync::Arc::new(crate::project::Placements::from_run(
+                &results,
+                revisions.into_inner().unwrap(),
+            ));
+            let _ = tx.unbounded_send(SyncMsg::Done(Box::new(Ok(SyncOutput {
+                results,
+                placements,
+            }))));
         });
         let view = cx.entity();
         cx.spawn(async move |_, cx| {
@@ -859,6 +952,9 @@ impl AlignApp {
                 let _ = view.update(cx, |this, cx| {
                     if this.data.generation == generation {
                         this.apply_sync_msgs(batch);
+                        if finished {
+                            this.project_changed(cx);
+                        }
                         cx.notify();
                     }
                 });
@@ -873,20 +969,32 @@ impl AlignApp {
     fn choose_missing_media(&mut self, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
-            directories: false,
+            directories: self.data.has_missing_source_folder(),
             multiple: true,
             prompt: None,
         });
+        let generation = self.data.generation;
         let view = cx.entity();
         cx.spawn(async move |_, cx| {
             let Ok(Ok(Some(paths))) = receiver.await else {
                 return;
             };
             let _ = view.update(cx, |this, cx| {
-                if this.data.add_manual_relinks(paths) == 0 {
+                if this.projects.busy || this.data.generation != generation {
+                    return;
+                }
+                if this.data.add_manual_relinks(
+                    paths
+                        .into_iter()
+                        .filter_map(|path| std::path::absolute(path).ok())
+                        .collect(),
+                ) == 0
+                {
                     return;
                 }
                 this.data.show_warning_details = false;
+                this.data.mark_sync_dirty();
+                this.project_changed(cx);
                 this.start_sync(cx);
             });
         })
@@ -1029,7 +1137,10 @@ impl AlignApp {
                 }
             }
             SyncMsg::Done(boxed) => match *boxed {
-                Ok(results) => self.data.apply_results(results),
+                Ok(output) => {
+                    self.projects.placements = Some(output.placements);
+                    self.data.apply_results(output.results);
+                }
                 Err(error) => {
                     if error == "Cancelled." {
                         self.data.restore_after_sync_cancel();
@@ -1044,8 +1155,16 @@ impl AlignApp {
     }
 
     pub(crate) fn start_export_sheet(&mut self, cx: &mut Context<Self>) {
-        if !self.data.can_export() {
+        if self.projects.busy || !self.data.can_export() {
             return;
+        }
+        if self
+            .data
+            .export_dir
+            .as_ref()
+            .is_none_or(|path| align_decode::export::check_export_directory(path).is_err())
+        {
+            self.data.export_dir = crate::settings::last_export_directory(&crate::settings::file());
         }
         self.data.show_export = true;
         self.export_sidebar_exit.cancel();
@@ -1141,6 +1260,7 @@ impl AlignApp {
         let is_dirty = self.data.common_settings != self.settings_initial_common
             || self.data.current_sequence_settings() != self.settings_initial_sequence;
         self.data.settings_changed = is_dirty;
+        self.project_changed(cx);
         let is_default = self.data.scoped_settings_are_default();
         let buttons = &mut self.settings_buttons;
         let token = buttons.restart();
@@ -1265,7 +1385,7 @@ impl AlignApp {
         update(&mut self.data);
         let select_is_available = match self.export_select {
             Some(ExportSelect::AafFrameRate) => {
-                self.data.export_selected.contains(&ExportTarget::Aaf)
+                self.data.export.targets.contains(&ExportTarget::Aaf)
             }
             Some(ExportSelect::UnmatchedPlacement) => self.data.unmatched_count() > 0,
             None => true,
@@ -1411,11 +1531,19 @@ impl AlignApp {
         cx.notify();
     }
 
-    fn apply_path_fixer_settings(&mut self, cx: &App) {
+    fn apply_path_fixer_settings(&mut self, cx: &mut Context<Self>) {
+        let previous_omits = self.data.omit_extensions.clone();
+        let previous_proxy_choice = self.data.prefer_proxies;
         let omitted = self.path_fixer_inputs.omit_extensions.read(cx).text();
         self.data.set_omit_extensions(&omitted);
         self.data.prefer_proxies = self.data.path_fixer_prefer_proxies;
         self.data.save_path_redirections();
+        if previous_omits != self.data.omit_extensions
+            || previous_proxy_choice != self.data.prefer_proxies
+        {
+            self.data.mark_sync_dirty();
+            self.project_changed(cx);
+        }
     }
 
     fn save_fixed_project_copy(&mut self, cx: &mut Context<Self>) {
@@ -1539,6 +1667,7 @@ impl AlignApp {
             prompt: None,
         });
         let view = cx.entity();
+        let generation = self.data.generation;
         cx.spawn(async move |_, cx| {
             let Ok(Ok(Some(mut paths))) = receiver.await else {
                 return;
@@ -1547,6 +1676,12 @@ impl AlignApp {
                 return;
             };
             let _ = view.update(cx, |this, cx| {
+                if this.data.generation != generation
+                    || !this.data.show_export
+                    || this.data.has_active_job()
+                {
+                    return;
+                }
                 this.data.export_dir = Some(dir);
                 cx.notify();
             });
@@ -1559,7 +1694,7 @@ impl AlignApp {
         else {
             return;
         };
-        if !self.data.can_begin_export() {
+        if self.projects.busy || !self.data.can_begin_export() {
             return;
         }
         let Some(result) = self.data.result.clone() else {
@@ -1582,25 +1717,25 @@ impl AlignApp {
         let mut timelines = Vec::with_capacity(result_count);
         for (index, result) in results.iter().enumerate() {
             let options = ExportAssemblyOptions {
-                unmatched: self.data.export_unmatched,
-                apply_estimated_placements: self.data.export_apply_estimates,
-                prevent_group_overlaps: self.data.export_prevent_overlaps,
-                disable_unmatched: self.data.export_disable_unmatched,
-                label_synced: self.data.export_label_synced,
-                label_unmatched: self.data.export_label_unmatched,
+                unmatched: self.data.export.unmatched,
+                apply_estimated_placements: self.data.export.apply_estimated_placements,
+                prevent_group_overlaps: self.data.export.prevent_group_overlaps,
+                disable_unmatched: self.data.export.disable_unmatched,
+                label_synced: self.data.export.label_synced,
+                label_unmatched: self.data.export.label_unmatched,
                 cut_remove: CutRemoveOptions {
-                    common_gaps: self.data.export_cut_common_gaps,
-                    lone_recorder: self.data.export_cut_lone_recorder,
-                    shorter_than: self.data.export_cut_shorter_than,
-                    trim_starts: self.data.export_trim_starts,
-                    trim_ends: self.data.export_trim_ends,
+                    common_gaps: self.data.export.cut_common_gaps,
+                    lone_recorder: self.data.export.cut_lone_recorder,
+                    shorter_than: self.data.export.cut_shorter_than,
+                    trim_starts: self.data.export.trim_starts,
+                    trim_ends: self.data.export.trim_ends,
                 },
                 synced_symbol: synced_symbol.clone(),
-                synced_symbol_suffix: self.data.export_synced_symbol_suffix,
+                synced_symbol_suffix: self.data.export.synced_symbol_suffix,
                 synced_color: synced_color.clone(),
                 synced_role: synced_role.clone(),
                 unmatched_symbol: unmatched_symbol.clone(),
-                unmatched_symbol_suffix: self.data.export_unmatched_symbol_suffix,
+                unmatched_symbol_suffix: self.data.export.unmatched_symbol_suffix,
                 unmatched_color: unmatched_color.clone(),
                 unmatched_role: unmatched_role.clone(),
                 sequence_name: sequence_name.as_ref().map(|name| {
@@ -1619,12 +1754,13 @@ impl AlignApp {
             timelines.push(timeline);
         }
         self.data.operation = Operation::Exporting;
+        self.data.cancel = Default::default();
         self.data.progress = 0.0;
         self.data.export_started = true;
         self.data.error = None;
-        self.data.status = if self.data.export_drift && self.data.has_drift() {
+        self.data.status = if self.data.export.correct_drift && self.data.has_drift() {
             "Preparing drift-corrected audio…".to_string()
-        } else if self.data.export_media {
+        } else if self.data.export.media_files {
             "Exporting clean-audio video…".to_string()
         } else if timelines.len() > 1 {
             format!("Writing {} sequences…", timelines.len())
@@ -1635,14 +1771,14 @@ impl AlignApp {
 
         let generation = self.data.generation;
         let cancel = self.data.cancel.clone();
-        let drift = self.data.export_drift;
-        let replaced = self.data.export_replaced;
-        let media_bins = self.data.export_media_bins;
-        let storylines = self.data.export_storylines;
-        let fcpxml_timeline = self.data.export_fcpxml_timeline;
-        let fcpxml_multicam = self.data.export_fcpxml_multicam;
-        let aaf_frame_duration = self.data.export_aaf_frame_duration;
-        let media = self.data.export_media;
+        let drift = self.data.export.correct_drift;
+        let replaced = self.data.export.replaced_sequence;
+        let media_bins = self.data.export.media_bins;
+        let storylines = self.data.export.fcpxml_storylines;
+        let fcpxml_timeline = self.data.export.fcpxml_timeline;
+        let fcpxml_multicam = self.data.export.fcpxml_multicam;
+        let aaf_frame_duration = self.data.export.aaf_frame_duration;
+        let media = self.data.export.media_files;
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<ExportMsg>();
         std::thread::spawn(move || {
             let pipeline = Pipeline::default_backend();
@@ -1677,7 +1813,7 @@ impl AlignApp {
                     ..Default::default()
                 },
             };
-            let out = align_decode::export::export_prepared_many(
+            let result = align_decode::export::export_prepared_many_new(
                 align_decode::export::ExportBatchRequest {
                     backend: pipeline.backend(),
                     timelines: &timelines,
@@ -1687,12 +1823,15 @@ impl AlignApp {
                 },
                 Some(&mut progress),
             );
-            let _ = tx.unbounded_send(ExportMsg::Done(out.map_err(|e| e.to_string())));
+            let _ = tx.unbounded_send(ExportMsg::Done {
+                directory: dir,
+                result,
+            });
         });
         let view = cx.entity();
         cx.spawn(async move |_, cx| {
             while let Some(msg) = rx.next().await {
-                let finished = matches!(msg, ExportMsg::Done(_));
+                let finished = matches!(msg, ExportMsg::Done { .. });
                 let _ = view.update(cx, |this, cx| {
                     if this.data.generation == generation {
                         this.apply_export_msg(msg);
@@ -1713,26 +1852,48 @@ impl AlignApp {
                 self.data.status = label;
                 self.data.progress = fraction;
             }
-            ExportMsg::Done(Ok(artifacts)) => {
+            ExportMsg::Done {
+                directory,
+                result: Ok(artifacts),
+            } => {
+                if !artifacts.is_empty()
+                    && let Err(error) = crate::settings::remember_export_directory(
+                        &crate::settings::file(),
+                        &directory,
+                    )
+                {
+                    eprintln!("Could not remember the export folder: {error}");
+                }
                 self.data.exported_files = artifacts.iter().map(|a| a.url.clone()).collect();
                 self.data.operation = Operation::Exported;
                 self.data.progress = 1.0;
                 self.data.status = "Export complete.".to_string();
             }
-            ExportMsg::Done(Err(error)) => {
-                if error == "Cancelled." {
-                    self.data.operation = Operation::Ready;
-                    self.data.status = "Export cancelled.".to_string();
-                } else {
-                    self.data.operation = Operation::Ready;
-                    self.data.error = Some(error);
-                    self.data.status = "Export failed.".to_string();
+            ExportMsg::Done {
+                result: Err(error), ..
+            } => {
+                self.data.operation = Operation::Ready;
+                self.data.export_started = false;
+                match error {
+                    ExportError::Cancelled => self.data.status = "Export cancelled.".to_string(),
+                    _ => {
+                        if matches!(error, ExportError::DestinationUnavailable { .. }) {
+                            self.data.export_dir = None;
+                        }
+                        self.data.error = Some(error.to_string());
+                        self.data.status = "Export failed.".to_string();
+                    }
                 }
             }
         }
     }
 
     fn cancel_current(&mut self, cx: &mut Context<Self>) {
+        if self.data.importing() {
+            self.data.cancel_import();
+            cx.notify();
+            return;
+        }
         self.data
             .cancel
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1744,6 +1905,8 @@ impl AlignApp {
     fn find_another(&mut self, target: &CorrectionOption, cx: &mut Context<Self>) {
         if self.data.reject_alignment(target) {
             self.data.menu = None;
+            self.data.mark_sync_dirty();
+            self.project_changed(cx);
             self.start_sync(cx);
         }
     }
@@ -1751,75 +1914,27 @@ impl AlignApp {
     fn reject_pair(&mut self, target: &CorrectionOption, cx: &mut Context<Self>) {
         if self.data.reject_pair(target) {
             self.data.menu = None;
+            self.data.mark_sync_dirty();
+            self.project_changed(cx);
             self.start_sync(cx);
         }
     }
 
-    fn set_stream_source(&mut self, source: Option<AudioAnalysisSource>, cx: &mut Context<Self>) {
-        let lane_id = self.data.menu.clone().and_then(|m| m.lane_id.clone());
-        let changed = match lane_id {
-            Some(id) => self.data.set_analysis_source(source, &id),
-            None => false,
-        };
-        if changed {
+    fn set_lane_option<T>(
+        &mut self,
+        update: fn(&mut AppData, T, &str) -> bool,
+        value: T,
+        cx: &mut Context<Self>,
+    ) {
+        let lane_id = self
+            .data
+            .menu
+            .as_ref()
+            .and_then(|menu| menu.lane_id.clone());
+        if lane_id.is_some_and(|id| update(&mut self.data, value, &id)) {
             self.data.menu = None;
-            self.start_sync(cx);
-        }
-    }
-
-    fn set_temporal_mode(&mut self, mode: Option<TemporalMode>, cx: &mut Context<Self>) {
-        let lane_id = self.data.menu.clone().and_then(|m| m.lane_id.clone());
-        let changed = match lane_id {
-            Some(id) => self.data.set_temporal_mode(mode, &id),
-            None => false,
-        };
-        if changed {
-            self.data.menu = None;
-            self.start_sync(cx);
-        }
-    }
-
-    fn set_match_threshold(&mut self, threshold: Option<MatchThreshold>, cx: &mut Context<Self>) {
-        let lane_id = self.data.menu.clone().and_then(|m| m.lane_id.clone());
-        let changed = match lane_id {
-            Some(id) => self.data.set_match_threshold(threshold, &id),
-            None => false,
-        };
-        if changed {
-            self.data.menu = None;
-            self.start_sync(cx);
-        }
-    }
-
-    fn set_clip_order(&mut self, mode: Option<ClipOrder>, cx: &mut Context<Self>) {
-        let lane_id = self.data.menu.clone().and_then(|m| m.lane_id.clone());
-        let changed = match lane_id {
-            Some(id) => self.data.set_clip_order(mode, &id),
-            None => false,
-        };
-        if changed {
-            self.data.menu = None;
-            self.start_sync(cx);
-        }
-    }
-
-    fn set_track_content(&mut self, mode: Option<TrackContent>, cx: &mut Context<Self>) {
-        let lane_id = self.data.menu.clone().and_then(|m| m.lane_id.clone());
-        let changed = match lane_id {
-            Some(id) => self.data.set_track_content(mode, &id),
-            None => false,
-        };
-        if changed {
-            self.data.menu = None;
-            self.start_sync(cx);
-        }
-    }
-
-    fn set_preserve_editing(&mut self, preserve: bool, cx: &mut Context<Self>) {
-        let lane_id = self.data.menu.clone().and_then(|menu| menu.lane_id);
-        let changed = lane_id.is_some_and(|id| self.data.set_preserve_editing(preserve, &id));
-        if changed {
-            self.data.menu = None;
+            self.data.mark_sync_dirty();
+            self.project_changed(cx);
             self.start_sync(cx);
         }
     }

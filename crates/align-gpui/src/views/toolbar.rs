@@ -1,113 +1,16 @@
 //! Top toolbar: sources, synchronization, and export.
 
-use super::*;
+use super::animation::{export_button_entrance, quality_dropdown_motion, quality_shift_for_export};
+use super::controls::{icon_button, prominent_button};
+use super::menu_sidebar::app_menu_button;
+use super::settings::{search_quality_button, search_quality_menu};
+use super::timeline::zoom_slider;
+use super::{
+    AlignApp, AnchoredPositionMode, Context, Div, Operation, ParentElement, Styled, Theme,
+    anchored, deferred, div, point, px, rgb,
+};
 
 // ---------------- top toolbar (sources / sync / export)
-
-pub(super) fn app_menu_button(
-    cx: &mut Context<AlignApp>,
-    theme: &Theme,
-    active: bool,
-) -> impl IntoElement {
-    button(
-        cx,
-        theme,
-        "btn-app-menu",
-        div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .child("Menu")
-            .child(svg_icon(icons().chevron_down.clone(), 12., theme.icon)),
-        active,
-        |this, event, window, cx| {
-            this.data.menu = None;
-            this.app_menu_position = Some(event.position() + point(px(0.), px(12.)));
-            this.focus_handle.focus(window);
-            cx.notify();
-            cx.stop_propagation();
-        },
-    )
-}
-
-pub(super) fn app_menu_panel(
-    cx: &mut Context<AlignApp>,
-    theme: &Theme,
-    window: &Window,
-) -> Stateful<Div> {
-    let menus = crate::app_menu::in_window_menus(cx.get_menus().unwrap_or_default());
-    let mut panel = div()
-        .id("app-menu")
-        .flex()
-        .flex_col()
-        .p_1()
-        .min_w(px(260.))
-        .max_h(px(
-            (f32::from(window.viewport_size().height) - 32.).clamp(100., 560.)
-        ))
-        .overflow_y_scroll()
-        .rounded_lg()
-        .border_1()
-        .border_color(rgb(theme.border))
-        .bg(rgb(theme.panel))
-        .shadow_md()
-        .occlude()
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-        .on_scroll_wheel(|_, _, cx| cx.stop_propagation());
-    for menu in menus {
-        panel = append_app_menu(cx, theme, panel, menu, String::new());
-    }
-    panel
-}
-
-pub(super) fn append_app_menu(
-    cx: &mut Context<AlignApp>,
-    theme: &Theme,
-    mut panel: Stateful<Div>,
-    menu: OwnedMenu,
-    parent: String,
-) -> Stateful<Div> {
-    let path = if parent.is_empty() {
-        menu.name.to_string()
-    } else {
-        format!("{parent} › {}", menu.name)
-    };
-    panel = panel.child(menu_header(theme, path.clone()));
-    for (index, item) in menu.items.into_iter().enumerate() {
-        match item {
-            OwnedMenuItem::Action { name, action, .. } => {
-                panel = panel.child(menu_row(
-                    cx,
-                    theme,
-                    format!("app-menu-{path}-{index}"),
-                    name,
-                    false,
-                    move |this, _, window, cx| {
-                        this.app_menu_position = None;
-                        cx.notify();
-                        window.dispatch_action(action.boxed_clone(), cx);
-                        cx.stop_propagation();
-                    },
-                ));
-            }
-            OwnedMenuItem::Submenu(submenu) => {
-                panel = append_app_menu(cx, theme, panel, submenu, path.clone());
-            }
-            OwnedMenuItem::Separator => {
-                panel = panel.child(
-                    div()
-                        .flex_shrink_0()
-                        .my_1()
-                        .h(px(1.))
-                        .bg(rgb(theme.separator)),
-                );
-            }
-            OwnedMenuItem::SystemMenu(_) => {}
-        }
-    }
-    panel
-}
 
 pub(super) fn toolbar(
     cx: &mut Context<AlignApp>,
@@ -141,7 +44,7 @@ pub(super) fn toolbar(
         cx,
         theme,
         "btn-add",
-        icons().plus.clone(),
+        "icons/plus.svg",
         "Add Media",
         true,
         |this, _, _, cx| this.add_media(cx),
@@ -155,7 +58,7 @@ pub(super) fn toolbar(
         cx,
         theme,
         "btn-clear",
-        icons().trash.clone(),
+        "icons/trash.svg",
         trash_tip,
         !data.clips.is_empty(),
         |this, _, _, cx| this.delete_or_clear(cx),
@@ -251,7 +154,7 @@ pub(super) fn timeline_zoom_controls(
             cx,
             theme,
             "zoom-fit",
-            icons().fit.clone(),
+            "icons/fit.svg",
             "Zoom to fit",
             active && data.zoom_level > 0.001,
             |this, _, _, cx| {
@@ -264,7 +167,7 @@ pub(super) fn timeline_zoom_controls(
             cx,
             theme,
             "zoom-out",
-            icons().zoom_out.clone(),
+            "icons/zoom-out.svg",
             "Zoom out",
             active && data.zoom_level > 0.0,
             |this, _, _, cx| {
@@ -280,7 +183,7 @@ pub(super) fn timeline_zoom_controls(
             cx,
             theme,
             "zoom-in",
-            icons().zoom_in.clone(),
+            "icons/zoom-in.svg",
             "Zoom in",
             active && data.zoom_level < 1.0,
             |this, _, _, cx| {

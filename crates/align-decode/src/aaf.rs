@@ -155,22 +155,17 @@ impl ImportedAudio {
                     source_out: (clip.source_in + clip.length) as f64 / rate,
                     timeline_start: clip.start as f64 / rate,
                     timeline_end: (clip.start + clip.length) as f64 / rate,
-                    playback_rate: 1.0,
-                    plays_backward: false,
-                    fcp7_time_remap_xml: None,
-                    fcp7_filter_xmls: Vec::new(),
-                    fcp7_retime_in: None,
-                    fcp7_retime_out: None,
-                    fcp7_retime_duration: None,
-                    fcp7_labels_xml: None,
+                    retime: Default::default(),
+
+                    fcp7: Default::default(),
+
                     time_scale: numerator as i32,
                     include_embedded_audio: false,
                     audio_source_channel: clip.channel,
                     fcpxml_audio_role: None,
                     track_index: track_index + 1,
-                    enabled: true,
-                    track_enabled: true,
-                    track_locked: false,
+                    flags: Default::default(),
+
                     linked_edit_ids: Default::default(),
                 });
             }
@@ -465,8 +460,8 @@ fn audio_manifest_linking(
                 || item.linked_audio_edit.is_some()
                 || item.is_retimed(align_core::MediaKind::Audio)
                 || item.transition_for(align_core::MediaKind::Audio).is_some()
-                || !item.enabled
-                || !item.track_enabled
+                || !item.flags.enabled
+                || !item.flags.track_enabled
             {
                 return Err(fail("AAF edit semantics not implemented for this item"));
             }
@@ -652,7 +647,7 @@ pub fn timeline_manifest_with_frame_rate(
         if item.is_retimed(align_core::MediaKind::Video)
             || item.transition_for(align_core::MediaKind::Video).is_some()
             || !item.is_enabled(align_core::MediaKind::Video)
-            || !item.track_enabled
+            || !item.flags.track_enabled
         {
             return Err(fail("AAF picture edit semantics not implemented"));
         }

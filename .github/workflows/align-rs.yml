@@ -191,12 +191,12 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install -y nasm libxkbcommon-dev
           libxkbcommon-x11-dev libwayland-dev libasound2-dev libudev-dev libvulkan-dev
-          libgtk-4-dev rpm
+          libgtk-4-dev rpm patchelf
       - name: Install assembler (macOS)
         if: runner.os == 'macOS'
         run: brew install nasm
       - name: Build release
-        run: cargo build --locked --release -p align-cli -p align-mcp -p align-gpui
+        run: cargo build --locked --release -p align-cli -p align-gpui
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -225,15 +225,24 @@ jobs:
           exe=""
           if [[ "${{ runner.os }}" == "Windows" ]]; then exe=".exe"; fi
           mkdir -p dist-bundle
-          cp "target/release/align-cli$exe" "target/release/align-mcp$exe" "target/release/align$exe" dist-bundle/
-          cp "target/release/align-aaf$exe" dist-bundle/
-          # Windows ships the AAF module's Python runtime as a folder.
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            cp -R target/release/align-aaf-runtime dist-bundle/
+          cp "target/release/align$exe" dist-bundle/
+          if [[ -n "$exe" ]]; then
+            cp target/release/align-cli.exe dist-bundle/
+          else
+            ln -s align dist-bundle/align-cli
           fi
+          cp "target/release/align-aaf$exe" dist-bundle/
+          cp -a target/release/align-aaf-runtime dist-bundle/
+          python script/check-frozen-aaf.py "dist-bundle/align-aaf$exe"
           cp -R target/release/AAF-Licenses dist-bundle/
           cp LICENSE THIRD_PARTY_NOTICES.txt dist-bundle/
           cp "target/ffmpeg-minimal/ffmpeg$exe" "target/ffmpeg-minimal/ffprobe$exe" dist-bundle/
+          shopt -s nullglob
+          for library in target/ffmpeg-minimal/*.so.* target/ffmpeg-minimal/*.dylib; do
+            cp "$library" dist-bundle/
+          done
+          "dist-bundle/ffmpeg$exe" -version >/dev/null
+          "dist-bundle/ffprobe$exe" -version >/dev/null
           cp target/ffmpeg-minimal/FFMPEG-LICENSE.txt dist-bundle/
           ls -la dist-bundle/
       - name: Verify staged sidecars without MSYS2 (Windows)
@@ -341,7 +350,6 @@ jobs:
         run: |
           pacman -U --noconfirm installers/*.pkg.tar.zst
           align-cli --help >/dev/null
-          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | align-mcp | grep -q align_sync
           pacman -Qkk align
       - uses: actions/upload-artifact@v4
         with:
@@ -362,7 +370,6 @@ jobs:
         run: |
           dnf install -y ./Align-*-Fedora-x86_64.rpm
           align-cli --help >/dev/null
-          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | align-mcp | grep -q align_sync
           rpm -V align
           sha256sum -c ./*.sha256
 

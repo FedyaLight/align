@@ -114,18 +114,24 @@ def counting_tools(root):
     return env, log
 
 
-def run(cli, media, env, cache):
+def run(cli, media, env, cache, backend="portable", phases=None):
     # Isolated cache and settings: XDG on Linux, HOME-relative elsewhere.
     environment = dict(os.environ, **env, XDG_CACHE_HOME=str(cache),
-                       XDG_CONFIG_HOME=str(cache / 'config'), ALIGN_BACKEND='portable')
+                       XDG_CONFIG_HOME=str(cache / 'config'), ALIGN_BACKEND=backend,
+                       ALIGN_PHASE_TIMING='1' if phases is not None else '0')
     if platform.system() == 'Darwin':
-        environment['HOME'] = str(cache)
+        environment['HOME'] = environment['CFFIXED_USER_HOME'] = str(cache)
     started = time.perf_counter()
     proc = subprocess.run([str(cli), 'sync', str(media)], env=environment,
                           capture_output=True, text=True, timeout=1800)
     elapsed = time.perf_counter() - started
     if proc.returncode:
         raise RuntimeError(f'CLI exited {proc.returncode}: {proc.stderr[-2000:]}')
+    if phases is not None:
+        for line in proc.stderr.splitlines():
+            if line.startswith('align-phase '):
+                _, phase, seconds = line.split()
+                phases[phase] = float(seconds)
     return elapsed, json.loads(proc.stdout)
 
 
@@ -151,40 +157,56 @@ def main():
     parser.add_argument('--cameras', type=int, default=6)
     parser.add_argument('--duration', type=int, default=240)
     parser.add_argument('--repeat', type=int, default=3)
+    parser.add_argument('--backend', choices=['portable', 'apple-native'], default='portable')
+    parser.add_argument('--corpus', type=Path, help='Reuse media/ and truth.json from an earlier benchmark')
     args = parser.parse_args()
-    if shutil.which('ffmpeg') is None:
+    if args.backend == 'apple-native' and platform.system() != 'Darwin':
+        parser.error('apple-native requires macOS')
+    if not args.corpus and shutil.which('ffmpeg') is None:
         parser.error('ffmpeg must be on PATH to generate the corpus')
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)
-    cli = args.cli.resolve()
-    media, truth = build_corpus(root, args.cameras, args.duration)
+    cli = args.cli.absolute()
+    if args.corpus:
+        media = args.corpus.resolve() / 'media'
+        truth = json.loads((media.parent / 'truth.json').read_text())
+    else:
+        media, truth = build_corpus(root, args.cameras, args.duration)
+        (root / 'truth.json').write_text(json.dumps(truth, indent=2) + '\n')
+    with wave.open(str(media / 'recorder-2.wav')) as last_take:
+        duration = truth['recorder-2.wav'] + last_take.getnframes() / last_take.getframerate()
     env, log = counting_tools(root)
 
     def measure(label, cache, fresh):
-        times, spawns = [], []
+        times, spawns, phases = [], [], []
         result = None
         for attempt in range(args.repeat):
             if fresh and cache.exists():
                 shutil.rmtree(cache)
             log.write_text('')
-            elapsed, result = run(cli, media, env, cache)
+            stage_times = {}
+            elapsed, result = run(cli, media, env, cache, args.backend, stage_times)
+            phases.append(stage_times)
             times.append(elapsed)
             spawns.append(log.read_text().split())
         counts = {tool: spawns[-1].count(tool) for tool in ('ffmpeg', 'ffprobe')}
         print(f'{label}: {statistics.median(times):.3f}s, spawns {counts}', flush=True)
         return {'medianSeconds': round(statistics.median(times), 4),
-                'runs': [round(t, 4) for t in times], 'spawns': counts}, result
+                'runs': [round(t, 4) for t in times], 'spawns': counts, 'phaseSeconds': phases}, result
 
     cold, result = measure('cold', root / 'cache-cold', True)
     warm_cache = root / 'cache-warm'
-    run(cli, media, env, warm_cache)
+    run(cli, media, env, warm_cache, args.backend)
     warm, _ = measure('warm', warm_cache, False)
     errors = offset_errors(result, truth)
     report = {
         'platform': platform.platform(),
+        'backend': args.backend,
+        'cliVersion': subprocess.check_output([str(cli), '--version'], text=True).strip(),
         'cliBytes': cli.stat().st_size,
-        'cameras': args.cameras,
-        'durationSeconds': args.duration,
+        'corpus': str(media),
+        'cameras': len(truth) - 2,
+        'durationSeconds': duration,
         'cold': cold,
         'warm': warm,
         'islands': len(result['islands']),

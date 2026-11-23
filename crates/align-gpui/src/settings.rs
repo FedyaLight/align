@@ -8,6 +8,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
+const LAST_EXPORT_DIRECTORY: &str = "lastExportDirectory";
+
 pub fn file() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(std::env::temp_dir)
@@ -29,7 +31,11 @@ pub fn read<T: DeserializeOwned>(path: &Path, key: &str) -> Option<T> {
 }
 
 /// Store `value` under `key`; `None` removes the key.
-pub fn write<T: Serialize>(path: &Path, key: &str, value: Option<&T>) -> std::io::Result<()> {
+pub fn write<T: Serialize + ?Sized>(
+    path: &Path,
+    key: &str,
+    value: Option<&T>,
+) -> std::io::Result<()> {
     let mut entries = entries(path);
     match value {
         Some(value) => {
@@ -43,6 +49,15 @@ pub fn write<T: Serialize>(path: &Path, key: &str, value: Option<&T>) -> std::io
         std::fs::create_dir_all(parent)?;
     }
     align_core::staged::write(path, &serde_json::to_vec_pretty(&entries)?)
+}
+
+pub fn last_export_directory(settings: &Path) -> Option<PathBuf> {
+    read::<PathBuf>(settings, LAST_EXPORT_DIRECTORY)
+        .filter(|path| align_decode::export::check_export_directory(path).is_ok())
+}
+
+pub fn remember_export_directory(settings: &Path, directory: &Path) -> std::io::Result<()> {
+    write(settings, LAST_EXPORT_DIRECTORY, Some(directory))
 }
 
 #[cfg(test)]
@@ -62,5 +77,21 @@ mod tests {
         assert_eq!(read::<String>(&path, "appearance").as_deref(), Some("dark"));
         // A value of another shape reads as absent.
         assert_eq!(read::<u32>(&path, "appearance"), None);
+    }
+
+    #[test]
+    fn remembered_export_folder_is_restored_only_while_usable() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = root.path().join("settings.json");
+        let destination = root.path().join("destination");
+        std::fs::create_dir(&destination).unwrap();
+        remember_export_directory(&settings, &destination).unwrap();
+        assert_eq!(last_export_directory(&settings), Some(destination.clone()));
+
+        std::fs::remove_dir(&destination).unwrap();
+        assert_eq!(last_export_directory(&settings), None);
+        assert!(!destination.exists());
+        std::fs::write(&destination, b"regular file").unwrap();
+        assert_eq!(last_export_directory(&settings), None);
     }
 }

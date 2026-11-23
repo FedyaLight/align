@@ -244,27 +244,18 @@ pub struct DraftEdit {
     pub source_out: f64,
     pub timeline_start: f64,
     pub timeline_end: f64,
-    pub playback_rate: f64,
-    pub plays_backward: bool,
-    pub fcp7_time_remap_xml: Option<String>,
-    /// Verbatim non-timeremap `<filter>` payloads (e.g. audio levels):
-    /// clip-relative like the remap graph, so a rigid track shift keeps
-    /// them valid. Passed through to FCP 7 XML; Resolve OTIO has no
-    /// portable gain/effect model and drops them with a warning.
-    pub fcp7_filter_xmls: Vec<String>,
-    pub fcp7_retime_in: Option<i64>,
-    pub fcp7_retime_out: Option<i64>,
-    pub fcp7_retime_duration: Option<i64>,
-    pub fcp7_labels_xml: Option<String>,
+    pub retime: crate::model::RetimeSpec,
+
+    pub fcp7: crate::model::Fcp7Passthrough,
+
     /// Resolution for imported edit times; AAF uses the track sample rate.
     pub time_scale: i32,
     pub include_embedded_audio: bool,
     pub audio_source_channel: Option<usize>,
     pub fcpxml_audio_role: Option<String>,
     pub track_index: usize,
-    pub enabled: bool,
-    pub track_enabled: bool,
-    pub track_locked: bool,
+    pub flags: crate::model::TrackFlags,
+
     pub linked_edit_ids: HashSet<String>,
 }
 
@@ -537,16 +528,16 @@ impl TimelineDraft {
             let portable = t.is_otio_portable
                 && edits_by_id
                     .get(&format!("{}:{}", t.media_type.raw(), t.left_edit_id))
-                    .is_some_and(|e| e.playback_rate == 1.0)
+                    .is_some_and(|e| e.retime.playback_rate == 1.0)
                 && edits_by_id
                     .get(&format!("{}:{}", t.media_type.raw(), t.right_edit_id))
-                    .is_some_and(|e| e.playback_rate == 1.0)
+                    .is_some_and(|e| e.retime.playback_rate == 1.0)
                 && edits_by_id
                     .get(&format!("{}:{}", t.media_type.raw(), t.left_edit_id))
-                    .is_some_and(|e| !e.plays_backward)
+                    .is_some_and(|e| !e.retime.plays_backward)
                 && edits_by_id
                     .get(&format!("{}:{}", t.media_type.raw(), t.right_edit_id))
-                    .is_some_and(|e| !e.plays_backward);
+                    .is_some_and(|e| !e.retime.plays_backward);
             TimelineTransition {
                 kind: t.kind,
                 right_edit_id: t.right_edit_id.clone(),
@@ -604,20 +595,15 @@ impl TimelineDraft {
                 source_out: audio.media_time(audio.source_out),
                 timeline_start: audio.media_time(audio.timeline_start),
                 timeline_end: audio.media_time(audio.timeline_end),
-                playback_rate: audio.playback_rate,
-                plays_backward: audio.plays_backward,
-                fcp7_time_remap_xml: audio.fcp7_time_remap_xml.clone(),
-                fcp7_filter_xmls: audio.fcp7_filter_xmls.clone(),
-                fcp7_retime_in: audio.fcp7_retime_in,
-                fcp7_retime_out: audio.fcp7_retime_out,
-                fcp7_retime_duration: audio.fcp7_retime_duration,
-                fcp7_labels_xml: audio.fcp7_labels_xml.clone(),
+                retime: audio.retime,
+
+                fcp7: audio.fcp7.clone(),
+
                 audio_source_channel: audio.audio_source_channel,
                 fcpxml_audio_role: audio.fcpxml_audio_role.clone(),
                 track_index: audio.track_index,
-                enabled: audio.enabled,
-                track_enabled: audio.track_enabled,
-                track_locked: audio.track_locked,
+                flags: audio.flags,
+
                 transition_after: transitions_by_left
                     .get(&format!("audio:{}", audio.id))
                     .map(|t| resolved_transition(t)),
@@ -631,28 +617,23 @@ impl TimelineDraft {
                 source_out: edit.media_time(edit.source_out),
                 timeline_start: edit.media_time(edit.timeline_start),
                 timeline_end: edit.media_time(edit.timeline_end),
-                playback_rate: edit.playback_rate,
-                plays_backward: edit.plays_backward,
-                fcp7_time_remap_xml: edit.fcp7_time_remap_xml.clone(),
-                fcp7_filter_xmls: edit.fcp7_filter_xmls.clone(),
-                fcp7_retime_in: edit.fcp7_retime_in,
-                fcp7_retime_out: edit.fcp7_retime_out,
-                fcp7_retime_duration: edit.fcp7_retime_duration,
-                fcp7_labels_xml: edit.fcp7_labels_xml.clone(),
+                retime: edit.retime,
+
+                fcp7: edit.fcp7.clone(),
+
                 audio_source_channel: edit.audio_source_channel,
                 fcpxml_audio_role: edit.fcpxml_audio_role.clone(),
                 track_index: edit.track_index,
                 audio_track_index: embedded.map(|a| a.track_index),
-                enabled: edit.enabled,
-                track_enabled: edit.track_enabled,
-                track_locked: edit.track_locked,
+                flags: edit.flags,
+
                 audio_enabled: if edit.include_embedded_audio {
-                    embedded.map(|a| a.enabled)
+                    embedded.map(|a| a.flags.enabled)
                 } else {
                     Some(false)
                 },
-                audio_track_enabled: embedded.map(|a| a.track_enabled),
-                audio_track_locked: embedded.map(|a| a.track_locked),
+                audio_track_enabled: embedded.map(|a| a.flags.track_enabled),
+                audio_track_locked: embedded.map(|a| a.flags.track_locked),
                 transition_after: if edit.media_type == DraftMediaKind::Video {
                     transition.map(|t| resolved_transition(t))
                 } else {

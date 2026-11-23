@@ -7,7 +7,7 @@
 
 use realfft::{RealFftPlanner, RealToComplex};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Search work budget: more spectral bands generate more candidate landmarks.
 /// Match confidence, repeated-take rejection and fine waveform validation
@@ -83,13 +83,20 @@ struct Peak {
     bin: u16,
 }
 
+// ~8.9 hours at one byte per 64 ms hop. Longer recordings still get
+// complete landmarks; never search a truncated envelope as a whole clip.
+pub const MAX_FLUX_HOPS: usize = 500_000;
+
 pub struct FingerprintExtractor {
+    flux_limit: usize,
+    previous_spectrum: Vec<f32>,
+    flux: Vec<u8>,
     accuracy: SearchAccuracy,
     forward: Arc<dyn RealToComplex<f32>>,
     spectrum: Vec<num_complex::Complex32>,
     fft_scratch: Vec<num_complex::Complex32>,
     magnitudes: Vec<f32>,
-    window: Vec<f32>,
+    window: &'static [f32],
     scratch: Vec<f32>,
     pending: Vec<f32>,
     consumed: usize,
@@ -109,19 +116,27 @@ impl FingerprintExtractor {
     }
 
     pub fn with_accuracy(accuracy: SearchAccuracy) -> Self {
-        let mut planner = RealFftPlanner::<f32>::new();
-        let forward = planner.plan_fft_forward(FRAME_SIZE);
+        static PLAN: OnceLock<Arc<dyn RealToComplex<f32>>> = OnceLock::new();
+        static WINDOW: OnceLock<Vec<f32>> = OnceLock::new();
+        let forward =
+            Arc::clone(PLAN.get_or_init(|| RealFftPlanner::new().plan_fft_forward(FRAME_SIZE)));
         let spectrum = forward.make_output_vec();
         let fft_scratch = forward.make_scratch_vec();
         // vDSP_HANN_NORM equivalent: 0.5 * (1 - cos(2*pi*n/(N-1))).
         // Relative peak picking is insensitive to the NORM scale factor.
-        let window: Vec<f32> = (0..FRAME_SIZE)
-            .map(|n| {
-                0.5 - 0.5 * (2.0 * std::f32::consts::PI * n as f32 / (FRAME_SIZE - 1) as f32).cos()
-            })
-            .collect();
+        let window = WINDOW.get_or_init(|| {
+            (0..FRAME_SIZE)
+                .map(|n| {
+                    0.5 - 0.5
+                        * (2.0 * std::f32::consts::PI * n as f32 / (FRAME_SIZE - 1) as f32).cos()
+                })
+                .collect()
+        });
         let pending = Vec::with_capacity(FRAME_SIZE * 16);
         Self {
+            flux_limit: 0,
+            previous_spectrum: Vec::new(),
+            flux: Vec::new(),
             accuracy,
             forward,
             spectrum,
@@ -134,6 +149,41 @@ impl FingerprintExtractor {
             frame_number: 0,
             peaks: Vec::new(),
         }
+    }
+
+    pub fn enable_flux(&mut self, limit: usize) {
+        self.flux_limit = limit.min(MAX_FLUX_HOPS);
+        self.previous_spectrum.resize(476, 0.);
+    }
+
+    pub fn take_flux(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.flux)
+    }
+
+    fn record_flux(&mut self) {
+        if self.flux.len() == self.flux_limit {
+            self.flux = Vec::new();
+            self.previous_spectrum.clear();
+            return;
+        }
+        let magnitudes = &self.magnitudes[10..486];
+        let mut current = [0.0; 476];
+        for (out, power) in current.iter_mut().zip(magnitudes) {
+            *out = power.sqrt();
+        }
+        let sum: f32 = current.iter().sum();
+        let scale = if sum.is_finite() && sum > 1e-5 {
+            sum.recip()
+        } else {
+            0.
+        };
+        let mut flux = 0.;
+        for (old, magnitude) in self.previous_spectrum.iter_mut().zip(current) {
+            let v = if scale > 0. { magnitude * scale } else { 0. };
+            flux += (v - *old).max(0.);
+            *old = v;
+        }
+        self.flux.push((flux * 255.).round() as u8);
     }
 
     /// Streaming ingest. Bounded memory: the pending buffer is compacted
@@ -161,6 +211,9 @@ impl FingerprintExtractor {
                 // vDSP_zvmags = squared magnitude.
                 self.magnitudes[i] = c.re * c.re + c.im * c.im;
             }
+            if !self.previous_spectrum.is_empty() {
+                self.record_flux();
+            }
             self.analyze_frame();
             self.consumed += HOP_SIZE;
             self.frame_number = self.frame_number.wrapping_add(1);
@@ -186,10 +239,15 @@ impl FingerprintExtractor {
                     max_bin = bin;
                 }
             }
+            // A corrupt float sample can overflow even a finite FFT bin's
+            // squared magnitude. Discard this frame, preserving hop timing.
+            if !sum.is_finite() {
+                return;
+            }
             let mean = sum / band.len() as f32;
             candidates[slot] = (max / mean.max(1e-12), max_bin);
         }
-        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
         for (score, bin) in candidates.iter().take(self.accuracy.peak_count()) {
             if *score >= 2.5 {
                 self.peaks.push(Peak {
@@ -268,6 +326,17 @@ mod tests {
         (0..(secs * SAMPLE_RATE as f32) as usize)
             .map(|n| (2.0 * std::f32::consts::PI * freq * n as f32 / SAMPLE_RATE as f32).sin())
             .collect()
+    }
+
+    #[test]
+    fn damaged_samples_do_not_mask_surrounding_tones() {
+        let mut samples = sine(440.0, 4.0);
+        samples[1500] = 1e20;
+        samples[6000] = f32::NAN;
+        samples[16000] = f32::INFINITY;
+        let mut ex = FingerprintExtractor::with_accuracy(crate::SearchAccuracy::Balanced);
+        ex.consume(&samples);
+        assert!(!ex.finish().is_empty());
     }
 
     #[test]

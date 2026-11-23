@@ -24,6 +24,8 @@ mod ridge;
 
 use std::collections::{HashMap, HashSet};
 
+use rustc_hash::FxHashMap;
+
 use crate::fingerprint::{Fingerprint, HOP_SIZE, SAMPLE_RATE};
 use crate::model::{Clip, ClipId, MatchEvidence, SyncConstraint, TemporalPolicy};
 
@@ -68,7 +70,8 @@ pub struct ClipTimingHints {
     pub source_timecodes: HashMap<ClipId, f64>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum MatchThreshold {
     Permissive,
     #[default]
@@ -245,7 +248,7 @@ pub fn match_fingerprints(
 
     // Hash groups are ordered by clip, then frame. Look up each pair's
     // histogram once per group; occurrences from one clip cannot vote.
-    let mut votes: HashMap<PairKey, HashMap<i64, usize>> = HashMap::new();
+    let mut votes: FxHashMap<PairKey, FxHashMap<i64, usize>> = FxHashMap::default();
     for &(start, end) in &groups {
         for_each_clip_pair(&records[start..end], |key, left, right| {
             let histogram = votes.entry(key).or_default();
@@ -261,8 +264,8 @@ pub fn match_fingerprints(
     }
 
     // Winners + repeated-take guard.
-    let mut winning: HashMap<PairKey, (i64, usize, usize)> = HashMap::new();
-    let mut drifting = HashMap::new();
+    let mut winning: FxHashMap<PairKey, (i64, usize, usize)> = FxHashMap::default();
+    let mut drifting = FxHashMap::default();
     for (pair, histogram) in &votes {
         let left_id = &clip_ids[pair.left as usize];
         let right_id = &clip_ids[pair.right as usize];
@@ -325,7 +328,7 @@ pub fn match_fingerprints(
     // Only the last eligible right occurrence survives each anchor write.
     // Its upper bound moves monotonically through the sorted right frames,
     // so recovering anchors takes O(left.len() + right.len()) per clip pair.
-    let mut anchors: HashMap<PairKey, HashMap<i64, Anchor>> = HashMap::new();
+    let mut anchors: FxHashMap<PairKey, FxHashMap<i64, Anchor>> = FxHashMap::default();
     for &(start, end) in &groups {
         for_each_clip_pair(&records[start..end], |key, left, right| {
             if let Some(candidate) = drifting.get_mut(&key) {
@@ -356,24 +359,57 @@ pub fn match_fingerprints(
     }
     drop(records);
 
-    let mut out: Vec<PairwiseMatch> = winning
-        .iter()
-        .filter_map(|(key, winner)| {
-            let mut points: Vec<Anchor> = anchors
-                .remove(key)
-                .unwrap_or_default()
-                .into_values()
-                .collect();
-            points.sort_by(|a, b| a.left.total_cmp(&b.left));
-            let fit = robust_fit(&points)?;
-            let margin = winner.1 as f64 / winner.2.max(1) as f64;
-            Some(fitted_match(*key, fit, margin, &clip_ids))
+    enum Evidence {
+        Peak(FxHashMap<i64, Anchor>, f64),
+        Ridge(ridge::Candidate),
+    }
+    let jobs: Vec<_> = anchors
+        .into_iter()
+        .map(|(key, points)| {
+            let (_, votes, runner_up) = winning[&key];
+            (
+                key,
+                Evidence::Peak(points, votes as f64 / runner_up.max(1) as f64),
+            )
         })
+        .chain(
+            drifting
+                .into_iter()
+                .map(|(key, c)| (key, Evidence::Ridge(c))),
+        )
         .collect();
-    out.extend(drifting.into_iter().filter_map(|(key, candidate)| {
-        let (fit, margin) = candidate.fit()?;
+    let fit_pair = |(key, evidence)| {
+        let (fit, margin) = match evidence {
+            Evidence::Peak(points, margin) => {
+                let mut points: Vec<_> = points.into_values().collect();
+                points.sort_by(|a, b| a.left.total_cmp(&b.left));
+                (robust_fit(&points)?, margin)
+            }
+            Evidence::Ridge(candidate) => candidate.fit()?,
+        };
         Some(fitted_match(key, fit, margin, &clip_ids))
-    }));
+    };
+    let workers = crate::parallel::worker_limit(8).min(jobs.len() / 2);
+    let mut out: Vec<_> = if jobs.len() < 8 || workers <= 1 {
+        jobs.into_iter().filter_map(fit_pair).collect()
+    } else {
+        let queue = std::sync::Mutex::new(jobs.into_iter());
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..workers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        std::iter::from_fn(|| queue.lock().unwrap().next())
+                            .filter_map(fit_pair)
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect()
+        })
+    };
     // Drift can move allowed histogram buckets back to a rejected affine
     // offset. Apply the user's constraint to the fitted result as well.
     out.retain(|m| !SyncConstraint::rejects_alignment(constraints, &m.left, &m.right, m.offset));
@@ -401,11 +437,19 @@ fn fitted_match(key: PairKey, fit: Fit, margin: f64, clip_ids: &[ClipId]) -> Pai
         } else {
             1.0
         };
+    // If the evidence is too short for drift, fit the intercept at the
+    // chosen rate. Reusing the sloped line's intercept at time zero can
+    // move every predicted observation outside the refinement window.
+    let offset = if rate == fit.rate {
+        fit.offset
+    } else {
+        fit.points.iter().map(|p| p.right - p.left).sum::<f64>() / fit.points.len() as f64
+    };
     PairwiseMatch {
         left: clip_ids[key.left as usize].clone(),
         right: clip_ids[key.right as usize].clone(),
         rate,
-        offset: fit.offset,
+        offset,
         confidence,
         anchors: fit.inliers,
         left_start_seconds: fit.start,
@@ -633,6 +677,25 @@ mod tests {
         assert!(m.residual_seconds < 1e-9);
         assert!(approx(m.confidence, 0.63, 0.05), "conf={}", m.confidence);
         assert_eq!(m.evidence, MatchEvidence::Waveform);
+    }
+
+    #[test]
+    fn pinning_drift_preserves_the_observed_offset_far_from_the_origin() {
+        let mut clips = synth_pair("a", "b", 20, 16, 0xace);
+        for clip in &mut clips {
+            for fp in &mut clip.fingerprints {
+                fp.frame += 20000;
+            }
+        }
+        for (i, fp) in clips[1].fingerprints.iter_mut().enumerate() {
+            fp.frame += (i / 4) as u32;
+        }
+        let matches = match_fingerprints(clips, None, &[]);
+        let m = &matches[0];
+        assert_eq!(m.rate, 1.);
+        // The anchors span offsets of 20–23 hops. A pinned prediction must
+        // still reach those observations inside the 250 ms refinement search.
+        assert!((20. * SECONDS_PER_FRAME..=23. * SECONDS_PER_FRAME).contains(&m.offset));
     }
 
     #[test]

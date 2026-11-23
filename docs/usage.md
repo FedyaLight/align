@@ -23,7 +23,7 @@ open "/Applications/Align.app"
 The export sheet starts from Align's defaults. **Save as Default** keeps the
 current export options for new sessions and later launches; the destination
 and sequence name are not saved. **Revert to Saved** and **Use Align Defaults**
-load either set back into the sheet. The command line and MCP server do not
+load either set back into the sheet. The command line does not
 read these saved defaults.
 
 Search accuracy controls how much analysis work is performed. Start with
@@ -34,11 +34,35 @@ For an existing edit, enable Preserve basic editing on the tracks that should
 remain fixed. This preserves their trims, duplicates, positions, and gaps while
 other tracks align to them. See [format limits](formats.md) for unsupported edits.
 
+### Save and reopen projects
+
+Align creates an autosave when synchronization starts and updates that same
+project as you work. **File → Project Autosave** can turn this off or choose a
+different folder for new projects. The default is **Align** inside your system
+Documents folder. At startup, Align removes its autosaves that have gone seven
+days without an update.
+
+Use **File → Recent Projects** or **Open Project…** to reopen a `.align` file.
+The Windows installer registers Align to open these files in Explorer.
+**Save As…** creates a project you can name and keep. **Save Project** saves to
+that file even when autosave is off.
+
+A project keeps the source paths, sequence choices, synchronization settings,
+relinks, corrections, and completed placements. A reopened timeline can be
+exported immediately when its result is current and its sources are unchanged.
+If sources were moved or changed, use **Relink…** as needed, then synchronize
+again. Embedded AAF audio is extracted again from the original AAF on open.
+The project does not contain the original media and works independently of the
+analysis cache.
+
 ### Keyboard shortcuts
 
 | Action | macOS | Windows and Linux |
 | --- | --- | --- |
 | Add media | Cmd+O | Ctrl+O |
+| Open project | Cmd+Shift+O | Ctrl+Shift+O |
+| Save project | Cmd+S | Ctrl+S |
+| Save project as | Cmd+Shift+S | Ctrl+Shift+S |
 | Synchronize again | Cmd+R | Ctrl+R |
 | Export | Cmd+E | Ctrl+E |
 | Zoom the timeline | Cmd or Option + scroll | Ctrl or Alt + scroll |
@@ -46,10 +70,10 @@ other tracks align to them. See [format limits](formats.md) for unsupported edit
 | Full screen | Ctrl+Cmd+F | F11 |
 | Quit | Cmd+Q | Ctrl+Q |
 
-On Windows and Linux, the **Menu** button is available in the top toolbar and
-on the empty start screen. It provides About, Check for Updates, Use with AI
-Agents, Path Fixer, analysis-cache settings, appearance selection, and Report a
-Problem. On macOS, these commands are available in the native menu bar.
+On Windows and Linux, **Menu** opens a sidebar from the top toolbar or the
+empty start screen. **Path Fixer** appears after you import a timeline.
+Export is available from the timeline toolbar after synchronization. On macOS,
+use the native menu bar.
 
 Escape closes the open menu, panel, or dialog.
 
@@ -223,35 +247,31 @@ align-cli clear-cache
 align-cli clear-cache --older-than-days 30
 ```
 
-The analysis cache contains fingerprints and portable video-timing inspections.
-Clearing it causes later runs to repeat that work. Desktop cache controls also
-support clearing the current media and changing retention.
+The on-disk analysis cache stores fingerprints, waveform previews, spectral
+flux, LTC detections, and portable video timing. Align keeps entries for 7 days
+by default. Open **File → Analysis Cache** from the macOS menu bar or the
+**Menu** sidebar on Windows and Linux to change retention, clear entries for
+the current project, or clear all entries.
+
+Use the on-disk analysis cache control to skip reading and writing the cache
+on new desktop and CLI runs. Existing entries stay on disk and can still be
+cleared. Turning the cache back on resumes caching with your selected
+retention. **Until cleared** sets retention with no automatic expiration.
 
 Embedded AAF audio retained for saved JSON is application data, not cache.
 Do not delete it while those results are needed. See
 [media ownership](formats.md#media-ownership) for file locations and export behavior.
 
-## MCP integration
+## AI agents
 
-`align-mcp` is a stdio server. Keep `align-cli` beside it. The server exposes
-`align_inspect`, `align_sync`, and `align_export`; it invokes the adjacent CLI and
-returns its result. The structured result is an object: a list the CLI prints
-appears under `media`, `results`, or `artifacts` respectively. Use absolute
-media and output paths.
+Open **Align → Use with AI Agents…** to copy the installed CLI path or a prompt.
+Inspect media by passing paths directly. Save the complete synchronization result
+and print a short JSON summary with:
 
-For clients that accept an `mcpServers` configuration:
-
-```json
-{
-  "mcpServers": {
-    "align": {
-      "command": "/absolute/path/to/align-mcp",
-      "args": []
-    }
-  }
-}
+```sh
+align-cli sync --output-json result.json --summary /path/to/media
+align-cli export-json result.json /path/to/export
 ```
 
-The desktop menu **Align → Use with AI Agents…** provides a configuration using
-its installed executable path. The MCP tool schema is the reference for supported
-arguments; it does not expose every CLI setting.
+The same flags work with `--all-sequences`. Without `--summary`, sync prints
+the full result. See the [agent skill](../skills/align-cli/SKILL.md).

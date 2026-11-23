@@ -1,6 +1,14 @@
 //! Warning banner and the bottom operation bar.
 
-use super::*;
+use super::animation::entrance;
+use super::controls::{button, icon_button, modal_header};
+use super::export::export_reveal_label;
+use super::toolbar::timeline_zoom_controls;
+use super::{
+    AlignApp, AnimationExt, Context, Div, FluentBuilder, InteractiveElement, IntoElement,
+    PROGRESS_MOVE_MS, ParentElement, ProgressMotion, SharedString, StatefulInteractiveElement,
+    Styled, Theme, div, px, rgb, rgba, svg_icon,
+};
 
 // ---------------- warning banner + details
 
@@ -9,7 +17,7 @@ pub(super) fn warning_banner(
     theme: &Theme,
     data: &crate::state::AppData,
 ) -> impl IntoElement {
-    let n = data.warnings.len();
+    let n = data.warnings.len() + data.restore_warnings.len();
     div()
         .flex()
         .flex_row()
@@ -18,7 +26,7 @@ pub(super) fn warning_banner(
         .px_5()
         .py_1()
         .bg(rgba((theme.warning << 8) | 0x14))
-        .child(svg_icon(icons().warn.clone(), 14.0, theme.orange))
+        .child(svg_icon("icons/warn.svg", 14.0, theme.orange))
         .child(format!(
             "{} media warning{}",
             n,
@@ -35,7 +43,7 @@ pub(super) fn warning_banner(
                 cx.notify();
             },
         ))
-        .when(data.can_locate_timeline_media(), |banner| {
+        .when(data.can_relink_media(), |banner| {
             banner.child(button(
                 cx,
                 theme,
@@ -61,7 +69,7 @@ pub(super) fn warning_details(theme: &Theme, data: &crate::state::AppData) -> im
         .border_1()
         .border_color(rgb(theme.orange))
         .bg(rgb(theme.panel));
-    for message in data.warnings.iter().take(50) {
+    for message in data.restore_warnings.iter().chain(&data.warnings).take(50) {
         panel = panel.child(div().text_color(rgb(theme.text)).child(message.clone()));
     }
     panel
@@ -77,10 +85,11 @@ pub(super) fn operation_bar(
     active: bool,
 ) -> Div {
     use crate::state::Operation;
-    let busy = matches!(
-        data.operation,
-        Operation::Synchronizing | Operation::Exporting | Operation::Repairing
-    );
+    let busy = data.importing()
+        || matches!(
+            data.operation,
+            Operation::Synchronizing | Operation::Exporting | Operation::Repairing
+        );
     let mut bar = div()
         .flex()
         .flex_row()
@@ -96,9 +105,9 @@ pub(super) fn operation_bar(
     if matches!(data.operation, Operation::Ready) && data.has_result() && !data.is_stale() {
         // A check only for complete success; partial results get a warning.
         bar = bar.child(if data.unmatched_count() == 0 {
-            svg_icon(icons().check.clone(), 14.0, theme.green)
+            svg_icon("icons/check.svg", 14.0, theme.green)
         } else {
-            svg_icon(icons().warn.clone(), 14.0, theme.orange)
+            svg_icon("icons/warn.svg", 14.0, theme.orange)
         });
     }
     // Status + progress.
@@ -110,7 +119,11 @@ pub(super) fn operation_bar(
             .text_size(px(12.))
             .gap_1();
         if !(data.show_export && matches!(data.operation, Operation::Exported)) {
-            status = status.child(data.status.clone());
+            status = status.child(if data.importing() {
+                "Reading inputs…".to_owned()
+            } else {
+                data.status.clone()
+            });
         }
         if busy {
             let fill = div().h_full().rounded_full().bg(rgb(theme.accent));
@@ -142,7 +155,7 @@ pub(super) fn operation_bar(
             cx,
             theme,
             "btn-cancel",
-            icons().close.clone(),
+            "icons/close.svg",
             "Cancel",
             true,
             |this, _, _, cx| this.cancel_current(cx),
@@ -214,6 +227,8 @@ pub(super) fn operation_bar(
                 true,
                 |this, _, _, cx| {
                     if this.data.reset_corrections() {
+                        this.data.mark_sync_dirty();
+                        this.project_changed(cx);
                         this.start_sync(cx);
                     } else {
                         cx.notify();
@@ -259,7 +274,9 @@ pub(super) fn stage_settings_panel(
                 ),
                 true,
                 move |this, _, _, cx| {
-                    this.update_timeline_layout(|data| data.select_sync_stage(index));
+                    if this.update_timeline_layout(|data| data.select_sync_stage(index)) {
+                        this.project_changed(cx);
+                    }
                     cx.notify();
                 },
             ));
@@ -318,7 +335,9 @@ pub(super) fn sequence_results_panel(
             format!("{check}{} · {name}", index + 1),
             true,
             move |this, _, _, cx| {
-                this.update_timeline_layout(|data| data.select_sequence_result(index));
+                if this.update_timeline_layout(|data| data.select_sequence_result(index)) {
+                    this.project_changed(cx);
+                }
                 cx.notify();
             },
         ));

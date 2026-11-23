@@ -1,6 +1,13 @@
 //! Shared controls (buttons, overlays, tips) and display formatting.
 
-use super::*;
+use super::animation::{entrance, slide_in};
+use super::{
+    AlignApp, AnimationExt, AnyView, App, ClickEvent, Context, Div, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Render, SIDEBAR_CLOSE_MS, SettingsScope, SharedString,
+    Stateful, StatefulInteractiveElement, Styled, Theme, ThemeMode, Window, div, px, rgb, rgba,
+    svg_icon,
+};
+use gpui::AppContext as _;
 
 // ------------------------------------------------------------ rendering
 //
@@ -214,7 +221,7 @@ pub(super) fn icon_button(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     id: impl Into<SharedString>,
-    icon: String,
+    icon: &'static str,
     tip: &str,
     enabled: bool,
     action: impl Fn(&mut AlignApp, &ClickEvent, &mut Window, &mut Context<AlignApp>) + 'static,
@@ -246,7 +253,7 @@ pub(super) fn icon_button(
 pub(super) fn modal_header(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
-    title: &'static str,
+    title: impl Into<SharedString>,
     close_id: &'static str,
     close: impl Fn(&mut AlignApp, &ClickEvent, &mut Window, &mut Context<AlignApp>) + 'static,
 ) -> Div {
@@ -261,14 +268,14 @@ pub(super) fn modal_header(
             div()
                 .text_size(px(16.))
                 .font_weight(gpui::FontWeight(600.0))
-                .child(title),
+                .child(title.into()),
         )
         .child(div().flex_1())
         .child(icon_button(
             cx,
             theme,
             close_id,
-            icons().close.clone(),
+            "icons/close.svg",
             "Close",
             true,
             close,

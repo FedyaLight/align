@@ -37,6 +37,17 @@ pub fn cleanup() {
         .take();
 }
 
+/// Identifies a content-addressed WAV owned by this process's AAF extraction.
+pub fn embedded_aaf_name(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    let digest = name.strip_suffix(".wav")?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let directory = active_directory().ok().flatten()?;
+    (path.parent()? == directory).then_some(name)
+}
+
 pub fn preserve_project(project: &mut SyncProject, cancel: &AtomicBool) -> io::Result<()> {
     let Some(session) = active_directory()? else {
         return Ok(());
@@ -50,6 +61,7 @@ pub fn preserve_project(project: &mut SyncProject, cancel: &AtomicBool) -> io::R
         project.clips.iter_mut().map(|clip| &mut clip.url),
         &destination,
         cancel,
+        false,
     )
 }
 
@@ -59,6 +71,7 @@ pub(crate) fn preserve_export(
     timeline: &mut ExportTimeline,
     directory: &Path,
     cancel: &AtomicBool,
+    protect_existing: bool,
 ) -> io::Result<()> {
     let Some(session) = active_directory()? else {
         return Ok(());
@@ -71,6 +84,7 @@ pub(crate) fn preserve_export(
             .flat_map(|island| island.clips.iter_mut().map(|item| &mut item.clip.url)),
         &directory.join("Source Media"),
         cancel,
+        protect_existing,
     )
 }
 
@@ -88,6 +102,7 @@ fn retain_from<'a>(
     paths: impl Iterator<Item = &'a mut PathBuf>,
     destination: &Path,
     cancel: &AtomicBool,
+    protect_existing: bool,
 ) -> io::Result<()> {
     let mut retained: HashMap<PathBuf, PathBuf> = HashMap::new();
     for path in paths {
@@ -110,7 +125,7 @@ fn retain_from<'a>(
             path.file_name()
                 .ok_or_else(|| io::Error::other("Embedded media has no filename"))?,
         );
-        copy_atomic(path, &saved, cancel)?;
+        copy_atomic(path, &saved, cancel, protect_existing)?;
         retained.insert(path.clone(), saved.clone());
         *path = saved;
     }
@@ -125,7 +140,20 @@ fn check_cancel(cancel: &AtomicBool) -> io::Result<()> {
     }
 }
 
-fn copy_atomic(source: &Path, destination: &Path, cancel: &AtomicBool) -> io::Result<()> {
+fn copy_atomic(
+    source: &Path,
+    destination: &Path,
+    cancel: &AtomicBool,
+    protect_existing: bool,
+) -> io::Result<()> {
+    if protect_existing {
+        match std::fs::symlink_metadata(destination) {
+            Ok(_) => return reuse_retained_media(source, destination, cancel),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let source_path = source;
     let mut source = std::fs::File::open(source)?;
     let mut copy = tempfile::NamedTempFile::new_in(destination.parent().unwrap())?;
     let mut buffer = vec![0; 1_048_576];
@@ -139,8 +167,49 @@ fn copy_atomic(source: &Path, destination: &Path, cancel: &AtomicBool) -> io::Re
     }
     copy.as_file().sync_all()?;
     check_cancel(cancel)?;
-    copy.persist(destination).map_err(|error| error.error)?;
-    Ok(())
+    if !protect_existing {
+        return copy
+            .persist(destination)
+            .map(drop)
+            .map_err(|error| error.error);
+    }
+    match copy.persist_noclobber(destination) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+            reuse_retained_media(source_path, destination, cancel)
+        }
+        Err(error) => Err(error.error),
+    }
+}
+
+/// An extracted WAV is named by its contents. Check that a retained copy
+/// still agrees before linking a new timeline to it.
+fn reuse_retained_media(source: &Path, destination: &Path, cancel: &AtomicBool) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(destination)?;
+    let mut source = std::fs::File::open(source)?;
+    if metadata.is_file() && metadata.len() == source.metadata()?.len() {
+        let mut saved = std::fs::File::open(destination)?;
+        let mut original = vec![0; 1_048_576];
+        let mut retained = vec![0; original.len()];
+        loop {
+            check_cancel(cancel)?;
+            let count = source.read(&mut original)?;
+            if count == 0 {
+                return Ok(());
+            }
+            saved.read_exact(&mut retained[..count])?;
+            if original[..count] != retained[..count] {
+                break;
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "“{}” differs from the source audio. Choose another destination or move the existing file before trying again.",
+            destination.display()
+        ),
+    ))
 }
 
 #[cfg(test)]
@@ -162,6 +231,7 @@ mod tests {
             paths.iter_mut(),
             &output.path().join("saved"),
             &AtomicBool::new(false),
+            false,
         )
         .unwrap();
         drop(temporary);
@@ -186,11 +256,50 @@ mod tests {
             std::iter::once(&mut path),
             output.path(),
             &AtomicBool::new(true),
+            false,
         )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert_eq!(path, source);
         assert_eq!(std::fs::read(saved).unwrap(), b"previous PCM");
         assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn protected_export_reuses_matching_retained_audio_and_preserves_a_changed_copy() {
+        let session = tempfile::tempdir().unwrap();
+        let session_path = align_core::model::canonical_path(session.path()).unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let source = session_path.join("content.wav");
+        let saved = output.path().join("content.wav");
+        std::fs::write(&source, b"original").unwrap();
+        let retain = |path: &mut PathBuf| {
+            retain_from(
+                &session_path,
+                std::iter::once(path),
+                output.path(),
+                &AtomicBool::new(false),
+                true,
+            )
+        };
+        let mut path = source.clone();
+        retain(&mut path).unwrap();
+        let saved_revision = align_core::cache::media_revision(&saved).unwrap();
+        path = source.clone();
+        retain(&mut path).unwrap();
+        assert_eq!(path, align_core::model::canonical_path(&saved).unwrap());
+        assert_eq!(
+            align_core::cache::media_revision(&saved).unwrap(),
+            saved_revision
+        );
+
+        std::fs::write(&saved, b"modified").unwrap();
+        path = source.clone();
+        assert_eq!(
+            retain(&mut path).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(path, source);
+        assert_eq!(std::fs::read(saved).unwrap(), b"modified");
     }
 }

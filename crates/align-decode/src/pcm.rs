@@ -20,6 +20,10 @@ use crate::isobmff::{self, TrackKind};
 /// Frames converted per callback block.
 const BLOCK_FRAMES: usize = 8_192;
 
+/// Analysis borrows the planes so the next block reuses their capacity.
+/// Native render callbacks take ownership of a block handed to the backend.
+type ConsumePlanes<'a, T> = dyn FnMut(&mut Vec<Vec<T>>) -> Result<(), DecodeError> + 'a;
+
 pub struct PcmTrack {
     file: File,
     pub sample_rate: f64,
@@ -27,67 +31,149 @@ pub struct PcmTrack {
     bits: u32,
     float: bool,
     big_endian: bool,
-    /// Presentation start in frames (edit list).
-    lead: u64,
     /// (file offset, first frame, frame count) per chunk.
     chunks: Vec<(u64, u64, u64)>,
     total: u64,
+    complete: bool,
+}
+
+#[derive(Default)]
+struct PcmBuffer {
+    bytes: Vec<u8>,
+    samples: Vec<f32>,
+    next: Option<u64>,
+}
+
+/// Interleave the requested physical tracks by ascending file offset. A
+/// single file description (including its kernel read-ahead state) advances
+/// through the movie. Each track has independent channel and SRC state.
+pub(crate) fn fingerprint_tracks(
+    path: &Path,
+    sources: &[align_core::AudioAnalysisSource],
+    consume: crate::backend::TrackConsumer<'_>,
+) -> Option<Result<(), DecodeError>> {
+    if !(2..=16).contains(&sources.len()) || !isobmff::is_candidate(path) {
+        return None;
+    }
+    let mut file = File::open(path).ok()?;
+    let movie = isobmff::shared_movie_for_file(path, &mut file)?;
+    let consume = std::cell::RefCell::new(consume);
+    let mut tracks = Vec::new();
+    for (slot, source) in sources.iter().enumerate() {
+        let desc = movie.audio().nth(source.stream_index())?;
+        let track = PcmTrack::from_movie_track(file.try_clone().ok()?, desc, &movie.media_ranges)?;
+        if track.chunks.windows(2).any(|w| w[0].0 > w[1].0) || source.selected_channel().is_some() {
+            return None;
+        }
+        let sink = &consume;
+        let pipe = crate::mono::MonoPipe::new(
+            track.sample_rate,
+            8000.,
+            track.channels,
+            None,
+            source.mixes_channels(),
+            move |block: &[f32]| (sink.borrow_mut())(slot, block),
+        )
+        .ok()?;
+        tracks.push((track, pipe, 0usize));
+    }
+    Some((|| {
+        let mut buffer = PcmBuffer::default();
+        while let Some((offset, count, slot)) = tracks
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, (track, _, index))| {
+                track
+                    .chunks
+                    .get(*index)
+                    .map(|&(offset, _, count)| (offset, count, slot))
+            })
+            .min()
+        {
+            let (track, pipe, index) = &mut tracks[slot];
+            track.read_chunk(offset, count, None, &mut buffer, &mut |s| {
+                pipe.push_interleaved(s)
+            })?;
+            *index += 1;
+        }
+        for (_, pipe, _) in tracks {
+            pipe.finish()?;
+        }
+        Ok(())
+    })())
 }
 
 impl PcmTrack {
     /// `None` when the stream is not plain interleaved PCM in a WAVE,
     /// QuickTime or MP4 file (callers then use the general decoder).
     pub fn open(path: &Path, stream_index: usize) -> Option<Self> {
-        if let Some(wave) = Self::open_wave(path) {
+        if let Some(wave) = Self::open_wave(path, false) {
             return (stream_index == 0).then_some(wave);
         }
         if !isobmff::is_candidate(path) {
             return None;
         }
-        let movie = isobmff::read(path)?;
+        let mut file = File::open(path).ok()?;
+        let movie = isobmff::shared_movie_for_file(path, &mut file)?;
         let track = movie
             .tracks
             .iter()
             .filter(|t| t.kind == TrackKind::Audio)
             .nth(stream_index)?;
+        Self::from_movie_track(file, track, &movie.media_ranges)
+    }
+
+    fn from_movie_track(
+        file: File,
+        track: &isobmff::Track,
+        ranges: &[std::ops::Range<u64>],
+    ) -> Option<Self> {
         let audio = track.audio.as_ref()?;
         let (bits, float) = (audio.bit_depth?, audio.is_float?);
         if !matches!((bits, float), (16 | 24 | 32, false) | (32 | 64, true))
-            || !one_frame_per_sample(&track.sample_entry)
-            || audio.sample_rate.fract() != 0.0
+            || !track.linear_pcm_layout
+            || audio.channels > 64
+            || !track.composition_offsets.is_empty()
+            || audio.sample_rate != f64::from(track.timescale)
+            || track.time_to_sample.iter().any(|&(_, delta)| delta != 1)
+            || !one_frame_per_sample(&track.sample_entry, audio.channels, bits, float)
         {
             return None;
         }
         let bytes_per_frame = audio.channels as u64 * bits as u64 / 8;
-        let mut chunks = Vec::with_capacity(track.chunk_offsets.len());
-        let mut frame = 0u64;
-        for (index, &offset) in track.chunk_offsets.iter().enumerate() {
-            let number = index as u32 + 1;
-            let run = track
-                .chunk_runs
-                .iter()
-                .rev()
-                .find(|run| run.first_chunk <= number)?;
-            let frames = run.samples_per_chunk as u64;
-            chunks.push((offset, frame, frames));
-            frame += frames;
-        }
-        let file = File::open(path).ok()?;
-        let length = file.metadata().ok()?.len();
-        // Every chunk must lie inside the file; anything else is not a
-        // layout this reader understands.
-        if chunks
-            .iter()
-            .any(|&(offset, _, frames)| offset + frames * bytes_per_frame > length)
-            || frame != track.sample_count()
+        let matching_sizes = match &track.sample_sizes {
+            isobmff::SampleSizes::Constant { size, .. } => u64::from(*size) == bytes_per_frame,
+            isobmff::SampleSizes::Table(sizes) => {
+                sizes.iter().all(|&size| u64::from(size) == bytes_per_frame)
+            }
+        };
+        if !matching_sizes
+            || track.media_duration != track.sample_count()
+            || track.media_duration != track.sample_sizes.count() as u64
         {
             return None;
         }
-        let lead = if track.timescale > 0 {
-            (track.media_start as f64 * audio.sample_rate / track.timescale as f64).round() as u64
-        } else {
-            0
-        };
+        let mut chunks = Vec::with_capacity(track.chunk_offsets.len());
+        let mut frame = 0u64;
+        for chunk in track.chunk_layout() {
+            let (offset, count) = chunk?;
+            let frames = u64::from(count);
+            chunks.push((offset, frame, frames));
+            frame += frames;
+        }
+        if frame != track.sample_count()
+            || chunks.iter().any(|&(offset, _, frames)| {
+                let i = ranges.partition_point(|r| r.end <= offset);
+                !ranges.get(i).is_some_and(|r| {
+                    r.start <= offset
+                        && offset
+                            .checked_add(frames * bytes_per_frame)
+                            .is_some_and(|end| end <= r.end)
+                })
+            })
+        {
+            return None;
+        }
         Some(Self {
             file,
             sample_rate: audio.sample_rate,
@@ -95,15 +181,23 @@ impl PcmTrack {
             bits,
             float,
             big_endian: audio.big_endian,
-            lead,
             chunks,
             total: frame,
+            complete: true,
         })
+    }
+
+    /// Only canonical, complete WAVE files can replace a native media probe.
+    pub(crate) fn inspection_wave(path: &Path) -> Option<Self> {
+        path.extension()?
+            .eq_ignore_ascii_case("wav")
+            .then_some(())?;
+        Self::open_wave(path, true)
     }
 
     /// RIFF/RF64/BW64 WAVE with 16/24/32-bit integer or 32/64-bit float
     /// samples (`WAVE_FORMAT_EXTENSIBLE` included).
-    fn open_wave(path: &Path) -> Option<Self> {
+    fn open_wave(path: &Path, strict: bool) -> Option<Self> {
         let mut file = File::open(path).ok()?;
         let length = file.metadata().ok()?.len();
         let mut header = [0u8; 12];
@@ -116,6 +210,15 @@ impl PcmTrack {
         if &header[8..] != b"WAVE" {
             return None;
         }
+        if strict
+            && (large && &header[..4] != b"RF64"
+                || !large
+                    && u64::from(u32::from_le_bytes(header[4..8].try_into().ok()?)) + 8 != length)
+        {
+            return None;
+        }
+        let mut declared_frames = None;
+        let mut fact = None;
         let mut ds64_data = None;
         let mut format = None;
         let mut offset = 12u64;
@@ -129,30 +232,73 @@ impl PcmTrack {
                 b"ds64" if large && size >= 24 => {
                     let mut sizes = [0u8; 16];
                     file.read_exact(&mut sizes).ok()?;
+                    if strict {
+                        if offset != 12
+                            || size != 28
+                            || header[4..8] != [255; 4]
+                            || u64::from_le_bytes(sizes[..8].try_into().ok()?).checked_add(8)?
+                                != length
+                        {
+                            return None;
+                        }
+                        let mut counts = [0; 12];
+                        file.read_exact(&mut counts).ok()?;
+                        if counts[8..] != [0; 4] {
+                            return None;
+                        }
+                        declared_frames = Some(u64::from_le_bytes(counts[..8].try_into().ok()?));
+                    }
                     ds64_data = Some(u64::from_le_bytes(sizes[8..].try_into().ok()?));
                 }
                 b"fmt " if size >= 16 => {
+                    if strict && (format.is_some() || !matches!(size, 16 | 18 | 40)) {
+                        return None;
+                    }
                     let mut fmt = vec![0u8; size.min(40) as usize];
                     file.read_exact(&mut fmt).ok()?;
                     format = Some(fmt);
+                }
+                b"fact" if strict && size == 4 && fact.is_none() => {
+                    let mut bytes = [0; 4];
+                    file.read_exact(&mut bytes).ok()?;
+                    fact = Some(u64::from(u32::from_le_bytes(bytes)));
+                }
+                b"LIST" if strict => {
+                    let mut kind = [0; 4];
+                    file.read_exact(&mut kind).ok()?;
+                    if size < 4 || &kind != b"INFO" {
+                        return None;
+                    }
                 }
                 b"data" => {
                     let fmt = format?;
                     let field = |at: usize| u16::from_le_bytes([fmt[at], fmt[at + 1]]);
                     let mut tag = field(0);
-                    if tag == 0xfffe && fmt.len() >= 26 {
-                        tag = field(24); // SubFormat GUID starts with the tag
+                    if tag == 0xfffe {
+                        if fmt.len() < 40
+                            || field(16) < 22
+                            || field(18) != field(14)
+                            || fmt[26..40]
+                                != [0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71]
+                        {
+                            return None;
+                        }
+                        tag = field(24);
                     }
                     let channels = field(2) as usize;
                     let sample_rate = u32::from_le_bytes(fmt[4..8].try_into().ok()?);
                     let block_align = field(12) as u64;
                     if channels == 0
+                        || channels > 64
                         || sample_rate == 0
                         || !block_align.is_multiple_of(channels as u64)
                     {
                         return None;
                     }
                     let bits = (block_align / channels as u64 * 8) as u32;
+                    if bits != u32::from(field(14)) {
+                        return None;
+                    }
                     let float = match (tag, bits) {
                         (1, 16 | 24 | 32) => false,
                         (3, 32 | 64) => true,
@@ -164,6 +310,31 @@ impl PcmTrack {
                     };
                     // Interrupted recordings keep a header larger than the file.
                     let frames = declared.min(length.saturating_sub(body)) / block_align;
+                    if strict
+                        && (frames == 0
+                            || frames * block_align != declared
+                            || body.checked_add(declared)?.checked_add(declared & 1)? != length
+                            || large && (size != u64::from(u32::MAX) || ds64_data.is_none())
+                            || declared_frames.is_some_and(|n| n != frames)
+                            || fact.is_some_and(|n| n != frames)
+                            || u64::from(u32::from_le_bytes(fmt[8..12].try_into().ok()?))
+                                != u64::from(sample_rate) * block_align
+                            || !matches!(
+                                sample_rate,
+                                8000 | 16000
+                                    | 22050
+                                    | 24000
+                                    | 32000
+                                    | 44100
+                                    | 48000
+                                    | 88200
+                                    | 96000
+                                    | 192000
+                            )
+                            || channels > 8)
+                    {
+                        return None;
+                    }
                     return Some(Self {
                         file,
                         sample_rate: sample_rate as f64,
@@ -171,11 +342,13 @@ impl PcmTrack {
                         bits,
                         float,
                         big_endian: false,
-                        lead: 0,
                         chunks: vec![(body, 0, frames)],
                         total: frames,
+                        complete: frames * block_align == declared,
                     });
                 }
+                b"bext" | b"iXML" | b"JUNK" | b"PAD " => {}
+                _ if strict => return None,
                 _ => {}
             }
             let size = match (&chunk[..4], large, size) {
@@ -187,17 +360,144 @@ impl PcmTrack {
         None
     }
 
+    /// Decode one whole physical track in chunk order. Keep the source clock
+    /// through channel selection, including windows crossing chunk boundaries.
+    pub(crate) fn fingerprint(
+        &mut self,
+        source: align_core::AudioAnalysisSource,
+        consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
+    ) -> Result<(), DecodeError> {
+        if !self.complete {
+            return Err(DecodeError::Incomplete("truncated WAVE data chunk".into()));
+        }
+        let selected = source.selected_channel();
+        if selected.is_some_and(|channel| channel >= self.channels) {
+            return Err(DecodeError::InvalidPcm);
+        }
+        let native_float = self.native_f32();
+        #[cfg(target_os = "macos")]
+        let stride = self.channels * (self.bits / 8) as usize;
+        let single = selected.is_some() && !native_float;
+        let mut pipe = crate::mono::MonoPipe::new(
+            self.sample_rate,
+            8000.,
+            if single { 1 } else { self.channels },
+            if single { Some(0) } else { selected },
+            source.mixes_channels(),
+            consume,
+        )?;
+        let mut buffer = PcmBuffer::default();
+        for index in 0..self.chunks.len() {
+            let (offset, _, count) = self.chunks[index];
+            #[cfg(target_os = "macos")]
+            if self.chunks.len() > 1 && index % 32 == 0 {
+                use std::os::fd::AsRawFd;
+                for &(pos, _, frames) in self.chunks.iter().skip(index).take(32) {
+                    let hint = libc::radvisory {
+                        ra_offset: pos as i64,
+                        ra_count: (frames * stride as u64).min(i32::MAX as u64) as i32,
+                    };
+                    // SAFETY: valid descriptor and read-only advisory structure.
+                    // Failure only disables this kernel prefetch hint.
+                    unsafe {
+                        libc::fcntl(self.file.as_raw_fd(), libc::F_RDADVISE, &hint);
+                    }
+                }
+            }
+            self.read_chunk(offset, count, selected, &mut buffer, &mut |s| {
+                pipe.push_interleaved(s)
+            })?;
+        }
+        pipe.finish()
+    }
+
+    fn converter(&self) -> Option<fn(&[u8]) -> f32> {
+        Some(match (self.bits, self.float, self.big_endian) {
+            (16, false, false) => scaled::<2, false>,
+            (16, false, true) => scaled::<2, true>,
+            (24, false, false) => scaled::<3, false>,
+            (24, false, true) => scaled::<3, true>,
+            (32, false, false) => scaled::<4, false>,
+            (32, false, true) => scaled::<4, true>,
+            (_, true, true) => |b| float(b, true) as f32,
+            (_, true, false) => |b| float(b, false) as f32,
+            _ => return None,
+        })
+    }
+
+    fn read_chunk(
+        &mut self,
+        offset: u64,
+        count: u64,
+        selected: Option<usize>,
+        buffer: &mut PcmBuffer,
+        consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
+    ) -> Result<(), DecodeError> {
+        let width = (self.bits / 8) as usize;
+        let stride = self.channels * width;
+        let native_float = self.native_f32();
+        let convert = self.converter().ok_or(DecodeError::InvalidPcm)?;
+        if buffer.next != Some(offset) {
+            self.file.seek(SeekFrom::Start(offset))?;
+        }
+        let samples = &mut buffer.samples;
+        let bytes = &mut buffer.bytes;
+        let mut remaining = count;
+        while remaining > 0 {
+            let n = remaining.min(32768.min((1024 * 1024 / stride) as u64)) as usize;
+            if native_float {
+                samples.resize(n * self.channels, 0.);
+                // SAFETY: initialized, exclusively borrowed, aligned f32 storage.
+                // Every native f32 bit pattern is valid, even on a short read.
+                let dest = unsafe {
+                    std::slice::from_raw_parts_mut(samples.as_mut_ptr().cast::<u8>(), n * stride)
+                };
+                self.file.read_exact(dest)?;
+            } else {
+                bytes.resize(n * stride, 0);
+                self.file.read_exact(bytes)?;
+                samples.clear();
+                if self.bits == 24 {
+                    // Specialize the packed 3-byte stride once per block.
+                    // Explicit selection converts just one word per frame.
+                    if self.big_endian {
+                        unpack_24::<true>(bytes, self.channels, selected, samples);
+                    } else {
+                        unpack_24::<false>(bytes, self.channels, selected, samples);
+                    }
+                } else if let Some(channel) = selected {
+                    let at = channel * width;
+                    samples.extend(
+                        bytes
+                            .chunks_exact(stride)
+                            .map(|f| convert(&f[at..at + width])),
+                    );
+                } else {
+                    samples.extend(bytes.chunks_exact(width).map(convert));
+                }
+            }
+            consume(samples)?;
+            remaining -= n as u64;
+        }
+        buffer.next = Some(offset + count * stride as u64);
+        Ok(())
+    }
+
+    fn native_f32(&self) -> bool {
+        cfg!(target_endian = "little") && self.float && self.bits == 32 && !self.big_endian
+    }
+
     /// Stream format and duration without decoding.
     pub fn probe(&self) -> crate::backend::ProbeReport {
         crate::backend::ProbeReport {
-            duration_seconds: self.total.saturating_sub(self.lead) as f64 / self.sample_rate,
+            duration_seconds: self.total as f64 / self.sample_rate,
             audio_streams: vec![crate::backend::AudioStreamProbe {
                 sample_rate: self.sample_rate,
                 channels: self.channels,
                 bit_depth: Some(self.bits),
                 is_float: Some(self.float),
                 decoder_delay: 0.0,
-                end_seconds: Some(self.total.saturating_sub(self.lead) as f64 / self.sample_rate),
+                end_seconds: Some(self.total as f64 / self.sample_rate),
             }],
             has_video: false,
             video: None,
@@ -211,10 +511,10 @@ impl PcmTrack {
         start: u64,
         count: Option<u64>,
         convert: F,
-        consume: &mut dyn FnMut(Vec<Vec<T>>) -> Result<(), DecodeError>,
+        consume: &mut ConsumePlanes<'_, T>,
     ) -> Result<(), DecodeError> {
-        let first = start + self.lead;
-        let end = count.map_or(self.total, |n| (first + n).min(self.total));
+        let first = start;
+        let end = count.map_or(self.total, |n| first.saturating_add(n).min(self.total));
         if first >= end {
             return Ok(());
         }
@@ -223,6 +523,7 @@ impl PcmTrack {
         let index = self
             .chunks
             .partition_point(|&(_, chunk_first, frames)| chunk_first + frames <= first);
+        let mut planes: Vec<Vec<T>> = Vec::new();
         let mut bytes = Vec::new();
         let mut frame = first;
         for &(offset, chunk_first, frames) in &self.chunks[index..] {
@@ -237,15 +538,16 @@ impl PcmTrack {
                 let take = remaining.min(BLOCK_FRAMES);
                 bytes.resize(take * frame_bytes, 0);
                 self.file.read_exact(&mut bytes)?;
-                let planes = (0..self.channels)
-                    .map(|channel| {
+                planes.resize_with(self.channels, Vec::new);
+                for (channel, plane) in planes.iter_mut().enumerate() {
+                    plane.clear();
+                    plane.extend(
                         bytes[channel * width..]
                             .chunks(frame_bytes)
-                            .map(|frame| convert(&frame[..width]))
-                            .collect()
-                    })
-                    .collect();
-                consume(planes)?;
+                            .map(|frame| convert(&frame[..width])),
+                    );
+                }
+                consume(&mut planes)?;
                 remaining -= take;
                 frame += take as u64;
             }
@@ -257,7 +559,7 @@ impl PcmTrack {
         &mut self,
         start: u64,
         count: Option<u64>,
-        consume: &mut dyn FnMut(Vec<Vec<f32>>) -> Result<(), DecodeError>,
+        consume: &mut ConsumePlanes<'_, f32>,
     ) -> Result<(), DecodeError> {
         const SCALE: f32 = 1.0 / 2_147_483_648.0;
         macro_rules! int {
@@ -288,7 +590,7 @@ impl PcmTrack {
         &mut self,
         start: u64,
         count: Option<u64>,
-        consume: &mut dyn FnMut(Vec<Vec<i32>>) -> Result<(), DecodeError>,
+        consume: &mut ConsumePlanes<'_, i32>,
     ) -> Result<(), DecodeError> {
         match (self.bits, self.float, self.big_endian) {
             (16, false, false) => self.read_with(start, count, integer::<2, false>, consume),
@@ -313,7 +615,7 @@ impl PcmTrack {
 }
 
 /// QuickTime v1/v2 sound descriptions must describe one frame per sample.
-fn one_frame_per_sample(entry: &[u8]) -> bool {
+fn one_frame_per_sample(entry: &[u8], channels: usize, bits: u32, float: bool) -> bool {
     let body = entry.get(8..).unwrap_or_default();
     let field = |at: usize| {
         body.get(at..at + 4)
@@ -321,10 +623,46 @@ fn one_frame_per_sample(entry: &[u8]) -> bool {
     };
     match body.get(8..10).map(|v| u16::from_be_bytes([v[0], v[1]])) {
         Some(0) => true,
-        Some(1) => field(28) == Some(1),
-        Some(2) => field(60) == Some(1),
+        Some(1) => {
+            field(28) == Some(1)
+                && field(32) == Some(bits / 8)
+                && field(36) == Some(channels as u32 * (bits / 8))
+        }
+        Some(2) => {
+            field(60) == Some(1)
+                && field(56) == Some(channels as u32 * (bits / 8))
+                && field(52).is_some_and(|flags| {
+                    // Packed, interleaved signed integer or floating point. Only
+                    // byte order may vary; reject aligned-high, planar, etc.
+                    flags & !2 == if float { 9 } else { 12 }
+                })
+        }
         _ => false,
     }
+}
+
+fn unpack_24<const BIG: bool>(
+    bytes: &[u8],
+    channels: usize,
+    selected: Option<usize>,
+    out: &mut Vec<f32>,
+) {
+    let words = bytes.as_chunks::<3>().0;
+    if let Some(channel) = selected {
+        out.extend(
+            words[channel..]
+                .iter()
+                .step_by(channels)
+                .map(|w| scaled::<3, BIG>(w)),
+        );
+    } else {
+        out.extend(words.iter().map(|w| scaled::<3, BIG>(w)));
+    }
+}
+
+#[inline]
+fn scaled<const W: usize, const BIG: bool>(sample: &[u8]) -> f32 {
+    integer::<W, BIG>(sample) as f32 * (1.0 / 2_147_483_648.0)
 }
 
 /// Signed `W`-byte integer sample widened to the top of an i32.
@@ -383,7 +721,7 @@ mod tests {
             fmt.extend_from_slice(&24u16.to_le_bytes());
             fmt.extend_from_slice(&3u32.to_le_bytes());
             fmt.extend_from_slice(&1u16.to_le_bytes());
-            fmt.extend_from_slice(&[0; 14]);
+            fmt.extend_from_slice(&[0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71]);
         }
         let mut out = Vec::new();
         out.extend_from_slice(if large { b"RF64" } else { b"RIFF" });
@@ -439,7 +777,142 @@ mod tests {
         let path = dir.path().join("truncated.wav");
         let bytes = wave(false, false, &samples);
         std::fs::write(&path, &bytes[..bytes.len() - 600]).unwrap();
-        assert_eq!(PcmTrack::open(&path, 0).unwrap().total, 900);
+        let mut interrupted = PcmTrack::open(&path, 0).unwrap();
+        assert_eq!(interrupted.total, 900);
+        assert!(matches!(
+            interrupted.fingerprint(align_core::AudioAnalysisSource::Automatic, &mut |_| panic!(
+                "incomplete data reached fingerprint cache"
+            )),
+            Err(DecodeError::Incomplete(_))
+        ));
+    }
+
+    #[test]
+    fn edited_or_reconfigured_pcm_tracks_require_a_timeline_decoder() {
+        let Some(ffmpeg) = crate::ff::test_ffmpeg() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.mov");
+        assert!(
+            std::process::Command::new(ffmpeg)
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=duration=1:sample_rate=48000",
+                    "-c:a",
+                    "pcm_s24le",
+                    "-use_editlist",
+                    "1"
+                ])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(PcmTrack::open(&path, 0).is_some());
+        let data = std::fs::read(&path).unwrap();
+        for (kind, offset, value) in [
+            (b"elst", 16, 32768u32),
+            (b"stsc", 20, 2),
+            (b"stts", 16, 2),
+            (b"stsz", 8, 2),
+            (b"stco", 12, 0),
+        ] {
+            let mut corrupt = data.clone();
+            let start = data.windows(4).position(|b| b == kind).unwrap() + offset;
+            corrupt[start..start + 4].copy_from_slice(&value.to_be_bytes());
+            let path = dir
+                .path()
+                .join(format!("{}.mov", std::str::from_utf8(kind).unwrap()));
+            std::fs::write(&path, corrupt).unwrap();
+            assert!(PcmTrack::open(&path, 0).is_none(), "{}", path.display());
+        }
+    }
+
+    #[test]
+    fn interleaved_movie_tracks_keep_independent_clocks_and_channel_state() {
+        use crate::MediaBackend;
+        use align_core::AudioAnalysisSource;
+        let Some(ffmpeg) = crate::ff::test_ffmpeg() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two.mov");
+        assert!(
+            std::process::Command::new(ffmpeg)
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "aevalsrc='sin(73*t)*lt(t,1)|cos(293*t)*gte(t,1)':s=48000:d=2",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=845:sample_rate=44100:duration=3",
+                    "-map",
+                    "0:a",
+                    "-map",
+                    "1:a",
+                    "-c:a",
+                    "pcm_s24le",
+                    "-use_editlist",
+                    "0"
+                ])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let sources = [0, 1].map(|index| AudioAnalysisSource::Stream {
+            index,
+            channel: None,
+        });
+        let mut combined = [Vec::new(), Vec::new()];
+        fingerprint_tracks(&path, &sources, &mut |i, s| {
+            combined[i].extend_from_slice(s);
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        let read = |i, source| {
+            let mut samples = Vec::new();
+            PcmTrack::open(&path, i)
+                .unwrap()
+                .fingerprint(source, &mut |s| {
+                    samples.extend_from_slice(s);
+                    Ok(())
+                })
+                .unwrap();
+            samples
+        };
+        for i in 0..2 {
+            assert_eq!(combined[i], read(i, sources[i]));
+        }
+        let left = read(0, AudioAnalysisSource::MixedStream(0));
+        let right = read(1, AudioAnalysisSource::MixedStream(1));
+        let expected: Vec<_> = right
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (left.get(i).unwrap_or(&0.) + r) * 0.5)
+            .collect();
+        let mut actual = Vec::new();
+        crate::portable::PortableBackend
+            .decode_mono_8k(&path, AudioAnalysisSource::AllMixed, &mut |s| {
+                actual.extend_from_slice(s);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert!(matches!(
+            fingerprint_tracks(&path, &sources, &mut |_, _| Err(DecodeError::Cancelled)),
+            Some(Err(DecodeError::Cancelled))
+        ));
     }
 
     /// Every layout FFmpeg writes must decode to the same samples through

@@ -54,6 +54,12 @@ pub fn replace_audio(
     if !isobmff::is_candidate(video) {
         return Err(RemuxError::Unsupported("not a QuickTime or MP4 file"));
     }
+    let total_frames = (audio.total.max(0.0) * OUTPUT_RATE as f64).round() as u64;
+    if total_frames > u64::from(u32::MAX) {
+        return Err(RemuxError::Unsupported(
+            "audio exceeds the sample table limit",
+        ));
+    }
     let mut input = File::open(video)?;
     let moov = isobmff::read_moov(&mut input).ok_or(RemuxError::Unsupported("no movie header"))?;
     let moov_body = atoms(&moov)
@@ -111,7 +117,6 @@ pub fn replace_audio(
         copied.push((trak, offsets));
     }
 
-    let total_frames = (audio.total.max(0.0) * OUTPUT_RATE as f64).round() as u64;
     let delay_frames =
         ((audio.leading_silence.max(0.0) * OUTPUT_RATE as f64).round() as u64).min(total_frames);
     let channels = audio
@@ -165,7 +170,8 @@ pub fn replace_audio(
     moov_out.extend(audio_trak(
         audio_id,
         channels,
-        audio_frames,
+        u32::try_from(audio_frames)
+            .map_err(|_| RemuxError::Unsupported("audio exceeds the sample table limit"))?,
         (audio_frames as f64 / OUTPUT_RATE as f64 * movie_scale as f64).round() as u64,
         &audio_chunks,
     ));
@@ -365,7 +371,7 @@ fn chunk_offsets(offsets: &[u64]) -> Vec<u8> {
 fn audio_trak(
     id: u32,
     channels: usize,
-    frames: u64,
+    frames: u32,
     movie_duration: u64,
     chunks: &[(u64, u32)],
 ) -> Vec<u8> {
@@ -388,19 +394,10 @@ fn audio_trak(
 
     let mut mdhd = vec![0u8; 8];
     mdhd.extend_from_slice(&OUTPUT_RATE.to_be_bytes());
-    mdhd.extend_from_slice(&(frames.min(u32::MAX as u64) as u32).to_be_bytes());
+    mdhd.extend_from_slice(&frames.to_be_bytes());
     mdhd.extend_from_slice(&0x55c4u16.to_be_bytes()); // "und"
     mdhd.extend_from_slice(&[0u8; 2]);
-    let mdhd = if frames > u32::MAX as u64 {
-        let mut long = vec![0u8; 16];
-        long.extend_from_slice(&OUTPUT_RATE.to_be_bytes());
-        long.extend_from_slice(&frames.to_be_bytes());
-        long.extend_from_slice(&0x55c4u16.to_be_bytes());
-        long.extend_from_slice(&[0u8; 2]);
-        full(b"mdhd", 1, 0, &long)
-    } else {
-        full(b"mdhd", 0, 0, &mdhd)
-    };
+    let mdhd = full(b"mdhd", 0, 0, &mdhd);
     let hdlr = full(
         b"hdlr",
         0,
@@ -437,12 +434,7 @@ fn audio_trak(
         b"stts",
         0,
         0,
-        &[
-            1u32.to_be_bytes(),
-            (frames as u32).to_be_bytes(),
-            1u32.to_be_bytes(),
-        ]
-        .concat(),
+        &[1u32.to_be_bytes(), frames.to_be_bytes(), 1u32.to_be_bytes()].concat(),
     );
     let mut runs: Vec<(u32, u32)> = Vec::new();
     for (index, &(_, count)) in chunks.iter().enumerate() {
@@ -461,7 +453,7 @@ fn audio_trak(
         b"stsz",
         0,
         0,
-        &[bytes_per_frame.to_be_bytes(), (frames as u32).to_be_bytes()].concat(),
+        &[bytes_per_frame.to_be_bytes(), frames.to_be_bytes()].concat(),
     );
     let offsets: Vec<u64> = chunks.iter().map(|&(offset, _)| offset).collect();
     let stbl = boxed(
@@ -659,6 +651,19 @@ mod tests {
             total: 1.0,
         };
         let output = dir.path().join("out.mov");
+        // If size validation regresses, stop at audio probing rather than
+        // writing a day of PCM to the test machine.
+        let missing = dir.path().join("absent.wav");
+        let too_long = ReplacementAudio {
+            source: &missing,
+            total: (1u64 << 32) as f64 / OUTPUT_RATE as f64,
+            ..audio
+        };
+        assert!(matches!(
+            replace_audio(&camera, &output, &too_long, &AtomicBool::new(false)),
+            Err(RemuxError::Unsupported(_))
+        ));
+        assert!(!output.exists());
         let cancelled = replace_audio(&camera, &output, &audio, &AtomicBool::new(true));
         assert!(matches!(
             cancelled,

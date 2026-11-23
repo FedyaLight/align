@@ -20,6 +20,29 @@ use crate::DecodeError;
 /// dominated analysis time.
 const CHUNK: usize = 4608;
 
+// All FFTs here process one already selected/mixed channel, CHUNK frames
+// and two sub-chunks. Only retain common analysis geometries, so media with
+// unusual rates cannot leave oversized FFT plans in a long-lived process.
+struct IdleResampler {
+    rates: (usize, usize),
+    fft: FftFixedIn<f32>,
+}
+static IDLE_FFT: std::sync::Mutex<Vec<IdleResampler>> = std::sync::Mutex::new(Vec::new());
+
+fn pooled(rates: (usize, usize)) -> bool {
+    matches!(rates, (44_100 | 48_000 | 96_000, 8_000 | 16_000))
+}
+
+fn resampler(rates: (usize, usize)) -> Result<FftFixedIn<f32>, DecodeError> {
+    if pooled(rates) {
+        let mut idle = crate::lock_idle(&IDLE_FFT);
+        if let Some(i) = idle.iter().rposition(|entry| entry.rates == rates) {
+            return Ok(idle.swap_remove(i).fft);
+        }
+    }
+    FftFixedIn::new(rates.0, rates.1, CHUNK, 2, 1).map_err(|e| DecodeError::Resample(e.to_string()))
+}
+
 /// Interleaved → planar (render path; decode chains stay interleaved for
 /// zero-copy streaming).
 pub(crate) fn deinterleave_f32(frames: &[f32], channels: usize) -> Vec<Vec<f32>> {
@@ -42,6 +65,8 @@ pub struct MonoPipe<F> {
     mix_channels: bool,
     selected: Option<usize>,
     adaptive_pending: Vec<f32>,
+    energies: Vec<f64>,
+    resampled: Vec<Vec<f32>>,
     resampler: Option<FftFixedIn<f32>>,
     source_rate: f64,
     target_rate: f64,
@@ -53,6 +78,26 @@ pub struct MonoPipe<F> {
     in_total: u64,
     out_total: usize,
     consume: F,
+}
+
+impl<F> Drop for MonoPipe<F> {
+    fn drop(&mut self) {
+        let rates = (
+            self.source_rate.round() as usize,
+            self.target_rate.round() as usize,
+        );
+        if !std::thread::panicking()
+            && pooled(rates)
+            && let Some(mut fft) = self.resampler.take()
+        {
+            fft.reset();
+            let mut idle = crate::lock_idle(&IDLE_FFT);
+            if idle.len() == 12 {
+                idle.remove(0);
+            }
+            idle.push(IdleResampler { rates, fft });
+        }
+    }
 }
 
 impl<F> MonoPipe<F>
@@ -84,24 +129,23 @@ where
         let resampler = if (source_rate - target_rate).abs() < 0.001 {
             None
         } else {
-            Some(
-                FftFixedIn::new(
-                    source_rate.round() as usize,
-                    target_rate.round() as usize,
-                    CHUNK,
-                    2,
-                    1,
-                )
-                .map_err(|e| DecodeError::Resample(e.to_string()))?,
-            )
+            Some(resampler((
+                source_rate.round() as usize,
+                target_rate.round() as usize,
+            ))?)
         };
         let skip = resampler.as_ref().map(|r| r.output_delay()).unwrap_or(0);
+        let resampled = resampler
+            .as_ref()
+            .map_or_else(Vec::new, |r| r.output_buffer_allocate(true));
         Ok(Self {
             channels,
             explicit,
             mix_channels: mix_channels && explicit.is_none(),
             selected: None,
             adaptive_pending: Vec::new(),
+            energies: vec![0.; channels],
+            resampled,
             resampler,
             source_rate,
             target_rate,
@@ -116,48 +160,62 @@ where
 
     /// Push owned planar channels.
     pub fn push_owned(&mut self, planes: &[Vec<f32>]) -> Result<(), DecodeError> {
-        let refs: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
-        self.push_planar(&refs)
+        self.planar_from(planes, 0)
     }
 
-    /// Push planar channels (Symphonia `AudioBuffer.chan(i)` slices).
+    /// Push planar channels (Symphonia AudioBuffer channel slices).
     pub fn push_planar(&mut self, planes: &[&[f32]]) -> Result<(), DecodeError> {
+        self.planar_from(planes, 0)
+    }
+
+    pub(crate) fn planar_from<P: AsRef<[f32]>>(
+        &mut self,
+        planes: &[P],
+        mut start: usize,
+    ) -> Result<(), DecodeError> {
         if planes.len() != self.channels {
             return Err(DecodeError::InvalidPcm);
         }
-        if planes.iter().any(|p| p.len() != planes[0].len()) {
-            // Ragged trailing packet: process the common prefix only.
-            let n = planes.iter().map(|p| p.len()).min().unwrap_or(0);
-            if n == 0 {
-                return Ok(());
-            }
-            return self.push_planar_truncated(planes, n);
-        }
-        let n = planes[0].len();
-        self.push_planar_truncated(planes, n)
-    }
-
-    fn push_planar_truncated(&mut self, planes: &[&[f32]], n: usize) -> Result<(), DecodeError> {
+        let n = planes.iter().map(|p| p.as_ref().len()).min().unwrap_or(0);
         if self.mix_channels {
             let scale = 1.0 / self.channels as f32;
             return self.push_mono(
-                (0..n).map(|i| planes.iter().map(|plane| plane[i]).sum::<f32>() * scale),
+                (start..n)
+                    .map(|i| planes.iter().map(|plane| plane.as_ref()[i]).sum::<f32>() * scale),
             );
         }
-        if self.explicit.is_none() && self.channels > 1 {
-            for start in (0..n).step_by(512) {
-                let end = (start + 512).min(n);
-                let interleaved: Vec<f32> = (start..end)
-                    .flat_map(|i| planes.iter().map(move |plane| plane[i]))
-                    .collect();
-                self.push_adaptive(&interleaved)?;
-            }
-            return Ok(());
+        if self.explicit.is_some() || self.channels == 1 {
+            let channel = self.explicit.unwrap_or(0);
+            self.selected = Some(channel);
+            return self.push_mono(planes[channel].as_ref()[start..n].iter().copied());
         }
-        let channel = self.pick(planes, n, |planes, ch| {
-            planes[ch][..n].iter().map(|&v| v as f64 * v as f64).sum()
-        });
-        self.push_mono(planes[channel][..n].iter().copied())
+        while start < n {
+            let needed = 512 - self.adaptive_pending.len() / self.channels;
+            let end = (start + needed).min(n);
+            if end - start == 512 {
+                // An intact window: analyse the planes and copy only the winner.
+                for (energy, plane) in self.energies.iter_mut().zip(planes) {
+                    *energy = plane.as_ref()[start..end]
+                        .iter()
+                        .map(|&v| v as f64 * v as f64)
+                        .sum();
+                }
+                let channel = align_core::select_mono_channel(&self.energies, self.selected);
+                self.selected = Some(channel);
+                self.push_mono(planes[channel].as_ref()[start..end].iter().copied())?;
+            } else {
+                // Keep only the packet boundary in the common interleaved buffer.
+                for i in start..end {
+                    self.adaptive_pending
+                        .extend(planes.iter().map(|p| p.as_ref()[i]));
+                }
+                if end - start == needed {
+                    self.flush_adaptive()?;
+                }
+            }
+            start = end;
+        }
+        Ok(())
     }
 
     /// Push interleaved frames (FFmpeg `f32le` pipe). Never a downmix:
@@ -177,7 +235,7 @@ where
         if self.explicit.is_none() && channels > 1 {
             return self.push_adaptive(&frames[..n * channels]);
         }
-        let channel = self.pick_channel_interleaved(frames, n);
+        let channel = self.pick_channel_interleaved(frames);
         self.push_mono((0..n).map(move |i| frames[i * channels + channel]))
     }
 
@@ -187,6 +245,12 @@ where
         let quantum = 512 * self.channels;
         let mut remaining = frames;
         while !remaining.is_empty() {
+            if self.adaptive_pending.is_empty() && remaining.len() >= quantum {
+                let (window, rest) = remaining.split_at(quantum);
+                self.adaptive_window(window)?;
+                remaining = rest;
+                continue;
+            }
             let take = (quantum - self.adaptive_pending.len()).min(remaining.len());
             self.adaptive_pending.extend_from_slice(&remaining[..take]);
             remaining = &remaining[take..];
@@ -202,70 +266,62 @@ where
             return Ok(());
         }
         let block = std::mem::take(&mut self.adaptive_pending);
-        let channels = self.channels;
-        let n = block.len() / channels;
-        let channel = self.pick_channel_interleaved(&block, n);
-        self.push_mono((0..n).map(|i| block[i * channels + channel]))?;
+        self.adaptive_window(&block)?;
         self.adaptive_pending = block;
         self.adaptive_pending.clear();
         Ok(())
     }
 
-    fn pick_channel_interleaved(&mut self, frames: &[f32], n: usize) -> usize {
-        if let Some(ch) = self.explicit {
-            self.selected = Some(ch);
-            return ch;
-        }
-        let mut energies = vec![0.0f64; self.channels];
-        for i in 0..n {
-            for ch in 0..self.channels {
-                let v = frames[i * self.channels + ch] as f64;
-                energies[ch] += v * v;
-            }
-        }
-        let selected = align_core::select_mono_channel(&energies, self.selected);
-        self.selected = Some(selected);
-        selected
+    fn adaptive_window(&mut self, block: &[f32]) -> Result<(), DecodeError> {
+        let channels = self.channels;
+        let n = block.len() / channels;
+        let channel = self.pick_channel_interleaved(block);
+        self.push_mono((0..n).map(|i| block[i * channels + channel]))
     }
 
-    fn pick(
-        &mut self,
-        planes: &[&[f32]],
-        _n: usize,
-        energy: impl Fn(&[&[f32]], usize) -> f64,
-    ) -> usize {
+    fn pick_channel_interleaved(&mut self, frames: &[f32]) -> usize {
         if let Some(ch) = self.explicit {
             self.selected = Some(ch);
             return ch;
         }
-        let energies: Vec<f64> = (0..self.channels).map(|ch| energy(planes, ch)).collect();
-        let selected = align_core::select_mono_channel(&energies, self.selected);
+        if self.channels == 2 {
+            let (mut left, mut right) = (0.0, 0.0);
+            for &[l, r] in frames.as_chunks::<2>().0 {
+                left += f64::from(l) * f64::from(l);
+                right += f64::from(r) * f64::from(r);
+            }
+            self.energies.copy_from_slice(&[left, right]);
+        } else {
+            self.energies.fill(0.);
+            for frame in frames.chunks_exact(self.channels) {
+                for (energy, &sample) in self.energies.iter_mut().zip(frame) {
+                    *energy += f64::from(sample) * f64::from(sample);
+                }
+            }
+        }
+        let selected = align_core::select_mono_channel(&self.energies, self.selected);
         self.selected = Some(selected);
         selected
     }
 
     fn push_mono(&mut self, samples: impl Iterator<Item = f32>) -> Result<(), DecodeError> {
-        match self.resampler.as_mut() {
-            None => {
-                // Passthrough: collect to one slice per call (still streaming).
-                let v: Vec<f32> = samples.collect();
-                if !v.is_empty() {
-                    self.out_total += v.len();
-                    (self.consume)(&v)?;
-                }
-                Ok(())
+        let mut pending = std::mem::take(&mut self.pending);
+        let before = pending.len();
+        pending.extend(samples);
+        if self.resampler.is_none() {
+            self.emit(&pending)?;
+            pending.clear();
+        } else {
+            self.in_total += (pending.len() - before) as u64;
+            let (chunks, tail) = pending.as_chunks::<CHUNK>();
+            for chunk in chunks {
+                self.emit_chunk(chunk)?;
             }
-            Some(_) => {
-                let before = self.pending.len();
-                self.pending.extend(samples);
-                self.in_total += (self.pending.len() - before) as u64;
-                while self.pending.len() >= CHUNK {
-                    let chunk: Vec<f32> = self.pending.drain(..CHUNK).collect();
-                    self.emit_chunk(&chunk)?;
-                }
-                Ok(())
-            }
+            let consumed = pending.len() - tail.len();
+            pending.drain(..consumed);
         }
+        self.pending = pending;
+        Ok(())
     }
 
     fn emit(&mut self, frames: &[f32]) -> Result<(), DecodeError> {
@@ -293,10 +349,13 @@ where
             .resampler
             .as_mut()
             .expect("resampler present: guarded by caller");
-        let out = resampler
-            .process(&[chunk], None)
+        let mut out = std::mem::take(&mut self.resampled);
+        let (_, written) = resampler
+            .process_into_buffer(&[chunk], &mut out, None)
             .map_err(|e| DecodeError::Resample(e.to_string()))?;
-        self.emit(&out[0])
+        let result = self.emit(&out[0][..written]);
+        self.resampled = out;
+        result
     }
 
     pub fn finish(mut self) -> Result<(), DecodeError> {
@@ -349,6 +408,25 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resampling_survives_a_poisoned_pool() {
+        let pipe = MonoPipe::new(48000., 8000., 1, None, false, |_| Ok(())).unwrap();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = IDLE_FFT.lock().unwrap();
+            panic!("interrupted pool update");
+        });
+        drop(pipe);
+        let mut count = 0;
+        let mut next = MonoPipe::new(48000., 8000., 1, None, false, |samples| {
+            count += samples.len();
+            Ok(())
+        })
+        .unwrap();
+        next.push_interleaved(&[0.0; CHUNK]).unwrap();
+        next.finish().unwrap();
+        assert_eq!(count, CHUNK / 6);
+    }
 
     #[test]
     fn passthrough_is_exact() {
@@ -477,6 +555,29 @@ mod tests {
     fn explicit_channel_validated() {
         assert!(MonoPipe::new(8000.0, 8000.0, 2, Some(2), false, |_: &[f32]| Ok(())).is_err());
         assert!(MonoPipe::new(8000.0, 8000.0, 0, None, false, |_: &[f32]| Ok(())).is_err());
+    }
+
+    #[test]
+    fn cancelled_resampling_cannot_leave_audio_in_the_next_clip() {
+        let mut loud = MonoPipe::new(48000., 16000., 1, None, false, |_| {
+            Err(DecodeError::Cancelled)
+        })
+        .unwrap();
+        assert!(matches!(
+            loud.push_planar(&[&[1.0; CHUNK * 2]]),
+            Err(DecodeError::Cancelled)
+        ));
+        drop(loud);
+        let mut frames = 0;
+        let mut quiet = MonoPipe::new(48000., 16000., 1, None, false, |samples| {
+            assert!(samples.iter().all(|&s| s == 0.));
+            frames += samples.len();
+            Ok(())
+        })
+        .unwrap();
+        quiet.push_planar(&[&[0.; 48000]]).unwrap();
+        quiet.finish().unwrap();
+        assert!(frames >= 16000);
     }
 
     #[test]

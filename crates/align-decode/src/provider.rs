@@ -1,4 +1,4 @@
-//! Adapter from [`MediaBackend`] to [`WindowProvider`].
+//! Adapter from [`crate::MediaBackend`] to [`WindowProvider`].
 //!
 //! The refine stage addresses clips by [`ClipId`]; this maps ids to media
 //! paths and uses the requested audio source, preserving
@@ -9,14 +9,19 @@ use std::path::PathBuf;
 
 use align_core::{AudioAnalysisSource, AudioWindow, ClipId, FINE_SAMPLE_RATE, WindowProvider};
 
-use crate::backend::MediaBackend;
+use crate::backend::WindowDecoder;
 
 pub struct BackendWindowProvider<'a> {
-    pub backend: &'a dyn MediaBackend,
+    pub worker_cap: usize,
+    pub decode: WindowDecoder<'a>,
     pub clips: HashMap<ClipId, PathBuf>,
 }
 
 impl<'a> WindowProvider for BackendWindowProvider<'a> {
+    fn worker_cap(&self) -> usize {
+        self.worker_cap
+    }
+
     fn window(
         &self,
         clip: &ClipId,
@@ -25,10 +30,7 @@ impl<'a> WindowProvider for BackendWindowProvider<'a> {
         source: AudioAnalysisSource,
     ) -> Option<AudioWindow> {
         let path = self.clips.get(clip)?;
-        let (actual_start, samples) = self
-            .backend
-            .decode_window_16k(path, start, duration, source)
-            .ok()?;
+        let (actual_start, samples) = (self.decode)(path, start, duration, source).ok()?;
         Some(AudioWindow {
             start: actual_start,
             sample_rate: FINE_SAMPLE_RATE,

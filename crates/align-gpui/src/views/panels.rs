@@ -1,6 +1,12 @@
 //! Updates, feedback, About, AI agent setup, and error alerts.
 
-use super::*;
+use super::animation::slide_in;
+use super::controls::{button, hover_tip, modal_header, prominent_button};
+use super::{
+    AlignApp, ClipboardItem, Context, Div, FluentBuilder, InteractiveElement, IntoElement,
+    Operation, ParentElement, PathBuf, SharedString, StatefulInteractiveElement, Styled, Theme,
+    UpdateState, div, img, px, rgb, svg_icon, updater,
+};
 
 // ---------------- updates
 
@@ -115,7 +121,7 @@ pub(super) fn floating_notice(
         .border_color(rgb(theme.border))
         .bg(rgb(theme.panel))
         .shadow_lg()
-        .child(img(PathBuf::from(&icons().app)).size(px(36.)).rounded_md())
+        .child(img(crate::icons::APP_ICON).size(px(36.)).rounded_md())
         .child(
             div()
                 .flex_1()
@@ -144,7 +150,7 @@ pub(super) fn floating_notice(
                     .cursor_pointer()
                     .opacity(0.6)
                     .hover(|this| this.opacity(1.))
-                    .child(svg_icon(icons().close.clone(), 12., theme.icon))
+                    .child(svg_icon("icons/close.svg", 12., theme.icon))
                     .tooltip(hover_tip(tip.to_string(), theme))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         dismiss(this);
@@ -387,7 +393,7 @@ pub(super) fn about_panel(
             },
         ))
         .child(
-            img(PathBuf::from(&icons().app))
+            img(crate::icons::APP_ICON)
                 .mt_1()
                 .size(px(72.))
                 .rounded_xl(),
@@ -417,7 +423,7 @@ pub(super) fn about_panel(
                 .flex()
                 .items_center()
                 .gap_1()
-                .child(svg_icon(icons().github.clone(), 13.0, theme.icon))
+                .child(svg_icon("icons/github.svg", 13.0, theme.icon))
                 .child("Star on GitHub"),
             true,
             |_, _, _, cx| cx.open_url(updater::REPOSITORY_URL),
@@ -438,31 +444,25 @@ pub(super) fn about_panel(
         )
 }
 
-// ---------------- MCP setup (Align menu → Use with AI Agents…)
+// ---------------- CLI setup (Align menu → Use with AI Agents…)
 
-pub(super) const AGENT_PROMPT: &str = "Use the Align MCP server for media synchronization. Start with align_inspect when you need to understand the supplied media or timeline project. Use align_sync to calculate synchronization and align_export only when I ask for editor-ready files. Pass absolute paths, keep the default balanced settings unless the material calls for a different choice, and report the output files and any warnings clearly.";
+fn agent_prompt() -> String {
+    format!(
+        "Use the Align CLI at {}. Inspect my media by passing its paths directly. Run sync --output-json result.json --summary, then report matched and unmatched clips, drift and warnings. When I request an export, use export-json with the saved result.",
+        cli_path().display()
+    )
+}
 
-pub(super) fn mcp_server_path() -> PathBuf {
+fn cli_path() -> PathBuf {
     let executable = if cfg!(windows) {
-        "align-mcp.exe"
+        "align-cli.exe"
     } else {
-        "align-mcp"
+        "align-cli"
     };
     std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(|parent| parent.join(executable)))
         .unwrap_or_else(|| PathBuf::from(executable))
-}
-
-pub(super) fn mcp_configuration() -> String {
-    serde_json::to_string_pretty(&serde_json::json!({
-        "mcpServers": {
-            "align": {
-                "command": mcp_server_path()
-            }
-        }
-    }))
-    .unwrap_or_default()
 }
 
 pub(super) fn setup_text_block(theme: &Theme, text: impl Into<SharedString>) -> Div {
@@ -480,7 +480,7 @@ pub(super) fn setup_text_block(theme: &Theme, text: impl Into<SharedString>) -> 
 }
 
 pub(super) fn agent_setup_panel(cx: &mut Context<AlignApp>, theme: &Theme) -> impl IntoElement {
-    let configuration = mcp_configuration();
+    let path = cli_path().display().to_string();
     div()
         .id("agent-setup")
         .w(px(620.))
@@ -508,7 +508,7 @@ pub(super) fn agent_setup_panel(cx: &mut Context<AlignApp>, theme: &Theme) -> im
         .child(
             div()
                 .text_color(rgb(theme.dim))
-                .child("Connect the bundled MCP server, then give your agent the prompt below."),
+                .child("Copy the prompt into an agent that can run local commands."),
         )
         .child(
             div()
@@ -518,21 +518,23 @@ pub(super) fn agent_setup_panel(cx: &mut Context<AlignApp>, theme: &Theme) -> im
                 .child(
                     div()
                         .font_weight(gpui::FontWeight(600.))
-                        .child("MCP configuration"),
+                        .child("CLI executable"),
                 )
                 .child(div().flex_1())
                 .child(button(
                     cx,
                     theme,
-                    "copy-mcp-config",
-                    "Copy configuration",
+                    "copy-cli-path",
+                    "Copy path",
                     true,
                     |_, _, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(mcp_configuration()));
+                        cx.write_to_clipboard(ClipboardItem::new_string(
+                            cli_path().display().to_string(),
+                        ));
                     },
                 )),
         )
-        .child(setup_text_block(theme, configuration))
+        .child(setup_text_block(theme, path))
         .child(
             div()
                 .flex()
@@ -551,11 +553,11 @@ pub(super) fn agent_setup_panel(cx: &mut Context<AlignApp>, theme: &Theme) -> im
                     "Copy prompt",
                     true,
                     |_, _, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(AGENT_PROMPT.to_string()));
+                        cx.write_to_clipboard(ClipboardItem::new_string(agent_prompt()));
                     },
                 )),
         )
-        .child(setup_text_block(theme, AGENT_PROMPT))
+        .child(setup_text_block(theme, agent_prompt()))
 }
 
 // ---------------- error alert
@@ -594,7 +596,7 @@ pub(super) fn error_alert(
         );
     // Recovery comes first; reporting is the fallback when it does not help.
     panel
-        .when(data.can_locate_timeline_media(), |panel| {
+        .when(data.can_relink_media(), |panel| {
             panel.child(button(
                 cx,
                 theme,

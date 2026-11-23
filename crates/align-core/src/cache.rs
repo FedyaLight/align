@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const CACHE_VERSION: u32 = 6;
-pub const CACHE_MAX_AGE_DAYS: u64 = 30;
+pub const CACHE_MAX_AGE_DAYS: u64 = 7;
 const LEGACY_CACHE_VERSION: u32 = 5;
 const HEAD_TAIL_BYTES: u64 = 1_048_576;
 
@@ -28,6 +28,78 @@ struct TimingPayload {
     timing: crate::VideoTimingInspection,
 }
 
+#[derive(Serialize, Deserialize)]
+struct LtcPayload {
+    media_path: PathBuf,
+    detection: Option<(usize, crate::SourceTimecode)>,
+}
+
+/// The same bytes and metadata used by the on-disk v5 and v6 formats.
+/// Keep these only for the duration of one clip's fingerprint pass.
+#[derive(PartialEq)]
+pub struct MediaSample {
+    revision: Option<String>,
+    path: PathBuf,
+    size: u64,
+    mtime: f64,
+    bytes: Vec<u8>,
+}
+
+impl MediaSample {
+    pub fn read(media: &Path) -> std::io::Result<Self> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(media)?;
+        let meta = file.metadata()?;
+        let revision = file_revision(&file, &meta).ok();
+        let size = meta.len();
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0.0, |d| d.as_secs_f64());
+        let head = size.min(HEAD_TAIL_BYTES) as usize;
+        let tail = if size > HEAD_TAIL_BYTES {
+            HEAD_TAIL_BYTES as usize
+        } else {
+            0
+        };
+        let mut bytes = vec![0; head + tail];
+        file.read_exact(&mut bytes[..head])?;
+        if tail > 0 {
+            let overlap = (head + tail).saturating_sub(usize::try_from(size).unwrap_or(usize::MAX));
+            if overlap > 0 {
+                // Preserve the overlapping bytes in the v5/v6 hash input.
+                bytes.copy_within(head - overlap..head, head);
+            } else {
+                file.seek(SeekFrom::End(-(tail as i64)))?;
+            }
+            file.read_exact(&mut bytes[head + overlap..])?;
+        }
+        Ok(Self {
+            revision,
+            path: normalized_path(media),
+            size,
+            mtime,
+            bytes,
+        })
+    }
+    fn is_current(&self) -> bool {
+        match &self.revision {
+            Some(revision) => media_revision(&self.path).as_ref().ok() == Some(revision),
+            // Some filesystems do not expose a change time. Keep v5/v6
+            // caching available and recheck the sampled identity before writing.
+            None => Self::read(&self.path).is_ok_and(|sample| sample == *self),
+        }
+    }
+}
+
+pub struct FingerprintEntry<'a> {
+    cache: &'a FingerprintCache,
+    sample: &'a MediaSample,
+    path: PathBuf,
+    variant: &'a str,
+}
+
 /// v5 omitted the media path but its fingerprints remain valid. Keep this
 /// reader so an upgrade does not re-analyse hours-long recordings.
 #[derive(Serialize, Deserialize)]
@@ -38,7 +110,9 @@ struct LegacyPayload {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CacheSettings {
+    pub enabled: bool,
     /// `None` keeps cached analysis until the user clears it.
     pub retention_days: Option<u64>,
 }
@@ -46,6 +120,7 @@ pub struct CacheSettings {
 impl Default for CacheSettings {
     fn default() -> Self {
         Self {
+            enabled: true,
             retention_days: Some(CACHE_MAX_AGE_DAYS),
         }
     }
@@ -56,8 +131,8 @@ impl CacheSettings {
         Self::load_from(&settings_file())
     }
 
-    pub fn save(self) {
-        self.save_to(&settings_file());
+    pub fn save(self) -> std::io::Result<()> {
+        self.save_to(&settings_file())
     }
 
     pub fn load_from(path: &Path) -> Self {
@@ -67,13 +142,11 @@ impl CacheSettings {
             .unwrap_or_default()
     }
 
-    pub fn save_to(self, path: &Path) {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+    pub fn save_to(self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
         }
-        if let Ok(bytes) = serde_json::to_vec_pretty(&self) {
-            let _ = std::fs::write(path, bytes);
-        }
+        crate::staged::write(path, &serde_json::to_vec_pretty(&self)?)
     }
 }
 
@@ -104,6 +177,19 @@ impl FingerprintCache {
         }
     }
 
+    /// Keep unaffected generations readable when a decoder changes for one codec.
+    pub fn decoder_variant(&self, variant: &str) -> Self {
+        self.for_backend(format!("{}:{variant}", self.backend_tag))
+    }
+
+    /// Use another analysis namespace in the same cache directory.
+    pub fn for_backend(&self, backend_tag: impl Into<String>) -> Self {
+        Self {
+            dir: self.dir.clone(),
+            backend_tag: backend_tag.into(),
+        }
+    }
+
     pub fn statistics(&self) -> CacheStatistics {
         let mut st = CacheStatistics::default();
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
@@ -113,15 +199,15 @@ impl FingerprintCache {
             let p = e.path();
             if !matches!(
                 p.extension().and_then(|s| s.to_str()),
-                Some("bin" | "timing")
+                Some("bin" | "timing" | "ltc")
             ) {
                 continue;
             }
             st.file_count += 1;
             st.total_bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
-            st.total_bytes += std::fs::metadata(p.with_extension("waveform"))
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
+            for ext in ["waveform", "flux1"] {
+                st.total_bytes += std::fs::metadata(p.with_extension(ext)).map_or(0, |m| m.len());
+            }
         }
         st
     }
@@ -142,7 +228,7 @@ impl FingerprintCache {
             let path = entry.path();
             if !matches!(
                 path.extension().and_then(|value| value.to_str()),
-                Some("bin" | "timing")
+                Some("bin" | "timing" | "ltc")
             ) {
                 continue;
             }
@@ -152,6 +238,10 @@ impl FingerprintCache {
             let Some(media_path) = std::fs::read(&path).ok().and_then(|bytes| {
                 if path.extension().and_then(|value| value.to_str()) == Some("timing") {
                     serde_json::from_slice::<TimingPayload>(&bytes)
+                        .ok()
+                        .map(|p| p.media_path)
+                } else if path.extension().is_some_and(|e| e == "ltc") {
+                    serde_json::from_slice::<LtcPayload>(&bytes)
                         .ok()
                         .map(|p| p.media_path)
                 } else {
@@ -166,11 +256,13 @@ impl FingerprintCache {
             if media.contains(&normalized_path(&media_path)) && std::fs::remove_file(path).is_ok() {
                 removed.file_count += 1;
                 removed.total_bytes += metadata.len();
-                let waveform = entry.path().with_extension("waveform");
-                if let Ok(metadata) = std::fs::metadata(&waveform)
-                    && std::fs::remove_file(waveform).is_ok()
-                {
-                    removed.total_bytes += metadata.len();
+                for ext in ["waveform", "flux1"] {
+                    let sidecar = entry.path().with_extension(ext);
+                    if let Ok(metadata) = std::fs::metadata(&sidecar)
+                        && std::fs::remove_file(sidecar).is_ok()
+                    {
+                        removed.total_bytes += metadata.len();
+                    }
                 }
             }
         }
@@ -190,7 +282,7 @@ impl FingerprintCache {
             let path = entry.path();
             if !matches!(
                 path.extension().and_then(|value| value.to_str()),
-                Some("bin" | "timing")
+                Some("bin" | "timing" | "ltc")
             ) {
                 continue;
             }
@@ -205,11 +297,13 @@ impl FingerprintCache {
             if expired && std::fs::remove_file(path).is_ok() {
                 removed.file_count += 1;
                 removed.total_bytes += metadata.len();
-                let waveform = entry.path().with_extension("waveform");
-                if let Ok(metadata) = std::fs::metadata(&waveform)
-                    && std::fs::remove_file(waveform).is_ok()
-                {
-                    removed.total_bytes += metadata.len();
+                for ext in ["waveform", "flux1"] {
+                    let sidecar = entry.path().with_extension(ext);
+                    if let Ok(metadata) = std::fs::metadata(&sidecar)
+                        && std::fs::remove_file(sidecar).is_ok()
+                    {
+                        removed.total_bytes += metadata.len();
+                    }
                 }
             }
         }
@@ -223,11 +317,7 @@ impl FingerprintCache {
         media: &Path,
         decoder: &str,
     ) -> Option<crate::VideoTimingInspection> {
-        let path = self.video_timing_path(media, decoder).ok()?;
-        let bytes = std::fs::read(path).ok()?;
-        serde_json::from_slice::<TimingPayload>(&bytes)
-            .ok()
-            .map(|p| p.timing)
+        self.video_timing_entry(media, decoder)?.load()
     }
 
     pub fn save_video_timing(
@@ -236,84 +326,239 @@ impl FingerprintCache {
         decoder: &str,
         timing: crate::VideoTimingInspection,
     ) {
-        let Ok(path) = self.video_timing_path(media, decoder) else {
-            return;
-        };
-        let payload = TimingPayload {
-            media_path: normalized_path(media),
-            timing,
-        };
-        let Ok(bytes) = serde_json::to_vec(&payload) else {
-            return;
-        };
-        if std::fs::create_dir_all(&self.dir).is_err() {
-            return;
+        if let Some(entry) = self.video_timing_entry(media, decoder) {
+            entry.save(timing);
         }
-        // Best effort: a cache entry that cannot be written is recomputed.
-        let _ = crate::staged::write(&path, &bytes);
     }
 
-    fn video_timing_path(&self, media: &Path, decoder: &str) -> std::io::Result<PathBuf> {
-        // Keep nanosecond mtime precision in addition to the existing sampled
-        // fingerprint identity (path, length, mtime, first/last MiB).
-        let revision = media_revision(media)?;
-        self.cache_path(media, &format!("video-timing-v1:{decoder}:{revision}"))
-            .map(|p| p.with_extension("timing"))
+    pub fn video_timing_entry(&self, media: &Path, decoder: &str) -> Option<VideoTimingEntry> {
+        let sample = MediaSample::read(media).ok()?;
+        let revision = sample.revision.as_ref()?;
+        let variant = format!("video-timing-v1:{decoder}:{revision}");
+        let path = self
+            .path_for_version(&sample, &variant, CACHE_VERSION)
+            .with_extension("timing");
+        Some(VideoTimingEntry {
+            path,
+            media_path: sample.path,
+            revision: sample.revision?,
+        })
+    }
+
+    pub fn entry<'a>(&'a self, sample: &'a MediaSample, variant: &'a str) -> FingerprintEntry<'a> {
+        FingerprintEntry {
+            cache: self,
+            sample,
+            variant,
+            path: self.path_for_version(sample, variant, CACHE_VERSION),
+        }
     }
 
     pub fn load(&self, media: &Path, variant: &str) -> Option<Vec<Fingerprint>> {
-        if let Ok(url) = self.cache_path(media, variant)
-            && let Ok(bytes) = std::fs::read(url)
+        self.entry(&MediaSample::read(media).ok()?, variant).load()
+    }
+
+    pub fn save(&self, fingerprints: &[Fingerprint], media: &Path, variant: &str) {
+        if let Ok(sample) = MediaSample::read(media) {
+            self.entry(&sample, variant).save(fingerprints);
+        }
+    }
+
+    pub fn load_waveform(&self, media: &Path, variant: &str) -> Option<Vec<f32>> {
+        self.entry(&MediaSample::read(media).ok()?, variant)
+            .load_waveform()
+    }
+
+    pub fn save_waveform(&self, waveform: &[f32], media: &Path, variant: &str) {
+        if let Ok(sample) = MediaSample::read(media) {
+            self.entry(&sample, variant).save_waveform(waveform);
+        }
+    }
+
+    fn path_for_version(&self, sample: &MediaSample, variant: &str, version: u32) -> PathBuf {
+        let MediaSample {
+            path,
+            size,
+            mtime,
+            bytes,
+            ..
+        } = sample;
+        let mut hasher = blake3::Hasher::new();
+        let prefix = if version == LEGACY_CACHE_VERSION {
+            format!(
+                "fingerprints-{version}\0{}\0{variant}\0{size}\0{mtime}",
+                self.backend_tag
+            )
+        } else {
+            format!(
+                "fingerprints-{version}\0{}\0{variant}\0{}\0{size}\0{mtime}",
+                self.backend_tag,
+                path.to_string_lossy()
+            )
+        };
+        hasher.update(prefix.as_bytes());
+        hasher.update(bytes);
+        self.dir.join(format!("{}.bin", hasher.finalize().to_hex()))
+    }
+
+    /// LTC is independent of fingerprint accuracy and channel selection.
+    /// Unix change time also detects rewrites with a restored mtime.
+    pub fn ltc_entry(&self, media: &Path) -> Option<LtcEntry> {
+        let media_path = normalized_path(media);
+        let revision = media_revision(&media_path).ok()?;
+        let mut key = blake3::Hasher::new();
+        key.update(b"ltc-v1\0");
+        key.update(self.backend_tag.as_bytes());
+        key.update(&[0]);
+        key.update(media_path.as_os_str().as_encoded_bytes());
+        key.update(&[0]);
+        key.update(revision.as_bytes());
+        Some(LtcEntry {
+            path: self.dir.join(format!("{}.ltc", key.finalize())),
+            media_path,
+            revision,
+        })
+    }
+}
+
+pub struct VideoTimingEntry {
+    path: PathBuf,
+    media_path: PathBuf,
+    revision: String,
+}
+
+impl VideoTimingEntry {
+    pub fn load(&self) -> Option<crate::VideoTimingInspection> {
+        let bytes = std::fs::read(&self.path).ok()?;
+        serde_json::from_slice::<TimingPayload>(&bytes)
+            .ok()
+            .map(|p| p.timing)
+    }
+
+    pub fn save(&self, timing: crate::VideoTimingInspection) {
+        if media_revision(&self.media_path).ok().as_ref() != Some(&self.revision) {
+            return;
+        }
+        let payload = TimingPayload {
+            media_path: self.media_path.clone(),
+            timing,
+        };
+        if let Ok(bytes) = serde_json::to_vec(&payload)
+            && let Some(dir) = self.path.parent()
+            && std::fs::create_dir_all(dir).is_ok()
+        {
+            let _ = crate::staged::write(&self.path, &bytes);
+        }
+    }
+}
+
+pub struct LtcEntry {
+    path: PathBuf,
+    media_path: PathBuf,
+    revision: String,
+}
+
+impl LtcEntry {
+    pub fn load(&self) -> Option<Option<(usize, crate::SourceTimecode)>> {
+        Some(
+            serde_json::from_slice::<LtcPayload>(&std::fs::read(&self.path).ok()?)
+                .ok()?
+                .detection,
+        )
+    }
+
+    pub fn save(&self, detection: Option<(usize, crate::SourceTimecode)>) {
+        if media_revision(&self.media_path).ok().as_ref() != Some(&self.revision) {
+            return;
+        }
+        let payload = LtcPayload {
+            media_path: self.media_path.clone(),
+            detection,
+        };
+        if let Ok(bytes) = serde_json::to_vec(&payload)
+            && let Some(dir) = self.path.parent()
+            && std::fs::create_dir_all(dir).is_ok()
+        {
+            let _ = crate::staged::write(&self.path, &bytes);
+        }
+    }
+}
+
+impl FingerprintEntry<'_> {
+    pub fn exists(&self) -> bool {
+        self.path.is_file()
+            || self
+                .cache
+                .path_for_version(self.sample, self.variant, LEGACY_CACHE_VERSION)
+                .is_file()
+    }
+    pub fn load(&self) -> Option<Vec<Fingerprint>> {
+        if let Ok(bytes) = std::fs::read(&self.path)
             && let Ok(payload) = bincode::deserialize::<Payload>(&bytes)
             && payload.version == CACHE_VERSION
-            && payload.backend_tag == self.backend_tag
+            && payload.backend_tag == self.cache.backend_tag
         {
             return Some(payload.fingerprints);
         }
 
         // Promote v5 in place after the first successful read. The legacy
         // key still validates backend, variant, metadata, and sampled bytes.
-        let legacy_url = self.legacy_cache_path(media, variant).ok()?;
+        let legacy_url =
+            self.cache
+                .path_for_version(self.sample, self.variant, LEGACY_CACHE_VERSION);
         let bytes = std::fs::read(&legacy_url).ok()?;
         let payload: LegacyPayload = bincode::deserialize(&bytes).ok()?;
-        if payload.version != LEGACY_CACHE_VERSION || payload.backend_tag != self.backend_tag {
+        if payload.version != LEGACY_CACHE_VERSION || payload.backend_tag != self.cache.backend_tag
+        {
             return None;
         }
-        self.save(&payload.fingerprints, media, variant);
-        if self
-            .cache_path(media, variant)
-            .is_ok_and(|path| path.exists())
-        {
+        self.save(&payload.fingerprints);
+        if self.path.exists() {
             let _ = std::fs::remove_file(legacy_url);
         }
         Some(payload.fingerprints)
     }
 
-    pub fn save(&self, fingerprints: &[Fingerprint], media: &Path, variant: &str) {
-        let Ok(url) = self.cache_path(media, variant) else {
-            return;
-        };
-        if std::fs::create_dir_all(&self.dir).is_err() {
+    pub fn save(&self, fingerprints: &[Fingerprint]) {
+        if !self.sample.is_current() || std::fs::create_dir_all(&self.cache.dir).is_err() {
             return;
         }
         let payload = Payload {
             version: CACHE_VERSION,
-            backend_tag: self.backend_tag.clone(),
-            media_path: normalized_path(media),
+            backend_tag: self.cache.backend_tag.clone(),
+            media_path: self.sample.path.clone(),
             fingerprints: fingerprints.to_vec(),
         };
         let Ok(bytes) = bincode::serialize(&payload) else {
             return;
         };
-        let _ = crate::staged::write(&url, &bytes);
+        let _ = crate::staged::write(&self.path, &bytes);
+    }
+
+    pub fn load_flux(&self, limit: usize) -> Option<Vec<u8>> {
+        use std::io::Read;
+        let file = std::fs::File::open(self.path.with_extension("flux1")).ok()?;
+        let limit = limit.min(crate::fingerprint::MAX_FLUX_HOPS);
+        if file.metadata().ok()?.len() > limit as u64 {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        file.take(limit as u64 + 1).read_to_end(&mut bytes).ok()?;
+        (bytes.len() <= limit).then_some(bytes)
+    }
+
+    pub fn save_flux(&self, bytes: &[u8]) {
+        if bytes.len() <= crate::fingerprint::MAX_FLUX_HOPS
+            && self.path.is_file()
+            && self.sample.is_current()
+        {
+            let _ = crate::staged::write(&self.path.with_extension("flux1"), bytes);
+        }
     }
 
     /// Load the compact amplitude envelope stored beside a fingerprint entry.
-    pub fn load_waveform(&self, media: &Path, variant: &str) -> Option<Vec<f32>> {
-        let url = self
-            .cache_path(media, variant)
-            .ok()?
-            .with_extension("waveform");
+    pub fn load_waveform(&self) -> Option<Vec<f32>> {
+        let url = self.path.with_extension("waveform");
         let waveform: Vec<f32> = bincode::deserialize(&std::fs::read(url).ok()?).ok()?;
         (!waveform.is_empty()
             && waveform.len() <= 4_096
@@ -324,7 +569,7 @@ impl FingerprintCache {
     }
 
     /// Store a session waveform without changing the fingerprint payload.
-    pub fn save_waveform(&self, waveform: &[f32], media: &Path, variant: &str) {
+    pub fn save_waveform(&self, waveform: &[f32]) {
         if waveform.is_empty()
             || waveform.len() > 4_096
             || !waveform
@@ -333,13 +578,8 @@ impl FingerprintCache {
         {
             return;
         }
-        let Ok(url) = self
-            .cache_path(media, variant)
-            .map(|path| path.with_extension("waveform"))
-        else {
-            return;
-        };
-        if std::fs::create_dir_all(&self.dir).is_err() {
+        let url = self.path.with_extension("waveform");
+        if !self.sample.is_current() || std::fs::create_dir_all(&self.cache.dir).is_err() {
             return;
         }
         let Ok(bytes) = bincode::serialize(waveform) else {
@@ -347,68 +587,62 @@ impl FingerprintCache {
         };
         let _ = crate::staged::write(&url, &bytes);
     }
-
-    fn cache_path(&self, media: &Path, variant: &str) -> std::io::Result<PathBuf> {
-        self.cache_path_for_version(media, variant, CACHE_VERSION, true)
-    }
-
-    fn legacy_cache_path(&self, media: &Path, variant: &str) -> std::io::Result<PathBuf> {
-        self.cache_path_for_version(media, variant, LEGACY_CACHE_VERSION, false)
-    }
-
-    fn cache_path_for_version(
-        &self,
-        media: &Path,
-        variant: &str,
-        version: u32,
-        include_path: bool,
-    ) -> std::io::Result<PathBuf> {
-        let meta = std::fs::metadata(media)?;
-        let size = meta.len();
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
-        let mut hasher = blake3::Hasher::new();
-        let prefix = if include_path {
-            format!(
-                "fingerprints-{version}\0{}\0{variant}\0{}\0{size}\0{mtime}",
-                self.backend_tag,
-                normalized_path(media).to_string_lossy()
-            )
-        } else {
-            format!(
-                "fingerprints-{version}\0{}\0{variant}\0{size}\0{mtime}",
-                self.backend_tag
-            )
-        };
-        hasher.update(prefix.as_bytes());
-        // Head + tail sampling: content change invalidates without hashing
-        // 119 GB corpora in full.
-        if let Ok(f) = std::fs::File::open(media) {
-            use std::io::{Read, Seek, SeekFrom};
-            let mut f = f;
-            let mut buf = vec![0u8; HEAD_TAIL_BYTES as usize];
-            if let Ok(n) = f.read(&mut buf) {
-                hasher.update(&buf[..n]);
-            }
-            if size > HEAD_TAIL_BYTES
-                && f.seek(SeekFrom::End(-(HEAD_TAIL_BYTES as i64))).is_ok()
-                && let Ok(n) = f.read(&mut buf)
-            {
-                hasher.update(&buf[..n]);
-            }
-        }
-        Ok(self.dir.join(format!("{}.bin", hasher.finalize().to_hex())))
-    }
 }
 
 /// Cheap change stamp used before/after a packet walk. Cache keys additionally
 /// sample file contents. Unix ctime detects rewrites with a restored mtime.
 pub fn media_revision(path: &Path) -> std::io::Result<String> {
-    let metadata = std::fs::metadata(path)?;
+    #[cfg(windows)]
+    {
+        let file = std::fs::File::open(path)?;
+        opened_media_revision(&file)
+    }
+    #[cfg(not(windows))]
+    {
+        metadata_revision(&std::fs::metadata(path)?)
+    }
+}
+
+/// Revision of the opened object, including when its path has been replaced.
+pub fn opened_media_revision(file: &std::fs::File) -> std::io::Result<String> {
+    file_revision(file, &file.metadata()?)
+}
+
+fn file_revision(_file: &std::fs::File, metadata: &std::fs::Metadata) -> std::io::Result<String> {
+    let stamp = metadata_revision(metadata)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
+        };
+        let mut info = std::mem::MaybeUninit::<FILE_BASIC_INFO>::uninit();
+        // The handle stays open and the OS fills one FILE_BASIC_INFO on success.
+        let success = unsafe {
+            GetFileInformationByHandleEx(
+                _file.as_raw_handle(),
+                FileBasicInfo,
+                info.as_mut_ptr().cast(),
+                size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        };
+        if success == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // ChangeTime includes writes followed by restoration of LastWriteTime.
+        let change = unsafe { info.assume_init() }.ChangeTime;
+        if change == 0 {
+            return Err(std::io::Error::other("missing file change time"));
+        }
+        Ok(format!("{stamp}:{change}"))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(stamp)
+    }
+}
+
+fn metadata_revision(metadata: &std::fs::Metadata) -> std::io::Result<String> {
     let stamp = format!(
         "{}:{:?}:{:?}",
         metadata.len(),
@@ -484,7 +718,7 @@ mod tests {
             "sampled bytes invalidate even with unchanged size/mtime"
         );
         cache.save_video_timing(&media, "decoder1", timing);
-        let path = cache.video_timing_path(&media, "decoder1").unwrap();
+        let path = cache.video_timing_entry(&media, "decoder1").unwrap().path;
         std::fs::write(&path, b"broken cache").unwrap();
         assert_eq!(cache.load_video_timing(&media, "decoder1"), None);
         cache.save_video_timing(&media, "decoder1", timing);
@@ -571,22 +805,34 @@ mod tests {
 
     #[test]
     fn cache_settings_roundtrip_and_default() {
-        let dir =
-            std::env::temp_dir().join(format!("align-cache-settings-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("cache.json");
-        assert_eq!(CacheSettings::load_from(&path), CacheSettings::default());
-        CacheSettings {
-            retention_days: None,
-        }
-        .save_to(&path);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
         assert_eq!(
             CacheSettings::load_from(&path),
             CacheSettings {
-                retention_days: None
+                enabled: true,
+                retention_days: Some(7),
             }
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        for (legacy, retention_days) in [
+            (r#"{"retention_days": 7}"#, Some(7)),
+            (r#"{"retention_days": 30}"#, Some(30)),
+            (r#"{"retention_days": 90}"#, Some(90)),
+            (r#"{"retention_days": null}"#, None),
+        ] {
+            std::fs::write(&path, legacy).unwrap();
+            let mut settings = CacheSettings::load_from(&path);
+            assert!(settings.enabled);
+            assert_eq!(settings.retention_days, retention_days);
+
+            for enabled in [false, true] {
+                settings.enabled = enabled;
+                settings.save_to(&path).unwrap();
+                settings = CacheSettings::load_from(&path);
+                assert_eq!(settings.enabled, enabled);
+                assert_eq!(settings.retention_days, retention_days);
+            }
+        }
     }
 
     #[test]
@@ -595,7 +841,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let media = dir.join("clip.wav");
-        std::fs::write(&media, vec![1u8; 4096]).unwrap();
+        let payload: Vec<u8> = (0..1_400_013).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&media, &payload).unwrap();
         let cache = FingerprintCache::new(Some(dir.join("cache")));
         let fingerprints = vec![Fingerprint { hash: 1, frame: 2 }];
         let legacy = LegacyPayload {
@@ -603,12 +850,35 @@ mod tests {
             backend_tag: "portable1".to_string(),
             fingerprints: fingerprints.clone(),
         };
-        let legacy_path = cache.legacy_cache_path(&media, "automatic").unwrap();
+        // Independent v5 key, including overlapping first and last MiB.
+        let modified = std::fs::metadata(&media)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let mut hash = blake3::Hasher::new();
+        hash.update(
+            format!(
+                "fingerprints-5\0portable1\0automatic\0{}\0{modified}",
+                payload.len()
+            )
+            .as_bytes(),
+        );
+        hash.update(&payload[..1_048_576]);
+        hash.update(&payload[payload.len() - 1_048_576..]);
+        let legacy_path = dir.join("cache").join(format!("{}.bin", hash.finalize()));
         std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
         std::fs::write(&legacy_path, bincode::serialize(&legacy).unwrap()).unwrap();
 
         assert_eq!(cache.load(&media, "automatic"), Some(fingerprints));
-        assert!(cache.cache_path(&media, "automatic").unwrap().exists());
+        assert!(
+            cache
+                .entry(&MediaSample::read(&media).unwrap(), "automatic")
+                .path
+                .exists()
+        );
         assert!(!legacy_path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

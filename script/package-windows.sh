@@ -7,7 +7,7 @@ STAGE="$(cd "${1:?staged release required}" && pwd)"
 mkdir -p "${2:?output directory required}"
 OUT="$(cd "$2" && pwd)"
 VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
-for bin in align align-cli align-mcp align-aaf ffmpeg ffprobe; do
+for bin in align align-cli align-aaf ffmpeg ffprobe; do
   test -s "$STAGE/$bin.exe"
 done
 for notice in LICENSE THIRD_PARTY_NOTICES.txt FFMPEG-LICENSE.txt; do

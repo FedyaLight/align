@@ -1,6 +1,27 @@
 //! The window: layout of every panel, sheet, and overlay.
 
-use super::*;
+use super::animation::toolbar_entrance;
+use super::controls::{overlay, sidebar_scrim};
+use super::export::{ExportPanel, export_sidebar, export_sidebar_action, path_fixer_panel};
+use super::menu_sidebar::app_menu_sidebar;
+use super::menus::{context_menu, menu_dismiss_layer, sequence_picker_panel};
+use super::operation::{
+    operation_bar, sequence_results_panel, stage_settings_panel, warning_banner, warning_details,
+};
+use super::panels::{
+    about_panel, agent_setup_panel, error_alert, feedback_notice, problem_report_panel,
+    update_notice,
+};
+use super::settings::{
+    export_select_dismiss_layer, search_quality_dismiss_layer, search_settings_panel,
+};
+use super::sources::main_content;
+use super::toolbar::toolbar;
+use super::{
+    AlignApp, Context, Corner, Instant, InteractiveElement, IntoElement, KeyDownEvent,
+    MinimizeWindow, Operation, ParentElement, Point, Render, Styled, Theme, ToggleFullscreen,
+    Window, ZoomWindow, anchored, deferred, div, px, rgb,
+};
 
 impl Render for AlignApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -11,12 +32,13 @@ impl Render for AlignApp {
         // While a modal or context menu is open the content below keeps
         // its layout but loses hover/cursor feedback (clicks are already
         // swallowed by the overlay layers).
-        let content_active = !self.show_problem_report
-            && self.app_menu_position.is_none()
+        let content_active = !self.projects.busy
+            && !self.show_problem_report
+            && self.app_menu.is_none()
             && self.data.menu.is_none()
             && !self.data.show_path_fixer
             && self.data.error.is_none()
-            && self.data.sequence_picker.is_none()
+            && self.data.sequence_pickers.is_empty()
             && !self.data.show_about
             && !self.data.show_agent_setup
             && !self.data.show_search_quality
@@ -36,6 +58,11 @@ impl Render for AlignApp {
             // Focusable root: without a focused view GPUI key dispatch
             // never reaches the app-level system shortcuts (Cmd+Q etc.).
             .track_focus(&self.focus_handle)
+            .capture_key_down(cx.listener(|this, _, _, cx| {
+                if this.projects.busy {
+                    cx.stop_propagation();
+                }
+            }))
             // Window actions run here (not in app-level handlers): menu and
             // key dispatch already hold the window checked out, so a nested
             // update_window would fail with "window not found".
@@ -58,8 +85,10 @@ impl Render for AlignApp {
                     }
                     return;
                 }
-                if key == "escape" && this.app_menu_position.take().is_some() {
-                    cx.notify();
+                if this.app_menu.is_some() {
+                    if key == "escape" {
+                        this.dismiss_app_menu(cx);
+                    }
                     return;
                 }
                 if key == "escape" && this.data.menu.take().is_some() {
@@ -71,7 +100,7 @@ impl Render for AlignApp {
                     cx.notify();
                     return;
                 }
-                if this.app_menu_position.is_some() || this.data.show_about {
+                if this.data.show_about {
                     return;
                 }
                 if key == "escape" && this.export_select.is_some() {
@@ -136,11 +165,12 @@ impl Render for AlignApp {
                     _ => return,
                 }
                 cx.notify();
-            }))
-            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
-                this.data.add_paths(paths.paths().to_vec());
-                cx.notify();
             }));
+        if content_active && !self.data.has_active_job() {
+            root = root.on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
+                this.add_paths(paths.paths().to_vec(), cx);
+            }));
+        }
         let mut content = div()
             .id("primary-content")
             .relative()
@@ -171,14 +201,23 @@ impl Render for AlignApp {
             content_active,
             self.selection_controls_exit.is_active(),
         ));
-        if !self.data.warnings.is_empty() {
+        if !self.data.warnings.is_empty() || !self.data.restore_warnings.is_empty() {
             content = content.child(warning_banner(cx, &theme, &self.data));
             if self.data.show_warning_details {
                 content = content.child(warning_details(&theme, &self.data));
             }
         }
+        if let Some(notice) = &self.projects.notice {
+            content = content.child(
+                div()
+                    .px_5()
+                    .py_1()
+                    .text_color(rgb(theme.dim))
+                    .child(notice.clone()),
+            );
+        }
         // No bottom bar over the empty drop zone either.
-        if !self.data.clips.is_empty() {
+        if !self.data.clips.is_empty() || self.data.importing() {
             self.progress_motion
                 .track(self.data.progress, Instant::now());
             content = content.child(toolbar_entrance(
@@ -190,37 +229,17 @@ impl Render for AlignApp {
             content = content.child(sidebar_scrim(&theme, self.export_sidebar_exit.is_active()));
         }
         root = root.child(content);
-        if let Some(position) = self.app_menu_position {
-            root = root.child(
+        if self.projects.busy {
+            return root.child(
                 div()
+                    .id("project-busy")
                     .absolute()
                     .top(px(0.))
                     .left(px(0.))
                     .size_full()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.app_menu_position = None;
-                            cx.notify();
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, _, _, cx| {
-                            this.app_menu_position = None;
-                            cx.notify();
-                            cx.stop_propagation();
-                        }),
-                    ),
+                    .occlude()
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation()),
             );
-            root = root.child(deferred(
-                anchored()
-                    .anchor(Corner::TopLeft)
-                    .position(position)
-                    .snap_to_window_with_margin(px(8.))
-                    .child(app_menu_panel(cx, &theme, window)),
-            ));
         }
         if self.data.show_export {
             root = root
@@ -242,10 +261,13 @@ impl Render for AlignApp {
         if self.export_select.is_some() {
             root = root.child(export_select_dismiss_layer(cx));
         }
+        if let Some(page) = &self.app_menu {
+            root = root.child(app_menu_sidebar(cx, &theme, self, page));
+        }
         // The problem report temporarily replaces the open modal, keeping a
         // single dim layer; that modal returns when the report closes.
         let modals_visible = !self.show_problem_report;
-        if let (true, Some(picker)) = (modals_visible, self.data.sequence_picker.as_ref()) {
+        if let (true, Some(picker)) = (modals_visible, self.data.sequence_pickers.front()) {
             root = root.child(overlay(
                 &theme,
                 "overlay-seq",

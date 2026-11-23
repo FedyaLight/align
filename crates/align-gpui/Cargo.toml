@@ -19,28 +19,37 @@ align-decode.workspace = true
 gpui.workspace = true
 futures.workspace = true
 mimalloc.workspace = true
-serde.workspace = true
+serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
 dirs.workspace = true
+tempfile.workspace = true
 # Native package updates use the same HTTP client and version parser as Velopack.
 ureq = "3"
 semver = "1"
 url = "2"
 sha2.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+align-cli = { path = "../align-cli" }
+
 [target.'cfg(windows)'.dependencies]
 velopack = "1.2.0"
+winreg = "0.55"
 windows-sys = { version = "0.59", features = [
     "Wdk_System_SystemServices",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
     "Win32_System_SystemInformation",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
 ] }
 
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3.0.11"
 
 [dev-dependencies]
-tempfile.workspace = true
+hound.workspace = true
 # Same renderer the GPUI sprite atlas uses: the test below parses every
 # icon exactly like `SvgRenderer::render_pixmap` does.
 usvg = "=0.45.1"

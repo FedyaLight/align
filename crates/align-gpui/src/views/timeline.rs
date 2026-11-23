@@ -1,6 +1,18 @@
 //! Timeline preview: toolbar, ruler, and lanes.
 
-use super::*;
+use super::animation::{entrance, timeline_bar_motion};
+use super::controls::{
+    RULER_LABEL_W, ZoomDrag, ZoomDragGhost, clip_color, fmt_duration, fmt_timecode, hover_tip,
+    ruler_ticks, waveform_columns,
+};
+use super::{
+    AlignApp, AnimationExt, AudioAnalysisSource, ClipId, Context, DragMoveEvent, FluentBuilder,
+    HashMap, InteractiveElement, IntoElement, MediaKind, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
+    TIMELINE_ROW_H, Theme, TimelineTransition, div, point, poses_differ, px, rgb, rgba, svg_icon,
+    timeline_duration, timeline_poses,
+};
+use gpui::AppContext as _;
 
 // ---------------- timeline preview (toolbar + ruler + lanes)
 
@@ -12,7 +24,7 @@ pub(super) fn timeline_preview(
     fit_width: f32,
     active: bool,
 ) -> impl IntoElement {
-    let mut root = div().flex().flex_col().bg(rgb(theme.bg)).overflow_hidden();
+    let mut root = div().flex().flex_col().overflow_hidden();
     // Lanes (the header row with zoom controls lives in the unified
     // toolbar now).
     root = root.child(timeline_lanes(
@@ -109,7 +121,7 @@ pub(super) fn timeline_lanes(
     let zoom = data.zoom();
     let (px_per_sec, timeline_w) = timeline_scale(duration, zoom, fit_width);
     let tick_times = ruler_ticks(duration, px_per_sec, data.ruler_timecode.unwrap_or(0.));
-    let target_poses = timeline_poses(data);
+    let target_poses = (!timeline_transitions.is_empty()).then(|| timeline_poses(data));
 
     // Labels stay fixed while only the ruler and clips scroll horizontally.
     // This also makes a normal two-finger/vertical wheel pan the timeline:
@@ -288,33 +300,37 @@ pub(super) fn timeline_lanes(
                 if width >= 24.0 {
                     if let Some(waveform) = data.waveform_previews.get(&bar.clip_id) {
                         let (columns, bar_width) = waveform_columns(waveform, width);
-                        let mut preview = div()
-                            .absolute()
-                            .left(px(0.))
-                            .right(px(0.))
-                            .top(px(0.))
-                            .bottom(px(0.))
-                            .overflow_hidden();
-                        for (index, amplitude) in columns.into_iter().enumerate() {
-                            let height = 3.0 + amplitude * (TIMELINE_ROW_H - 21.0);
-                            preview = preview.child(
-                                div()
-                                    .absolute()
-                                    .left(px(index as f32 * bar_width))
-                                    .top(px((TIMELINE_ROW_H - 12.0 - height) * 0.5))
-                                    .w(px((bar_width - 1.0).max(1.0)))
-                                    .h(px(height))
-                                    .rounded_sm()
-                                    .bg(rgba(0xFFFFFF42)),
-                            );
-                        }
+                        let preview = gpui::canvas(
+                            |_, _, _| (),
+                            move |bounds, (), window, _| {
+                                let radius = window.rem_size() * 0.125;
+                                for (index, amplitude) in columns.into_iter().enumerate() {
+                                    let h = 3.0 + amplitude * (TIMELINE_ROW_H - 21.0);
+                                    let origin = bounds.origin
+                                        + point(
+                                            px(index as f32 * bar_width),
+                                            px((TIMELINE_ROW_H - 12.0 - h) * 0.5),
+                                        );
+                                    let rect = gpui::Bounds::new(
+                                        origin,
+                                        gpui::size(px((bar_width - 1.0).max(1.0)), px(h)),
+                                    );
+                                    window.paint_quad(
+                                        gpui::fill(rect, rgba(0xFFFFFF42)).corner_radii(radius),
+                                    );
+                                }
+                            },
+                        )
+                        .absolute()
+                        .inset_0()
+                        .overflow_hidden();
                         el = el.child(preview);
                     }
                     let video = matches!(bar.kind, MediaKind::Video);
                     let icon_path = if video {
-                        icons().film.clone()
+                        "icons/film.svg"
                     } else {
-                        icons().waveform.clone()
+                        "icons/waveform.svg"
                     };
                     el = el.child(
                         div()
@@ -363,7 +379,8 @@ pub(super) fn timeline_lanes(
                         .copied()
                         .filter(|transition| {
                             target_poses
-                                .get(&bar.clip_id)
+                                .as_ref()
+                                .and_then(|poses| poses.get(&bar.clip_id))
                                 .is_some_and(|pose| !poses_differ(transition.to, *pose))
                         });
                 if let Some(transition) = transition {

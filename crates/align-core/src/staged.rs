@@ -8,7 +8,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// A temporary sibling of `destination` that replaces it on [`commit`].
+/// A temporary sibling of `destination` for publishing a completed file.
 ///
 /// The staged file exists (empty) on creation and is removed when dropped
 /// without committing. No handle is held open, so writers, external
@@ -65,6 +65,13 @@ impl StagedFile {
             .persist(&self.destination)
             .map_err(|error| error.error)
     }
+
+    /// Publishes the completed file only if the destination is still free.
+    pub fn commit_new(self) -> io::Result<()> {
+        self.temporary
+            .persist_noclobber(&self.destination)
+            .map_err(|error| error.error)
+    }
 }
 
 /// Writes `bytes` to `destination` atomically.
@@ -105,6 +112,22 @@ mod tests {
         write(&destination, b"replacement").unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), b"replacement");
         assert_eq!(entries(dir.path()), ["take.wav"]);
+    }
+
+    #[test]
+    fn commit_new_preserves_a_destination_created_during_render() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("timeline.xml");
+        let staged = StagedFile::new(&destination).unwrap();
+        std::fs::write(staged.path(), b"finished render").unwrap();
+        std::fs::write(&destination, b"already published").unwrap();
+
+        assert_eq!(
+            staged.commit_new().unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(destination).unwrap(), b"already published");
+        assert_eq!(entries(dir.path()), ["timeline.xml"]);
     }
 
     #[test]

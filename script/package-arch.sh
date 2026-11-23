@@ -11,7 +11,7 @@ if [[ $(id -u) == 0 ]]; then
   echo 'Run this script as an unprivileged build user (makepkg requires it).' >&2
   exit 1
 fi
-for bin in align align-cli align-mcp align-aaf ffmpeg ffprobe; do
+for bin in align align-cli align-aaf ffmpeg ffprobe; do
   test -x "$STAGE/$bin"
 done
 for notice in LICENSE THIRD_PARTY_NOTICES.txt FFMPEG-LICENSE.txt; do
@@ -19,12 +19,13 @@ for notice in LICENSE THIRD_PARTY_NOTICES.txt FFMPEG-LICENSE.txt; do
 done
 test -s "$STAGE/ThirdPartyLicenses/BUILD-MANIFEST.json"
 test -d "$STAGE/AAF-Licenses"
+test -s "$STAGE/align-aaf-runtime/base_library.zip"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/input/payload" "$TMP/input/integration" "$TMP/build"
 tar -C "$STAGE" --exclude=./AAF-Sources -cf - . | tar -C "$TMP/input/payload" -xf -
 cp "$ROOT/Support/Linux/com.align.app.desktop" "$ROOT/Support/Linux/com.align.app.metainfo.xml" \
-  "$ROOT/Support/AppIcon.png" "$TMP/input/integration/"
+  "$ROOT/Support/Linux/com.align.app.project.xml" "$ROOT/Support/AppIcon.png" "$TMP/input/integration/"
 tar -C "$TMP/input" -czf "$TMP/build/align-payload.tar.gz" payload integration
 HASH="$(sha256sum "$TMP/build/align-payload.tar.gz" | cut -d ' ' -f 1)"
 sed -e "s/@VERSION@/$VERSION/g" -e "s/@PAYLOAD_SHA256@/$HASH/g" \

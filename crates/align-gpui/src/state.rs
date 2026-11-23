@@ -12,6 +12,9 @@ use align_core::{
 use align_decode::pipeline::{PipelineInput, PipelineOptions};
 use gpui::{Point, ScrollHandle, px};
 
+mod project;
+pub(crate) use project::ProjectSession;
+
 use crate::lane::{self, BarVisual, CorrectionOption, LaneVisual, LiveClip, LiveMatch};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -96,6 +99,30 @@ pub struct MenuTarget {
     pub lane_id: Option<String>,
     /// Right-click point in window px: the popup anchors here.
     pub position: (f32, f32),
+}
+
+pub struct InputPath {
+    path: PathBuf,
+    is_dir: bool,
+    timeline: bool,
+    sequences: Vec<TimelineSequenceSummary>,
+}
+
+impl InputPath {
+    pub fn inspect(path: PathBuf, cancel: &std::sync::atomic::AtomicBool) -> Self {
+        let timeline = align_decode::timeline::is_supported(&path);
+        let sequences = if timeline {
+            align_decode::timeline::sequences(&path, cancel).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Self {
+            is_dir: path.is_dir(),
+            path,
+            timeline,
+            sequences,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -239,7 +266,8 @@ impl ExportTarget {
 
 /// Concrete defaults used by every sequence unless that sequence replaces a
 /// field. Track settings then replace the effective sequence value.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SyncDefaults {
     pub search_accuracy: align_core::SearchAccuracy,
     pub audio_source: AudioAnalysisSource,
@@ -252,7 +280,8 @@ pub struct SyncDefaults {
 /// `None` means that the current sequence inherits the corresponding common
 /// value. Keeping each field optional preserves inheritance when Common is
 /// edited later.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SequenceDefaults {
     pub search_accuracy: Option<align_core::SearchAccuracy>,
     pub audio_source: Option<AudioAnalysisSource>,
@@ -282,31 +311,33 @@ pub enum SettingsScope {
     CurrentSequence,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopedOverride<T> {
+    by_clip: HashMap<ClipId, T>,
+    by_key: HashMap<String, T>,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct TrackOverrides {
-    search: HashMap<ClipId, align_core::SearchAccuracy>,
-    search_keys: HashMap<String, align_core::SearchAccuracy>,
-    audio: HashMap<ClipId, AudioAnalysisSource>,
-    audio_keys: HashMap<String, AudioAnalysisSource>,
-    temporal: HashMap<ClipId, TemporalMode>,
-    temporal_keys: HashMap<String, TemporalMode>,
-    thresholds: HashMap<ClipId, MatchThreshold>,
-    threshold_keys: HashMap<String, MatchThreshold>,
-    orders: HashMap<ClipId, ClipOrder>,
-    order_keys: HashMap<String, ClipOrder>,
-    contents: HashMap<ClipId, TrackContent>,
-    content_keys: HashMap<String, TrackContent>,
+    search: ScopedOverride<align_core::SearchAccuracy>,
+    audio: ScopedOverride<AudioAnalysisSource>,
+    temporal: ScopedOverride<TemporalMode>,
+    thresholds: ScopedOverride<MatchThreshold>,
+    orders: ScopedOverride<ClipOrder>,
+    contents: ScopedOverride<TrackContent>,
     preserve_editing: HashSet<String>,
 }
 
 impl TrackOverrides {
     fn count(&self) -> usize {
-        self.search.len()
-            + self.audio.len()
-            + self.temporal.len()
-            + self.thresholds.len()
-            + self.orders.len()
-            + self.contents.len()
+        self.search.by_clip.len()
+            + self.audio.by_clip.len()
+            + self.temporal.by_clip.len()
+            + self.thresholds.by_clip.len()
+            + self.orders.by_clip.len()
+            + self.contents.by_clip.len()
             + self.preserve_editing.len()
     }
 
@@ -321,6 +352,8 @@ pub struct AppData {
     pub settings_scope: SettingsScope,
     pub settings_changed: bool,
     sync_dirty: bool,
+    pub restore_warnings: Vec<String>,
+    restore_paths: Vec<PathBuf>,
     quality_only_dirty: bool,
     incremental_quality_run: bool,
     track_overrides: HashMap<usize, TrackOverrides>,
@@ -365,7 +398,10 @@ pub struct AppData {
     pub waveform_previews: HashMap<ClipId, Vec<f32>>,
     pub pending_count: usize,
     pub menu: Option<MenuTarget>,
-    pub sequence_picker: Option<SequencePicker>,
+    pub sequence_pickers: std::collections::VecDeque<SequencePicker>,
+    pending_inputs: HashSet<PathBuf>,
+    pub import_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub folder_inputs: HashSet<PathBuf>,
     pub timeline_choices: HashMap<PathBuf, Vec<usize>>,
     /// Path Fixer state. Saved prefix redirections load once when the app
     /// starts; exact file choices are session-local and survive re-syncs.
@@ -379,29 +415,7 @@ pub struct AppData {
     // Export sheet state.
     pub show_export: bool,
     pub export_dir: Option<PathBuf>,
-    pub export_selected: HashSet<ExportTarget>,
-    pub export_drift: bool,
-    pub export_replaced: bool,
-    /// Group imported source clips by source folder.
-    pub export_media_bins: bool,
-    pub export_storylines: bool,
-    pub export_fcpxml_timeline: bool,
-    pub export_fcpxml_multicam: bool,
-    pub export_aaf_frame_duration: Option<align_core::MediaTime>,
-    pub export_media: bool,
-    pub export_unmatched: UnmatchedPlacement,
-    pub export_apply_estimates: bool,
-    pub export_prevent_overlaps: bool,
-    pub export_disable_unmatched: bool,
-    pub export_label_synced: bool,
-    pub export_label_unmatched: bool,
-    pub export_cut_common_gaps: bool,
-    pub export_cut_lone_recorder: bool,
-    pub export_cut_shorter_than: f64,
-    pub export_trim_starts: f64,
-    pub export_trim_ends: f64,
-    pub export_synced_symbol_suffix: bool,
-    pub export_unmatched_symbol_suffix: bool,
+    pub export: ExportSettings,
     pub export_started: bool,
     /// The user's saved export defaults; new jobs start from these.
     pub saved_export_settings: Option<ExportSettings>,
@@ -429,6 +443,8 @@ impl Default for AppData {
             settings_scope: Default::default(),
             settings_changed: false,
             sync_dirty: false,
+            restore_warnings: Vec::new(),
+            restore_paths: Vec::new(),
             quality_only_dirty: false,
             incremental_quality_run: false,
             track_overrides: HashMap::new(),
@@ -460,7 +476,10 @@ impl Default for AppData {
             waveform_previews: HashMap::new(),
             pending_count: 0,
             menu: None,
-            sequence_picker: None,
+            sequence_pickers: Default::default(),
+            pending_inputs: Default::default(),
+            import_cancel: Default::default(),
+            folder_inputs: HashSet::new(),
             timeline_choices: HashMap::new(),
             redirects: Vec::new(),
             manual_relinks: Vec::new(),
@@ -471,28 +490,7 @@ impl Default for AppData {
             path_fixer_dir: None,
             show_export: false,
             export_dir: None,
-            export_selected: [ExportTarget::ResolveOtio].into_iter().collect(),
-            export_drift: true,
-            export_replaced: false,
-            export_media_bins: false,
-            export_storylines: false,
-            export_fcpxml_timeline: true,
-            export_fcpxml_multicam: true,
-            export_aaf_frame_duration: None,
-            export_media: false,
-            export_unmatched: UnmatchedPlacement::ByOrderAndTime,
-            export_apply_estimates: false,
-            export_prevent_overlaps: false,
-            export_disable_unmatched: false,
-            export_label_synced: false,
-            export_label_unmatched: false,
-            export_cut_common_gaps: false,
-            export_cut_lone_recorder: false,
-            export_cut_shorter_than: 0.0,
-            export_trim_starts: 0.0,
-            export_trim_ends: 0.0,
-            export_synced_symbol_suffix: false,
-            export_unmatched_symbol_suffix: false,
+            export: ExportSettings::default(),
             export_started: false,
             saved_export_settings: None,
             show_warning_details: false,
@@ -668,19 +666,26 @@ impl AppData {
     }
 
     pub fn is_stale(&self) -> bool {
-        self.result.is_some() && (self.pending_count > 0 || self.sync_dirty)
+        self.result.is_some()
+            && (self.pending_count > 0 || self.sync_dirty || self.settings_changed)
     }
 
     pub fn can_synchronize(&self) -> bool {
         self.can_run_sync() && (self.result.is_none() || self.pending_count > 0 || self.sync_dirty)
     }
 
-    fn can_run_sync(&self) -> bool {
-        !self.clips.is_empty()
-            && !matches!(
-                self.operation,
-                Operation::Synchronizing | Operation::Exporting | Operation::Repairing
-            )
+    pub(crate) fn can_run_sync(&self) -> bool {
+        !self.importing()
+            && self.sequence_pickers.is_empty()
+            && !self.clips.is_empty()
+            && !self.has_active_job()
+    }
+
+    pub(crate) fn has_active_job(&self) -> bool {
+        matches!(
+            self.operation,
+            Operation::Synchronizing | Operation::Exporting | Operation::Repairing
+        )
     }
 
     pub fn mark_sync_dirty(&mut self) {
@@ -707,16 +712,15 @@ impl AppData {
     }
 
     pub fn can_export(&self) -> bool {
-        self.has_result()
+        !self.importing()
+            && self.sequence_pickers.is_empty()
+            && self.has_result()
             && !self.is_stale()
-            && !matches!(
-                self.operation,
-                Operation::Synchronizing | Operation::Exporting | Operation::Repairing
-            )
+            && !self.has_active_job()
     }
 
     pub fn export_output_selected(&self) -> bool {
-        !self.export_targets().is_empty() || self.export_media
+        !self.export_targets().is_empty() || self.export.media_files
     }
 
     pub fn can_begin_export(&self) -> bool {
@@ -806,29 +810,59 @@ impl AppData {
 
     // ---------------- session edits
 
+    pub fn importing(&self) -> bool {
+        !self.pending_inputs.is_empty()
+    }
+
+    pub fn begin_import(&mut self, paths: Vec<PathBuf>) -> Vec<PathBuf> {
+        if self.has_active_job() {
+            return Vec::new();
+        }
+        let existing: HashSet<_> = self
+            .inputs
+            .iter()
+            .chain(self.clips.iter().map(|r| &r.url))
+            .chain(self.sequence_pickers.iter().map(|p| &p.path))
+            .collect();
+        paths
+            .into_iter()
+            .filter(|p| !existing.contains(p) && self.pending_inputs.insert(p.clone()))
+            .collect()
+    }
+
+    pub fn cancel_import(&mut self) {
+        self.import_cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.import_cancel = Default::default();
+        self.pending_inputs.clear();
+    }
+
     /// Add media/tagged timeline paths; marks the session stale when a
     /// result exists, otherwise resets the preview. Multi-sequence
     /// timelines open the picker instead of joining the inputs.
-    pub fn add_paths(&mut self, paths: Vec<PathBuf>) {
-        let existing: HashSet<PathBuf> = self.clips.iter().map(|c| c.url.clone()).collect();
+    pub fn finish_import(&mut self, token: &std::sync::atomic::AtomicBool, paths: Vec<InputPath>) {
+        if token.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let mut additions = Vec::new();
         let mut timelines = Vec::new();
-        for path in paths.iter().cloned() {
-            if existing.contains(&path) || additions.iter().any(|r: &ClipRow| r.url == path) {
+        for InputPath {
+            path,
+            is_dir,
+            timeline,
+            sequences,
+        } in paths
+        {
+            if !self.pending_inputs.remove(&path) {
                 continue;
             }
-            let timeline = is_timeline(&path);
-            if timeline
-                && !self.timeline_choices.contains_key(&path)
-                && let Ok(summaries) = align_decode::timeline::sequences(
-                    &path,
-                    &std::sync::atomic::AtomicBool::new(false),
-                )
-                && summaries.len() > 1
-            {
-                self.sequence_picker = Some(SequencePicker {
+            if is_dir {
+                self.folder_inputs.insert(path.clone());
+            }
+            if sequences.len() > 1 && !self.timeline_choices.contains_key(&path) {
+                self.sequence_pickers.push_back(SequencePicker {
                     path,
-                    options: summaries,
+                    options: sequences,
                 });
                 continue;
             }
@@ -837,28 +871,26 @@ impl AppData {
             }
             additions.push(ClipRow {
                 clip_id: None,
+                name: file_name(&path),
                 url: path,
-                name: String::new(),
                 kind: None,
                 duration: None,
                 timecode: None,
                 state: ClipState::Queued,
             });
         }
-        for row in &mut additions {
-            row.name = file_name(&row.url);
-        }
         if additions.is_empty() {
             return;
         }
         self.inputs.extend(additions.iter().map(|r| r.url.clone()));
         self.timeline_inputs.extend(timelines);
-        self.clips.extend(additions.iter().cloned());
+        let added = additions.len();
+        self.clips.extend(additions);
         self.clips
             .sort_by(|a, b| a.url.to_string_lossy().cmp(&b.url.to_string_lossy()));
-        let added = additions.len();
         if self.result.is_some() {
             self.pending_count += added;
+            self.mark_sync_dirty();
             self.exported_files.clear();
             self.status = format!("{} file{} added.", added, if added == 1 { "" } else { "s" });
             return;
@@ -894,9 +926,11 @@ impl AppData {
         self.timeline_inputs.retain(|u| !selected.contains(u));
         for url in &selected {
             self.timeline_choices.remove(url);
+            self.folder_inputs.remove(url);
         }
         if self.result.is_some() {
             self.pending_count += selected.len();
+            self.mark_sync_dirty();
             self.exported_files.clear();
             self.status = "Selection changed.".to_string();
             return;
@@ -920,6 +954,8 @@ impl AppData {
     }
 
     pub fn clear(&mut self) {
+        self.import_cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.cancel
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let generation = self.generation.wrapping_add(1);
@@ -942,57 +978,15 @@ impl AppData {
         ExportSettings {
             targets: ExportTarget::all()
                 .into_iter()
-                .filter(|target| self.export_selected.contains(target))
+                .filter(|t| self.export.targets.contains(t))
                 .collect(),
-            correct_drift: self.export_drift,
-            replaced_sequence: self.export_replaced,
-            media_bins: self.export_media_bins,
-            fcpxml_timeline: self.export_fcpxml_timeline,
-            fcpxml_multicam: self.export_fcpxml_multicam,
-            fcpxml_storylines: self.export_storylines,
-            aaf_frame_duration: self.export_aaf_frame_duration,
-            media_files: self.export_media,
-            unmatched: self.export_unmatched,
-            apply_estimated_placements: self.export_apply_estimates,
-            prevent_group_overlaps: self.export_prevent_overlaps,
-            disable_unmatched: self.export_disable_unmatched,
-            label_synced: self.export_label_synced,
-            label_unmatched: self.export_label_unmatched,
-            cut_common_gaps: self.export_cut_common_gaps,
-            cut_lone_recorder: self.export_cut_lone_recorder,
-            cut_shorter_than: self.export_cut_shorter_than,
-            trim_starts: self.export_trim_starts,
-            trim_ends: self.export_trim_ends,
-            synced_symbol_suffix: self.export_synced_symbol_suffix,
-            unmatched_symbol_suffix: self.export_unmatched_symbol_suffix,
             labels,
+            ..self.export.clone()
         }
     }
 
-    /// Put `settings` in the sheet, except the text fields the view owns.
     pub fn apply_export_settings(&mut self, settings: &ExportSettings) {
-        self.export_selected = settings.targets.iter().copied().collect();
-        self.export_drift = settings.correct_drift;
-        self.export_replaced = settings.replaced_sequence;
-        self.export_media_bins = settings.media_bins;
-        self.export_fcpxml_timeline = settings.fcpxml_timeline;
-        self.export_fcpxml_multicam = settings.fcpxml_multicam;
-        self.export_storylines = settings.fcpxml_storylines;
-        self.export_aaf_frame_duration = settings.aaf_frame_duration;
-        self.export_media = settings.media_files;
-        self.export_unmatched = settings.unmatched;
-        self.export_apply_estimates = settings.apply_estimated_placements;
-        self.export_prevent_overlaps = settings.prevent_group_overlaps;
-        self.export_disable_unmatched = settings.disable_unmatched;
-        self.export_label_synced = settings.label_synced;
-        self.export_label_unmatched = settings.label_unmatched;
-        self.export_cut_common_gaps = settings.cut_common_gaps;
-        self.export_cut_lone_recorder = settings.cut_lone_recorder;
-        self.export_cut_shorter_than = settings.cut_shorter_than;
-        self.export_trim_starts = settings.trim_starts;
-        self.export_trim_ends = settings.trim_ends;
-        self.export_synced_symbol_suffix = settings.synced_symbol_suffix;
-        self.export_unmatched_symbol_suffix = settings.unmatched_symbol_suffix;
+        self.export.clone_from(settings);
     }
 
     /// What a new job starts from: the saved defaults, else Align's.
@@ -1011,7 +1005,7 @@ impl AppData {
 
     /// Record a sequence choice and queue the timeline as an input.
     pub fn choose_sequence(&mut self, index: usize) {
-        if let Some(picker) = self.sequence_picker.take()
+        if let Some(picker) = self.sequence_pickers.pop_front()
             && picker.options.iter().any(|o| o.index == index)
         {
             self.queue_timeline_sequences(picker.path, vec![index]);
@@ -1019,7 +1013,7 @@ impl AppData {
     }
 
     pub fn choose_all_sequences(&mut self) {
-        if let Some(picker) = self.sequence_picker.take() {
+        if let Some(picker) = self.sequence_pickers.pop_front() {
             let indices = picker.options.iter().map(|option| option.index).collect();
             self.queue_timeline_sequences(picker.path, indices);
         }
@@ -1186,10 +1180,12 @@ impl AppData {
     }
 
     pub fn begin_path_repair(&mut self) -> bool {
-        if matches!(
-            self.operation,
-            Operation::Synchronizing | Operation::Exporting | Operation::Repairing
-        ) {
+        if self.importing()
+            || matches!(
+                self.operation,
+                Operation::Synchronizing | Operation::Exporting | Operation::Repairing
+            )
+        {
             return false;
         }
         self.cancel_run();
@@ -1383,6 +1379,8 @@ impl AppData {
         self.active_sequence_result = 0;
         self.apply_visible_result(result);
         self.sync_dirty = false;
+        self.restore_warnings.clear();
+        self.restore_paths.clear();
         self.quality_only_dirty = false;
         self.incremental_quality_run = false;
         self.report_sync_duration();
@@ -1419,6 +1417,8 @@ impl AppData {
         self.active_sequence_result = active;
         self.apply_visible_result(visible);
         self.sync_dirty = false;
+        self.restore_warnings.clear();
+        self.restore_paths.clear();
         self.quality_only_dirty = false;
         self.incremental_quality_run = false;
         if count > 1 {
@@ -1447,7 +1447,16 @@ impl AppData {
         self.active_sequence_result = index;
         self.show_sequence_results = false;
         self.exported_files.clear();
+        let pending = self.pending_count;
+        let queued = self
+            .clips
+            .iter()
+            .filter(|clip| clip.clip_id.is_none())
+            .cloned()
+            .collect::<Vec<_>>();
         self.apply_visible_result(result);
+        self.pending_count = pending;
+        self.clips.extend(queued);
         let count = self.sequence_results.len();
         let name = self
             .result
@@ -1645,12 +1654,23 @@ impl AppData {
         Some((key, ids))
     }
 
-    /// Lane-level audio source override. `None` explicitly inherits the
-    /// current sequence; `Some(Automatic)` remains a real override.
-    pub fn set_analysis_source(
-        &mut self,
-        source: Option<AudioAnalysisSource>,
+    fn lane_override<T: Copy>(
+        &self,
         lane_id: &str,
+        select: impl FnOnce(&TrackOverrides) -> &ScopedOverride<T>,
+    ) -> Option<T> {
+        let (key, _) = self.lane_group(lane_id)?;
+        select(self.current_track_overrides()?)
+            .by_key
+            .get(&key)
+            .copied()
+    }
+
+    fn set_lane_override<T: Copy>(
+        &mut self,
+        lane_id: &str,
+        value: Option<T>,
+        select: impl FnOnce(&mut TrackOverrides) -> &mut ScopedOverride<T>,
     ) -> bool {
         let Some((key, ids)) = self.lane_group(lane_id) else {
             return false;
@@ -1658,29 +1678,32 @@ impl AppData {
         if ids.is_empty() {
             return false;
         }
-        let sequence_key = self.current_sequence_key();
-        let overrides = self.track_overrides.entry(sequence_key).or_default();
-        if let Some(source) = source {
-            overrides.audio_keys.insert(key, source);
-            for id in ids {
-                overrides.audio.insert(id, source);
-            }
+        let sequence = self.current_sequence_key();
+        let field = select(self.track_overrides.entry(sequence).or_default());
+        if let Some(value) = value {
+            field.by_key.insert(key, value);
+            field.by_clip.extend(ids.into_iter().map(|id| (id, value)));
         } else {
-            overrides.audio_keys.remove(&key);
+            field.by_key.remove(&key);
             for id in ids {
-                overrides.audio.remove(&id);
+                field.by_clip.remove(&id);
             }
         }
         true
     }
 
+    /// Lane-level audio source override. `None` explicitly inherits the
+    /// current sequence; `Some(Automatic)` remains a real override.
+    pub fn set_analysis_source(
+        &mut self,
+        source: Option<AudioAnalysisSource>,
+        lane_id: &str,
+    ) -> bool {
+        self.set_lane_override(lane_id, source, |o| &mut o.audio)
+    }
+
     pub fn lane_analysis_source(&self, lane_id: &str) -> Option<AudioAnalysisSource> {
-        self.lane_group(lane_id).and_then(|(key, _)| {
-            self.current_track_overrides()?
-                .audio_keys
-                .get(&key)
-                .copied()
-        })
+        self.lane_override(lane_id, |o| &o.audio)
     }
 
     pub fn effective_lane_analysis_source(&self, lane_id: &str) -> AudioAnalysisSource {
@@ -1689,35 +1712,11 @@ impl AppData {
     }
 
     pub fn set_temporal_mode(&mut self, mode: Option<TemporalMode>, lane_id: &str) -> bool {
-        let Some((key, ids)) = self.lane_group(lane_id) else {
-            return false;
-        };
-        if ids.is_empty() {
-            return false;
-        }
-        let sequence_key = self.current_sequence_key();
-        let overrides = self.track_overrides.entry(sequence_key).or_default();
-        if let Some(mode) = mode {
-            overrides.temporal_keys.insert(key, mode);
-            for id in ids {
-                overrides.temporal.insert(id, mode);
-            }
-        } else {
-            overrides.temporal_keys.remove(&key);
-            for id in ids {
-                overrides.temporal.remove(&id);
-            }
-        }
-        true
+        self.set_lane_override(lane_id, mode, |o| &mut o.temporal)
     }
 
     pub fn lane_temporal_mode(&self, lane_id: &str) -> Option<TemporalMode> {
-        self.lane_group(lane_id).and_then(|(key, _)| {
-            self.current_track_overrides()?
-                .temporal_keys
-                .get(&key)
-                .copied()
-        })
+        self.lane_override(lane_id, |o| &o.temporal)
     }
 
     /// Current lane mode + whether any grouped clip offers its evidence.
@@ -1747,37 +1746,11 @@ impl AppData {
         accuracy: Option<align_core::SearchAccuracy>,
         lane_id: &str,
     ) -> bool {
-        let Some((key, ids)) = self.lane_group(lane_id) else {
-            return false;
-        };
-        if ids.is_empty() {
-            return false;
-        }
-        if let Some(accuracy) = accuracy {
-            let sequence_key = self.current_sequence_key();
-            let overrides = self.track_overrides.entry(sequence_key).or_default();
-            overrides.search_keys.insert(key, accuracy);
-            for id in ids {
-                overrides.search.insert(id, accuracy);
-            }
-        } else {
-            let sequence_key = self.current_sequence_key();
-            let overrides = self.track_overrides.entry(sequence_key).or_default();
-            overrides.search_keys.remove(&key);
-            for id in ids {
-                overrides.search.remove(&id);
-            }
-        }
-        true
+        self.set_lane_override(lane_id, accuracy, |o| &mut o.search)
     }
 
     pub fn lane_search_accuracy(&self, lane_id: &str) -> Option<align_core::SearchAccuracy> {
-        self.lane_group(lane_id).and_then(|(key, _)| {
-            self.current_track_overrides()?
-                .search_keys
-                .get(&key)
-                .copied()
-        })
+        self.lane_override(lane_id, |o| &o.search)
     }
 
     pub fn set_match_threshold(
@@ -1785,99 +1758,27 @@ impl AppData {
         threshold: Option<MatchThreshold>,
         lane_id: &str,
     ) -> bool {
-        let Some((key, ids)) = self.lane_group(lane_id) else {
-            return false;
-        };
-        if ids.is_empty() {
-            return false;
-        }
-        let sequence_key = self.current_sequence_key();
-        let overrides = self.track_overrides.entry(sequence_key).or_default();
-        if let Some(threshold) = threshold {
-            overrides.threshold_keys.insert(key, threshold);
-            for id in ids {
-                overrides.thresholds.insert(id, threshold);
-            }
-        } else {
-            overrides.threshold_keys.remove(&key);
-            for id in ids {
-                overrides.thresholds.remove(&id);
-            }
-        }
-        true
+        self.set_lane_override(lane_id, threshold, |o| &mut o.thresholds)
     }
 
     pub fn lane_match_threshold(&self, lane_id: &str) -> Option<MatchThreshold> {
-        self.lane_group(lane_id).and_then(|(key, _)| {
-            self.current_track_overrides()?
-                .threshold_keys
-                .get(&key)
-                .copied()
-        })
+        self.lane_override(lane_id, |o| &o.thresholds)
     }
 
     pub fn set_clip_order(&mut self, mode: Option<ClipOrder>, lane_id: &str) -> bool {
-        let Some((key, ids)) = self.lane_group(lane_id) else {
-            return false;
-        };
-        if ids.is_empty() {
-            return false;
-        }
-        let sequence_key = self.current_sequence_key();
-        let overrides = self.track_overrides.entry(sequence_key).or_default();
-        if let Some(mode) = mode {
-            overrides.order_keys.insert(key, mode);
-            for id in ids {
-                overrides.orders.insert(id, mode);
-            }
-        } else {
-            overrides.order_keys.remove(&key);
-            for id in ids {
-                overrides.orders.remove(&id);
-            }
-        }
-        true
+        self.set_lane_override(lane_id, mode, |o| &mut o.orders)
     }
 
     pub fn lane_clip_order(&self, lane_id: &str) -> Option<ClipOrder> {
-        self.lane_group(lane_id).and_then(|(key, _)| {
-            self.current_track_overrides()?
-                .order_keys
-                .get(&key)
-                .copied()
-        })
+        self.lane_override(lane_id, |o| &o.orders)
     }
 
     pub fn set_track_content(&mut self, mode: Option<TrackContent>, lane_id: &str) -> bool {
-        let Some((key, ids)) = self.lane_group(lane_id) else {
-            return false;
-        };
-        if ids.is_empty() {
-            return false;
-        }
-        let sequence_key = self.current_sequence_key();
-        let overrides = self.track_overrides.entry(sequence_key).or_default();
-        if let Some(mode) = mode {
-            overrides.content_keys.insert(key, mode);
-            for id in ids {
-                overrides.contents.insert(id, mode);
-            }
-        } else {
-            overrides.content_keys.remove(&key);
-            for id in ids {
-                overrides.contents.remove(&id);
-            }
-        }
-        true
+        self.set_lane_override(lane_id, mode, |o| &mut o.contents)
     }
 
     pub fn lane_track_content(&self, lane_id: &str) -> Option<TrackContent> {
-        self.lane_group(lane_id).and_then(|(key, _)| {
-            self.current_track_overrides()?
-                .content_keys
-                .get(&key)
-                .copied()
-        })
+        self.lane_override(lane_id, |o| &o.contents)
     }
 
     pub fn lane_can_preserve_editing(&self, lane_id: &str) -> bool {
@@ -1937,10 +1838,10 @@ impl AppData {
     pub fn export_targets(&self) -> Vec<TimelineExportFormat> {
         let mut formats = Vec::new();
         for target in ExportTarget::all() {
-            if self.export_selected.contains(&target) {
+            if self.export.targets.contains(&target) {
                 if target == ExportTarget::FinalCutPro
-                    && !self.export_fcpxml_timeline
-                    && !self.export_fcpxml_multicam
+                    && !self.export.fcpxml_timeline
+                    && !self.export.fcpxml_multicam
                 {
                     continue;
                 }
@@ -2004,10 +1905,18 @@ impl AppData {
         })
     }
 
-    pub fn can_locate_timeline_media(&self) -> bool {
-        !self.timeline_inputs.is_empty()
-            && (self.has_missing_media_warning()
-                || self.error.as_deref() == Some("No readable audio or video media was found."))
+    pub fn can_relink_media(&self) -> bool {
+        !self.restore_paths.is_empty()
+            || (!self.timeline_inputs.is_empty()
+                && (self.has_missing_media_warning()
+                    || self.error.as_deref()
+                        == Some("No readable audio or video media was found.")))
+    }
+
+    pub fn has_missing_source_folder(&self) -> bool {
+        self.restore_paths
+            .iter()
+            .any(|path| self.folder_inputs.contains(path))
     }
 
     /// Add exact file choices from the native picker. A later choice for
@@ -2023,6 +1932,9 @@ impl AppData {
             else {
                 continue;
             };
+            // A moved top-level source has no timeline edit to relink.
+            // Replace it in the inputs while retaining the chosen indices.
+            self.relink_project_source(&name, &path);
             self.manual_relinks
                 .retain(|(existing, _)| !existing.eq_ignore_ascii_case(&name));
             self.manual_relinks.push((name, path));
@@ -2073,23 +1985,25 @@ impl AppData {
     /// Media represented by the current session/result, for project-only
     /// analysis-cache cleanup. Timeline containers themselves have no
     /// fingerprint entry.
-    pub fn current_cache_media(&self) -> Vec<PathBuf> {
-        let mut media: Vec<PathBuf> = self
-            .sequence_results
+    pub(crate) fn current_cache_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.sequence_results
             .iter()
-            .flat_map(|result| result.project.clips.iter().map(|clip| clip.url.clone()))
+            .flat_map(|result| result.project.clips.iter().map(|clip| &clip.url))
             .chain(
                 self.result
                     .iter()
-                    .flat_map(|result| result.project.clips.iter().map(|clip| clip.url.clone())),
+                    .flat_map(|result| result.project.clips.iter().map(|clip| &clip.url)),
             )
             .chain(
                 self.clips
                     .iter()
                     .filter(|clip| !self.timeline_inputs.contains(&clip.url))
-                    .map(|clip| clip.url.clone()),
+                    .map(|clip| &clip.url),
             )
-            .collect();
+    }
+
+    pub fn current_cache_media(&self) -> Vec<PathBuf> {
+        let mut media: Vec<PathBuf> = self.current_cache_paths().cloned().collect();
         media.sort();
         media.dedup();
         media
@@ -2195,26 +2109,26 @@ impl AppData {
         PipelineOptions {
             generate_waveform_previews: true,
             search_accuracy: defaults.search_accuracy,
-            search_overrides: overrides.search,
-            source_search_overrides: overrides.search_keys,
+            search_overrides: overrides.search.by_clip,
+            source_search_overrides: overrides.search.by_key,
             audio_source: defaults.audio_source,
-            audio_sources: overrides.audio,
+            audio_sources: overrides.audio.by_clip,
             match_policy: align_core::MatchPolicy {
                 default: defaults.match_threshold,
-                thresholds: overrides.thresholds,
+                thresholds: overrides.thresholds.by_clip,
             },
             clip_order: align_core::ClipOrderPolicy {
                 default: defaults.clip_order,
-                modes: overrides.orders,
+                modes: overrides.orders.by_clip,
             },
             track_content: align_core::TrackContentPolicy {
                 default: defaults.track_content,
-                modes: overrides.contents,
+                modes: overrides.contents.by_clip,
             },
             preserve_editing_tracks: overrides.preserve_editing,
             temporal: align_core::TemporalPolicy {
                 default: defaults.temporal_mode,
-                modes: overrides.temporal,
+                modes: overrides.temporal.by_clip,
             },
             redirects: self.redirects.clone(),
             manual_relinks: self.manual_relinks.clone(),
@@ -2274,10 +2188,6 @@ fn drift_of_placement(result: &SyncResult, clip_id: &ClipId) -> f64 {
     }
     let mapped = last.island.as_seconds() - first.island.as_seconds();
     (mapped / source - 1.0) * 1_000_000.0
-}
-
-fn is_timeline(path: &std::path::Path) -> bool {
-    align_decode::timeline::is_supported(path)
 }
 
 fn sorted_live_matches(map: &HashMap<String, LiveMatch>) -> Vec<LiveMatch> {
@@ -2358,7 +2268,7 @@ mod tests {
         let mut data = AppData::default();
         let destination = PathBuf::from("/tmp/finished-export");
         data.export_dir = Some(destination.clone());
-        data.export_selected.insert(ExportTarget::Premiere);
+        data.export.targets.push(ExportTarget::Premiere);
         data.exported_files.push(destination.join("timeline.xml"));
         data.operation = Operation::Exported;
         data.export_started = true;
@@ -2371,7 +2281,7 @@ mod tests {
         assert_eq!(data.progress, 0.0);
         assert!(data.exported_files.is_empty());
         assert_eq!(data.export_dir, Some(destination));
-        assert!(data.export_selected.contains(&ExportTarget::Premiere));
+        assert!(data.export.targets.contains(&ExportTarget::Premiere));
     }
 
     #[test]
@@ -2424,7 +2334,7 @@ mod tests {
         let media = PathBuf::from("/tmp/extra.wav");
         let mut data = AppData::default();
         data.inputs.push(media.clone());
-        data.sequence_picker = Some(SequencePicker {
+        data.sequence_pickers.push_back(SequencePicker {
             path: path.clone(),
             options: vec![
                 TimelineSequenceSummary {
@@ -3041,9 +2951,9 @@ mod tests {
     fn media_only_export_is_a_valid_output_selection() {
         use align_core::SyncProject;
         let mut data = AppData::default();
-        data.export_selected.clear();
+        data.export.targets.clear();
         assert!(!data.export_output_selected());
-        data.export_media = true;
+        data.export.media_files = true;
         assert!(data.export_output_selected());
         assert!(
             !data.can_begin_export(),
@@ -3078,19 +2988,51 @@ mod tests {
         data.pending_count = 1;
         assert!(!data.can_begin_export(), "stale results must not export");
         data.pending_count = 0;
-        data.export_media = false;
-        data.export_selected.insert(ExportTarget::Premiere);
+        data.export.media_files = false;
+        data.export.targets.push(ExportTarget::Premiere);
         assert!(data.export_output_selected());
+    }
+
+    fn add_paths(data: &mut AppData, paths: Vec<PathBuf>) {
+        let token = data.import_cancel.clone();
+        let inputs = data
+            .begin_import(paths)
+            .into_iter()
+            .map(|p| InputPath::inspect(p, &token))
+            .collect();
+        data.finish_import(&token, inputs);
+    }
+
+    #[test]
+    fn cancelled_import_cannot_restore_a_cleared_or_readded_input() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().to_owned();
+        let mut data = AppData::default();
+        let old = data.import_cancel.clone();
+        data.begin_import(vec![path.clone()]);
+        let input = InputPath::inspect(path.clone(), &old);
+        data.clear();
+        assert_eq!(data.begin_import(vec![path.clone(), path.clone()]).len(), 1);
+        data.finish_import(&old, vec![input]);
+        assert!(data.importing() && data.inputs.is_empty());
+        let token = data.import_cancel.clone();
+        data.finish_import(&token, vec![InputPath::inspect(path.clone(), &token)]);
+        assert!(!data.importing());
+        assert_eq!(data.inputs.as_slice(), std::slice::from_ref(&path));
+        assert!(data.folder_inputs.contains(&path));
     }
 
     #[test]
     fn add_remove_selection_session() {
         let mut data = AppData::default();
-        data.add_paths(vec![
-            PathBuf::from("/v/b.wav"),
-            PathBuf::from("/v/a.wav"),
-            PathBuf::from("/v/a.wav"),
-        ]);
+        add_paths(
+            &mut data,
+            vec![
+                PathBuf::from("/v/b.wav"),
+                PathBuf::from("/v/a.wav"),
+                PathBuf::from("/v/a.wav"),
+            ],
+        );
         // Deduped + sorted by path.
         assert_eq!(data.clips.len(), 2);
         assert_eq!(data.clips[0].url, PathBuf::from("/v/a.wav"));
@@ -3107,7 +3049,7 @@ mod tests {
     #[test]
     fn synchronize_requires_new_inputs_or_changed_settings_after_a_result() {
         let mut data = AppData::default();
-        data.add_paths(vec![PathBuf::from("/v/a.wav")]);
+        add_paths(&mut data, vec![PathBuf::from("/v/a.wav")]);
         data.result = Some(empty_sequence_result("Finished"));
         data.operation = Operation::Ready;
 
@@ -3124,14 +3066,14 @@ mod tests {
         assert!(!data.sync_dirty);
         assert!(!data.can_synchronize());
 
-        data.add_paths(vec![PathBuf::from("/v/b.wav")]);
+        add_paths(&mut data, vec![PathBuf::from("/v/b.wav")]);
         assert!(data.can_synchronize());
     }
 
     #[test]
     fn quality_retry_upgrades_only_unmatched_fingerprints() {
         let mut data = AppData::default();
-        data.add_paths(vec![PathBuf::from("/v/a.wav")]);
+        add_paths(&mut data, vec![PathBuf::from("/v/a.wav")]);
         let unmatched = ClipId::new("unmatched");
         let matched = ClipId::new("matched");
         let mut previous = empty_sequence_result("Previous");
@@ -3170,7 +3112,7 @@ mod tests {
     #[test]
     fn quality_change_does_not_stale_a_fully_matched_result() {
         let mut data = AppData::default();
-        data.add_paths(vec![PathBuf::from("/v/a.wav")]);
+        add_paths(&mut data, vec![PathBuf::from("/v/a.wav")]);
         let result = empty_sequence_result("Complete");
         data.result = Some(result.clone());
         data.sequence_results = vec![result];
@@ -3184,7 +3126,10 @@ mod tests {
     #[test]
     fn trash_removes_selection_then_clears_session() {
         let mut data = AppData::default();
-        data.add_paths(vec![PathBuf::from("/v/a.wav"), PathBuf::from("/v/b.wav")]);
+        add_paths(
+            &mut data,
+            vec![PathBuf::from("/v/a.wav"), PathBuf::from("/v/b.wav")],
+        );
         data.selection.insert(PathBuf::from("/v/a.wav"));
 
         data.delete_or_clear();
@@ -3232,7 +3177,7 @@ mod tests {
         );
         assert_eq!(data.path_repair_options().redirects, data.redirects);
         assert_eq!(data.path_repair_inputs().len(), data.inputs.len());
-        data.add_paths(vec![PathBuf::from("/v/recorder.wav")]);
+        add_paths(&mut data, vec![PathBuf::from("/v/recorder.wav")]);
         assert!(data.can_synchronize());
         assert!(data.begin_path_repair());
         assert_eq!(data.operation, Operation::Repairing);
@@ -3246,10 +3191,13 @@ mod tests {
     #[test]
     fn current_cache_media_excludes_timeline_containers() {
         let mut data = AppData::default();
-        data.add_paths(vec![
-            PathBuf::from("/v/edit.fcpxml"),
-            PathBuf::from("/v/recorder.wav"),
-        ]);
+        add_paths(
+            &mut data,
+            vec![
+                PathBuf::from("/v/edit.fcpxml"),
+                PathBuf::from("/v/recorder.wav"),
+            ],
+        );
         assert_eq!(
             data.current_cache_media(),
             vec![PathBuf::from("/v/recorder.wav")]
@@ -3264,36 +3212,36 @@ mod tests {
         data.warnings
             .push("camera.mov: Variable frame rate detected.".into());
         assert!(!data.has_missing_media_warning());
-        assert!(!data.can_locate_timeline_media());
+        assert!(!data.can_relink_media());
         data.warnings
             .push("cut.xml: Timeline media could not be opened: /old/card/A.WAV".into());
         assert!(data.has_missing_media_warning());
-        assert!(data.can_locate_timeline_media());
+        assert!(data.can_relink_media());
 
         data.warnings.clear();
         data.error = Some("No readable audio or video media was found.".into());
-        assert!(data.can_locate_timeline_media());
+        assert!(data.can_relink_media());
     }
 
     #[test]
     fn export_targets_follow_selection() {
         let mut data = AppData::default();
         assert_eq!(data.export_targets().len(), 2);
-        data.export_selected.insert(ExportTarget::Premiere);
+        data.export.targets.push(ExportTarget::Premiere);
         let formats = data.export_targets();
         assert!(formats.contains(&TimelineExportFormat::PremiereXML));
         // Canonical order: OTIO, script, then Premiere.
         let names: Vec<_> = formats.iter().map(|f| f.file_extension()).collect();
         assert_eq!(names, vec!["otio", "py", "xml"]);
 
-        data.export_selected.clear();
-        data.export_selected.insert(ExportTarget::FinalCutPro);
+        data.export.targets.clear();
+        data.export.targets.push(ExportTarget::FinalCutPro);
         assert_eq!(
             data.export_targets(),
             vec![TimelineExportFormat::FinalCutProXML]
         );
-        data.export_fcpxml_timeline = false;
-        data.export_fcpxml_multicam = false;
+        data.export.fcpxml_timeline = false;
+        data.export.fcpxml_multicam = false;
         assert!(data.export_targets().is_empty());
         assert!(!data.export_output_selected());
     }
@@ -3454,15 +3402,15 @@ mod tests {
             saved_export_settings: Some(saved.clone()),
             ..Default::default()
         };
-        data.export_media_bins = false;
-        data.export_drift = false;
+        data.export.media_bins = false;
+        data.export.correct_drift = false;
         data.clear();
         assert_eq!(data.saved_export_settings.as_ref(), Some(&saved));
         assert_eq!(data.export_settings(ExportLabels::default()), saved);
 
         // Without saved defaults, Align's own apply.
         data.saved_export_settings = None;
-        data.export_drift = false;
+        data.export.correct_drift = false;
         data.clear();
         assert_eq!(
             data.export_settings(ExportLabels::default()),

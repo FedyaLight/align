@@ -169,6 +169,8 @@ pub struct Track {
     /// First sample description: its four-character code and full bytes.
     pub codec: [u8; 4],
     pub sample_entry: Vec<u8>,
+    /// All chunks use a single local description and an unmodified timeline.
+    pub(crate) linear_pcm_layout: bool,
     pub timescale: u32,
     pub media_duration: u64,
     /// Presented duration from the edit list, in the movie timescale.
@@ -213,40 +215,80 @@ impl SampleSizes {
 }
 
 impl Track {
+    pub(crate) fn needs_sbr_decoder(&self, path: &Path, audio_index: usize) -> bool {
+        self.sbr_from_header()
+            .unwrap_or_else(|| crate::ff::probed_sbr(path, audio_index).unwrap_or(true))
+    }
+
+    /// None requires a packet probe before selecting the decoder.
+    pub(crate) fn sbr_from_header(&self) -> Option<bool> {
+        if &self.codec != b"mp4a" {
+            return Some(false);
+        }
+        let Some(config) = aac_config(&self.sample_entry) else {
+            return Some(false);
+        };
+        if signals_sbr(config).unwrap_or(false) {
+            return Some(true);
+        }
+        // A low-rate LC core without an ASC extension can carry SBR in its
+        // packets. Probe the selected stream before handing audio to a consumer.
+        let mut bits = symphonia::core::io::BitReaderLtr::new(config);
+        use symphonia::core::io::ReadBitsLtr;
+        let low_rate_core = bits.read_bits_leq32(5).ok() == Some(2)
+            && match bits.read_bits_leq32(4) {
+                Ok(6..=12) => true, // 24 kHz down to 7.35 kHz
+                Ok(15) => bits.read_bits_leq32(24).is_ok_and(|r| r <= 24000),
+                _ => false,
+            };
+        (!low_rate_core).then_some(false)
+    }
+
     pub fn sample_count(&self) -> u64 {
         self.time_to_sample.iter().map(|&(n, _)| n as u64).sum()
+    }
+
+    /// Sample-to-chunk runs are ordered and use 1-based chunk indices.
+    pub(crate) fn chunk_layout(&self) -> impl Iterator<Item = Option<(u64, u32)>> + '_ {
+        let mut runs = self.chunk_runs.iter().peekable();
+        let mut count = None;
+        self.chunk_offsets
+            .iter()
+            .enumerate()
+            .map(move |(index, &offset)| {
+                let number = u32::try_from(index + 1).ok()?;
+                if let Some(run) = runs.next_if(|run| run.first_chunk == number) {
+                    count = Some(run.samples_per_chunk);
+                }
+                Some((offset, count?))
+            })
     }
 
     /// Byte ranges of each chunk in file order: (offset, length, samples).
     pub fn chunks(&self) -> Option<Vec<(u64, u64, u32)>> {
         let mut out = Vec::with_capacity(self.chunk_offsets.len());
         let mut sample = 0usize;
-        for (index, &offset) in self.chunk_offsets.iter().enumerate() {
-            let number = index as u32 + 1;
-            let run = self
-                .chunk_runs
-                .iter()
-                .rev()
-                .find(|run| run.first_chunk <= number)?;
+        for chunk in self.chunk_layout() {
+            let (offset, samples_per_chunk) = chunk?;
             let mut length = 0u64;
-            for _ in 0..run.samples_per_chunk {
+            for _ in 0..samples_per_chunk {
                 if sample >= self.sample_sizes.count() {
                     return None;
                 }
                 length += self.sample_sizes.size(sample) as u64;
                 sample += 1;
             }
-            out.push((offset, length, run.samples_per_chunk));
+            out.push((offset, length, samples_per_chunk));
         }
         (sample == self.sample_sizes.count()).then_some(out)
     }
 
     /// Nominal rate as FFmpeg derives it: samples per summed decode time.
     fn average_rate(&self) -> Option<f64> {
-        let total: u64 = self
+        let total: u128 = self
             .time_to_sample
             .iter()
-            .map(|&(n, d)| n as u64 * d as u64)
+            .map(|&(n, d)| u128::from(n) * u128::from(d))
             .sum();
         (total > 0 && self.timescale > 0)
             .then(|| self.sample_count() as f64 * self.timescale as f64 / total as f64)
@@ -255,6 +297,9 @@ impl Track {
     /// Presentation timing without decoding: decode deltas plus
     /// composition offsets, classified exactly like the FFmpeg packet walk.
     fn timing_mode(&self) -> align_core::VideoFrameRateMode {
+        if self.composition_offsets.is_empty() {
+            return decode_time_mode(self.timescale, &self.time_to_sample);
+        }
         let scale = self.timescale as f64;
         let mut timing = PacketTiming::default();
         let mut offsets = self
@@ -273,8 +318,35 @@ impl Track {
     }
 }
 
+// Without composition offsets every positive PTS spacing is already a
+// sample duration. Work in ticks: subtracting rounded absolute timestamps
+// can turn an exact threshold into a spurious VFR classification.
+fn decode_time_mode(timescale: u32, runs: &[(u32, u32)]) -> align_core::VideoFrameRateMode {
+    use align_core::VideoFrameRateMode;
+    let mut samples = 0u32;
+    let (mut min, mut max) = (u32::MAX, 0);
+    for &(count, delta) in runs {
+        if count > 0 && delta > 0 {
+            samples = samples.saturating_add(count);
+            min = min.min(delta);
+            max = max.max(delta);
+        }
+    }
+    if timescale == 0 || samples < 2 {
+        return VideoFrameRateMode::Unknown;
+    }
+    let spread = u64::from(max - min);
+    if spread * 100_000 > u64::from(timescale) && spread * 200 > u64::from(min) {
+        VideoFrameRateMode::Variable
+    } else {
+        VideoFrameRateMode::Constant
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Movie {
+    header_bytes: usize,
+    pub(crate) media_ranges: Vec<std::ops::Range<u64>>,
     pub timescale: u32,
     pub duration: u64,
     pub tracks: Vec<Track>,
@@ -283,6 +355,30 @@ pub struct Movie {
 }
 
 impl Movie {
+    pub(crate) fn small_header(&self) -> bool {
+        self.header_bytes <= 4 * 1024 * 1024
+    }
+    fn retained_bytes(&self) -> usize {
+        size_of::<Movie>()
+            + self.media_ranges.capacity() * size_of::<std::ops::Range<u64>>()
+            + self.tracks.capacity() * size_of::<Track>()
+            + self
+                .tracks
+                .iter()
+                .map(|t| {
+                    t.sample_entry.capacity()
+                        + t.time_to_sample.capacity() * size_of::<(u32, u32)>()
+                        + t.composition_offsets.capacity() * size_of::<(u32, i32)>()
+                        + t.chunk_runs.capacity() * size_of::<ChunkRun>()
+                        + t.chunk_offsets.capacity() * size_of::<u64>()
+                        + match &t.sample_sizes {
+                            SampleSizes::Constant { .. } => 0,
+                            SampleSizes::Table(v) => v.capacity() * size_of::<u32>(),
+                        }
+                })
+                .sum::<usize>()
+    }
+
     pub fn duration_seconds(&self) -> f64 {
         if self.timescale == 0 {
             return 0.0;
@@ -321,6 +417,10 @@ impl Movie {
     }
 
     pub fn probe(&self) -> Option<ProbeReport> {
+        self.probe_with_video(true)
+    }
+
+    fn probe_with_video(&self, video_timing: bool) -> Option<ProbeReport> {
         let audio_streams: Vec<AudioStreamProbe> = self
             .audio()
             .filter_map(|track| {
@@ -339,15 +439,18 @@ impl Movie {
                 })
             })
             .collect();
-        let video = self.video().map(|track| VideoProbe {
-            width: track.width,
-            height: track.height,
-            frame_duration: track
-                .average_rate()
-                .and_then(|fps| canonical_frame_duration(fps, None)),
-            mode: track.timing_mode(),
-            source_timecode: self.source_timecode(),
-        });
+        let video = self
+            .video()
+            .filter(|_| video_timing)
+            .map(|track| VideoProbe {
+                width: track.width,
+                height: track.height,
+                frame_duration: track
+                    .average_rate()
+                    .and_then(|fps| canonical_frame_duration(fps, None)),
+                mode: track.timing_mode(),
+                source_timecode: self.source_timecode(),
+            });
         let duration_seconds = self.duration_seconds();
         if (audio_streams.is_empty() && video.is_none()) || duration_seconds <= 0.0 {
             return None;
@@ -355,7 +458,7 @@ impl Movie {
         Some(ProbeReport {
             duration_seconds,
             audio_streams,
-            has_video: video.is_some(),
+            has_video: self.video().is_some(),
             video,
         })
     }
@@ -363,26 +466,31 @@ impl Movie {
 
 // ------------------------------------------------------------ file access
 
+fn atom_header(file: &mut File, offset: u64, length: u64) -> Option<([u8; 4], u64, u64)> {
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut header = [0u8; 16];
+    file.read_exact(&mut header[..8]).ok()?;
+    let kind: [u8; 4] = header[4..8].try_into().ok()?;
+    let (size, header_len) = match u32::from_be_bytes(header[..4].try_into().ok()?) {
+        0 => (length - offset, 8),
+        1 => {
+            file.read_exact(&mut header[8..]).ok()?;
+            (u64::from_be_bytes(header[8..].try_into().ok()?), 16)
+        }
+        n => (n as u64, 8),
+    };
+    if size < header_len || offset.checked_add(size)? > length {
+        return None;
+    }
+    Some((kind, size, header_len))
+}
+
 /// Locate and load the top-level `moov` box without reading media data.
 pub(crate) fn read_moov(file: &mut File) -> Option<Vec<u8>> {
     let length = file.metadata().ok()?.len();
     let mut offset = 0u64;
     while offset + 8 <= length {
-        file.seek(SeekFrom::Start(offset)).ok()?;
-        let mut header = [0u8; 16];
-        file.read_exact(&mut header[..8]).ok()?;
-        let kind: [u8; 4] = header[4..8].try_into().ok()?;
-        let (size, header_len) = match u32::from_be_bytes(header[..4].try_into().ok()?) {
-            0 => (length - offset, 8),
-            1 => {
-                file.read_exact(&mut header[8..]).ok()?;
-                (u64::from_be_bytes(header[8..].try_into().ok()?), 16)
-            }
-            n => (n as u64, 8),
-        };
-        if size < header_len || offset.checked_add(size)? > length {
-            return None;
-        }
+        let (kind, size, _) = atom_header(file, offset, length)?;
         if &kind == b"moov" {
             if size > MAX_MOOV_BYTES {
                 return None;
@@ -400,8 +508,36 @@ pub(crate) fn read_moov(file: &mut File) -> Option<Vec<u8>> {
 pub fn read(path: &Path) -> Option<Movie> {
     let mut file = File::open(path).ok()?;
     let moov = read_moov(&mut file)?;
-    let body = atoms(&moov).next()?.body;
+    read_movie(&mut file, &moov)
+}
+
+fn read_movie(file: &mut File, moov: &[u8]) -> Option<Movie> {
+    let body = atoms(moov).next()?.body;
     let mut movie = parse_moov(body)?;
+    if movie
+        .audio()
+        .any(|t| t.audio.as_ref().is_some_and(|a| a.is_float.is_some()))
+    {
+        // Check top-level payload extents once per parsed header. Refuse
+        // the direct reader if the rest of the container is malformed.
+        let length = file.metadata().ok()?.len();
+        let mut pos = 0;
+        for _ in 0..65536 {
+            let Some((kind, size, header)) = atom_header(file, pos, length) else {
+                break;
+            };
+            if &kind == b"mdat" {
+                movie.media_ranges.push(pos + header..pos + size);
+            }
+            pos += size;
+            if pos == length {
+                break;
+            }
+        }
+        if pos != length {
+            movie.media_ranges.clear();
+        }
+    }
     if let Some(track) = movie.tracks.iter().find(|t| t.kind == TrackKind::Timecode) {
         let (offset, length, _) = *track.chunks()?.first()?;
         if length >= 4 {
@@ -414,12 +550,86 @@ pub fn read(path: &Path) -> Option<Movie> {
     Some(movie)
 }
 
+/// Share parsed tables across windows without holding media handles. The
+/// budget covers parsed table allocations, including expanded chunk offsets.
+pub(crate) fn shared_movie(path: &Path) -> Option<std::sync::Arc<Movie>> {
+    let mut file = File::open(path).ok()?;
+    shared_movie_for_file(path, &mut file)
+}
+
+pub(crate) fn shared_movie_for_file(path: &Path, file: &mut File) -> Option<std::sync::Arc<Movie>> {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    const TABLE_BUDGET: usize = 32 * 1024 * 1024;
+    struct Entry {
+        path: std::path::PathBuf,
+        revision: String,
+        movie: Arc<Movie>,
+        bytes: usize,
+    }
+    static CACHE: Mutex<VecDeque<Entry>> = Mutex::new(VecDeque::new());
+    let revision = align_core::cache::opened_media_revision(file).ok();
+    let cache = || {
+        CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    if let Some(revision) = &revision {
+        let mut cache = cache();
+        if let Some(i) = cache
+            .iter()
+            .position(|e| e.path == path && &e.revision == revision)
+        {
+            let entry = cache.remove(i)?;
+            let movie = entry.movie.clone();
+            cache.push_back(entry);
+            return Some(movie);
+        }
+    }
+    let moov = read_moov(file)?;
+    let movie = Arc::new(read_movie(file, &moov)?);
+    let bytes = movie.retained_bytes()
+        + path.as_os_str().len()
+        + size_of::<Entry>()
+        + revision.as_ref().map_or(0, String::capacity);
+    if bytes <= TABLE_BUDGET
+        && let Some(revision) = revision
+        && align_core::cache::media_revision(path).ok().as_ref() == Some(&revision)
+    {
+        let mut cache = cache();
+        cache.retain(|e| e.path != path);
+        let mut total = bytes + cache.iter().map(|e| e.bytes).sum::<usize>();
+        while cache.len() >= 128 || total > TABLE_BUDGET {
+            total -= cache.pop_front().expect("new movie fits the budget").bytes;
+        }
+        cache.push_back(Entry {
+            path: path.to_owned(),
+            revision,
+            movie: movie.clone(),
+            bytes,
+        });
+    }
+    Some(movie)
+}
+
+pub(crate) fn has_sbr_audio(path: &Path) -> bool {
+    (is_candidate(path)
+        || path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("m4a")))
+        && shared_movie(path).is_some_and(|m| {
+            m.audio()
+                .enumerate()
+                .any(|(i, t)| t.needs_sbr_decoder(path, i))
+        })
+}
+
 /// Header probe for the portable backend; `None` means "ask FFmpeg".
 pub fn inspect(path: &Path) -> Option<ProbeReport> {
     if !is_candidate(path) {
         return None;
     }
-    read(path)?.probe()
+    shared_movie(path)?.probe()
 }
 
 /// Audio formats only: skips the video timing classification that decode
@@ -428,12 +638,7 @@ pub fn inspect_audio(path: &Path) -> Option<ProbeReport> {
     if !is_candidate(path) {
         return None;
     }
-    let mut movie = read(path)?;
-    let has_video = movie.video().is_some();
-    movie.tracks.retain(|t| t.kind == TrackKind::Audio);
-    let mut report = movie.probe()?;
-    report.has_video = has_video;
-    Some(report)
+    shared_movie(path)?.probe_with_video(false)
 }
 
 // ------------------------------------------------------------ AAF linking
@@ -447,7 +652,7 @@ pub fn ama_metadata(path: &Path) -> Option<serde_json::Value> {
     if !is_candidate(path) {
         return None;
     }
-    let movie = read(path)?;
+    let movie = shared_movie(path)?;
     let mut streams = Vec::new();
     for track in &movie.tracks {
         match track.kind {
@@ -516,18 +721,18 @@ pub fn ama_metadata(path: &Path) -> Option<serde_json::Value> {
 
 impl Track {
     fn average_rate_fraction(&self) -> Option<String> {
-        let total: u64 = self
+        let total: u128 = self
             .time_to_sample
             .iter()
-            .map(|&(n, d)| n as u64 * d as u64)
+            .map(|&(n, d)| u128::from(n) * u128::from(d))
             .sum();
-        let frames = self.sample_count() * self.timescale as u64;
+        let frames = u128::from(self.sample_count()) * u128::from(self.timescale);
         let divisor = gcd(frames, total);
         (divisor > 0).then(|| format!("{}/{}", frames / divisor, total / divisor))
     }
 }
 
-fn gcd(mut a: u64, mut b: u64) -> u64 {
+fn gcd(mut a: u128, mut b: u128) -> u128 {
     while b != 0 {
         (a, b) = (b, a % b);
     }
@@ -734,9 +939,11 @@ pub(crate) fn parse_moov(moov: &[u8]) -> Option<Movie> {
     };
     let tracks = atoms(moov)
         .filter(|a| &a.kind == b"trak")
-        .map(|trak| parse_trak(trak.body))
+        .map(|trak| parse_trak(trak.body, timescale))
         .collect::<Option<Vec<_>>>()?;
     Some(Movie {
+        header_bytes: moov.len(),
+        media_ranges: Vec::new(),
         timescale,
         duration,
         tracks,
@@ -744,7 +951,7 @@ pub(crate) fn parse_moov(moov: &[u8]) -> Option<Movie> {
     })
 }
 
-fn parse_trak(trak: &[u8]) -> Option<Track> {
+fn parse_trak(trak: &[u8], movie_timescale: u32) -> Option<Track> {
     let (version, mut tkhd) = full_box(child(trak, b"tkhd")?.body)?;
     tkhd.skip(if version == 1 { 16 } else { 8 })?;
     let id = tkhd.u32()?;
@@ -771,13 +978,24 @@ fn parse_trak(trak: &[u8]) -> Option<Track> {
         _ => TrackKind::Other,
     };
     let stbl = path(mdia, &[b"minf", b"stbl"])?.body;
-    let entry = {
+    let (entry, mut linear_pcm_layout) = {
         let (_, mut stsd) = full_box(child(stbl, b"stsd")?.body)?;
         let count = stsd.u32()?;
         (count > 0).then_some(())?;
         let rest = &stsd.data[stsd.pos..];
-        atoms(rest).next()?
+        (atoms(rest).next()?, count == 1)
     };
+    let local_reference = path(mdia, &[b"minf", b"dinf", b"dref"]).and_then(|dref| {
+        let (_, mut b) = full_box(dref.body)?;
+        let count = b.u32()?;
+        let reference = atoms(&b.data[b.pos..]).next()?;
+        Some(
+            count == 1
+                && matches!(&reference.kind, b"alis" | b"url ")
+                && reference.body == [0, 0, 0, 1],
+        )
+    });
+    linear_pcm_layout &= local_reference == Some(true) && entry.body.get(6..8) == Some(&[0, 1]);
     let audio = if kind == TrackKind::Audio {
         Some(parse_audio_entry(entry)?)
     } else {
@@ -834,13 +1052,21 @@ fn parse_trak(trak: &[u8]) -> Option<Track> {
         .map(|_| {
             let first_chunk = stsc.u32()?;
             let samples_per_chunk = stsc.u32()?;
-            stsc.skip(4)?;
+            linear_pcm_layout &= stsc.u32()? == 1 && samples_per_chunk > 0;
             Some(ChunkRun {
                 first_chunk,
                 samples_per_chunk,
             })
         })
         .collect::<Option<Vec<_>>>()?;
+
+    if chunk_runs.first().is_some_and(|r| r.first_chunk != 1)
+        || chunk_runs
+            .windows(2)
+            .any(|r| r[0].first_chunk >= r[1].first_chunk)
+    {
+        return None;
+    }
 
     let chunk_offsets = if let Some(stco) = child(stbl, b"stco") {
         let (_, mut b) = full_box(stco.body)?;
@@ -868,7 +1094,14 @@ fn parse_trak(trak: &[u8]) -> Option<Track> {
             } else {
                 (b.u32()? as u64, b.u32()? as i32 as i64)
             };
-            b.skip(4)?; // media rate
+            let rate = b.u32()?;
+            linear_pcm_layout &= version <= 1
+                && entries == 1
+                && media_time == 0
+                && rate == 65536
+                && movie_timescale != 0
+                && u128::from(duration) * u128::from(timescale)
+                    == u128::from(media_duration) * u128::from(movie_timescale);
             presentation = presentation.checked_add(duration)?;
             if media_time >= 0 {
                 total = total.checked_add(duration)?;
@@ -877,6 +1110,8 @@ fn parse_trak(trak: &[u8]) -> Option<Track> {
         }
         Some((total, start.unwrap_or(0), presentation))
     });
+    linear_pcm_layout &=
+        child(trak, b"edts").is_none() || edits.is_some_and(|(_, _, duration)| duration > 0);
     let edited_duration = edits.map(|(total, _, _)| total);
     let media_start = edits.map_or(0, |(_, start, _)| start);
     let presentation_duration = edits.map(|(_, _, presentation)| presentation);
@@ -889,6 +1124,7 @@ fn parse_trak(trak: &[u8]) -> Option<Track> {
         media_start,
         codec: entry.kind,
         sample_entry: entry.raw.to_vec(),
+        linear_pcm_layout,
         timescale,
         media_duration,
         width,
@@ -901,6 +1137,95 @@ fn parse_trak(trak: &[u8]) -> Option<Track> {
         chunk_runs,
         chunk_offsets,
     })
+}
+
+// MPEG-4 descriptors use up to four 7-bit groups for a payload length.
+fn descriptor<'a>(mut bytes: Bytes<'a>, tag: u8) -> Option<Bytes<'a>> {
+    while bytes.remaining() > 0 {
+        let kind = bytes.u8()?;
+        let mut size = 0;
+        for group in 0..4 {
+            let part = bytes.u8()?;
+            size = (size << 7) | usize::from(part & 0x7f);
+            if part & 0x80 == 0 {
+                let body = bytes.take(size)?;
+                if kind == tag {
+                    return Some(Bytes::new(body));
+                }
+                break;
+            }
+            if group == 3 {
+                return None;
+            }
+        }
+    }
+    None
+}
+
+fn aac_config(sample_entry: &[u8]) -> Option<&[u8]> {
+    let entry = atoms(sample_entry).next()?;
+    let extensions = match entry.body.get(8..10)? {
+        [0, 0] => entry.body.get(28..)?,
+        [0, 1] => entry.body.get(44..)?,
+        [0, 2] => {
+            // QuickTime SoundDescriptionV2.sizeOfStructOnly is measured
+            // from the start of the sample entry, including its atom header.
+            let size = u32::from_be_bytes(entry.body.get(28..32)?.try_into().ok()?) as usize;
+            let header = entry.raw.len() - entry.body.len();
+            if size < header + 64 {
+                return None;
+            }
+            entry.raw.get(size..)?
+        }
+        _ => return None,
+    };
+    let esds =
+        child(extensions, b"esds").or_else(|| child(child(extensions, b"wave")?.body, b"esds"))?;
+    let mut es = descriptor(full_box(esds.body)?.1, 3)?;
+    es.skip(2)?; // ES_ID
+    let flags = es.u8()?;
+    if flags & 0x80 != 0 {
+        es.skip(2)?;
+    }
+    if flags & 0x40 != 0 {
+        let length = es.u8()?;
+        es.skip(usize::from(length))?;
+    }
+    if flags & 0x20 != 0 {
+        es.skip(2)?;
+    }
+    let mut decoder = descriptor(es, 4)?;
+    if !matches!(decoder.u8()?, 0x40 | 0x66..=0x68) {
+        return None;
+    }
+    decoder.skip(12)?; // stream type, buffer size and bit rates
+    Some(descriptor(decoder, 5)?.data)
+}
+
+/// HE-AAC can describe packets entirely in core-rate ticks. In that case
+/// the decoded frame count alone cannot tell that Symphonia omitted SBR.
+fn signals_sbr(config: &[u8]) -> std::io::Result<bool> {
+    use symphonia::core::io::{BitReaderLtr, ReadBitsLtr};
+    let mut bits = BitReaderLtr::new(config);
+    match bits.read_bits_leq32(5)? {
+        5 | 29 => return Ok(true), // explicit SBR or Parametric Stereo
+        2 => (),                   // backwards-compatible AAC-LC configuration
+        _ => return Ok(false),
+    }
+    if bits.read_bits_leq32(4)? == 15 {
+        bits.ignore_bits(24)?; // explicit sampling frequency
+    }
+    if bits.read_bits_leq32(4)? == 0 {
+        return Ok(false); // Symphonia already rejects program config elements
+    }
+    bits.ignore_bits(1)?; // frameLengthFlag
+    if bits.read_bool()? {
+        bits.ignore_bits(14)?; // coreCoderDelay
+    }
+    if bits.read_bool()? && bits.read_bool()? {
+        return Ok(false); // unknown GASpecificConfig extension
+    }
+    Ok(bits.read_bits_leq32(11)? == 0x2b7 && bits.read_bits_leq32(5)? == 5 && bits.read_bool()?)
 }
 
 /// QuickTime sound description versions 0–2 and ISO audio sample entries.
@@ -1080,7 +1405,22 @@ mod tests {
                 .expect("drop-frame timecode");
             assert_eq!(tc.text, "01:00:00;00");
             assert!(tc.drop_frame);
+            let camera = dir.path().join("pcm16.mov");
+            std::fs::write(&camera, b"truncated movie").unwrap();
+            assert!(
+                inspect(&camera).is_none(),
+                "stale camera header after replacement"
+            );
         }
+    }
+
+    #[test]
+    fn quicktime_v2_he_aac_uses_the_full_decoder() {
+        // Six-channel Core Audio HE-AAC, stream copied by FFmpeg 9 to MOV.
+        let clip = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/he-aac-v2.mov");
+        assert!(has_sbr_audio(&clip));
+        let metadata = ama_metadata(&clip).unwrap();
+        assert_eq!(metadata["streams"][0]["channels"], 6);
     }
 
     #[test]
@@ -1199,6 +1539,20 @@ mod tests {
     }
 
     #[test]
+    fn decode_time_runs_use_exact_frame_rate_tolerances() {
+        use VideoFrameRateMode::{Constant, Unknown, Variable};
+        for (scale, runs, expected) in [
+            (1_000_000, &[(u32::MAX, 2000), (3, 2010)][..], Constant),
+            (1_000_000, &[(1, 2000), (1, 2011)], Variable),
+            (1_000_000, &[(1, 100), (1, 110)], Constant),
+            (1_000_000, &[(0, 50), (3, 0), (1, 90)], Unknown),
+            (0, &[(u32::MAX, 2000)], Unknown),
+        ] {
+            assert_eq!(decode_time_mode(scale, runs), expected);
+        }
+    }
+
+    #[test]
     fn variable_frame_timing_is_classified_from_sample_tables() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("vfr.mp4");
@@ -1250,6 +1604,23 @@ mod tests {
         ) {
             let report = inspect(&output).expect("video-only probe");
             assert!(report.has_video && report.audio_streams.is_empty());
+            // A same-length replacement can restore the original mtime.
+            let stamp = std::fs::metadata(&output).unwrap().modified().unwrap();
+            let mut bytes = std::fs::read(&output).unwrap();
+            let tkhd = bytes.windows(4).position(|w| w == b"tkhd").unwrap();
+            let length = u32::from_be_bytes(bytes[tkhd - 4..tkhd].try_into().unwrap()) as usize;
+            let width = tkhd - 4 + length - 8;
+            bytes[width..width + 4].copy_from_slice(&(128u32 << 16).to_be_bytes());
+            let replacement = dir.path().join("replacement.mov");
+            std::fs::write(&replacement, bytes).unwrap();
+            File::options()
+                .write(true)
+                .open(&replacement)
+                .unwrap()
+                .set_modified(stamp)
+                .unwrap();
+            std::fs::rename(replacement, &output).unwrap();
+            assert_eq!(inspect(&output).unwrap().video.unwrap().width, 128);
         }
         let junk = dir.path().join("junk.mov");
         std::fs::write(&junk, b"\0\0\0\x10ftypqt  \0\0\0\0garbage").unwrap();

@@ -10,7 +10,7 @@ trigger the problem. Examples of what to report:
 
 - a media file, timeline, or AAF project that makes Align run code, write
   outside the folder the user chose, or delete files;
-- a problem in how the update check or the MCP server handles what it receives.
+- a problem in how the update check handles what it receives.
 
 Fixes go into the latest release. Align is maintained by one person, so a
 reply may take a few days.

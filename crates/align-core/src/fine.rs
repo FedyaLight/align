@@ -15,7 +15,7 @@
 //!
 //! Audio access goes through [`WindowProvider`] so this crate stays
 //! backend-agnostic: production wires it to `MediaBackend::decode_window_16k`
-//! (either engine), tests use synthetic clips. Four parallel workers return
+//! (either engine), tests use synthetic clips. Bounded parallel workers return
 //! indexed results, so acceptance remains deterministic.
 
 use std::collections::HashMap;
@@ -24,6 +24,9 @@ use crate::gccphat;
 use crate::matcher::{MatchPolicy, PairAlignmentPoint, PairwiseMatch};
 use crate::model::{AudioAnalysisSource, ClipId, MatchEvidence};
 use crate::piecewise::PiecewiseTimeMapping;
+
+mod flux;
+pub use flux::recover_short_takes;
 
 pub const FINE_SAMPLE_RATE: f64 = 16_000.0;
 /// Rate gate shared with the coarse matcher policy.
@@ -42,6 +45,11 @@ pub struct AudioWindow {
 
 /// 16 kHz mono window source. `None` means undecodable or cancelled.
 pub trait WindowProvider: Send + Sync {
+    /// Maximum simultaneous window requests this source handles efficiently.
+    fn worker_cap(&self) -> usize {
+        8
+    }
+
     fn window(
         &self,
         clip: &ClipId,
@@ -70,16 +78,9 @@ pub struct RefineEvent {
 
 /// A refined pair that closes a cycle below this confidence is dropped.
 const WEAK_CYCLE_CONFIDENCE: f64 = 0.85;
-/// Candidates refined together before acceptance looks again; a weak pair
-/// whose clips earlier batches joined is skipped.
-const REFINE_BATCH: usize = 16;
 
-/// Refine all candidates; `clips` are all known ids (disjoint-set universe).
-/// Progress reports unusable candidates first, then one event per candidate.
-/// Up to four workers refine each batch of candidates; indexed results keep
-/// input order, so outcomes are identical to sequential execution. Progress
-/// events carry a monotonic completion count; disjoint-set acceptance stays
-/// sequential and deterministic.
+/// Workers refine independently. The caller accepts and reports the results
+/// in input order, even if later candidates finish first.
 pub fn refine_forest(
     durations: &HashMap<ClipId, f64>,
     candidates: &[PairwiseMatch],
@@ -103,75 +104,79 @@ pub fn refine_forest(
         }
     }
     let total = usable.len();
-    // Workers count and report under one lock, so the counts they report
-    // arrive in order.
-    let completed = std::sync::Mutex::new(0usize);
-    let report_done = |candidate: &PairwiseMatch, stage: RefineStage| {
-        if let Some(report) = &progress {
-            let mut done = completed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *done += 1;
-            report(RefineEvent {
-                completed: *done,
-                total,
-                left: candidate.left.clone(),
-                right: candidate.right.clone(),
-                stage,
-            });
-        }
-    };
+    let workers = crate::parallel::worker_limit(provider.worker_cap().min(8)).min(total);
+    // Limit speculative reads before earlier decisions can prune weak cycles.
+    let lookahead = (workers * 2).min(8);
     let clips: Vec<_> = durations.keys().cloned().collect();
     let mut components = FineDisjointSet::new(&clips);
     let mut accepted = Vec::new();
-    // Candidates refine in batches, so a weak pair between clips that the
-    // pairs accepted before its batch already join is skipped rather than
-    // decoded and correlated: acceptance would drop it anyway, as joined
-    // clips stay joined.
-    for batch in usable.chunks(REFINE_BATCH) {
-        let jobs: Vec<(&PairwiseMatch, bool)> = batch
-            .iter()
-            .map(|&candidate| {
-                let dropped = candidate.confidence < WEAK_CYCLE_CONFIDENCE
-                    && components.connected(&candidate.left, &candidate.right);
-                (candidate, dropped)
-            })
-            .collect();
-        let refined: Vec<Option<PairwiseMatch>> =
-            crate::parallel::par_map(&jobs, 4, |&(candidate, dropped)| {
-                if dropped || cancel.load(Ordering::Relaxed) {
-                    return None;
+    use std::sync::{Mutex, mpsc};
+    let (send, receive) = mpsc::channel::<(&PairwiseMatch, mpsc::Sender<Option<PairwiseMatch>>)>();
+    let receive = Mutex::new(receive);
+    std::thread::scope(|scope| {
+        let send = send;
+        for _ in 0..workers {
+            let receive = &receive;
+            // Workers share a queue but release its lock before decoding.
+            scope.spawn(move || {
+                loop {
+                    let job = receive.lock().unwrap().recv();
+                    let Ok((candidate, reply)) = job else { break };
+                    let result = if cancel.load(Ordering::Relaxed) {
+                        None
+                    } else {
+                        refine(
+                            candidate,
+                            match_policy.minimum_confidence(&candidate.left, &candidate.right),
+                            durations,
+                            sources,
+                            provider,
+                        )
+                    };
+                    let _ = reply.send(result);
                 }
-                let result = refine(
-                    candidate,
-                    match_policy.minimum_confidence(&candidate.left, &candidate.right),
-                    durations,
-                    sources,
-                    provider,
-                );
-                let stage = if result.is_some() {
-                    RefineStage::Refined
-                } else {
-                    RefineStage::Rejected
-                };
-                report_done(candidate, stage);
-                result
             });
-        for &(candidate, _) in jobs.iter().filter(|(_, dropped)| *dropped) {
-            report_done(candidate, RefineStage::Rejected);
         }
-        for (&candidate, result) in batch.iter().zip(refined) {
-            let closes_cycle = components.connected(&candidate.left, &candidate.right);
-            let Some(result) = result else { continue };
-            if closes_cycle && candidate.confidence < WEAK_CYCLE_CONFIDENCE {
-                continue;
+        let mut next = 0;
+        let mut pending = std::collections::VecDeque::new();
+        for (index, &candidate) in usable.iter().enumerate() {
+            while next < total && pending.len() < lookahead {
+                let job = usable[next];
+                let skip = cancel.load(Ordering::Relaxed)
+                    || (job.confidence < WEAK_CYCLE_CONFIDENCE
+                        && components.connected(&job.left, &job.right));
+                pending.push_back(if skip {
+                    None
+                } else {
+                    let (reply, result) = mpsc::channel();
+                    send.send((job, reply)).unwrap();
+                    Some(result)
+                });
+                next += 1;
             }
-            if !closes_cycle {
-                components.union(&candidate.left, &candidate.right);
+            let result = pending.pop_front().unwrap().and_then(|r| r.recv().unwrap());
+            let mut stage = RefineStage::Rejected;
+            if let Some(result) = result {
+                let connected = components.connected(&candidate.left, &candidate.right);
+                if !connected || candidate.confidence >= WEAK_CYCLE_CONFIDENCE {
+                    if !connected {
+                        components.union(&candidate.left, &candidate.right);
+                    }
+                    accepted.push(result);
+                    stage = RefineStage::Refined;
+                }
             }
-            accepted.push(result);
+            if let Some(report) = progress {
+                report(RefineEvent {
+                    completed: index + 1,
+                    total,
+                    left: candidate.left.clone(),
+                    right: candidate.right.clone(),
+                    stage,
+                });
+            }
         }
-    }
+    });
     accepted
 }
 
@@ -358,7 +363,7 @@ impl Pair<'_> {
             &right_window.samples,
             (0.25 * FINE_SAMPLE_RATE) as usize,
         )?;
-        let common = 131_072.min(prev_pow2(
+        let common = 131_072.min(crate::gccphat::prev_pow2(
             left_window.samples.len().min(right_window.samples.len()),
         ));
         if common == 0 {
@@ -571,19 +576,6 @@ fn bounded_window_start(center: f64, duration: f64, clip_duration: f64) -> f64 {
     (center - duration / 2.0).clamp(0.0, (clip_duration - duration).max(0.0))
 }
 
-fn prev_pow2(mut v: usize) -> usize {
-    if v == 0 {
-        return 0;
-    }
-    v |= v >> 1;
-    v |= v >> 2;
-    v |= v >> 4;
-    v |= v >> 8;
-    v |= v >> 16;
-    v |= v >> 32;
-    v - (v >> 1)
-}
-
 // ------------------------------------------------------------ disjoint set
 
 struct FineDisjointSet {
@@ -711,6 +703,44 @@ mod tests {
     }
 
     #[test]
+    fn flux_rescue_requires_unique_envelope_and_independent_waveform_agreement() {
+        let rate = 16_000;
+        let q = noise(12 * rate, 17);
+        let mut r = noise(42 * rate, 91);
+        let start = 20 * rate + 512;
+        r[start..start + q.len()].copy_from_slice(&q);
+        let mut provider = SynthProvider {
+            clips: [(id("q"), q), (id("r"), r)].into_iter().collect(),
+            sample_rate: rate as f64,
+        };
+        let env: Vec<u8> = noise(185, 123)
+            .iter()
+            .map(|v| (128. + 120. * v) as u8)
+            .collect();
+        let mut reference = vec![33; 650];
+        reference[313..313 + 185].copy_from_slice(&env);
+        let search = |r: &[u8], provider: &SynthProvider| {
+            recover_short_takes(
+                &[(id("q"), env.clone()), (id("r"), r.to_vec())],
+                &[],
+                &[],
+                &Default::default(),
+                &Default::default(),
+                provider,
+                &Default::default(),
+            )
+        };
+        let result = search(&reference, &provider);
+        assert_eq!(result.len(), 1);
+        assert!((result[0].offset - 20.032).abs() < 0.0001);
+        let mut repeated = reference.clone();
+        repeated[20..205].copy_from_slice(&env);
+        assert!(search(&repeated, &provider).is_empty());
+        provider.clips.insert(id("r"), noise(42 * rate, 87));
+        assert!(search(&reference, &provider).is_empty());
+    }
+
+    #[test]
     fn refines_to_sample_accuracy() {
         let (provider, durations) = delayed_pair();
         let m = coarse("a", "b", 800.0 / FINE_SAMPLE_RATE, 0.9);
@@ -773,7 +803,7 @@ mod tests {
             coarse("a", "b", 800.0 / FINE_SAMPLE_RATE, 0.9),
             coarse("b", "c", 800.0 / FINE_SAMPLE_RATE, 0.9),
         ];
-        for index in 0..REFINE_BATCH - 2 {
+        for index in 0..14 {
             candidates.push(coarse(&format!("x{index}"), &format!("y{index}"), 0.0, 0.9));
         }
         for m in &candidates {

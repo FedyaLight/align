@@ -105,7 +105,7 @@ fn audio_tracks(asset: &AVURLAsset) -> Result<Vec<Retained<AVAssetTrack>>, Decod
 /// `AVSampleCursor` duration/PTS walk feeding the shared classifier.
 /// Mirrors `VideoTimingInspector.inspect` (same thresholds, same early
 /// evidence rules). Returns `None` when the asset has no video track.
-fn video_probe(asset: &AVURLAsset) -> Result<Option<VideoProbe>, DecodeError> {
+fn video_probe(asset: &AVURLAsset, path: &Path) -> Result<Option<VideoProbe>, DecodeError> {
     use align_core::{RangeAccumulator, VideoFrameRateMode, canonical_frame_duration};
 
     let mt_opt = unsafe { AVMediaTypeVideo };
@@ -127,9 +127,14 @@ fn video_probe(asset: &AVURLAsset) -> Result<Option<VideoProbe>, DecodeError> {
     let mode = if unsafe { track.canProvideSampleCursors() } {
         // SAFETY: cursor walk over plain-data CMTime getters.
         let range = unsafe { track.timeRange() };
-        match unsafe { track.makeSampleCursorWithPresentationTimeStamp(range.start) } {
-            None => VideoFrameRateMode::Unknown,
-            Some(cursor) => unsafe {
+        let table_mode = table_frame_rate_mode(path, track, range);
+        match (
+            unsafe { track.makeSampleCursorWithPresentationTimeStamp(range.start) },
+            table_mode,
+        ) {
+            (None, _) => VideoFrameRateMode::Unknown,
+            (Some(_), Some(mode)) => mode,
+            (Some(cursor), None) => unsafe {
                 let mut durations = RangeAccumulator::new();
                 let mut deltas = RangeAccumulator::new();
                 let mut previous: Option<CMTime> = None;
@@ -175,6 +180,66 @@ fn video_probe(asset: &AVURLAsset) -> Result<Option<VideoProbe>, DecodeError> {
         // Standard timecode track first (Sony tail enriches in pipeline).
         source_timecode: standard_timecode(asset),
     }))
+}
+
+// With no reordering or edits, every positive PTS spacing is also an stts
+// duration. Use the native classifier on its extrema, after checking that
+// the table covers exactly the selected track on AVFoundation's timeline.
+fn table_frame_rate_mode(
+    path: &Path,
+    track: &AVAssetTrack,
+    range: CMTimeRange,
+) -> Option<align_core::VideoFrameRateMode> {
+    use align_core::{RangeAccumulator, VideoFrameRateMode};
+    if !crate::isobmff::is_candidate(path)
+        || !is_numeric(range.start)
+        || range.start.value != 0
+        || !is_numeric(range.duration)
+        || range.duration.value <= 0
+    {
+        return None;
+    }
+    let movie = crate::isobmff::shared_movie(path)?;
+    let id = u32::try_from(unsafe { track.trackID() }).ok()?;
+    let mut tracks = movie.tracks.iter().filter(|t| t.id == id);
+    let t = tracks.next()?;
+    if tracks.next().is_some()
+        || t.kind != crate::isobmff::TrackKind::Video
+        || !t.linear_pcm_layout
+        || !t.composition_offsets.is_empty()
+        || t.timescale == 0
+        || !(2..=4_000_000).contains(&t.sample_sizes.count())
+        || t.sample_count() != t.sample_sizes.count() as u64
+        || i128::from(range.duration.value) * i128::from(t.timescale)
+            != i128::from(range.duration.timescale) * i128::from(t.media_duration)
+    {
+        return None;
+    }
+    let mut durations = RangeAccumulator::new();
+    let mut duration = 0_u64;
+    for &(count, delta) in &t.time_to_sample {
+        if count == 0 || delta == 0 {
+            return None;
+        }
+        duration = duration.checked_add(u64::from(count) * u64::from(delta))?;
+        durations.observe(f64::from(delta) / f64::from(t.timescale));
+    }
+    if duration != t.media_duration
+        || !t.chunks()?.into_iter().all(|(offset, size, _)| {
+            let i = movie.media_ranges.partition_point(|r| r.end <= offset);
+            size > 0
+                && movie.media_ranges.get(i).is_some_and(|r| {
+                    r.contains(&offset) && offset.checked_add(size).is_some_and(|end| end <= r.end)
+                })
+        })
+    {
+        return None;
+    }
+    Some(if durations.is_variable() {
+        VideoFrameRateMode::Variable
+    } else {
+        VideoFrameRateMode::Constant
+    })
 }
 
 /// Standard timecode track read: each tmcd sample is a big-endian frame
@@ -349,10 +414,18 @@ fn open_reader(
     let track = tracks
         .get(stream_index)
         .ok_or_else(|| DecodeError::NoAudio(path.display().to_string()))?;
+    reader_for_track(&asset, track, window)
+}
+
+fn reader_for_track(
+    asset: &AVURLAsset,
+    track: &AVAssetTrack,
+    window: Option<(f64, f64)>,
+) -> Result<(Reader, f64), DecodeError> {
     let (sample_rate, channels, _, _) = stream_format(track)?;
     let settings = pcm_settings(sample_rate, channels);
     // SAFETY: objects valid; reader creation copies settings.
-    let reader = unsafe { AVAssetReader::assetReaderWithAsset_error(&asset) }
+    let reader = unsafe { AVAssetReader::assetReaderWithAsset_error(asset) }
         .map_err(|e| apple_error("AVAssetReader", Some(e)))?;
     // SAFETY: track belongs to reader's asset; settings dict well-formed.
     let output = unsafe {
@@ -410,19 +483,16 @@ fn check_completed(reader: &AVAssetReader, path: &Path) -> Result<(), DecodeErro
     ))
 }
 
-/// Next data buffer: owned bytes; the first buffer's PTS (captured even
-/// from marker-only buffers) flows through
-/// `first_pts`. Marker-only buffers are skipped inside the loop. Owned
-/// copy only — one memcpy per buffer is noise next to decode cost, and a
-/// single path means fewer unsafe blocks than a zero-copy fast lane.
+/// Copy the framework block directly into aligned reusable f32 storage.
 fn next_buffer(
-    output: &AVAssetReaderTrackOutput,
+    session: &Reader,
     first_pts: &mut Option<f64>,
-) -> Result<Option<Vec<u8>>, DecodeError> {
+    samples: &mut Vec<f32>,
+) -> Result<bool, DecodeError> {
     loop {
         // SAFETY: output is reading; every taken buffer is invalidated below.
-        let Some(sbuf) = (unsafe { output.copyNextSampleBuffer() }) else {
-            return Ok(None);
+        let Some(sbuf) = (unsafe { session.output.copyNextSampleBuffer() }) else {
+            return Ok(false);
         };
         if first_pts.is_none() {
             // SAFETY: plain-data getter on a live buffer.
@@ -433,30 +503,33 @@ fn next_buffer(
         }
         let data = unsafe { sbuf.data_buffer() };
         // None = marker-only buffer (skipped below); InvalidPcm = corrupt.
-        let result: Result<Option<Vec<u8>>, DecodeError> = (|| {
+        let result: Result<bool, DecodeError> = (|| {
             let Some(block) = data.as_deref() else {
-                return Ok(None);
+                return Ok(false);
             };
             // SAFETY: plain getter on a live buffer.
             let total = unsafe { block.data_length() };
             if total == 0 {
-                return Ok(None);
+                return Ok(false);
             }
-            let mut owned = vec![0u8; total];
+            if !total.is_multiple_of(4 * session.channels) {
+                return Err(DecodeError::InvalidPcm);
+            }
+            samples.resize(total / 4, 0.0);
             let dest = unsafe {
-                std::ptr::NonNull::new_unchecked(owned.as_mut_ptr() as *mut std::ffi::c_void)
+                std::ptr::NonNull::new_unchecked(samples.as_mut_ptr() as *mut std::ffi::c_void)
             };
             // SAFETY: dest is a valid writable allocation of total bytes.
             let status = unsafe { block.copy_data_bytes(0, total, dest) };
             if status != 0 {
                 return Err(DecodeError::InvalidPcm);
             }
-            Ok(Some(owned))
+            Ok(true)
         })();
         unsafe { sbuf.invalidate() };
         match result {
-            Ok(Some(bytes)) => return Ok(Some(bytes)),
-            Ok(None) => continue, // marker-only buffer
+            Ok(true) => return Ok(true),
+            Ok(false) => continue, // marker-only buffer
             Err(e) => return Err(e),
         }
     }
@@ -466,46 +539,103 @@ fn next_buffer(
 /// take milliseconds.
 const WINDOW_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Files AVFoundation did not read a window of in time, and how many of its
-/// readers are left blocked. Later windows of such a file, and every window
-/// once several readers are blocked, go to the portable engine at once
-/// rather than each waiting out the deadline and leaving another thread.
-static STALLED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+/// Reserve before launching: even simultaneous timeouts can leave at most
+/// four live window readers. A late return (or panic) releases its slot.
+#[derive(Default)]
+struct WindowReaders(std::sync::Mutex<Vec<std::sync::Weak<WindowRead>>>);
+
+struct WindowRead {
+    path: PathBuf,
+    timed_out: std::sync::atomic::AtomicBool,
+}
+
+static WINDOW_READERS: std::sync::LazyLock<WindowReaders> =
     std::sync::LazyLock::new(Default::default);
-static BLOCKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// Blocked readers after which AVFoundation reads no more windows.
-const BLOCKED_LIMIT: usize = 4;
+const WINDOW_LIMIT: usize = 4;
 
-fn avfoundation_stalled(path: &Path) -> bool {
-    BLOCKED.load(std::sync::atomic::Ordering::Relaxed) >= BLOCKED_LIMIT
-        || STALLED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(path)
+// A refine worker requests one window at a time. Reuse its native reader
+// thread for the next request, and close the channel when that caller exits.
+// After a timeout the caller drops its sender rather than queuing work behind
+// a stalled AVAssetReader. The global reservation still bounds late readers.
+type WindowTask = Box<dyn FnOnce() + Send>;
+thread_local! {
+    static WINDOW_WORKER: std::cell::RefCell<Option<mpsc::Sender<WindowTask>>> = const { std::cell::RefCell::new(None) };
+}
+fn submit_window(task: WindowTask) -> Option<()> {
+    WINDOW_WORKER.with_borrow_mut(|worker| {
+        let task = if let Some(sender) = worker {
+            match sender.send(task) {
+                Ok(()) => return Some(()),
+                Err(error) => error.0,
+            }
+        } else {
+            task
+        };
+        let (send, receive) = mpsc::channel::<WindowTask>();
+        std::thread::Builder::new()
+            .name("align-avfoundation-window".into())
+            .spawn(move || {
+                for task in receive {
+                    objc2::rc::autoreleasepool(|_| task());
+                }
+            })
+            .ok()?;
+        send.send(task).ok()?;
+        *worker = Some(send);
+        Some(())
+    })
 }
 
-fn note_stall(path: &Path) {
-    BLOCKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    STALLED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(path.to_path_buf());
-}
-
-/// `work`'s result, or `None` once `limit` passes first; the work then goes
-/// on in its own thread, unattended.
-fn within<T: Send + 'static>(
-    limit: std::time::Duration,
-    work: impl FnOnce() -> T + Send + 'static,
-) -> Option<T> {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("align-avfoundation-window".into())
-        .spawn(move || {
-            let _ = sender.send(work());
-        })
-        .ok()?;
-    receiver.recv_timeout(limit).ok()
+impl WindowReaders {
+    fn within<T: Send + 'static>(
+        &self,
+        path: &Path,
+        limit: std::time::Duration,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        use std::sync::{Arc, atomic::Ordering, mpsc};
+        let read = {
+            let mut active = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            active.retain(|read| read.strong_count() != 0);
+            if active.len() >= WINDOW_LIMIT
+                || active
+                    .iter()
+                    .filter_map(|r| r.upgrade())
+                    .any(|r| r.path == path && r.timed_out.load(Ordering::Relaxed))
+            {
+                return None;
+            }
+            let read = Arc::new(WindowRead {
+                path: path.to_owned(),
+                timed_out: false.into(),
+            });
+            active.push(Arc::downgrade(&read));
+            read
+        };
+        let worker = read.clone();
+        let (tx, rx) = mpsc::channel();
+        submit_window(Box::new(move || {
+            let result = work();
+            drop(worker);
+            let _ = tx.send(result);
+        }))?;
+        match rx.recv_timeout(limit) {
+            Ok(result) => Some(result),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                WINDOW_WORKER.with_borrow_mut(Option::take);
+                read.timed_out.store(true, Ordering::Relaxed);
+                eprintln!(
+                    "warning: AVFoundation timed out reading {}; using portable decoding",
+                    path.display()
+                );
+                None
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => None,
+        }
+    }
 }
 
 /// A window decoded to 16 kHz mono through AVFoundation.
@@ -535,17 +665,58 @@ fn avfoundation_window(
     )?;
     // Read presentation timestamps from the sample buffers.
     let mut actual_start = None::<f64>;
-    while samples.borrow().len() < want {
-        let Some(bytes) = next_buffer(&session.output, &mut actual_start)? else {
-            break;
-        };
-        pipe.push_interleaved(&bytes_to_f32(&bytes, session.channels)?)?;
+    let mut block = Vec::new();
+    while samples.borrow().len() < want && next_buffer(&session, &mut actual_start, &mut block)? {
+        pipe.push_interleaved(&block)?;
     }
     check_completed(&session.reader, path)?;
     pipe.finish()?;
     let mut samples = samples.into_inner();
     samples.truncate(want);
     Ok((actual_start.unwrap_or(start_seconds.max(0.0)), samples))
+}
+
+fn fingerprint_reader(
+    path: &Path,
+    session: Reader,
+    sample_rate: f64,
+    source: AudioAnalysisSource,
+    consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
+) -> Result<(), DecodeError> {
+    let mut pipe = crate::mono::MonoPipe::new(
+        sample_rate,
+        8000.0,
+        session.channels,
+        source.selected_channel(),
+        source.mixes_channels(),
+        consume,
+    )?;
+    let mut pts = None;
+    let mut block = Vec::new();
+    while next_buffer(&session, &mut pts, &mut block)? {
+        pipe.push_interleaved(&block)?;
+    }
+    check_completed(&session.reader, path)?;
+    pipe.finish()
+}
+
+fn native_blocks(
+    path: &Path,
+    session: Reader,
+    sample_rate: f64,
+    consume: &mut dyn FnMut(crate::backend::NativeBlock) -> Result<(), DecodeError>,
+) -> Result<Option<f64>, DecodeError> {
+    let mut actual = None;
+    let mut floats = Vec::new();
+    while next_buffer(&session, &mut actual, &mut floats)? {
+        consume(crate::backend::NativeBlock {
+            sample_rate,
+            channels: session.channels,
+            frames: crate::mono::deinterleave_f32(&floats, session.channels),
+        })?;
+    }
+    check_completed(&session.reader, path)?;
+    Ok(actual)
 }
 
 // ------------------------------------------------------------ backend
@@ -568,6 +739,55 @@ impl MediaBackend for AppleNativeBackend {
         if is_mxf(path) {
             return crate::portable::PortableBackend.inspect(path);
         }
+        self.inspect_for_import(path, None, None)
+            .map(|inspection| inspection.report)
+    }
+
+    fn local_inspection<'a>(&'a self, path: &'a Path) -> Option<crate::backend::Inspection<'a>> {
+        use crate::backend::{Inspection, NativeBlock};
+        let mut wave = crate::pcm::PcmTrack::inspection_wave(path)?;
+        let report = wave.probe();
+        let sample_rate = wave.sample_rate;
+        let channels = wave.channels;
+        Some(Inspection {
+            report,
+            opening_audio: Box::new(move |index, consume| {
+                if index != 0 {
+                    return Err(DecodeError::InvalidPcm);
+                }
+                wave.read_f32(0, Some((3. * sample_rate) as u64), &mut |planes| {
+                    consume(NativeBlock {
+                        sample_rate,
+                        channels,
+                        frames: std::mem::take(planes),
+                    })
+                })
+            }),
+        })
+    }
+    fn local_mono_8k(
+        &self,
+        path: &Path,
+        source: AudioAnalysisSource,
+        consume: &mut dyn FnMut(&[f32]) -> Result<(), DecodeError>,
+    ) -> Option<Result<(), DecodeError>> {
+        let mut pcm = crate::pcm::PcmTrack::open(path, source.stream_index())?;
+        Some(pcm.fingerprint(source, consume))
+    }
+    fn inspect_for_import<'a>(
+        &'a self,
+        path: &'a Path,
+        prepared: Option<&'a crate::backend::PreparedAudio>,
+        cache: Option<&align_core::FingerprintCache>,
+    ) -> Result<crate::backend::Inspection<'a>, DecodeError> {
+        use crate::backend::Inspection;
+        if is_mxf(path) {
+            return crate::portable::PortableBackend.inspect_for_import(path, None, cache);
+        }
+        if let Some(inspection) = self.local_inspection(path) {
+            return Ok(inspection);
+        }
+        let revision = prepared.and_then(|_| align_core::cache::media_revision(path).ok());
         let asset = open_asset(path)?;
         // SAFETY: plain-data property getter.
         let duration = unsafe { asset.duration() };
@@ -580,12 +800,9 @@ impl MediaBackend for AppleNativeBackend {
             return Err(DecodeError::InvalidPcm);
         }
         let audio = audio_tracks(&asset)?;
-        if audio.is_empty() {
-            // A file with neither audio nor video is inaccessible.
-            let no_video = video_probe(&asset)?.is_none();
-            if no_video {
-                return Err(DecodeError::NoAudio(path.display().to_string()));
-            }
+        let video = video_probe(&asset, path)?;
+        if audio.is_empty() && video.is_none() {
+            return Err(DecodeError::NoAudio(path.display().to_string()));
         }
         let mut audio_streams = Vec::with_capacity(audio.len());
         for track in &audio {
@@ -603,13 +820,49 @@ impl MediaBackend for AppleNativeBackend {
                     .filter(|end| end.is_finite() && *end > 0.0),
             });
         }
-        let video = video_probe(&asset)?;
-        Ok(ProbeReport {
+
+        let mut reusable =
+            revision.filter(|_| audio_streams.len() == 1 && audio_streams[0].is_float.is_none());
+        let report = ProbeReport {
             duration_seconds: seconds,
             audio_streams,
             has_video: video.is_some(),
             video,
+        };
+        Ok(Inspection {
+            report,
+            opening_audio: Box::new(move |index, consume| {
+                let track = audio.get(index).ok_or(DecodeError::InvalidPcm)?;
+                let (session, rate) = reader_for_track(&asset, track, Some((0., 3.)))?;
+                native_blocks(path, session, rate, consume)?;
+                if let (Some(prepared), Some(stamp)) = (prepared, reusable.take()) {
+                    let asset = asset.clone();
+                    let file = path.to_owned();
+                    prepared.remember(
+                        path,
+                        stamp,
+                        Box::new(move |source, sink| {
+                            let tracks = audio_tracks(&asset)?;
+                            let track = tracks
+                                .get(source.stream_index())
+                                .ok_or(DecodeError::InvalidPcm)?;
+                            let (reader, rate) = reader_for_track(&asset, track, None)?;
+                            fingerprint_reader(&file, reader, rate, source, sink)
+                        }),
+                    );
+                }
+                Ok(())
+            }),
         })
+    }
+
+    fn fingerprint_tracks(
+        &self,
+        path: &Path,
+        sources: &[AudioAnalysisSource],
+        consume: crate::backend::TrackConsumer<'_>,
+    ) -> Option<Result<(), DecodeError>> {
+        crate::pcm::fingerprint_tracks(path, sources, consume)
     }
 
     fn decode_mono_8k(
@@ -625,21 +878,11 @@ impl MediaBackend for AppleNativeBackend {
             let stream_count = self.inspect(path)?.audio_streams.len();
             return crate::mix::decode_all_streams_mono_8k(self, path, stream_count, consume);
         }
-        let (session, sample_rate) = open_reader(path, source.stream_index(), None)?;
-        let mut pipe = crate::mono::MonoPipe::new(
-            sample_rate,
-            8000.0,
-            session.channels,
-            source.selected_channel(),
-            source.mixes_channels(),
-            consume,
-        )?;
-        let mut pts = None;
-        while let Some(bytes) = next_buffer(&session.output, &mut pts)? {
-            pipe.push_interleaved(&bytes_to_f32(&bytes, session.channels)?)?;
+        if let Some(result) = self.local_mono_8k(path, source, consume) {
+            return result;
         }
-        check_completed(&session.reader, path)?;
-        pipe.finish()
+        let (session, sample_rate) = open_reader(path, source.stream_index(), None)?;
+        fingerprint_reader(path, session, sample_rate, source, consume)
     }
 
     fn decode_window_16k(
@@ -667,18 +910,19 @@ impl MediaBackend for AppleNativeBackend {
                 duration_seconds,
             );
         }
-        // AVAssetReader startup dominates sparse refinement windows. PCM/BWF
-        // WAV and linear PCM in QuickTime/MP4 are accurately seekable
-        // in-process and still use the identical shared mono/resample chain.
-        // Keep AVFoundation as the fallback for unusual WAV variants and
-        // compressed media.
-        let is_wav = path
+        // Reuse the PCM reader selected for this window. Compressed movies
+        // retain AVFoundation's native timeline and seek behavior.
+        let stream = source.stream_index();
+        let reader = if path
             .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"));
-        if (is_wav || crate::pcm::PcmTrack::open(path, source.stream_index()).is_some())
-            && let Ok(window) =
-                crate::sym::decode_window(path, start_seconds, duration_seconds, source)
+            .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+        {
+            crate::sym::AudioReader::validated(path, stream).ok()
+        } else {
+            crate::sym::AudioReader::pcm(path, stream)
+        };
+        if let Some(reader) = reader
+            && let Ok(window) = reader.decode_window(start_seconds, duration_seconds, source)
         {
             return Ok(window);
         }
@@ -693,20 +937,12 @@ impl MediaBackend for AppleNativeBackend {
                 source,
             )
         };
-        if avfoundation_stalled(path) {
-            return portable();
-        }
         let owned = path.to_path_buf();
-        let read = move || avfoundation_window(&owned, start_seconds, duration_seconds, source);
-        within(WINDOW_DEADLINE, read).unwrap_or_else(|| {
-            note_stall(path);
-            eprintln!(
-                "warning: AVFoundation did not read {} at {start_seconds:.3} s within {} s; reading it with the portable engine",
-                path.display(),
-                WINDOW_DEADLINE.as_secs()
-            );
-            portable()
-        })
+        WINDOW_READERS
+            .within(path, WINDOW_DEADLINE, move || {
+                avfoundation_window(&owned, start_seconds, duration_seconds, source)
+            })
+            .unwrap_or_else(portable)
     }
 
     fn decode_native(
@@ -726,17 +962,8 @@ impl MediaBackend for AppleNativeBackend {
         }
         let window = range.map(|(start, duration)| (start, duration.unwrap_or(1e9)));
         let (session, sample_rate) = open_reader(path, stream_index, window)?;
-        let mut actual = None;
-        while let Some(bytes) = next_buffer(&session.output, &mut actual)? {
-            let floats = bytes_to_f32(&bytes, session.channels)?;
-            consume(crate::backend::NativeBlock {
-                sample_rate,
-                channels: session.channels,
-                frames: crate::mono::deinterleave_f32(&floats, session.channels),
-            })?;
-        }
-        check_completed(&session.reader, path)?;
-        Ok(actual.unwrap_or(range.map_or(0.0, |(s, _)| s.max(0.0))))
+        Ok(native_blocks(path, session, sample_rate, consume)?
+            .unwrap_or(range.map_or(0.0, |(s, _)| s.max(0.0))))
     }
 
     fn decode_native_i32(
@@ -751,22 +978,6 @@ impl MediaBackend for AppleNativeBackend {
         crate::portable::PortableBackend.decode_native_i32(path, stream_index, range, consume)
     }
 }
-
-/// Little-endian f32 frames from an interleaved PCM block.
-fn bytes_to_f32(bytes: &[u8], channels: usize) -> Result<Vec<f32>, DecodeError> {
-    if !bytes.len().is_multiple_of(4 * channels) || bytes.is_empty() {
-        return Err(DecodeError::InvalidPcm);
-    }
-    Ok(bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|b| f32::from_le_bytes(*b))
-        .collect())
-}
-
-// ------------------------------------------------------------ traits used above
-// (MonoPipe takes planar *or* interleaved; the reader vends interleaved.)
 
 #[cfg(test)]
 mod tests {
@@ -1029,16 +1240,39 @@ mod tests {
     /// Work that finishes in time gives its result; work that blocks past
     /// the limit gives none, and the caller goes on without it.
     #[test]
-    fn work_past_its_deadline_is_left_behind() {
-        let limit = std::time::Duration::from_millis(50);
-        assert_eq!(within(limit, || 7), Some(7));
-        let started = std::time::Instant::now();
-        let blocked = within(limit, || {
-            std::thread::sleep(std::time::Duration::from_secs(5));
-            7
-        });
-        assert_eq!(blocked, None);
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    fn timed_out_windows_release_capacity_when_the_worker_returns() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let readers = WindowReaders::default();
+        let path = Path::new("camera.mov");
+        let (release, blocked) = mpsc::channel();
+        let (finished, done) = mpsc::channel();
+        assert_eq!(
+            readers.within(path, Duration::from_millis(20), move || {
+                blocked.recv().unwrap();
+                finished.send(()).unwrap();
+                7
+            }),
+            None
+        );
+        assert_eq!(readers.within(path, Duration::from_secs(1), || 8), None);
+        assert_eq!(
+            readers.within(Path::new("other.mov"), Duration::from_secs(1), || 9),
+            Some(9)
+        );
+        release.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(2)).unwrap();
+        let start = std::time::Instant::now();
+        while readers
+            .within(path, Duration::from_secs(1), || ())
+            .is_none()
+        {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "late reader still occupies a slot"
+            );
+            std::thread::yield_now();
+        }
     }
 
     #[test]

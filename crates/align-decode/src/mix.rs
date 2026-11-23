@@ -19,14 +19,73 @@ pub(crate) fn decode_all_streams_mono_8k(
     stream_count: usize,
     consume: Consumer,
 ) -> Result<(), DecodeError> {
-    mix_streams_mono_8k(
-        path,
-        stream_count,
-        &|index, consume| {
-            backend.decode_mono_8k(path, AudioAnalysisSource::MixedStream(index), consume)
-        },
-        consume,
-    )
+    let sequential = |consume: Consumer| {
+        mix_streams_mono_8k(
+            path,
+            stream_count,
+            &|index, sink| {
+                backend.decode_mono_8k(path, AudioAnalysisSource::MixedStream(index), sink)
+            },
+            consume,
+        )
+    };
+    if !(2..=16).contains(&stream_count) {
+        return sequential(consume);
+    }
+    let sources: Vec<_> = (0..stream_count)
+        .map(AudioAnalysisSource::MixedStream)
+        .collect();
+    // Preserve stream-index summation order even when PCM chunks are
+    // interleaved differently on disk. Temporary mono stems bound memory.
+    let mut stems: Vec<_> = (0..stream_count).map(|_| None).collect();
+    let mut bytes = Vec::new();
+    let batch = backend.fingerprint_tracks(path, &sources, &mut |index, samples| {
+        // Let the caller cancel while the mixed samples are still being staged.
+        consume(&[])?;
+        let stem = match &mut stems[index] {
+            Some(file) => file,
+            slot @ None => slot.insert(std::io::BufWriter::new(tempfile::tempfile()?)),
+        };
+        bytes.clear();
+        bytes.extend(samples.iter().flat_map(|s| s.to_le_bytes()));
+        stem.write_all(&bytes)?;
+        Ok(())
+    });
+    if let Some(result) = batch {
+        result?;
+        let mut files = Vec::new();
+        for writer in stems.into_iter().flatten() {
+            let mut file = writer.into_inner().map_err(|e| e.into_error())?;
+            file.rewind()?;
+            files.push(file);
+        }
+        let mut mixed = vec![0.0; IO_SAMPLES];
+        let scale = (stream_count as f32).recip();
+        loop {
+            let mut size = 0;
+            mixed.fill(0.);
+            for file in &mut files {
+                bytes.clear();
+                file.take((4 * IO_SAMPLES) as u64).read_to_end(&mut bytes)?;
+                let (values, remainder) = bytes.as_chunks::<4>();
+                if !remainder.is_empty() {
+                    return Err(DecodeError::InvalidPcm);
+                }
+                for (out, value) in mixed.iter_mut().zip(values) {
+                    *out += f32::from_le_bytes(*value);
+                }
+                size = size.max(values.len());
+            }
+            if size == 0 {
+                return Ok(());
+            }
+            for v in &mut mixed[..size] {
+                *v *= scale;
+            }
+            consume(&mixed[..size])?;
+        }
+    }
+    sequential(consume)
 }
 
 /// Mixes every stream, each decoded to 8 kHz mono with its channels mixed by

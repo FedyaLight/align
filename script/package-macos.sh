@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Packages Align for macOS (arm64): Align.app bundle +
-# align-cli, align-mcp and the AAF sidecar, ad-hoc signed.
+# align-cli and the AAF sidecar, ad-hoc signed.
 # Usage: ./script/package-macos.sh [output-dir]   (default: ~/Downloads/Align-macOS)
 set -euo pipefail
 
@@ -35,6 +35,7 @@ if [[ -z "$AAF_DIR" ]]; then
   AAF_DIR="$AAF_BUILD_DIR/dist"
 fi
 test -x "$AAF_DIR/align-aaf"
+test -s "$AAF_DIR/align-aaf-runtime/base_library.zip"
 test -d "$AAF_DIR/AAF-Licenses"
 if [[ -n "$RELEASE_LICENSES" ]]; then
   test -f "$RELEASE_LICENSES/BUILD-MANIFEST.json"
@@ -46,15 +47,20 @@ if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
     FFMPEG_DIR="$AAF_BUILD_DIR/ffmpeg"
     "$ROOT_DIR/script/build-ffmpeg-minimal.sh" "$FFMPEG_DIR"
   fi
-  for tool in ffmpeg ffprobe; do
-    test -x "$FFMPEG_DIR/$tool"
-    "$FFMPEG_DIR/$tool" -version >/dev/null
-    # Only macOS system libraries: a Homebrew or local dylib would be
-    # missing on users' Macs.
-    if otool -L "$FFMPEG_DIR/$tool" | tail -n +2 | grep -v -E '^[[:space:]]+(/usr/lib/|/System/Library/)'; then
-      echo "$tool links libraries outside macOS" >&2
-      exit 1
-    fi
+  for tool in ffmpeg ffprobe; do "$FFMPEG_DIR/$tool" -version >/dev/null; done
+  shopt -s nullglob
+  dylibs=("$FFMPEG_DIR"/*.dylib)
+  for binary in "$FFMPEG_DIR/ffmpeg" "$FFMPEG_DIR/ffprobe" ${dylibs[@]+"${dylibs[@]}"}; do
+    tool="${binary##*/}"
+    while read -r dependency; do
+      case "$dependency" in
+        /usr/lib/*|/System/Library/*) ;;
+        @loader_path/*)
+          sibling="${dependency#@loader_path/}"
+          [[ "$sibling" != */* && -f "$FFMPEG_DIR/$sibling" ]] || exit 1 ;;
+        *) echo "$tool links an unbundled library: $dependency" >&2; exit 1 ;;
+      esac
+    done < <(otool -L "$binary" | awk 'NR > 1 {print $1}')
     # Built for arm64 and for the app's minimum macOS, like the app itself.
     minos="$(vtool -show-build "$FFMPEG_DIR/$tool" | awk '$1 == "minos" { print $2; exit }')"
     if [[ "$(lipo -archs "$FFMPEG_DIR/$tool")" != "arm64" || "$minos" != "$MIN_MACOS" ]]; then
@@ -66,7 +72,7 @@ if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
 fi
 
 echo "==> building release"
-cargo build --locked --release --manifest-path "$ROOT_DIR/Cargo.toml" -p align-cli -p align-mcp -p align-gpui
+cargo build --locked --release --manifest-path "$ROOT_DIR/Cargo.toml" -p align-gpui
 
 BIN_DIR="$ROOT_DIR/target/release"
 APP_BUNDLE="$OUT_DIR/$APP_NAME.app"
@@ -85,15 +91,19 @@ cp "$ROOT_DIR/Support/AppIcon.icns" "$RESOURCES/AppIcon.icns"
 cp "$ROOT_DIR/Support/PrivacyInfo.xcprivacy" "$RESOURCES/PrivacyInfo.xcprivacy"
 cp "$ROOT_DIR/THIRD_PARTY_NOTICES.txt" "$RESOURCES/THIRD_PARTY_NOTICES.txt"
 cp "$ROOT_DIR/LICENSE" "$RESOURCES/LICENSE"
-cp "$BIN_DIR/align-cli" "$OUT_DIR/align-cli"
-cp "$BIN_DIR/align-cli" "$APP_MACOS/align-cli"
-cp "$BIN_DIR/align-mcp" "$OUT_DIR/align-mcp"
-cp "$BIN_DIR/align-mcp" "$APP_MACOS/align-mcp"
+ln -s "Align.app/Contents/MacOS/Align" "$OUT_DIR/align-cli"
+ln -s Align "$APP_MACOS/align-cli"
 cp "$ROOT_DIR/THIRD_PARTY_NOTICES.txt" "$OUT_DIR/THIRD_PARTY_NOTICES.txt"
 cp "$ROOT_DIR/LICENSE" "$OUT_DIR/LICENSE"
-chmod +x "$OUT_DIR/align-cli" "$APP_MACOS/align-cli" "$OUT_DIR/align-mcp" "$APP_MACOS/align-mcp"
-cp "$AAF_DIR/align-aaf" "$APP_MACOS/align-aaf"
-cp "$AAF_DIR/align-aaf" "$OUT_DIR/align-aaf"
+chmod +x "$OUT_DIR/align-cli" "$APP_MACOS/align-cli"
+# A PyInstaller executable physically in Contents/MacOS looks in Frameworks.
+# Keep its frozen directory intact, and expose the adjacent entry point to the CLI.
+mkdir "$RESOURCES/AAF"
+cp -p "$AAF_DIR/align-aaf" "$RESOURCES/AAF/"
+cp -a "$AAF_DIR/align-aaf-runtime" "$RESOURCES/AAF/"
+ln -s ../Resources/AAF/align-aaf "$APP_MACOS/align-aaf"
+ln -s Align.app/Contents/MacOS/align-aaf "$OUT_DIR/align-aaf"
+ln -s Align.app/Contents/Resources/AAF/align-aaf-runtime "$OUT_DIR/align-aaf-runtime"
 cp -R "$AAF_DIR/AAF-Licenses" "$RESOURCES/AAF-Licenses"
 cp -R "$AAF_DIR/AAF-Licenses" "$OUT_DIR/AAF-Licenses"
 chmod +x "$APP_MACOS/align-aaf" "$OUT_DIR/align-aaf"
@@ -109,6 +119,10 @@ if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
     cp "$FFMPEG_DIR/$tool" "$APP_MACOS/$tool"
     cp "$FFMPEG_DIR/$tool" "$OUT_DIR/$tool"
     chmod +x "$APP_MACOS/$tool" "$OUT_DIR/$tool"
+  done
+  for lib in ${dylibs[@]+"${dylibs[@]}"}; do
+    cp "$lib" "$APP_MACOS/"
+    cp "$lib" "$OUT_DIR/"
   done
   cp "$FFMPEG_DIR/FFMPEG-LICENSE.txt" "$RESOURCES/FFMPEG-LICENSE.txt"
   cp "$FFMPEG_DIR/FFMPEG-LICENSE.txt" "$OUT_DIR/FFMPEG-LICENSE.txt"
@@ -135,6 +149,25 @@ cat >"$APP_CONTENTS/Info.plist" <<PLIST
   <string>$APP_VERSION</string>
   <key>CFBundleVersion</key>
   <string>1</string>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Align Project</string>
+      <key>CFBundleTypeRole</key><string>Editor</string>
+      <key>LSHandlerRank</key><string>Owner</string>
+      <key>LSItemContentTypes</key><array><string>com.align.app.project</string></array>
+    </dict>
+  </array>
+  <key>UTExportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeIdentifier</key><string>com.align.app.project</string>
+      <key>UTTypeDescription</key><string>Align Project</string>
+      <key>UTTypeConformsTo</key><array><string>public.json</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict><key>public.filename-extension</key><array><string>align</string></array></dict>
+    </dict>
+  </array>
   <key>LSMinimumSystemVersion</key>
   <string>$MIN_MACOS</string>
   <key>NSHighResolutionCapable</key>
@@ -148,7 +181,6 @@ Align — audio synchronization for video editing
 
   Align.app            — desktop application
   align-cli            — batch CLI: sync / export / export-json
-  align-mcp            — MCP server for AI agents (stdio)
   align-aaf            — self-contained AAF module (no Python installation needed)
   LICENSE              — Align license
   THIRD_PARTY_NOTICES.txt — third-party license notices
@@ -162,7 +194,7 @@ CLI:
   ./align-cli export-json result.json /path/to/output
 
 AI AGENTS:
-  Open Align → Use with AI Agents… and copy the MCP configuration
+  Open Align → Use with AI Agents… and copy the CLI path
   and ready-to-use prompt.
 
 Requirements: macOS 15 or later, Apple Silicon.
@@ -170,7 +202,15 @@ Ad-hoc signed for local use. Distribution signing and notarization are not inclu
 README
 
 echo "==> ad-hoc sign + verify"
-codesign --force --deep --sign - "$APP_BUNDLE" >/dev/null
+# Leave the PyInstaller signatures in Resources/AAF intact.
+if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
+  for lib in ${dylibs[@]+"${dylibs[@]}"}; do
+    codesign --force --sign - "$APP_MACOS/${lib##*/}"
+  done
+  codesign --force --sign - "$APP_MACOS/ffmpeg" "$APP_MACOS/ffprobe"
+fi
+codesign --force --sign - "$APP_MACOS/$APP_NAME"
+codesign --force --sign - "$APP_BUNDLE" >/dev/null
 plutil -lint "$APP_CONTENTS/Info.plist"
 plutil -lint "$RESOURCES/PrivacyInfo.xcprivacy"
 codesign --verify --deep --strict "$APP_BUNDLE"
@@ -178,7 +218,7 @@ codesign -dv --verbose=2 "$APP_BUNDLE" 2>&1 | head -5
 
 echo "==> smoke test"
 "$OUT_DIR/align-cli" --help >/dev/null
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | "$OUT_DIR/align-mcp" | grep -q 'align_sync'
+python3 "$ROOT_DIR/script/check-frozen-aaf.py" "$APP_MACOS/align-aaf"
 if [[ "$ALIGN_SKIP_LAUNCH_CHECK" != "1" ]]; then
   "$APP_MACOS/$APP_NAME" >"$AAF_BUILD_DIR/launch.log" 2>&1 &
   launch_pid=$!

@@ -32,7 +32,7 @@ versions during dependency updates. Versions already in `Cargo.lock` remain usab
 ## Build
 
 ```sh
-cargo build --release -p align-cli -p align-mcp -p align-gpui
+cargo build --release -p align-cli -p align-gpui
 cargo run -p align-gpui
 cargo run -p align-cli -- --help
 ```
@@ -41,7 +41,7 @@ On macOS, `./script/build_and_run.sh` wraps a debug build in a signed
 `dist/Align.app` and opens it; `--debug` starts it under LLDB, `--logs` streams
 its unified log, and `--verify` checks that it launched.
 
-Binaries are written to `target/release`: `align`, `align-cli`, and `align-mcp`
+Binaries are written to `target/release`: `align` and `align-cli`
 (with `.exe` on Windows). Build only `align-cli` when desktop support is not
 needed. Backend selection is automatic; `ALIGN_BACKEND=portable` selects the
 portable implementation on macOS.
@@ -58,8 +58,8 @@ python script/build-aaf-sidecar.py target/release
 On Windows, activate `.venv\Scripts\Activate.ps1` in PowerShell instead.
 The builder creates `align-aaf` and `AAF-Licenses` beside the CLI. It freezes
 Python and pyaaf2 with PyInstaller, so end users do not need Python installed.
-On Windows it also creates `align-aaf-runtime`, which must stay beside
-`align-aaf.exe`; set `PYINSTALLER_COMPILE_BOOTLOADER=1` and install with
+Keep the generated `align-aaf-runtime` directory beside the executable on every OS.
+On Windows, set `PYINSTALLER_COMPILE_BOOTLOADER=1` and install with
 `--no-binary pyinstaller` to match the release build.
 Build the module separately for each target OS.
 
@@ -71,7 +71,6 @@ Build the module separately for each target OS.
 | `align-decode` | Media backends, import orchestration, AAF bridge, audio rendering, export jobs, and media ownership. |
 | `align-cli` | Argument parsing, synchronization, saved result loading, and common single/batch export settings. |
 | `align-gpui` | Desktop state, views, timeline interaction, and background job coordination. |
-| `align-mcp` | Stdio protocol adapter around the adjacent CLI. |
 
 `Pipeline` expands and inspects inputs, obtains cached or newly decoded
 fingerprints, matches candidates, refines them with audio windows, and solves
@@ -149,7 +148,14 @@ python script/bench-sync.py target/release/align-cli target/bench
 The benchmark generates cameras with known offsets (MOV/MP4 with PCM or AAC,
 timecode) and two split recorder takes, then reports cold and warm synchronization
 time, the number of FFmpeg/ffprobe processes started, and each clip's offset
-error against the generated ground truth. `--cameras`, `--duration`, and
+error against the generated ground truth. On macOS, compare both backends on
+the same files by running again with a new output directory and
+`--corpus target/bench --backend apple-native` (the benchmark defaults to
+`portable`). Each report includes the CLI version and wall seconds for inspect,
+fingerprint, match, refine and solve. To print the same timings to stderr for a
+single sync, set `ALIGN_PHASE_TIMING=1`. Cold and warm refer to Align’s analysis
+cache. The operating system can cache file data in both cases.
+`--cameras`, `--duration`, and
 `--repeat` scale it. Compare results only between runs on the same machine.
 
 ### Drift diagnostics
@@ -194,13 +200,13 @@ timeline before reading them. It is not part of the unattended CLI test suite.
 ./script/package-macos.sh /path/to/new/Align-macOS
 ```
 
-The script builds the application, CLI, MCP server, and AAF module; includes
+The script builds the application, CLI, and AAF module; includes
 the privacy manifest and license files;
 signs ad hoc; and runs a brief launch check. The output directory must not exist.
 It produces a local macOS bundle, not a notarized installer.
 
 Set `ALIGN_SKIP_LAUNCH_CHECK=1` to package without opening the desktop app.
-Bundle validation and the CLI/MCP checks still run.
+Bundle validation and the CLI checks still run.
 
 The macOS bundle has no FFmpeg: AVFoundation decodes media, and camera-file
 export and AAF picture metadata read QuickTime/MP4 natively. `BUNDLE_FFMPEG=1`

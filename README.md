@@ -36,8 +36,7 @@ Align is a free, open-source alternative to Syncaila and PluralEyes for
 synchronizing multicamera footage and external audio. It combines audio waveform
 matching, timecode overlap, and links between consecutive recording parts to
 place clips on a common timeline.
-Use the desktop app to review the result, the CLI for batch jobs, or the MCP
-server to connect it to other tools. Original recordings stay untouched.
+Use the desktop app to review the result, or use the CLI for batch jobs and AI agents. Original recordings stay untouched.
 
 ## Support development
 
@@ -101,7 +100,7 @@ before exporting. See [synchronization settings](docs/usage.md#synchronization-s
 If you are looking for a free Syncaila alternative or an open-source PluralEyes
 alternative, Align covers the workflow of syncing camera audio with a separate
 recorder and sending the aligned timeline to Premiere Pro, DaVinci Resolve, or
-Final Cut Pro. It runs locally and includes a desktop app, CLI, and MCP server.
+Final Cut Pro. It runs locally and includes a desktop app and CLI.
 There is no subscription or license key.
 
 Align is an independent project with its own workflow and
@@ -139,7 +138,7 @@ are needed for tests and for MTS/MXF/R3D media on Linux and Windows. See the
 [development guide](docs/development.md#prerequisites) for platform dependencies.
 
 ```sh
-cargo build --locked --release -p align-cli -p align-mcp -p align-gpui
+cargo build --locked --release -p align-cli -p align-gpui
 cargo run --locked --release -p align-gpui
 ```
 
@@ -169,13 +168,13 @@ Or synchronize and export in one command:
 On Windows, use `align-cli.exe`. JSON goes to stdout; progress goes to stderr.
 Keep generated audio folders with the exported timelines. See the
 [user guide](docs/usage.md) for sequence selection, relinking, export options,
-and [MCP configuration](docs/usage.md#mcp-integration).
+and [using Align with agents](docs/usage.md#ai-agents).
 
 ## Documentation
 
 | Guide | Contents |
 | :--- | :--- |
-| [Usage](docs/usage.md) | Desktop workflow, CLI commands, saved results, and MCP |
+| [Usage](docs/usage.md) | Desktop workflow, CLI commands, saved results, and AI agents |
 | [Formats](docs/formats.md) | Import/export support, editing limits, and media locations |
 | [Drift correction](docs/drift.md) | Clock drift, rendered audio, and export reuse |
 | [Development](docs/development.md) | Build setup, architecture, tests, and packaging |

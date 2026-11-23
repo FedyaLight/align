@@ -6,7 +6,7 @@
 //! (via [`BackendWindowProvider`]) → graph solve → [`align_core::SyncResult`].
 //!
 //! Important implementation choices:
-//! - inspection, fingerprinting and refinement use four bounded workers with
+//! - inspection, fingerprinting and refinement use bounded workers with
 //!   indexed deterministic results;
 //! - ClipIDs hash `path\0duration-micros`, using the same units across backends;
 //! - spanned-file, BWF/iXML/container/LTC timecode, FCP 7 XML and FCPXML
@@ -17,21 +17,76 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use align_core::{
-    AudioAnalysisSource, AudioSummary, Clip, ClipId, ClipPlacement, ClipTimingHints,
+    AudioAnalysisSource, AudioSummary, CacheSettings, Clip, ClipId, ClipPlacement, ClipTimingHints,
     FingerprintCache, FingerprintExtractor, MappingPoint, MatchSummary, MediaKind, MediaTime,
     RecordingTimestampSource, SyncConstraint, SyncIsland, SyncProject, SyncWarning, TimeMap,
     match_fingerprints, refine_forest, solve_graph,
 };
 use sha2::{Digest, Sha256};
 
-use crate::backend::{BackendKind, MediaBackend, default_backend};
+use crate::backend::{BackendKind, MediaBackend, default_backend_kind};
 use crate::provider::BackendWindowProvider;
 
-/// Files inspected at once. Inspection waits on ffprobe processes and header
-/// reads, and the first time it sees an MXF or MTS file it reads the whole
-/// file to classify frame timing. The bound matches the fingerprint stage's
-/// four concurrent readers of external media.
 const INSPECT_WORKERS: usize = 4;
+
+/// Four workers can start costly native/sidecar reads. All workers can
+/// drain the local queue. A speculative local job can yield to the normal
+/// backend before publishing, including after a decoder failure mid-file.
+fn map_media<T: Sync + Send, R: Send>(
+    items: &[T],
+    likely_local: impl Fn(&T) -> bool,
+    run: impl Fn(&T, bool) -> Option<R> + Sync + Send,
+) -> Vec<R> {
+    use align_core::parallel::{par_map, worker_limit};
+    use std::sync::Mutex;
+    let limit = worker_limit(8).min(items.len());
+    let normal = |item: &T| run(item, false).expect("the unrestricted route returns an outcome");
+    if limit <= INSPECT_WORKERS {
+        return par_map(items, limit, normal);
+    }
+    let (local, restricted): (Vec<_>, Vec<_>) =
+        (0..items.len()).partition(|&i| likely_local(&items[i]));
+    let reserved = INSPECT_WORKERS.min(restricted.len());
+    let workers = limit.min(reserved + local.len());
+    let local = Mutex::new(local.into_iter());
+    let restricted = Mutex::new(restricted.into_iter());
+    let mut outcomes = Vec::with_capacity(items.len());
+    let mut retry = Vec::new();
+    for batch in par_map(&(0..workers).collect::<Vec<_>>(), workers, |&worker| {
+        let mut batch = Vec::new();
+        loop {
+            let next = if worker < reserved {
+                restricted.lock().unwrap().next()
+            } else {
+                None
+            };
+            if let Some(i) = next {
+                batch.push((i, Some(normal(&items[i]))));
+            } else if let Some(i) = {
+                let mut queue = local.lock().unwrap();
+                queue.next()
+            } {
+                batch.push((i, run(&items[i], true)));
+            } else {
+                break;
+            }
+        }
+        batch
+    }) {
+        for (i, result) in batch {
+            if let Some(result) = result {
+                outcomes.push((i, result));
+            } else {
+                retry.push(i);
+            }
+        }
+    }
+    outcomes.extend(par_map(&retry, INSPECT_WORKERS, |&i| {
+        (i, normal(&items[i]))
+    }));
+    outcomes.sort_unstable_by_key(|(i, _)| *i);
+    outcomes.into_iter().map(|(_, r)| r).collect()
+}
 
 // ------------------------------------------------------------ types
 
@@ -129,13 +184,21 @@ impl WaveformPreview {
 }
 
 struct FingerprintRun {
+    envelopes: Vec<(ClipId, Vec<u8>)>,
     features: Vec<align_core::ClipFingerprints>,
     selected_sources: HashMap<ClipId, AudioAnalysisSource>,
     /// Clips left out because their audio could not be read.
     warnings: Vec<SyncWarning>,
 }
 
+#[derive(Clone, Copy)]
+enum DecodeRoute<'a> {
+    Local,
+    Normal(&'a crate::backend::PreparedAudio),
+}
+
 struct FingerprintRunOptions<'a> {
+    prepared: &'a crate::backend::PreparedAudio,
     accuracy: align_core::SearchAccuracy,
     overrides: &'a HashMap<ClipId, align_core::SearchAccuracy>,
     generate_waveform_previews: bool,
@@ -221,7 +284,7 @@ fn cancelled(flag: &std::sync::atomic::AtomicBool) -> bool {
 
 pub struct Pipeline {
     backend: Box<dyn MediaBackend>,
-    cache: FingerprintCache,
+    cache: Option<FingerprintCache>,
 }
 
 impl Pipeline {
@@ -229,23 +292,39 @@ impl Pipeline {
         Self::new_in(kind, None)
     }
 
-    /// `cache_dir`: isolated fingerprint cache (tests pass a temp dir for
-    /// hermetic runs; production uses the OS cache directory).
+    /// An explicit directory uses an isolated cache without automatic pruning.
     pub fn new_in(kind: BackendKind, cache_dir: Option<PathBuf>) -> Self {
+        let settings = if cache_dir.is_some() {
+            CacheSettings {
+                enabled: true,
+                retention_days: None,
+            }
+        } else {
+            CacheSettings::load()
+        };
+        Self::with_cache_settings(kind, cache_dir, settings)
+    }
+
+    fn with_cache_settings(
+        kind: BackendKind,
+        cache_dir: Option<PathBuf>,
+        settings: CacheSettings,
+    ) -> Self {
         let backend = crate::backend::create(kind);
-        let cache = FingerprintCache::with_backend(cache_dir, backend.kind().cache_tag());
+        let cache = settings.enabled.then(|| {
+            let cache = FingerprintCache::with_backend(cache_dir, backend.kind().cache_tag());
+            if let Some(days) = settings.retention_days {
+                cache.prune_older_than(std::time::Duration::from_secs(
+                    days.saturating_mul(24 * 60 * 60),
+                ));
+            }
+            cache
+        });
         Self { backend, cache }
     }
 
     pub fn default_backend() -> Self {
-        let backend = default_backend();
-        let cache = FingerprintCache::with_backend(None, backend.kind().cache_tag());
-        if let Some(days) = align_core::CacheSettings::load().retention_days {
-            cache.prune_older_than(std::time::Duration::from_secs(
-                days.saturating_mul(24 * 60 * 60),
-            ));
-        }
-        Self { backend, cache }
+        Self::new(default_backend_kind())
     }
 
     pub fn backend(&self) -> &dyn MediaBackend {
@@ -307,7 +386,12 @@ impl Pipeline {
             load_inputs(inputs, options, &std::sync::atomic::AtomicBool::new(false))?;
         let mut clips = Vec::new();
         let mut warnings = Vec::new();
-        let inspected = self.inspect_all(&urls, None, &std::sync::atomic::AtomicBool::new(false));
+        let inspected = self.inspect_all(
+            &urls,
+            None,
+            &std::sync::atomic::AtomicBool::new(false),
+            None,
+        );
         for (url, outcome) in urls.iter().zip(inspected) {
             match outcome {
                 Ok(clip) => clips.push(clip),
@@ -340,7 +424,7 @@ impl Pipeline {
     /// Full pipeline: media files/dirs (+ optional one timeline) →
     /// [`align_core::SyncResult`].
     ///
-    /// Inspection, fingerprint decode and fine refine run on up to 4 workers
+    /// Inspection, fingerprint decode and fine refine run on CPU-limited workers
     /// with deterministic indexed results; `progress`
     /// is shared across those threads, `cancel` is polled per clip,
     /// candidate and job.
@@ -357,10 +441,22 @@ impl Pipeline {
             return Err(PipelineError::NoMedia);
         }
 
+        let mut last = std::env::var_os("ALIGN_PHASE_TIMING")
+            .filter(|v| v == "1")
+            .map(|_| std::time::Instant::now());
+        let mut end_phase = |phase: &str| {
+            if let Some(start) = &mut last {
+                let now = std::time::Instant::now();
+                eprintln!("align-phase {phase} {:.6}", (now - *start).as_secs_f64());
+                *start = now;
+            }
+        };
+
         // ---- inspect
         let mut clips = Vec::new();
         let mut warnings = Vec::new();
-        let inspected = self.inspect_all(&urls, progress, cancel);
+        let prepared = crate::backend::PreparedAudio::default();
+        let inspected = self.inspect_all(&urls, progress, cancel, Some(&prepared));
         // Files already being inspected finish (or fail) after a
         // cancellation; it must not turn into a missing-media error.
         if cancelled(cancel) {
@@ -402,6 +498,7 @@ impl Pipeline {
 
         let search_overrides = search_overrides(&clips, imported_timeline.as_ref(), options);
 
+        end_phase("inspect");
         // ---- fingerprints (multi-stream variants + shared-hash selection)
         let usable: Vec<&Clip> = clips.iter().filter(|c| !c.audio.is_empty()).collect();
         let mut audio_sources = options.audio_sources.clone();
@@ -411,6 +508,7 @@ impl Pipeline {
                 .or_insert(options.audio_source);
         }
         let FingerprintRun {
+            envelopes,
             features,
             selected_sources,
             warnings: unreadable,
@@ -418,6 +516,7 @@ impl Pipeline {
             &usable,
             &audio_sources,
             FingerprintRunOptions {
+                prepared: &prepared,
                 accuracy: options.search_accuracy,
                 overrides: &search_overrides,
                 generate_waveform_previews: options.generate_waveform_previews,
@@ -425,10 +524,12 @@ impl Pipeline {
             progress,
             cancel,
         )?;
+        drop(prepared);
         warnings.extend(unreadable);
         let mut source_map = audio_sources;
         source_map.extend(selected_sources);
 
+        end_phase("fingerprint");
         // ---- coarse match
         if let Some(p) = &progress {
             p(PipelineProgress::basic(Phase::Match, 0, 1, None));
@@ -455,6 +556,7 @@ impl Pipeline {
         if cancelled(cancel) {
             return Err(PipelineError::Cancelled);
         }
+        end_phase("match");
         // ---- refine
         let durations: HashMap<ClipId, f64> = clips
             .iter()
@@ -465,7 +567,8 @@ impl Pipeline {
             .map(|c| (c.id.clone(), c.url.clone()))
             .collect();
         let provider = BackendWindowProvider {
-            backend: &*self.backend,
+            worker_cap: self.decode_worker_cap(clips.iter().map(|c| c.url.as_path())),
+            decode: self.backend.window_decoder(),
             clips: clip_paths,
         };
         if let Some(p) = &progress {
@@ -509,7 +612,7 @@ impl Pipeline {
                     p(out);
                 }) as Box<dyn Fn(align_core::RefineEvent) + Send + Sync>
             });
-        let refined = refine_forest(
+        let mut refined = refine_forest(
             &durations,
             &candidates,
             &options.match_policy,
@@ -519,6 +622,20 @@ impl Pipeline {
             refine_progress.as_deref(),
         );
 
+        if cancelled(cancel) {
+            return Err(PipelineError::Cancelled);
+        }
+
+        let rescue = align_core::fine::recover_short_takes(
+            &envelopes,
+            &refined,
+            constraints,
+            &options.match_policy,
+            &source_map,
+            &provider,
+            cancel,
+        );
+        refined.extend(rescue);
         if cancelled(cancel) {
             return Err(PipelineError::Cancelled);
         }
@@ -548,6 +665,7 @@ impl Pipeline {
         combined.extend(timecoded);
         let refined = eligible(&combined);
 
+        end_phase("refine");
         // ---- solve
         if let Some(p) = &progress {
             p(PipelineProgress::basic(Phase::Solve, 0, 1, None));
@@ -593,6 +711,7 @@ impl Pipeline {
             p(PipelineProgress::basic(Phase::Solve, 1, 1, None));
         }
 
+        end_phase("solve");
         Ok(align_core::SyncResult {
             search_overrides,
             stopped,
@@ -613,6 +732,42 @@ impl Pipeline {
         })
     }
 
+    fn decoder_cache(&self, path: &Path) -> Option<FingerprintCache> {
+        let cache = self.cache.as_ref()?;
+        if self.backend.kind() != BackendKind::Portable {
+            return None;
+        }
+        if crate::isobmff::has_sbr_audio(path) {
+            return Some(cache.decoder_variant("full-sbr-clock2"));
+        }
+        // Older portable builds could ignore PCM edit rates and switched
+        // sample descriptions. Invalidate just the affected movie variants.
+        if crate::isobmff::is_candidate(path)
+            && crate::isobmff::shared_movie(path).is_some_and(|movie| {
+                movie.audio().enumerate().any(|(i, t)| {
+                    t.audio.as_ref().is_some_and(|a| a.is_float.is_some())
+                        && crate::pcm::PcmTrack::open(path, i).is_none()
+                })
+            })
+        {
+            return Some(cache.decoder_variant("pcm-presentation-v1"));
+        }
+        None
+    }
+
+    fn decode_worker_cap<'a>(&self, mut paths: impl Iterator<Item = &'a Path>) -> usize {
+        // AVFoundation uses blocking native readers with four reservations.
+        // Other video containers need external decoders with their own threads.
+        if self.backend.kind() == BackendKind::AppleNative
+            || paths
+                .any(|p| crate::portable::is_video_container(p) && !crate::isobmff::is_candidate(p))
+        {
+            4
+        } else {
+            8
+        }
+    }
+
     /// Inspects files on bounded workers. Outcomes keep input order, so clips
     /// and warnings never depend on which file finishes first; progress
     /// reports each file as it starts and as it finishes.
@@ -621,6 +776,7 @@ impl Pipeline {
         urls: &[PathBuf],
         progress: Option<&(dyn Fn(PipelineProgress) + Send + Sync)>,
         cancel: &std::sync::atomic::AtomicBool,
+        prepared: Option<&crate::backend::PreparedAudio>,
     ) -> Vec<Result<Clip, PipelineError>> {
         // Counting and publishing under one lock keeps the completed count
         // monotonic for listeners such as the progress bar.
@@ -634,24 +790,51 @@ impl Pipeline {
             event.discovered = discovered;
             p(event);
         };
-        align_core::par_map(urls, INSPECT_WORKERS, |url| {
-            if cancelled(cancel) {
-                return Err(PipelineError::Cancelled);
-            }
-            publish(false, url, None);
-            let outcome = self.inspect_one(url);
-            publish(true, url, outcome.as_ref().ok().cloned());
-            outcome
-        })
+        map_media(
+            urls,
+            |url| {
+                url.extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+            },
+            |url, local_only| {
+                if cancelled(cancel) {
+                    return Some(Err(PipelineError::Cancelled));
+                }
+                let inspection = if local_only {
+                    let inspection = self.backend.local_inspection(url)?;
+                    publish(false, url, None);
+                    Ok(inspection)
+                } else {
+                    publish(false, url, None);
+                    self.backend
+                        .inspect_for_import(url, prepared, self.cache.as_ref())
+                };
+                let outcome = inspection
+                    .map_err(PipelineError::Decode)
+                    .and_then(|i| self.inspect_one(url, i));
+                publish(true, url, outcome.as_ref().ok().cloned());
+                Some(outcome)
+            },
+        )
     }
 
-    fn inspect_one(&self, url: &Path) -> Result<Clip, PipelineError> {
-        let probe = self.backend.inspect(url).map_err(PipelineError::Decode)?;
+    fn inspect_one(
+        &self,
+        url: &Path,
+        mut inspection: crate::backend::Inspection<'_>,
+    ) -> Result<Clip, PipelineError> {
+        let probe = inspection.report;
         let micros = (probe.duration_seconds * 1_000_000.0).round() as i64;
         if micros <= 0 {
             return Err(PipelineError::Decode(crate::DecodeError::InvalidPcm));
         }
-        let id = clip_id_for(&url.to_string_lossy(), micros);
+        // The AAF bridge names extracted WAVs by content. Temporary directory
+        // names change across launches, but project corrections must keep
+        // addressing the same embedded recording.
+        let id = match crate::media_assets::embedded_aaf_name(url) {
+            Some(name) => clip_id_for(&format!("embedded-aaf/{name}"), micros),
+            None => clip_id_for(&url.to_string_lossy(), micros),
+        };
         let mut audio: Vec<AudioSummary> = probe
             .audio_streams
             .iter()
@@ -669,7 +852,10 @@ impl Pipeline {
         // *differences* of embedded timestamps steer matching, and the BWF
         // date resolves in UTC (see meta.rs) — consistent per machine.
         let bwf = align_core::meta::read_bwf(url);
-        let sony = align_core::meta::read_sony_tail(url);
+        let sony = probe
+            .has_video
+            .then(|| align_core::meta::read_sony_tail(url))
+            .flatten();
         let (recorded_at, recorded_at_source) = sony
             .as_deref()
             .and_then(align_core::meta::sony_recording_date)
@@ -731,34 +917,39 @@ impl Pipeline {
             .and_then(|v| v.source_timecode.as_ref())
             .is_some()
             || audio.iter().any(|a| a.source_timecode.is_some());
-        if !has_timecode {
-            'streams: for (stream_index, stream) in probe.audio_streams.iter().enumerate() {
-                let mut sample_rate = stream.sample_rate;
-                let mut channels = vec![Vec::new(); stream.channels];
-                let decoded = self.backend.decode_native(
-                    url,
-                    stream_index,
-                    Some((0.0, Some(3.0))),
-                    &mut |block| {
-                        sample_rate = block.sample_rate;
-                        for (output, input) in channels.iter_mut().zip(&block.frames) {
-                            output.extend_from_slice(input);
-                        }
-                        Ok(())
-                    },
-                );
-                if decoded.is_err() {
-                    continue;
+        if !has_timecode && !audio.is_empty() {
+            let base_cache = self.cache.as_ref();
+            let decoder_cache = self.decoder_cache(url).or_else(|| {
+                // These containers use the FFmpeg absolute packet clock for
+                // the opening LTC window. Earlier versions could inspect
+                // audio beyond the window when a mapped track started late.
+                let cache = base_cache?;
+                let ext = url.extension()?;
+                let external = ext.eq_ignore_ascii_case("mxf")
+                    || (ext.eq_ignore_ascii_case("mts")
+                        && self.backend.kind() == BackendKind::Portable);
+                external.then(|| cache.decoder_variant("ltc-presented"))
+            });
+            let entry = decoder_cache
+                .as_ref()
+                .or(base_cache)
+                .and_then(|cache| cache.ltc_entry(url));
+            let cached = entry
+                .as_ref()
+                .and_then(|e| e.load())
+                .filter(|hit| hit.as_ref().is_none_or(|(index, _)| *index < audio.len()));
+            let detection = cached.unwrap_or_else(|| {
+                let (detection, complete) =
+                    Self::detect_ltc(&mut inspection.opening_audio, &probe.audio_streams);
+                // Retry incomplete reads, including failures before a later
+                // stream supplied a clock.
+                if complete && let Some(entry) = &entry {
+                    entry.save(detection.clone());
                 }
-                for samples in &channels {
-                    if let Some(timecode) = crate::ltc::detect(samples, sample_rate) {
-                        audio[stream_index].source_timecode = Some(align_core::SourceTimecode {
-                            derived: true,
-                            ..timecode
-                        });
-                        break 'streams;
-                    }
-                }
+                detection
+            });
+            if let Some((stream, timecode)) = detection {
+                audio[stream].source_timecode = Some(timecode);
             }
         }
 
@@ -807,6 +998,7 @@ impl Pipeline {
         clip: &Clip,
         source: AudioAnalysisSource,
         cancel: &std::sync::atomic::AtomicBool,
+        route: DecodeRoute<'_>,
         start: impl Fn() -> S,
         feed: impl Fn(&mut S, &[f32]),
     ) -> Result<S, PipelineError> {
@@ -823,7 +1015,26 @@ impl Pipeline {
             })
             .map(|()| state)
         };
-        let error = match run(&|consume| self.backend.decode_mono_8k(&clip.url, source, consume)) {
+        if let DecodeRoute::Local = route {
+            return run(&|consume| {
+                self.backend
+                    .local_mono_8k(&clip.url, source, consume)
+                    .unwrap_or(Err(DecodeError::UnsupportedOutput))
+            })
+            .map_err(PipelineError::Decode);
+        }
+        let DecodeRoute::Normal(prepared) = route else {
+            unreachable!()
+        };
+        let decoded = if source != AudioAnalysisSource::AllMixed
+            && source.stream_index() == 0
+            && let Some(decode) = prepared.take(&clip.url)
+        {
+            run(&|consume| decode(source, consume))
+        } else {
+            run(&|consume| self.backend.decode_mono_8k(&clip.url, source, consume))
+        };
+        let error = match decoded {
             Ok(state) => return Ok(state),
             Err(error @ (DecodeError::Symphonia(_) | DecodeError::Apple(_))) => error,
             Err(DecodeError::Cancelled) => return Err(PipelineError::Cancelled),
@@ -873,6 +1084,51 @@ impl Pipeline {
         }
     }
 
+    fn detect_ltc(
+        read: &mut crate::backend::OpeningAudio<'_>,
+        streams: &[crate::backend::AudioStreamProbe],
+    ) -> (Option<(usize, align_core::SourceTimecode)>, bool) {
+        let mut complete = true;
+        for (stream_index, stream) in streams.iter().enumerate() {
+            let mut sample_rate = stream.sample_rate;
+            let mut channels = vec![Vec::new(); stream.channels];
+            let decoded = read(stream_index, &mut |block| {
+                sample_rate = block.sample_rate;
+                for (output, input) in channels.iter_mut().zip(&block.frames) {
+                    output.extend_from_slice(input);
+                }
+                Ok(())
+            });
+            if decoded.is_err() {
+                complete = false;
+                continue;
+            }
+            // Some demuxers return success after a short/incomplete window.
+            // Keep any positive observation, but retry incomplete clocks.
+            let expected =
+                (stream.end_seconds.unwrap_or(3.).min(3.) * sample_rate).floor() as usize;
+            complete &= !channels.is_empty()
+                && channels
+                    .iter()
+                    .all(|s| !s.is_empty() && s.len().saturating_add(1) >= expected);
+            for samples in &channels {
+                if let Some(timecode) = crate::ltc::detect(samples, sample_rate) {
+                    return (
+                        Some((
+                            stream_index,
+                            align_core::SourceTimecode {
+                                derived: true,
+                                ..timecode
+                            },
+                        )),
+                        complete,
+                    );
+                }
+            }
+        }
+        (None, complete)
+    }
+
     fn fingerprints(
         &self,
         clips: &[&Clip],
@@ -883,6 +1139,7 @@ impl Pipeline {
     ) -> Result<FingerprintRun, PipelineError> {
         use align_core::Fingerprint;
         struct Variant {
+            flux: Vec<u8>,
             source: AudioAnalysisSource,
             fingerprints: Vec<Fingerprint>,
             waveform: Option<Vec<f32>>,
@@ -897,10 +1154,27 @@ impl Pipeline {
         if let Some(p) = &progress {
             p(PipelineProgress::basic(Phase::Fingerprint, 0, total, None));
         }
-        let analyse = |clip: &&Clip| -> Result<Vec<Variant>, PipelineError> {
+        // Bound project-wide envelope memory, including multiple audio variants.
+        let flux_limit =
+            |clip: &Clip| ((clip.duration.as_seconds() / 0.064).ceil() as usize).saturating_add(2);
+        let mut flux_hops = 0usize;
+        let flux_enabled = clips.iter().all(|clip| {
+            let hops = flux_limit(clip);
+            flux_hops = flux_hops.saturating_add(hops.saturating_mul(clip.audio.len()));
+            flux_hops <= 8 * 1024 * 1024
+        }) && clips.len() <= 256
+            && clips
+                .iter()
+                .any(|c| (5.0..=32.).contains(&c.duration.as_seconds()));
+        let analyse = |clip: &&Clip, local_only: bool| -> Result<Vec<Variant>, PipelineError> {
             if cancelled(cancel) {
                 return Err(PipelineError::Cancelled);
             }
+            let route = if local_only {
+                DecodeRoute::Local
+            } else {
+                DecodeRoute::Normal(options.prepared)
+            };
             let accuracy = overrides.get(&clip.id).copied().unwrap_or(accuracy);
             let req = requested
                 .get(&clip.id)
@@ -919,24 +1193,94 @@ impl Pipeline {
                 };
             let mut variants = Vec::with_capacity(sources.len());
             let mut failure = None;
+            let decoder_cache = self.decoder_cache(&clip.url);
+            let cache = decoder_cache.as_ref().or(self.cache.as_ref());
+            let sampled = cache.and_then(|cache| {
+                let sample = align_core::cache::MediaSample::read(&clip.url).ok()?;
+                Some((cache, sample))
+            });
+            // Producing a sidecar during a cold decode is independent of whether
+            // this project has a short take that can use it right now.
+            let hops = flux_limit(clip);
+            let flux_cacheable = accuracy.is_balanced()
+                && hops.saturating_sub(2) <= align_core::fingerprint::MAX_FLUX_HOPS;
+            let use_flux = flux_enabled && flux_cacheable;
+            let start = || {
+                let mut extractor = FingerprintExtractor::with_accuracy(accuracy);
+                if use_flux || (flux_cacheable && sampled.is_some()) {
+                    extractor.enable_flux(hops);
+                }
+                let preview = generate_waveform_previews
+                    .then(|| WaveformPreview::new(clip.duration.as_seconds()));
+                (extractor, preview)
+            };
+            let feed =
+                |(extractor, preview): &mut (FingerprintExtractor, Option<WaveformPreview>),
+                 block: &[f32]| {
+                    extractor.consume(block);
+                    if let Some(preview) = preview {
+                        preview.consume(block);
+                    }
+                };
+            let mut batched = Vec::new();
+            // A warm or partly warm movie only decodes the variants it needs.
+            let cold = (2..=16).contains(&sources.len())
+                && sources.iter().all(|source| {
+                    sampled.as_ref().is_none_or(|(cache, sample)| {
+                        !cache
+                            .entry(sample, &accuracy.cache_key(&source.cache_key()))
+                            .exists()
+                    })
+                });
+            if cold {
+                let mut states: Vec<_> = sources.iter().map(|_| start()).collect();
+                match self
+                    .backend
+                    .fingerprint_tracks(&clip.url, &sources, &mut |index, block| {
+                        if cancelled(cancel) {
+                            return Err(crate::DecodeError::Cancelled);
+                        }
+                        feed(&mut states[index], block);
+                        Ok(())
+                    }) {
+                    Some(Ok(())) => batched = states,
+                    Some(Err(crate::DecodeError::Cancelled)) => {
+                        return Err(PipelineError::Cancelled);
+                    }
+                    _ => {}
+                }
+            }
+            let mut batched = batched.into_iter();
             for source in sources {
+                let state = batched.next();
                 let variant = (|| -> Result<Variant, PipelineError> {
                     let cache_key = accuracy.cache_key(&source.cache_key());
-                    if let Some(cached) = self.cache.load(&clip.url, &cache_key) {
+                    let entry = sampled
+                        .as_ref()
+                        .map(|(cache, sample)| cache.entry(sample, &cache_key));
+                    if let Some(entry) = &entry
+                        && let Some(cached) = entry.load()
+                    {
+                        // Older Balanced entries may have only landmarks.
+                        let flux = if use_flux {
+                            entry.load_flux(hops).unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
                         let waveform = if generate_waveform_previews {
-                            if let Some(waveform) = self.cache.load_waveform(&clip.url, &cache_key)
-                            {
+                            if let Some(waveform) = entry.load_waveform() {
                                 Some(waveform)
                             } else {
                                 let preview = self.decode_mono_8k_into(
                                     clip,
                                     source,
                                     cancel,
+                                    route,
                                     || WaveformPreview::new(clip.duration.as_seconds()),
                                     |preview, block| preview.consume(block),
                                 )?;
                                 let waveform = preview.finish();
-                                self.cache.save_waveform(&waveform, &clip.url, &cache_key);
+                                entry.save_waveform(&waveform);
                                 Some(waveform)
                             }
                         } else {
@@ -945,37 +1289,33 @@ impl Pipeline {
                         return Ok(Variant {
                             source,
                             fingerprints: cached,
+                            flux,
                             waveform,
                         });
                     }
-                    let (extractor, preview) = self.decode_mono_8k_into(
-                        clip,
-                        source,
-                        cancel,
-                        || {
-                            (
-                                FingerprintExtractor::with_accuracy(accuracy),
-                                generate_waveform_previews
-                                    .then(|| WaveformPreview::new(clip.duration.as_seconds())),
-                            )
-                        },
-                        |(extractor, preview), block| {
-                            extractor.consume(block);
-                            if let Some(preview) = preview {
-                                preview.consume(block);
-                            }
-                        },
-                    )?;
+                    let (mut extractor, preview) = match state {
+                        Some(state) => state,
+                        None => {
+                            self.decode_mono_8k_into(clip, source, cancel, route, start, feed)?
+                        }
+                    };
                     if cancelled(cancel) {
                         return Err(PipelineError::Cancelled);
                     }
+                    let flux = extractor.take_flux();
                     let fingerprints = extractor.finish();
-                    self.cache.save(&fingerprints, &clip.url, &cache_key);
+                    if let Some(entry) = &entry {
+                        entry.save(&fingerprints);
+                        if !flux.is_empty() {
+                            entry.save_flux(&flux);
+                        }
+                    }
                     let waveform = preview.map(WaveformPreview::finish);
-                    if let Some(waveform) = &waveform {
-                        self.cache.save_waveform(waveform, &clip.url, &cache_key);
+                    if let (Some(waveform), Some(entry)) = (&waveform, &entry) {
+                        entry.save_waveform(waveform);
                     }
                     Ok(Variant {
+                        flux: if use_flux { flux } else { Vec::new() },
                         source,
                         fingerprints,
                         waveform,
@@ -985,7 +1325,7 @@ impl Pipeline {
                 // clip fails only when none of its streams can be read.
                 match variant {
                     Ok(variant) => variants.push(variant),
-                    Err(error) if self.ends_run(&error) => return Err(error),
+                    Err(error) if local_only || self.ends_run(&error) => return Err(error),
                     Err(error) => {
                         failure.get_or_insert(error);
                     }
@@ -996,11 +1336,59 @@ impl Pipeline {
                 _ => Ok(variants),
             }
         };
-        // Four streaming readers avoid saturating external media while
-        // variants of one clip stay sequential and results keep input order.
-        let outcomes: Vec<Result<Vec<Variant>, PipelineError>> =
-            align_core::par_map(clips, 4, |clip| {
-                let outcome = analyse(clip);
+        // Issue the longest reads first so the last worker does not inherit
+        // a whole camera reel while all other workers are already idle.
+        let mut jobs: Vec<_> = clips.iter().enumerate().collect();
+        jobs.sort_by(|a, b| {
+            b.1.duration
+                .as_seconds()
+                .total_cmp(&a.1.duration.as_seconds())
+        });
+        let mut outcomes = map_media(
+            &jobs,
+            |&(_, clip)| {
+                if clip.audio.is_empty()
+                    || requested.get(&clip.id) == Some(&AudioAnalysisSource::AllMixed)
+                {
+                    return false;
+                }
+                let pcm = clip.audio.iter().all(|a| a.is_float.is_some())
+                    && (crate::isobmff::is_candidate(&clip.url)
+                        || clip
+                            .url
+                            .extension()
+                            .is_some_and(|e| e.eq_ignore_ascii_case("wav")));
+                let simple_audio = clip.url.extension().is_some_and(|e| {
+                    ["mp3", "aif", "aiff"]
+                        .iter()
+                        .any(|s| e.eq_ignore_ascii_case(s))
+                });
+                if self.backend.kind() == BackendKind::AppleNative {
+                    return pcm;
+                }
+                if simple_audio
+                    || clip
+                        .url
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+                {
+                    return true;
+                }
+                // Header-only classification. Low-rate AAC cores may require
+                // a sidecar probe even when the sample description says LC.
+                (crate::isobmff::is_candidate(&clip.url)
+                    || clip
+                        .url
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("m4a")))
+                    && crate::isobmff::shared_movie(&clip.url)
+                        .is_some_and(|m| m.audio().all(|t| t.sbr_from_header() == Some(false)))
+            },
+            |&(index, clip), local_only| {
+                let outcome = analyse(clip, local_only);
+                if local_only && outcome.is_err() && !cancelled(cancel) {
+                    return None;
+                }
                 if let Some(p) = &progress
                     && !outcome.as_ref().is_err_and(|error| self.ends_run(error))
                 {
@@ -1027,13 +1415,15 @@ impl Pipeline {
                     event.completed = *done;
                     p(event);
                 }
-                outcome
-            });
+                Some((index, outcome))
+            },
+        );
+        outcomes.sort_unstable_by_key(|(index, _)| *index);
         // One unreadable file is reported and left unmatched; the others
         // still synchronize. Results stay in input order.
         let mut analysed = Vec::with_capacity(clips.len());
         let mut warnings = Vec::new();
-        for (clip, outcome) in clips.iter().zip(outcomes) {
+        for (clip, (_, outcome)) in clips.iter().zip(outcomes) {
             match outcome {
                 Ok(variants) => analysed.push((*clip, variants)),
                 Err(error) if self.ends_run(&error) => return Err(error),
@@ -1063,6 +1453,7 @@ impl Pipeline {
                 .copied()
                 .unwrap_or(AudioAnalysisSource::Automatic)
         };
+        let mut envelopes = Vec::new();
         if analysed.iter().all(|(_, variants)| variants.len() == 1) {
             let mut selected = HashMap::new();
             let mut features = Vec::with_capacity(analysed.len());
@@ -1071,12 +1462,16 @@ impl Pipeline {
                 if variant.source != requested_source(clip) {
                     selected.insert(clip.id.clone(), variant.source);
                 }
+                if !variant.flux.is_empty() {
+                    envelopes.push((clip.id.clone(), variant.flux));
+                }
                 features.push(align_core::ClipFingerprints {
                     clip_id: clip.id.clone(),
                     fingerprints: variant.fingerprints,
                 });
             }
             return Ok(FingerprintRun {
+                envelopes,
                 features,
                 selected_sources: selected,
                 warnings,
@@ -1124,6 +1519,9 @@ impl Pipeline {
                 if v.source != requested_source(clip) {
                     selected.insert(clip.id.clone(), v.source);
                 }
+                if !v.flux.is_empty() {
+                    envelopes.push((clip.id.clone(), v.flux));
+                }
                 features.push(align_core::ClipFingerprints {
                     clip_id: clip.id.clone(),
                     fingerprints: v.fingerprints,
@@ -1131,6 +1529,7 @@ impl Pipeline {
             }
         }
         Ok(FingerprintRun {
+            envelopes,
             features,
             selected_sources: selected,
             warnings,
@@ -1965,9 +2364,35 @@ mod tests {
             backend: Box::new(FailingInspect {
                 delay: std::time::Duration::from_millis(delay_ms),
             }),
-            cache: FingerprintCache::with_backend(Some(dir.join(".cache")), "failing-inspect"),
+            cache: Some(FingerprintCache::with_backend(
+                Some(dir.join(".cache")),
+                "failing-inspect",
+            )),
         };
         (dir, pipe)
+    }
+
+    #[test]
+    fn mixed_queue_limits_native_jobs_and_retries_in_source_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let jobs: Vec<_> = (0..72).collect();
+        let active = AtomicUsize::new(0);
+        let results = map_media(
+            &jobs,
+            |i| i % 3 != 0,
+            |i, local_only| {
+                if local_only && i % 5 == 0 {
+                    return None;
+                }
+                if !local_only {
+                    assert!(active.fetch_add(1, Ordering::SeqCst) < 4);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }
+                Some(*i)
+            },
+        );
+        assert_eq!(results, jobs);
     }
 
     /// Cancelling while every worker is busy used to end as "no media" once
@@ -2124,6 +2549,7 @@ mod tests {
     /// fails like a decoder part way through the audio, after passing some
     /// samples on.
     struct FaultyAnalysis {
+        native_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         fails: fn(&Path, AudioAnalysisSource) -> Option<crate::DecodeError>,
         /// Whether refinement windows of those sources fail too.
         windows_fail: bool,
@@ -2172,6 +2598,8 @@ mod tests {
             range: Option<(f64, Option<f64>)>,
             consume: &mut dyn FnMut(crate::backend::NativeBlock) -> Result<(), crate::DecodeError>,
         ) -> Result<f64, crate::DecodeError> {
+            self.native_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             crate::portable::PortableBackend.decode_native(path, stream, range, consume)
         }
 
@@ -2191,7 +2619,10 @@ mod tests {
     fn faulty_pipeline(dir: &Path, backend: FaultyAnalysis) -> Pipeline {
         Pipeline {
             backend: Box::new(backend),
-            cache: FingerprintCache::with_backend(Some(dir.join(".cache")), "faulty-test"),
+            cache: Some(FingerprintCache::with_backend(
+                Some(dir.join(".cache")),
+                "faulty-test",
+            )),
         }
     }
 
@@ -2220,6 +2651,7 @@ mod tests {
             let pipe = faulty_pipeline(
                 &dir,
                 FaultyAnalysis {
+                    native_reads: Default::default(),
                     fails: |path, _| {
                         named(path, "a.wav").then(|| {
                             crate::DecodeError::Symphonia("unexpected end of bitstream".into())
@@ -2284,6 +2716,7 @@ mod tests {
         let pipe = faulty_pipeline(
             &dir,
             FaultyAnalysis {
+                native_reads: Default::default(),
                 fails: |path, source| {
                     (named(path, "two-streams.mov") && source.stream_index() == 0)
                         .then(|| crate::DecodeError::Incomplete("stream 0 is unreadable".into()))
@@ -2615,6 +3048,70 @@ mod tests {
     }
 
     #[test]
+    fn disabled_disk_cache_recomputes_ffprobe_video_timing() {
+        let (Some(ffmpeg), Some(ffprobe)) = (crate::ff::test_ffmpeg(), crate::ff::test_ffprobe())
+        else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("clip.mts");
+        let status = crate::process::command(ffmpeg)
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x120:rate=25:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=1",
+                "-c:v",
+                "mpeg2video",
+                "-c:a",
+                "mp2",
+                "-f",
+                "mpegts",
+            ])
+            .arg(&media)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        use align_core::{VideoFrameRateMode, VideoTimingInspection};
+        let cache_dir = dir.path().join("cache");
+        let cache = FingerprintCache::with_backend(Some(cache_dir.clone()), "portable-timing1");
+        let ffprobe = ffprobe.canonicalize().unwrap();
+        let decoder = format!(
+            "{}:{}",
+            ffprobe.display(),
+            align_core::cache::media_revision(&ffprobe).unwrap()
+        );
+        let stale = VideoTimingInspection {
+            frame_duration: Some(MediaTime::new(1, 25)),
+            mode: VideoFrameRateMode::Variable,
+        };
+        cache.save_video_timing(&media, &decoder, stale);
+        let inputs = [PipelineInput::Media(media.clone())];
+        let inspect = |enabled| {
+            let pipe = Pipeline::with_cache_settings(
+                BackendKind::Portable,
+                Some(cache_dir.clone()),
+                CacheSettings {
+                    enabled,
+                    retention_days: None,
+                },
+            );
+            let project = pipe.open(&inputs).unwrap();
+            project.clips[0].video.as_ref().unwrap().frame_rate_mode
+        };
+        assert_eq!(inspect(true), Some(VideoFrameRateMode::Variable));
+        assert_eq!(inspect(false), Some(VideoFrameRateMode::Constant));
+        assert_eq!(cache.load_video_timing(&media, &decoder), Some(stale));
+    }
+
+    #[test]
     fn independent_groups_and_singleton_survive_export() {
         use align_core::export::{ExportTimeline, TimelineExportFormat};
         let dir = fixture_dir("independent-groups");
@@ -2872,6 +3369,129 @@ mod tests {
     }
 
     #[test]
+    fn adding_short_take_reuses_long_fingerprints_even_without_legacy_flux() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = noise(40 * 44100, 0xBEEF);
+        write_delayed_wav(dir.path(), "long-a.wav", &body, 0.0);
+        write_delayed_wav(dir.path(), "long-b.wav", &body, 1.024);
+        let inputs = [PipelineInput::Media(dir.path().to_owned())];
+        let sync = |fails: fn(&Path, AudioAnalysisSource) -> Option<crate::DecodeError>| {
+            faulty_pipeline(
+                dir.path(),
+                FaultyAnalysis {
+                    native_reads: Default::default(),
+                    fails,
+                    windows_fail: false,
+                },
+            )
+            .synchronize(
+                &inputs,
+                &[],
+                &PipelineOptions::default(),
+                None,
+                &Default::default(),
+            )
+            .unwrap()
+        };
+        assert_eq!(sync(|_, _| None).matches.len(), 1);
+        let envelopes: Vec<_> = std::fs::read_dir(dir.path().join(".cache"))
+            .unwrap()
+            .map(|file| file.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "flux1"))
+            .collect();
+        assert_eq!(
+            envelopes.len(),
+            2,
+            "cold Balanced writes envelopes for long clips"
+        );
+        assert!(
+            envelopes
+                .iter()
+                .all(|p| std::fs::metadata(p).unwrap().len() > 0)
+        );
+        // Simulate one entry from a release that only saved landmarks.
+        std::fs::remove_file(&envelopes[0]).unwrap();
+        write_delayed_wav(dir.path(), "short.wav", &body[44100..16 * 44100], 0.0);
+        let warm =
+            sync(|path, _| (!named(path, "short.wav")).then_some(crate::DecodeError::Cancelled));
+        assert_eq!(warm.project.clips.len(), 3);
+        assert!(warm.unmatched.is_empty());
+    }
+
+    #[test]
+    fn disabled_disk_cache_recomputes_audio_analysis_and_preserves_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = noise(12 * 44100, 0xD15C);
+        let a = write_delayed_wav(dir.path(), "a.wav", &body, 0.0);
+        let b = write_delayed_wav(dir.path(), "b.wav", &body, 1.024);
+        let clock = write_mono_wav(dir.path(), "ltc.wav", &crate::ltc::synthetic_ltc(0, 40, 25));
+
+        let cache_dir = dir.path().join("cache");
+        let cache = FingerprintCache::new(Some(cache_dir.clone()));
+        let sample = align_core::cache::MediaSample::read(&a).unwrap();
+        let key = align_core::SearchAccuracy::Balanced
+            .cache_key(&AudioAnalysisSource::Automatic.cache_key());
+        let cached = cache.entry(&sample, &key);
+        cached.save(&[]);
+        cached.save_waveform(&[0.0]);
+        cached.save_flux(&[1]);
+        cache.ltc_entry(&clock).unwrap().save(None);
+
+        let payloads = || -> std::collections::BTreeMap<_, _> {
+            std::fs::read_dir(&cache_dir)
+                .unwrap()
+                .map(|file| {
+                    let file = file.unwrap();
+                    (file.file_name(), std::fs::read(file.path()).unwrap())
+                })
+                .collect()
+        };
+        let original = payloads();
+        assert_eq!(original.len(), 4);
+        let pipe = Pipeline::with_cache_settings(
+            BackendKind::Portable,
+            Some(cache_dir.clone()),
+            CacheSettings {
+                enabled: false,
+                retention_days: Some(0),
+            },
+        );
+        let waveforms = std::sync::Mutex::new(Vec::new());
+        let result = pipe
+            .synchronize(
+                &[PipelineInput::Media(a), PipelineInput::Media(b)],
+                &[],
+                &PipelineOptions {
+                    generate_waveform_previews: true,
+                    ..Default::default()
+                },
+                Some(&|event| {
+                    if let Some((_, waveform)) = event.waveform {
+                        waveforms.lock().unwrap().push(waveform);
+                    }
+                }),
+                &Default::default(),
+            )
+            .unwrap();
+        assert_eq!(result.matches.len(), 1);
+        assert!((result.matches[0].offset.as_seconds().abs() - 1.024).abs() < 0.001);
+        let waveforms = waveforms.into_inner().unwrap();
+        assert_eq!(waveforms.len(), 2);
+        assert!(
+            waveforms
+                .iter()
+                .all(|waveform| waveform.iter().any(|value| *value > 0.0))
+        );
+
+        let project = pipe.open(&[PipelineInput::Media(clock)]).unwrap();
+        assert_eq!(
+            project.clips[0].source_timecode().unwrap().text,
+            "01:02:03:00"
+        );
+        assert_eq!(payloads(), original);
+    }
+
+    #[test]
     fn per_clip_search_override_reuses_only_compatible_cache() {
         let dir = fixture_dir("search-override");
         let body = noise(12 * 44100, 0xBCAD);
@@ -2883,7 +3503,8 @@ mod tests {
         let baseline = pipe
             .synchronize(&inputs, &[], &PipelineOptions::default(), None, &cancel)
             .unwrap();
-        assert_eq!(pipe.cache.statistics().file_count, 2);
+        let cache = pipe.cache.as_ref().unwrap();
+        let baseline_entries = cache.statistics().file_count;
         let id = baseline.project.clips[0].id.clone();
         let options = PipelineOptions {
             search_overrides: [(id, align_core::SearchAccuracy::Exhaustive)]
@@ -2895,8 +3516,8 @@ mod tests {
             .synchronize(&inputs, &[], &options, None, &cancel)
             .unwrap();
         assert_eq!(
-            pipe.cache.statistics().file_count,
-            3,
+            cache.statistics().file_count,
+            baseline_entries + 1,
             "only overridden clip needs another cache entry"
         );
         assert_eq!(result.search_overrides, options.search_overrides);
@@ -2968,6 +3589,7 @@ mod tests {
         let pipe = Pipeline::new_in(BackendKind::Portable, Some(dir.join(".cache")));
         let inputs = [PipelineInput::Media(a), PipelineInput::Media(b)];
         let cancel = std::sync::atomic::AtomicBool::new(false);
+        let cache = pipe.cache.as_ref().unwrap();
         for (index, accuracy) in SearchAccuracy::ALL.into_iter().enumerate() {
             let options = PipelineOptions {
                 search_accuracy: accuracy,
@@ -2986,8 +3608,8 @@ mod tests {
                 cold.matches
             );
             assert_eq!(
-                pipe.cache.statistics().file_count,
-                (index + 1) * 2,
+                cache.statistics().file_count,
+                (index + 1) * 2 + 2,
                 "search levels must not reuse incompatible fingerprints"
             );
             let warm = pipe
@@ -3125,17 +3747,33 @@ mod tests {
     #[test]
     fn pipeline_reads_ltc_from_audio_signal() {
         let dir = fixture_dir("ltc");
-        let wav = write_mono_wav(&dir, "ltc.wav", &crate::ltc::synthetic_ltc(0, 40, 25));
-        let pipe = Pipeline::new_in(BackendKind::Portable, Some(dir.join(".cache")));
-        let project = pipe
-            .open(&[PipelineInput::Media(wav)])
-            .expect("inspect LTC WAV");
-        let timecode = project.clips[0].audio[0]
-            .source_timecode
-            .as_ref()
-            .expect("LTC source timecode");
-        assert_eq!(timecode.text, "01:02:03:00");
-        assert_eq!(timecode.frame_duration, MediaTime::new(1, 25));
+        let clock = crate::ltc::synthetic_ltc(0, 40, 25);
+        let wav = write_mono_wav(&dir, "ltc.wav", &vec![0.0; clock.len()]);
+        let native_reads = std::sync::Arc::<std::sync::atomic::AtomicUsize>::default();
+        let pipe = faulty_pipeline(
+            &dir,
+            FaultyAnalysis {
+                native_reads: native_reads.clone(),
+                fails: |_, _| None,
+                windows_fail: false,
+            },
+        );
+        let inputs = [PipelineInput::Media(wav)];
+        for _ in 0..2 {
+            let project = pipe.open(&inputs).unwrap();
+            assert!(project.clips[0].source_timecode().is_none());
+        }
+        assert_eq!(native_reads.load(std::sync::atomic::Ordering::Relaxed), 1);
+        write_mono_wav(&dir, "ltc.wav", &clock);
+        for _ in 0..2 {
+            let project = pipe.open(&inputs).unwrap();
+            let timecode = project.clips[0]
+                .source_timecode()
+                .expect("LTC source timecode");
+            assert_eq!(timecode.text, "01:02:03:00");
+            assert_eq!(timecode.frame_duration, MediaTime::new(1, 25));
+        }
+        assert_eq!(native_reads.load(std::sync::atomic::Ordering::Relaxed), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

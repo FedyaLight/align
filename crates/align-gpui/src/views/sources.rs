@@ -1,6 +1,17 @@
 //! Main content: drop zone and the source list.
 
-use super::*;
+use gpui::{ExternalPaths, StyleRefinement, Window};
+
+use super::animation::{selection_control_motion, slide_in};
+use super::controls::{fmt_duration, prominent_button};
+use super::export::check_row;
+use super::menu_sidebar::app_menu_button;
+use super::timeline::timeline_preview;
+use super::{
+    AlignApp, ClipId, ClipState, Context, FluentBuilder, HashMap, InteractiveElement, IntoElement,
+    MediaKind, ParentElement, SharedString, StatefulInteractiveElement, Styled, Theme,
+    TimelineTransition, div, kind_badge, px, rgb, rgba, svg_icon,
+};
 
 // ---------------- main content (drop zone → file list → timeline)
 
@@ -13,6 +24,7 @@ pub(super) fn main_content(
     active: bool,
     selection_controls_closing: bool,
 ) -> impl IntoElement {
+    let accepts_external_paths = active && !data.has_active_job();
     let mut content = div()
         .id("main")
         .flex_1()
@@ -30,7 +42,7 @@ pub(super) fn main_content(
     }
     if data.lanes.is_empty() {
         if data.clips.is_empty() {
-            content = content.child(drop_zone(cx, theme, data, active));
+            content = content.child(drop_zone(cx, theme, active, accepts_external_paths));
         } else {
             content = content.child(file_list(
                 cx,
@@ -49,6 +61,17 @@ pub(super) fn main_content(
             fit_width,
             active,
         ));
+        // Keep the scroll viewport stable as the drag style comes and goes.
+        content = content
+            .border_2()
+            .border_dashed()
+            .border_color(rgba(0x00000000))
+            .when(accepts_external_paths, |content| {
+                let accent = theme.accent;
+                content.drag_over::<ExternalPaths>(move |style, _, window, _| {
+                    external_drop_style(style, window, accent)
+                })
+            });
     }
     let screen = if !data.lanes.is_empty() {
         "screen-timeline"
@@ -65,8 +88,8 @@ pub(super) fn main_content(
 pub(super) fn drop_zone(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
-    _data: &crate::state::AppData,
     active: bool,
+    accepts_external_paths: bool,
 ) -> impl IntoElement {
     let accent = theme.accent;
     // The whole card is the drop target; it lights up while files hover.
@@ -83,10 +106,10 @@ pub(super) fn drop_zone(
         .border_2()
         .border_dashed()
         .border_color(rgb(theme.border))
-        .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| {
-            style
-                .border_color(rgb(accent))
-                .bg(rgba((accent << 8) | 0x14))
+        .when(accepts_external_paths, |panel| {
+            panel.drag_over::<ExternalPaths>(move |style, _, window, _| {
+                external_drop_style(style, window, accent)
+            })
         });
     div()
         .relative()
@@ -117,7 +140,7 @@ pub(super) fn drop_zone(
                         .items_center()
                         .justify_center()
                         .bg(rgba((accent << 8) | 0x1A))
-                        .child(svg_icon(icons().drop.clone(), 28.0, accent)),
+                        .child(svg_icon("icons/drop.svg", 28.0, accent)),
                 )
                 .child(
                     div()
@@ -157,6 +180,15 @@ pub(super) fn drop_zone(
                         .child(TIMELINE_FORMATS_HINT),
                 ),
         )
+}
+
+fn external_drop_style(style: StyleRefinement, window: &Window, accent: u32) -> StyleRefinement {
+    // GPUI clears the drag on a native exit without invalidating the view.
+    // Schedule a frame only while the highlight is on screen.
+    window.request_animation_frame();
+    style
+        .border_color(rgb(accent))
+        .bg(rgba((accent << 8) | 0x14))
 }
 
 /// Shown under the empty-state call to action.
@@ -239,16 +271,16 @@ pub(super) fn file_list(
             parts.push(clip.state.status_text());
             parts.join(" · ")
         };
-        let state_icon: Option<(String, u32)> = match &clip.state {
+        let state_icon: Option<(&str, u32)> = match &clip.state {
             ClipState::Synchronized { evidence, .. } => {
                 if *evidence == align_core::MatchEvidence::Timecode {
-                    Some((icons().check.clone(), theme.blue))
+                    Some(("icons/check.svg", theme.blue))
                 } else {
-                    Some((icons().check.clone(), theme.green))
+                    Some(("icons/check.svg", theme.green))
                 }
             }
-            ClipState::Matching { .. } => Some((icons().check.clone(), theme.green)),
-            ClipState::Unmatched | ClipState::Warning => Some((icons().warn.clone(), theme.orange)),
+            ClipState::Matching { .. } => Some(("icons/check.svg", theme.green)),
+            ClipState::Unmatched | ClipState::Warning => Some(("icons/warn.svg", theme.orange)),
             ClipState::Queued | ClipState::Analyzing => None,
         };
         let mut row = div()
@@ -306,7 +338,7 @@ pub(super) fn file_list(
                 .border_color(rgb(if selected { theme.accent } else { theme.border }))
                 .bg(rgb(if selected { theme.accent } else { theme.panel }))
                 .when(selected, |el| {
-                    el.child(svg_icon(icons().check.clone(), 10., theme.on_accent))
+                    el.child(svg_icon("icons/check.svg", 10., theme.on_accent))
                 });
             row = row.child(selection_control_motion(
                 indicator,
@@ -331,8 +363,8 @@ pub(super) fn file_list(
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(if clip.url.is_dir() {
-                        svg_icon(icons().folder.clone(), 13.0, badge_color).into_any_element()
+                    .child(if data.folder_inputs.contains(&clip.url) {
+                        svg_icon("icons/folder.svg", 13.0, badge_color).into_any_element()
                     } else {
                         kind_badge(video, badge_color, None).into_any_element()
                     }),

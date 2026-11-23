@@ -19,10 +19,31 @@ struct ObservedFrame {
 /// Decode the timecode at sample zero. `samples` should contain a few seconds
 /// at the source rate so the biphase transitions survive decoding.
 pub fn detect(samples: &[f32], sample_rate: f64) -> Option<SourceTimecode> {
-    if !sample_rate.is_finite() || samples.len() < (sample_rate.max(1.0) / 4.0) as usize {
+    if samples.is_empty()
+        || !sample_rate.is_finite()
+        || samples.len() < (sample_rate.max(1.0) / 4.0) as usize
+    {
+        return None;
+    }
+    // Constant samples have no biphase transitions. An amplitude threshold
+    // would also discard quiet but perfectly decodable clocks.
+    if samples.iter().all(|&value| value == samples[0]) {
         return None;
     }
     let mean = samples.iter().map(|&v| f64::from(v)).sum::<f64>() / samples.len() as f64;
+    // Bulk decoding is cheaper on ordinary audio. The decoder exposes no
+    // absolute sample position for a queued frame. Stop probing at the first
+    // frame, then replay with exact positions only for a possible LTC signal.
+    let mut probe = ltc::LTCDecoder::with_capacity((sample_rate / 25.0) as f32, 4);
+    let mut block = [0.0; 1024];
+    if !samples.chunks(block.len()).any(|chunk| {
+        for (dst, src) in block.iter_mut().zip(chunk) {
+            *dst = *src - mean as f32;
+        }
+        probe.write_samples(&block[..chunk.len()])
+    }) {
+        return None;
+    }
     let mut decoder = ltc::LTCDecoder::with_capacity((sample_rate / 25.0) as f32, 4);
     let mut observed = Vec::new();
     for (index, &sample) in samples.iter().enumerate() {

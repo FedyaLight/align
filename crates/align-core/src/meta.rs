@@ -199,7 +199,14 @@ fn numeric_parts(text: &str) -> Vec<i64> {
 
 /// Gregorian date → days since Unix epoch (Hinnant's algorithm, no deps).
 fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    let last_day = match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        _ => return None,
+    };
+    if !(1..=last_day).contains(&day) {
         return None;
     }
     let y = if month <= 2 { year - 1 } else { year };
@@ -716,43 +723,45 @@ pub fn sony_device_id(xml: &str) -> Option<String> {
 /// Minimal ISO 8601 (`YYYY-MM-DDTHH:MM:SS[.frac][Z|±HH[:MM]]`) → Unix.
 /// Only what camera sidecars emit; anything else is None, never guessed.
 pub fn parse_iso8601(text: &str) -> Option<i64> {
-    let (date_part, time_part) = text.split_once(['T', 't'])?;
-    let d: Vec<i64> = date_part
-        .split('-')
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    if d.len() != 3 {
-        return None;
+    fn digits(text: &str, width: usize) -> Option<i64> {
+        (text.len() == width && text.bytes().all(|c| c.is_ascii_digit()))
+            .then(|| text.parse().ok())
+            .flatten()
     }
-    // Split timezone suffix (cameras always emit one; refuse to assume).
-    let (clock, offset_secs) = if let Some(stripped) = time_part.strip_suffix(['Z', 'z']) {
-        (stripped, 0i64)
+    let (date, time) = text.split_once(['T', 't'])?;
+    let (year, rest) = date.split_once('-')?;
+    let (month, day) = rest.split_once('-')?;
+    let days = days_from_civil(digits(year, 4)?, digits(month, 2)?, digits(day, 2)?)?;
+    let (clock, offset) = if let Some(clock) = time.strip_suffix(['Z', 'z']) {
+        (clock, 0)
     } else {
-        let i = time_part.rfind(['+', '-']).filter(|&i| i > 0)?;
-        let (clock, zone) = time_part.split_at(i);
+        let index = time.rfind(['+', '-'])?;
+        let (clock, zone) = time.split_at(index);
         let sign = if zone.starts_with('+') { -1 } else { 1 };
-        let digits: String = zone[1..].chars().filter(|c| *c != ':').collect();
-        if digits.len() != 2 && digits.len() != 4 {
+        let hours = digits(zone.get(1..3)?, 2)?;
+        let minutes = match zone.get(3..)? {
+            "" => 0,
+            tail => digits(tail.strip_prefix(':').unwrap_or(tail), 2)?,
+        };
+        if hours > 23 || minutes > 59 {
             return None;
         }
-        let zh: i64 = digits.get(..2)?.parse().ok()?;
-        let zm: i64 = digits.get(2..).map(|s| s.parse().unwrap_or(0)).unwrap_or(0);
-        if zh > 23 || zm > 59 {
-            return None;
-        }
-        (clock, sign * (zh * 3600 + zm * 60))
+        (clock, sign * (hours * 3600 + minutes * 60))
     };
-    let t: Vec<&str> = clock.split(':').collect();
-    if t.len() != 3 {
+    let (hour, rest) = clock.split_once(':')?;
+    let (minute, second) = rest.split_once(':')?;
+    let second = match second.split_once(['.', ',']) {
+        Some((whole, frac)) if !frac.is_empty() && frac.bytes().all(|c| c.is_ascii_digit()) => {
+            whole
+        }
+        Some(_) => return None,
+        None => second,
+    };
+    let (hour, minute, second) = (digits(hour, 2)?, digits(minute, 2)?, digits(second, 2)?);
+    if hour > 23 || minute > 59 || second > 60 {
         return None;
     }
-    let (hh, mm): (i64, i64) = (t[0].parse().ok()?, t[1].parse().ok()?);
-    let ss: i64 = t[2].split(['.', ',']).next()?.parse().ok()?;
-    if hh > 23 || mm > 59 || ss > 60 {
-        return None;
-    }
-    let days = days_from_civil(d[0], d[1], d[2])?;
-    Some(days * 86_400 + hh * 3600 + mm * 60 + ss + offset_secs)
+    Some(days * 86_400 + hour * 3600 + minute * 60 + second + offset)
 }
 
 #[cfg(test)]
@@ -967,6 +976,19 @@ mod tests {
         assert!(parse_iso8601("2024-05-06 12:34:56").is_none());
         assert!(parse_iso8601("2024-05-06T12:34:56").is_none());
         assert!(parse_iso8601("garbage").is_none());
+        for bad in [
+            "2024-05-06T-5:12:00Z",
+            "2024-05-06T12:-5:00Z",
+            "2024-05-06T12:34:-5Z",
+            "2024-05-06T00:00:00+01xx",
+            "2024-05-06T00:00:00+01:",
+            "2023-02-29T12:00:00Z",
+            "2024-04-31T12:00:00Z",
+            "2024-05-06T00:00:00.badZ",
+            "2024-x-05-06T00:00:00Z",
+        ] {
+            assert_eq!(parse_iso8601(bad), None, "{bad}");
+        }
     }
 
     #[test]

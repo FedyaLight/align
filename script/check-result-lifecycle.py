@@ -89,7 +89,7 @@ def main():
     env = dict(os.environ, ALIGN_BACKEND='portable')
 
     def run(name, arguments, success=True):
-        process = subprocess.run([str(args.cli.resolve()), *map(str, arguments)],
+        process = subprocess.run([str(args.cli.absolute()), *map(str, arguments)],
             env=env, capture_output=True, text=True, encoding='utf-8', timeout=180)
         (root / f'{name}.stderr').write_text(process.stderr, encoding='utf-8')
         (root / f'{name}.json').write_text(process.stdout, encoding='utf-8')
@@ -109,7 +109,11 @@ def main():
         container.content.mobs.pop(list(container.content.toplevel())[1].mob_id)
     inspected = run('inspect', [single])
     assert all(Path(clip['url']).is_file() for clip in inspected['clips'])
-    results = run('batch', ['sync', '--all-sequences', project])
+    saved = root / 'batch.json'
+    summary = run('summary', ['sync', '--summary', '--output-json', saved, '--all-sequences', project])
+    assert [s['sequence'] for s in summary['sequences']] == ['First', 'Second']
+    assert all(len(s['unmatched']) == 1 for s in summary['sequences'])
+    results = json.loads(saved.read_text(encoding='utf-8'))
     assert len(results) == 2
     for result in results:
         for clip in result['project']['clips']:

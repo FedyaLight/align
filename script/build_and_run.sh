@@ -19,6 +19,7 @@ cargo build --manifest-path "$ROOT_DIR/Cargo.toml" -p align-gpui
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_MACOS" "$APP_RESOURCES"
 cp "$ROOT_DIR/target/debug/align" "$APP_BINARY"
+ln -s Align "$APP_MACOS/align-cli"
 cp "$ROOT_DIR/Support/AppIcon.icns" "$APP_RESOURCES/AppIcon.icns"
 cp "$ROOT_DIR/Support/PrivacyInfo.xcprivacy" "$APP_RESOURCES/PrivacyInfo.xcprivacy"
 
@@ -41,6 +42,25 @@ cat >"$APP_CONTENTS/Info.plist" <<PLIST
   <string>$APP_VERSION</string>
   <key>CFBundleVersion</key>
   <string>1</string>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Align Project</string>
+      <key>CFBundleTypeRole</key><string>Editor</string>
+      <key>LSHandlerRank</key><string>Owner</string>
+      <key>LSItemContentTypes</key><array><string>com.align.app.project</string></array>
+    </dict>
+  </array>
+  <key>UTExportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeIdentifier</key><string>com.align.app.project</string>
+      <key>UTTypeDescription</key><string>Align Project</string>
+      <key>UTTypeConformsTo</key><array><string>public.json</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict><key>public.filename-extension</key><array><string>align</string></array></dict>
+    </dict>
+  </array>
   <key>LSMinimumSystemVersion</key>
   <string>15.0</string>
   <key>NSHighResolutionCapable</key>

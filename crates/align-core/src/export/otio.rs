@@ -15,10 +15,11 @@ use std::path::PathBuf;
 use serde_json::{Value, json};
 
 use super::model::{ExportIsland, ExportItem, ExportTimeline, ExportTransition};
-use crate::allocator::{TimelineTrackRequest, allocate, source_key_for_url};
+use crate::allocator::{TimelineTrackRequest, source_key_for_url};
 use crate::bins::{GENERATED_AUDIO, MediaBins};
 use crate::model::{MediaKind, TIME_TOLERANCE};
 
+#[derive(Clone, Copy)]
 struct Entry<'a> {
     item: &'a ExportItem,
     source_channel: usize,
@@ -460,68 +461,12 @@ fn media_start(item: &ExportItem, kind: MediaKind) -> f64 {
 }
 
 fn tracks<'a>(entries: Vec<Entry<'a>>, kind: MediaKind) -> Vec<Vec<Entry<'a>>> {
-    // Clips joined by portable dissolves or crossfades, channel by channel,
-    // stay on one track as a chain; the others are packed.
-    let position: HashMap<(&str, usize), usize> = entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            (
-                (entry.item.instance_id.as_str(), entry.source_channel),
-                index,
-            )
-        })
-        .collect();
-    let next: Vec<Option<usize>> = entries
-        .iter()
-        .map(|entry| {
-            let t = entry
-                .item
-                .transition_for(kind)
-                .filter(|t| t.is_otio_portable)?;
-            position
-                .get(&(t.right_instance_id.as_str(), entry.source_channel))
-                .copied()
-        })
-        .collect();
-    let mut chained = vec![false; entries.len()];
-    let mut chains: Vec<Vec<usize>> = Vec::new();
-    let heads: Vec<usize> = (0..entries.len())
-        .filter(|&index| next[index].is_some() && !next.contains(&Some(index)))
-        .collect();
-    for head in heads {
-        let mut chain = vec![head];
-        let mut current = head;
-        while let Some(following) = next[current].filter(|following| !chain.contains(following)) {
-            chain.push(following);
-            current = following;
-        }
-        for &index in &chain {
-            chained[index] = true;
-        }
-        chains.push(chain);
-    }
-    let mut slots: Vec<Option<Entry<'a>>> = entries.into_iter().map(Some).collect();
-    let mut forced: Vec<Vec<Entry>> = chains
-        .iter()
-        .map(|chain| {
-            chain
-                .iter()
-                .filter_map(|&index| slots[index].take())
-                .collect()
-        })
-        .collect();
-    forced.sort_by(|a: &Vec<Entry>, b: &Vec<Entry>| {
-        timeline_start(&a[0], kind).total_cmp(&timeline_start(&b[0], kind))
-    });
-    let allocatable: Vec<Entry> = slots
-        .into_iter()
-        .zip(chained)
-        .filter_map(|(slot, chained)| slot.filter(|_| !chained))
-        .collect();
-    let requests: Vec<TimelineTrackRequest> = allocatable
-        .iter()
-        .map(|entry| {
+    super::lanes::allocate_entries(
+        &entries,
+        kind,
+        super::lanes::Format::Otio,
+        |entry| (entry.item, entry.source_channel),
+        |entry| {
             let item = entry.item;
             let base_key = item
                 .preferred_source_key(kind)
@@ -538,38 +483,8 @@ fn tracks<'a>(entries: Vec<Entry<'a>>, kind: MediaKind) -> Vec<Vec<Entry<'a>>> {
                 timeline_start(entry, kind),
                 timeline_duration(entry, kind),
             )
-        })
-        .collect();
-    let assignments = allocate(&requests);
-    let mut by_lane: HashMap<usize, Vec<Entry>> = HashMap::new();
-    for entry in allocatable {
-        let id = entry_id(entry.item, kind, entry.source_channel);
-        by_lane
-            .entry(assignments.get(&id).copied().unwrap_or(0))
-            .or_default()
-            .push(entry);
-    }
-    let mut lanes: Vec<usize> = by_lane.keys().copied().collect();
-    lanes.sort_unstable();
-    let mut allocated: Vec<Vec<Entry>> = lanes
-        .into_iter()
-        .map(|lane| {
-            let mut track = by_lane.remove(&lane).unwrap_or_default();
-            track.sort_by(|a, b| {
-                timeline_start(a, kind)
-                    .total_cmp(&timeline_start(b, kind))
-                    .then_with(|| {
-                        let fa = a.item.clip.url.file_name();
-                        let fb = b.item.clip.url.file_name();
-                        fa.cmp(&fb)
-                    })
-                    .then_with(|| a.source_channel.cmp(&b.source_channel))
-            });
-            track
-        })
-        .collect();
-    forced.append(&mut allocated);
-    forced
+        },
+    )
 }
 
 fn entry_id(item: &ExportItem, kind: MediaKind, channel: usize) -> String {

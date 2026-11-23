@@ -122,10 +122,19 @@ def main():
         if args.ffmpeg is not None:
             binaries += [args.ffmpeg.parent / f'ffmpeg{extension}',
                          args.ffmpeg.parent / f'ffprobe{extension}']
+            binaries += sorted(args.ffmpeg.parent.glob('*.dylib'))
+            binaries += sorted(args.ffmpeg.parent.glob('*.so.*'))
         runtime = args.aaf.parent / 'align-aaf-runtime'
-        if args.platform == 'Windows' and runtime.is_dir():
-            binaries += sorted(path for path in runtime.rglob('*')
-                               if path.is_file() and path.suffix.lower() in ('.exe', '.dll', '.pyd'))
+        if not (runtime / 'base_library.zip').is_file():
+            raise RuntimeError(f'Missing frozen AAF runtime: {runtime}')
+        manifest['component_links'] = {}
+        for path in sorted(runtime.rglob('*')):
+            if path.is_symlink():
+                if not path.resolve(strict=True).is_relative_to(runtime.resolve()):
+                    raise RuntimeError(f'External runtime symlink: {path}')
+                manifest['component_links'][path.relative_to(args.aaf.parent).as_posix()] = path.readlink().as_posix()
+            elif path.is_file():
+                binaries.append(path)
         for path in binaries:
             name = path.relative_to(args.aaf.parent).as_posix() if path.is_relative_to(args.aaf.parent) else path.name
             with path.open('rb') as stream:

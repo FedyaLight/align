@@ -24,7 +24,7 @@ output = args.smoke.resolve() / 'aaf'
 output.mkdir(parents=True, exist_ok=True)
 
 def run_cli(arguments, name):
-    proc = subprocess.run([str(args.cli.resolve()), *map(str, arguments)],
+    proc = subprocess.run([str(args.cli.absolute()), *map(str, arguments)],
         env=env, capture_output=True, text=True, encoding='utf-8', timeout=180)
     (output / (name + '.stderr')).write_text(proc.stderr, encoding='utf-8')
     (output / (name + '.json')).write_text(proc.stdout, encoding='utf-8')
