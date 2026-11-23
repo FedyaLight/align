@@ -58,7 +58,7 @@ pub(super) fn slide_in<E: IntoElement + Styled + 'static>(
     )
 }
 
-pub(super) fn slide_in_from_right<E: IntoElement + Styled + 'static>(
+pub(super) fn sidebar_reveal<E: IntoElement + Styled + 'static>(
     child: E,
     id: impl Into<gpui::ElementId>,
     distance: f32,

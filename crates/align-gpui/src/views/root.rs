@@ -3,6 +3,7 @@
 use super::animation::toolbar_entrance;
 use super::controls::{overlay, sidebar_scrim};
 use super::export::{ExportPanel, export_sidebar, export_sidebar_action, path_fixer_panel};
+use super::menu_sidebar::app_menu_sidebar;
 use super::menus::{context_menu, menu_dismiss_layer, sequence_picker_panel};
 use super::operation::{
     operation_bar, sequence_results_panel, stage_settings_panel, warning_banner, warning_details,
@@ -15,11 +16,11 @@ use super::settings::{
     export_select_dismiss_layer, search_quality_dismiss_layer, search_settings_panel,
 };
 use super::sources::main_content;
-use super::toolbar::{app_menu_panel, toolbar};
+use super::toolbar::toolbar;
 use super::{
     AlignApp, Context, Corner, Instant, InteractiveElement, IntoElement, KeyDownEvent,
-    MinimizeWindow, MouseButton, Operation, ParentElement, Point, Render, Styled, Theme,
-    ToggleFullscreen, Window, ZoomWindow, anchored, deferred, div, px, rgb,
+    MinimizeWindow, Operation, ParentElement, Point, Render, Styled, Theme, ToggleFullscreen,
+    Window, ZoomWindow, anchored, deferred, div, px, rgb,
 };
 
 impl Render for AlignApp {
@@ -32,7 +33,7 @@ impl Render for AlignApp {
         // its layout but loses hover/cursor feedback (clicks are already
         // swallowed by the overlay layers).
         let content_active = !self.show_problem_report
-            && self.app_menu_position.is_none()
+            && self.app_menu.is_none()
             && self.data.menu.is_none()
             && !self.data.show_path_fixer
             && self.data.error.is_none()
@@ -78,8 +79,10 @@ impl Render for AlignApp {
                     }
                     return;
                 }
-                if key == "escape" && this.app_menu_position.take().is_some() {
-                    cx.notify();
+                if this.app_menu.is_some() {
+                    if key == "escape" {
+                        this.dismiss_app_menu(cx);
+                    }
                     return;
                 }
                 if key == "escape" && this.data.menu.take().is_some() {
@@ -91,7 +94,7 @@ impl Render for AlignApp {
                     cx.notify();
                     return;
                 }
-                if this.app_menu_position.is_some() || this.data.show_about {
+                if this.data.show_about {
                     return;
                 }
                 if key == "escape" && this.export_select.is_some() {
@@ -210,38 +213,6 @@ impl Render for AlignApp {
             content = content.child(sidebar_scrim(&theme, self.export_sidebar_exit.is_active()));
         }
         root = root.child(content);
-        if let Some(position) = self.app_menu_position {
-            root = root.child(
-                div()
-                    .absolute()
-                    .top(px(0.))
-                    .left(px(0.))
-                    .size_full()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.app_menu_position = None;
-                            cx.notify();
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, _, _, cx| {
-                            this.app_menu_position = None;
-                            cx.notify();
-                            cx.stop_propagation();
-                        }),
-                    ),
-            );
-            root = root.child(deferred(
-                anchored()
-                    .anchor(Corner::TopLeft)
-                    .position(position)
-                    .snap_to_window_with_margin(px(8.))
-                    .child(app_menu_panel(cx, &theme, window)),
-            ));
-        }
         if self.data.show_export {
             root = root
                 .child(export_sidebar(
@@ -261,6 +232,9 @@ impl Render for AlignApp {
         }
         if self.export_select.is_some() {
             root = root.child(export_select_dismiss_layer(cx));
+        }
+        if let Some(page) = &self.app_menu {
+            root = root.child(app_menu_sidebar(cx, &theme, self, page));
         }
         // The problem report temporarily replaces the open modal, keeping a
         // single dim layer; that modal returns when the report closes.

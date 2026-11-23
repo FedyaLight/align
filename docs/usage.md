@@ -46,10 +46,10 @@ other tracks align to them. See [format limits](formats.md) for unsupported edit
 | Full screen | Ctrl+Cmd+F | F11 |
 | Quit | Cmd+Q | Ctrl+Q |
 
-On Windows and Linux, the **Menu** button is available in the top toolbar and
-on the empty start screen. It provides About, Check for Updates, Use with AI
-Agents, Path Fixer, analysis-cache settings, appearance selection, and Report a
-Problem. On macOS, these commands are available in the native menu bar.
+On Windows and Linux, **Menu** opens a sidebar from the top toolbar or the
+empty start screen. **Path Fixer** appears after you import a timeline.
+Export is available from the timeline toolbar after synchronization. On macOS,
+use the native menu bar.
 
 Escape closes the open menu, panel, or dialog.
 
@@ -225,14 +225,14 @@ align-cli clear-cache --older-than-days 30
 
 The on-disk analysis cache stores fingerprints, waveform previews, spectral
 flux, LTC detections, and portable video timing. Align keeps entries for 7 days
-by default. Use **File → Analysis Cache** to change retention, clear entries for
+by default. Open **File → Analysis Cache** from the macOS menu bar or the
+**Menu** sidebar on Windows and Linux to change retention, clear entries for
 the current project, or clear all entries.
 
-Choose **Disable On-Disk Analysis Cache** to skip reading and writing the cache
+Use the on-disk analysis cache control to skip reading and writing the cache
 on new desktop and CLI runs. Existing entries stay on disk and can still be
-cleared. Choose **Enable On-Disk Analysis Cache** to resume caching with your
-selected retention. **Keep Until Cleared** sets retention with no automatic
-expiration.
+cleared. Turning the cache back on resumes caching with your selected
+retention. **Until cleared** sets retention with no automatic expiration.
 
 Embedded AAF audio retained for saved JSON is application data, not cache.
 Do not delete it while those results are needed. See

@@ -14,10 +14,9 @@ use futures::StreamExt;
 use gpui::{
     AnchoredPositionMode, Animation, AnimationExt, AnyView, App, BoxShadow, ClickEvent,
     ClipboardItem, Context, Corner, Div, DragMoveEvent, Entity, FocusHandle, Focusable,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, OwnedMenu,
-    OwnedMenuItem, ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollHandle,
-    SharedString, Stateful, Styled, Window, anchored, deferred, div, img, point, prelude::*, px,
-    rgb, rgba,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
+    PathPromptOptions, Pixels, Point, Render, ScrollHandle, SharedString, Stateful, Styled, Window,
+    anchored, deferred, div, img, point, prelude::*, px, rgb, rgba,
 };
 
 use crate::icons::{kind_badge, svg_icon};
@@ -34,6 +33,7 @@ use crate::{MinimizeWindow, ToggleFullscreen, ZoomWindow};
 mod animation;
 mod controls;
 mod export;
+mod menu_sidebar;
 mod menus;
 mod operation;
 mod panels;
@@ -475,7 +475,9 @@ pub struct AlignApp {
     export_inputs: ExportInputs,
     path_fixer_inputs: PathFixerInputs,
     pan_origin: Option<Point<Pixels>>,
-    app_menu_position: Option<Point<Pixels>>,
+    app_menu: Option<menu_sidebar::AppMenuPage>,
+    app_menu_select: Option<menu_sidebar::AppMenuSelect>,
+    app_menu_exit: Exit,
     export_scroll: ScrollHandle,
     export_scroll_drag: Option<(f32, f32)>,
     export_sidebar_exit: Exit,
@@ -517,7 +519,9 @@ impl AlignApp {
             export_inputs: ExportInputs::new(cx),
             path_fixer_inputs: PathFixerInputs::new(cx),
             pan_origin: None,
-            app_menu_position: None,
+            app_menu: None,
+            app_menu_select: None,
+            app_menu_exit: Exit::default(),
             export_scroll: ScrollHandle::new(),
             export_scroll_drag: None,
             export_sidebar_exit: Exit::default(),

@@ -1,7 +1,7 @@
 //! Export sheet and its options.
 
 use super::animation::{
-    export_reveal, export_select_motion, motion_ease, slide_in, slide_in_from_right,
+    export_reveal, export_select_motion, motion_ease, sidebar_reveal, slide_in,
 };
 use super::controls::{button, hover_tip, modal_header, prominent_button};
 use super::settings::Dropdown;
@@ -748,7 +748,7 @@ pub(super) fn export_sidebar(
         .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
         .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
         .on_scroll_wheel(|_, _, cx| cx.stop_propagation());
-    slide_in_from_right(
+    sidebar_reveal(
         panel,
         if closing {
             "export-sidebar-slide-out"

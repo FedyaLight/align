@@ -660,14 +660,18 @@ impl AppData {
         self.can_run_sync() && (self.result.is_none() || self.pending_count > 0 || self.sync_dirty)
     }
 
-    fn can_run_sync(&self) -> bool {
+    pub(crate) fn can_run_sync(&self) -> bool {
         !self.importing()
             && self.sequence_pickers.is_empty()
             && !self.clips.is_empty()
-            && !matches!(
-                self.operation,
-                Operation::Synchronizing | Operation::Exporting | Operation::Repairing
-            )
+            && !self.has_active_job()
+    }
+
+    pub(crate) fn has_active_job(&self) -> bool {
+        matches!(
+            self.operation,
+            Operation::Synchronizing | Operation::Exporting | Operation::Repairing
+        )
     }
 
     pub fn mark_sync_dirty(&mut self) {
@@ -698,10 +702,7 @@ impl AppData {
             && self.sequence_pickers.is_empty()
             && self.has_result()
             && !self.is_stale()
-            && !matches!(
-                self.operation,
-                Operation::Synchronizing | Operation::Exporting | Operation::Repairing
-            )
+            && !self.has_active_job()
     }
 
     pub fn export_output_selected(&self) -> bool {
@@ -800,10 +801,7 @@ impl AppData {
     }
 
     pub fn begin_import(&mut self, paths: Vec<PathBuf>) -> Vec<PathBuf> {
-        if matches!(
-            self.operation,
-            Operation::Synchronizing | Operation::Exporting | Operation::Repairing
-        ) {
+        if self.has_active_job() {
             return Vec::new();
         }
         let existing: HashSet<_> = self
@@ -1947,23 +1945,25 @@ impl AppData {
     /// Media represented by the current session/result, for project-only
     /// analysis-cache cleanup. Timeline containers themselves have no
     /// fingerprint entry.
-    pub fn current_cache_media(&self) -> Vec<PathBuf> {
-        let mut media: Vec<PathBuf> = self
-            .sequence_results
+    pub(crate) fn current_cache_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.sequence_results
             .iter()
-            .flat_map(|result| result.project.clips.iter().map(|clip| clip.url.clone()))
+            .flat_map(|result| result.project.clips.iter().map(|clip| &clip.url))
             .chain(
                 self.result
                     .iter()
-                    .flat_map(|result| result.project.clips.iter().map(|clip| clip.url.clone())),
+                    .flat_map(|result| result.project.clips.iter().map(|clip| &clip.url)),
             )
             .chain(
                 self.clips
                     .iter()
                     .filter(|clip| !self.timeline_inputs.contains(&clip.url))
-                    .map(|clip| clip.url.clone()),
+                    .map(|clip| &clip.url),
             )
-            .collect();
+    }
+
+    pub fn current_cache_media(&self) -> Vec<PathBuf> {
+        let mut media: Vec<PathBuf> = self.current_cache_paths().cloned().collect();
         media.sort();
         media.dedup();
         media

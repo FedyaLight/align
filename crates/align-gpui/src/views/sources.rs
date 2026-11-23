@@ -3,8 +3,8 @@
 use super::animation::{selection_control_motion, slide_in};
 use super::controls::{fmt_duration, prominent_button};
 use super::export::check_row;
+use super::menu_sidebar::app_menu_button;
 use super::timeline::timeline_preview;
-use super::toolbar::app_menu_button;
 use super::{
     AlignApp, ClipId, ClipState, Context, FluentBuilder, HashMap, InteractiveElement, IntoElement,
     MediaKind, ParentElement, SharedString, StatefulInteractiveElement, Styled, Theme,

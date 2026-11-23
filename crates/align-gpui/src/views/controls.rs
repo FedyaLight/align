@@ -253,7 +253,7 @@ pub(super) fn icon_button(
 pub(super) fn modal_header(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
-    title: &'static str,
+    title: impl Into<SharedString>,
     close_id: &'static str,
     close: impl Fn(&mut AlignApp, &ClickEvent, &mut Window, &mut Context<AlignApp>) + 'static,
 ) -> Div {
@@ -268,7 +268,7 @@ pub(super) fn modal_header(
             div()
                 .text_size(px(16.))
                 .font_weight(gpui::FontWeight(600.0))
-                .child(title),
+                .child(title.into()),
         )
         .child(div().flex_1())
         .child(icon_button(

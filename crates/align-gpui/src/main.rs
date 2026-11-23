@@ -92,20 +92,17 @@ fn clear_analysis_cache(cx: &mut App) {
         return;
     };
     view.update(cx, |this, cx| {
-        if matches!(
-            this.data.operation,
-            state::Operation::Synchronizing
-                | state::Operation::Exporting
-                | state::Operation::Repairing
-        ) {
-            this.data.status = "Wait for the current operation before clearing the cache.".into();
-            cx.notify();
+        if this.data.has_active_job() {
+            this.set_analysis_cache_status(
+                "Wait for the current operation before clearing the cache.".into(),
+                cx,
+            );
             return;
         }
         let cache = align_core::FingerprintCache::new(None);
         let statistics = cache.statistics();
         cache.clear();
-        this.data.status = if statistics.file_count == 0 {
+        let status = if statistics.file_count == 0 {
             "Analysis cache is already empty.".into()
         } else {
             format!(
@@ -115,25 +112,22 @@ fn clear_analysis_cache(cx: &mut App) {
                 statistics.total_bytes as f64 / 1_048_576.0
             )
         };
-        cx.notify();
+        this.set_analysis_cache_status(status, cx);
     });
 }
 
 fn clear_current_analysis_cache(cx: &mut App) {
     update_view(cx, |this, cx| {
-        if matches!(
-            this.data.operation,
-            state::Operation::Synchronizing
-                | state::Operation::Exporting
-                | state::Operation::Repairing
-        ) {
-            this.data.status = "Wait for the current operation before clearing the cache.".into();
-            cx.notify();
+        if this.data.has_active_job() {
+            this.set_analysis_cache_status(
+                "Wait for the current operation before clearing the cache.".into(),
+                cx,
+            );
             return;
         }
         let media = this.data.current_cache_media();
         let removed = align_core::FingerprintCache::new(None).clear_media(&media);
-        this.data.status = if media.is_empty() {
+        let status = if media.is_empty() {
             "Analyze this project before clearing its cache.".into()
         } else if removed.file_count == 0 {
             "Current project analysis cache is already empty.".into()
@@ -145,7 +139,7 @@ fn clear_current_analysis_cache(cx: &mut App) {
                 removed.total_bytes as f64 / 1_048_576.0
             )
         };
-        cx.notify();
+        this.set_analysis_cache_status(status, cx);
     });
 }
 
@@ -160,8 +154,7 @@ fn set_cache_retention(days: Option<u64>, cx: &mut App) {
         Err(error) => format!("Could not save analysis cache settings: {error}"),
     };
     update_view(cx, |this, cx| {
-        this.data.status = status;
-        cx.notify();
+        this.set_analysis_cache_status(status, cx);
     });
 }
 
@@ -175,8 +168,7 @@ fn toggle_analysis_cache(cx: &mut App) {
     };
     update_view(cx, |this, cx| {
         cx.set_menus(app_menus(this.data.appearance));
-        this.data.status = status;
-        cx.notify();
+        this.set_analysis_cache_status(status, cx);
     });
 }
 
