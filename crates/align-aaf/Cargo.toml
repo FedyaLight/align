@@ -22,7 +22,3 @@ uuid = { version = "1", features = ["v4"] }
 
 [lints]
 workspace = true
-
-[[bin]]
-name = "align-aaf-rust"
-path = "src/main.rs"

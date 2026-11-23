@@ -105,9 +105,9 @@ with channel assignments. Edit rates are converted using rational arithmetic;
 source sample boundaries and composition frame rates are kept distinct.
 
 Embedded video, compressed embedded audio, AAF effects, transitions, and retiming
-are unsupported. Unsupported structures fail explicitly. AAF export writes
-linked media rather than embedding essence. Picture metadata for MOV/MP4 is
-read natively; other containers except MXF need ffprobe.
+are unsupported. Unsupported structures fail explicitly. AAF export links
+QuickTime/MP4 picture and PCM audio. It reads QuickTime picture metadata
+natively. MXF picture export and embedded essence export are unsupported.
 
 ## Synchronization and drift
 

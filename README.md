@@ -138,12 +138,12 @@ are needed for tests and for MTS/MXF/R3D media on Linux and Windows. See the
 [development guide](docs/development.md#prerequisites) for platform dependencies.
 
 ```sh
-cargo build --locked --release -p align-cli -p align-gpui
+cargo build --locked --release -p align-cli -p align-gpui -p align-aaf
 cargo run --locked --release -p align-gpui
 ```
 
-The desktop executable is `align`; the CLI is `align-cli`. AAF support needs the
-additional [AAF module](docs/development.md#aaf-module).
+The desktop executable is `align` and the CLI is `align-cli`. Both use the
+[AAF helper](docs/development.md#aaf-module) built beside them.
 
 ### Use the CLI
 

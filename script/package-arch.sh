@@ -18,12 +18,11 @@ for notice in LICENSE THIRD_PARTY_NOTICES.txt FFMPEG-LICENSE.txt; do
   test -s "$STAGE/$notice"
 done
 test -s "$STAGE/ThirdPartyLicenses/BUILD-MANIFEST.json"
-test -d "$STAGE/AAF-Licenses"
-test -s "$STAGE/align-aaf-runtime/base_library.zip"
+test -s "$STAGE/AAF-Licenses/PYAAF2-LICENSE.txt"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/input/payload" "$TMP/input/integration" "$TMP/build"
-tar -C "$STAGE" --exclude=./AAF-Sources -cf - . | tar -C "$TMP/input/payload" -xf -
+tar -C "$STAGE" -cf - . | tar -C "$TMP/input/payload" -xf -
 cp "$ROOT/Support/Linux/com.align.app.desktop" "$ROOT/Support/Linux/com.align.app.metainfo.xml" \
   "$ROOT/Support/Linux/com.align.app.project.xml" "$ROOT/Support/AppIcon.png" "$TMP/input/integration/"
 tar -C "$TMP/input" -czf "$TMP/build/align-payload.tar.gz" payload integration

@@ -560,7 +560,7 @@ impl Graph {
             !path
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("mxf")),
-            "MXF AAF export requires the bundled Python AAF module"
+            "AAF export of MXF picture is not supported"
         );
         ensure!(
             metadata

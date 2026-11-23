@@ -13,9 +13,7 @@ done
 for notice in LICENSE THIRD_PARTY_NOTICES.txt FFMPEG-LICENSE.txt; do
   test -s "$STAGE/$notice"
 done
-test -d "$STAGE/AAF-Licenses"
-# align-aaf.exe loads its Python runtime from this folder.
-test -d "$STAGE/align-aaf-runtime"
+test -s "$STAGE/AAF-Licenses/PYAAF2-LICENSE.txt"
 test -d "$STAGE/ThirdPartyLicenses"
 # Velopack needs the [win] directive only when packing on another OS.
 target=()
@@ -27,7 +25,6 @@ case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) ;; *) target=('[win]') ;; esac
   --icon "$ROOT/Support/Installer/Align.ico" \
   --splashImage "$ROOT/Support/Installer/Setup.gif" \
   --splashProgressColor '#0A84FF' --shortcuts StartMenuRoot \
-  --exclude '(^|[/\\])AAF-Sources([/\\]|$)' \
   --outputDir "$OUT/updates" --noPortable
 cp "$OUT/updates/com.align.app-win-Setup.exe" "$OUT/Align-$VERSION-Windows-x64-Setup.exe"
 (cd "$OUT" && sha256sum "Align-$VERSION-Windows-x64-Setup.exe" > "Align-$VERSION-Windows-x64-Setup.exe.sha256")
