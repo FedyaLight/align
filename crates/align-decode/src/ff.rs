@@ -302,7 +302,7 @@ fn parse_header(v: &serde_json::Value) -> Option<ProbeReport> {
             _ => {}
         }
     }
-    if audio_streams.is_empty() {
+    if audio_streams.is_empty() && !has_video {
         return None;
     }
     let duration_seconds = num(v.get("format")?.get("duration")?)
@@ -1354,9 +1354,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_audio_or_duration() {
-        let no_audio = br#"{"streams": [{"codec_type": "video", "disposition": {}}], "format": {"duration": "5"}}"#;
-        assert!(parse_ffprobe_json(no_audio).is_none());
+    fn rejects_missing_media_or_duration() {
+        let no_media = br#"{"streams": [{"codec_type": "video", "disposition": {"attached_pic": 1}}], "format": {"duration": "5"}}"#;
+        assert!(parse_ffprobe_json(no_media).is_none());
         let no_dur = br#"{"streams": [{"codec_type": "audio", "sample_rate": "48000", "channels": 1}], "format": {}}"#;
         assert!(parse_ffprobe_json(no_dur).is_none());
     }

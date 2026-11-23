@@ -34,6 +34,7 @@ def main():
         ('preserve-editing', 'check-preserve-editing-smoke.py', ['--cli', cli, '--output', root / 'preserve-editing'], None),
         ('linked-aaf', 'check-aaf-smoke.py', [cli, smoke], 'release'),
         ('picture-aaf', 'check-aaf-picture-smoke.py', [cli, root / 'picture-aaf'], None),
+        ('opatom-aaf', 'check-aaf-opatom-smoke.py', [cli, root / 'opatom-aaf'], None),
         ('embedded-mono', 'check-aaf-embedded-smoke.py', [cli, root / 'embedded-mono'], None),
         ('embedded-stereo', 'check-aaf-embedded-smoke.py', [cli, root / 'embedded-stereo', '--channels', '2'], None),
         ('mixed-clocks', 'check-aaf-embedded-smoke.py', [cli, root / 'mixed-clocks', '--channels', '2', '--mixed-clocks'], None),

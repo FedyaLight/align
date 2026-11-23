@@ -132,6 +132,10 @@ impl<F: Read + Seek> MetadataReader<F> {
 pub struct Props(BTreeMap<u16, (u16, Vec<u8>)>);
 
 impl Props {
+    pub fn extend(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+
     pub fn load<F: Read + Seek>(file: &mut MetadataReader<F>, path: &Path) -> Result<Self> {
         let data = file.read_stream(&path.join("properties"), 16 << 20)?;
         let [order, _, low, high, ..] = data.as_slice() else {

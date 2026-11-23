@@ -124,9 +124,9 @@ to generate fixtures.
 CI also builds API documentation with `RUSTDOCFLAGS="-D warnings"` to catch
 broken Rust documentation links.
 
-The acceptance runner executes eight checks: general release behavior, basic
-editing preservation, linked AAF, picture AAF, embedded mono, embedded stereo,
-mixed edit rates, and saved-result/media lifetime. It retains per-check logs and
+The acceptance runner checks general release behavior, basic editing
+preservation, linked AAF, QuickTime and MXF OP-Atom picture links, embedded mono,
+embedded stereo, mixed edit rates, and saved-result/media lifetime. It retains per-check logs and
 a `verification.json` containing status and the tested CLI's SHA-256. It does not
 open desktop or editor applications.
 

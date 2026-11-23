@@ -603,9 +603,8 @@ fn audio_manifest_linking(
     })
 }
 
-/// Stream description for the AAF module's media link without FFmpeg:
-/// QuickTime/MP4 headers are read natively, and the AAF module parses MXF
-/// itself (it ignores the description for `.mxf`).
+/// QuickTime/MP4 metadata is collected here. For `.mxf` the AAF helper
+/// reads the OP-Atom header for the package UMIDs, tracks, and descriptor.
 fn picture_metadata(path: &Path) -> Option<serde_json::Value> {
     let is_mxf = path
         .extension()

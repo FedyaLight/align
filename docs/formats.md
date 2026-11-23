@@ -106,8 +106,12 @@ source sample boundaries and composition frame rates are kept distinct.
 
 Embedded video, compressed embedded audio, AAF effects, transitions, and retiming
 are unsupported. Unsupported structures fail explicitly. AAF export links
-QuickTime/MP4 picture and PCM audio. It reads QuickTime picture metadata
-natively. MXF picture export and embedded essence export are unsupported.
+QuickTime/MP4 picture, PCM audio, and single-track, clip-wrapped VC-3
+(DNxHD/DNxHR) picture in MXF OP-Atom. The MXF link keeps the original file,
+its package identifiers, and source timecode. DaVinci Resolve Studio 21.1
+was verified with DNxHD 36 and DNxHR LB/HQX. Premiere Pro 27.0 left the
+tested DNxHR LB OP-Atom media offline. MXF OP1a, other MXF essence
+mappings, and embedded essence export are unsupported.
 
 ## Synchronization and drift
 

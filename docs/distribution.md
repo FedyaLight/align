@@ -129,5 +129,6 @@ or a Python runtime. The source archive includes the Rust helper and the
 dictionary embedded in it. The pyaaf2 notice for that dictionary is under
 `AAF-Licenses`.
 
-The native writer supports linked QuickTime picture and PCM audio. AAF export
-with MXF picture is not supported.
+The native writer links QuickTime picture, PCM audio, and clip-wrapped VC-3
+picture in MXF OP-Atom. See [AAF details](formats.md#aaf-details) for editor
+compatibility.

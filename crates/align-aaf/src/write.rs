@@ -1,3 +1,5 @@
+mod mxf;
+
 use crate::{Clock, Rate, absolute, file_url, integer, read::Kind, staged, storage::*};
 use anyhow::{Context, Result, ensure};
 use cfb::CompoundFile;
@@ -6,7 +8,7 @@ use num_traits::{ToPrimitive, Zero};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{self, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -407,10 +409,11 @@ struct SourceTrack {
     channel: Option<u32>,
 }
 
+#[derive(Clone)]
 struct Link {
     master: MobId,
     tracks: Vec<SourceTrack>,
-    tape: usize,
+    tape: Option<usize>,
 }
 
 struct Mob {
@@ -420,6 +423,8 @@ struct Mob {
 
 struct Graph {
     mobs: Vec<Mob>,
+    mxf_links: HashMap<PathBuf, Link>,
+    mxf_ids: HashSet<MobId>,
     timestamp: Vec<u8>,
 }
 
@@ -522,7 +527,7 @@ impl Graph {
         Ok(Link {
             master,
             tracks,
-            tape,
+            tape: Some(tape),
         })
     }
 
@@ -550,18 +555,104 @@ impl Graph {
         )
     }
 
+    fn mxf(&mut self, path: &Path, code: Option<&Timecode>) -> Result<Link> {
+        if let Some(link) = self.mxf_links.get(path) {
+            return Ok(link.clone());
+        }
+        let mxf::Picture {
+            material,
+            file,
+            rate,
+            length,
+            timecode: mxf_code,
+            cdci,
+        } = mxf::read(path).with_context(|| format!("Link MXF picture {}", path.display()))?;
+        ensure!(
+            self.mxf_ids.insert(material) && self.mxf_ids.insert(file),
+            "Different MXF sources share a package UMID"
+        );
+        let name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .context("Invalid MXF picture name")?;
+        let picture_slot = |id, target, target_slot| {
+            slot(
+                id,
+                "",
+                &rate,
+                Some(1),
+                clip(Kind::Picture, length, target, target_slot, 0),
+            )
+        };
+
+        // Match Resolve's linked AAF graph. The material and file mobs reuse
+        // the OP-Atom package UMIDs; the tape mob describes source timecode.
+        let (tape_id, tape_slot) = if let Some(code) = mxf_code.as_ref().or(code) {
+            let tape_id = new_id();
+            let clock = slot(1, "Timecode", &rate, Some(1), timecode(length, code)?)?;
+            let mut tape = mob(
+                SOURCE_MOB,
+                tape_id,
+                name,
+                &self.timestamp,
+                vec![clock, picture_slot(2, [0; 32], 0)?],
+            )?;
+            tape.object(DESCRIPTOR, "EssenceDescription", Object::new(0x4a));
+            self.add(tape_id, tape);
+            (tape_id, 2)
+        } else {
+            ([0; 32], 0)
+        };
+        let mut desc = descriptor(0x28, &rate, length, &file_url(path)?)?;
+        desc.props.extend(cdci);
+        desc.props.set(
+            0x3004,
+            WEAK,
+            weak(3, uuid::uuid!("4b464141-000d-4d4f-060e-2b34010101ff")),
+        );
+        let mut source = mob(
+            SOURCE_MOB,
+            file,
+            name,
+            &self.timestamp,
+            vec![picture_slot(1, tape_id, tape_slot)?],
+        )?;
+        source.object(DESCRIPTOR, "EssenceDescription", desc);
+        let master = mob(
+            MASTER_MOB,
+            material,
+            name,
+            &self.timestamp,
+            vec![picture_slot(1, file, 1)?],
+        )?;
+        self.add(file, source);
+        self.add(material, master);
+        let link = Link {
+            master: material,
+            tracks: vec![SourceTrack {
+                kind: Kind::Picture,
+                rate,
+                length,
+                channel: None,
+            }],
+            tape: None,
+        };
+        self.mxf_links.insert(path.to_owned(), link.clone());
+        Ok(link)
+    }
+
     fn camera(
         &mut self,
         path: &Path,
         metadata: &Metadata,
         code: Option<&Timecode>,
     ) -> Result<Link> {
-        ensure!(
-            !path
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("mxf")),
-            "AAF export of MXF picture is not supported"
-        );
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("mxf"))
+        {
+            return self.mxf(path, code);
+        }
         ensure!(
             metadata
                 .format
@@ -710,11 +801,11 @@ impl Graph {
                 Ok(entry.insert(link))
             }
             Entry::Occupied(entry) => {
-                if let Some(code) = code {
+                if let (Some(code), Some(tape)) = (code, entry.get().tape) {
                     // A clip that shares the file may supply its tape timecode
                     // after that file's first appearance.
                     let link = entry.get();
-                    let tape = &mut self.mobs[link.tape].object;
+                    let tape = &mut self.mobs[tape].object;
                     if tape
                         .children
                         .iter()
@@ -1089,6 +1180,8 @@ pub fn write(manifest: &Path, destination: &Path) -> Result<Value> {
         ident.save(&mut file.inner, &ident_path)?;
         let mut graph = Graph {
             mobs: Vec::new(),
+            mxf_links: HashMap::new(),
+            mxf_ids: HashSet::new(),
             timestamp: header.require(0x3b02)?.to_vec(),
         };
         for document in documents {
