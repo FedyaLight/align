@@ -261,6 +261,18 @@ jobs:
           mkdir -p installers
           PYTHON="$RUNNER_TEMP/dmg-venv/bin/python" ./script/create-macos-dmg.sh \
             target/macos-package/Align.app "installers/Align-$version-macOS-arm64.dmg"
+      - name: Verify AAF in the mounted macOS installer
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          image=(installers/Align-*-macOS-arm64.dmg)
+          mount_dir="$(mktemp -d)"
+          trap 'hdiutil detach "$mount_dir" >/dev/null; rmdir "$mount_dir"' EXIT
+          hdiutil attach "${image[0]}" -readonly -nobrowse -mountpoint "$mount_dir"
+          bundle="$mount_dir/Align.app"
+          codesign --verify --deep --strict "$bundle"
+          python script/check-aaf-sidecar.py "$bundle/Contents/MacOS/align-aaf" \
+            --cli "$bundle/Contents/MacOS/align-cli"
       - uses: actions/setup-dotnet@v5
         if: runner.os == 'Windows'
         with:
@@ -276,6 +288,22 @@ jobs:
           rm installers/updates/com.align.app-win-Setup.exe
           mv installers/updates/* installers/
           rmdir installers/updates
+      - name: Verify AAF after Windows Setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = (Get-ChildItem installers/Align-*-Windows-x64-Setup.exe).FullName
+          $destination = Join-Path $env:RUNNER_TEMP 'align-install'
+          $log = Join-Path $env:RUNNER_TEMP 'align-setup.log'
+          $setup = Start-Process -FilePath $installer -ArgumentList @(
+            '--silent', '--installto', ('"{0}"' -f $destination), '--log', ('"{0}"' -f $log)
+          ) -Wait -PassThru
+          if ($setup.ExitCode -ne 0) {
+            if (Test-Path $log) { Get-Content $log }
+            throw "Align Setup exited with code $($setup.ExitCode)"
+          }
+          python script/check-aaf-sidecar.py "$destination/current/align-aaf.exe" `
+            --cli "$destination/current/align-cli.exe"
       - name: Build Fedora package and installer (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -307,7 +335,7 @@ jobs:
     container: archlinux:latest
     steps:
       - name: Install packaging tools
-        run: pacman -Syu --noconfirm --needed base-devel gtk4 pkgconf
+        run: pacman -Syu --noconfirm --needed base-devel gtk4 pkgconf python
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v5
         with:
@@ -329,7 +357,7 @@ jobs:
         run: |
           pacman -U --noconfirm installers/*.pkg.tar.zst
           align-cli --help >/dev/null
-          /opt/align/align-aaf --version
+          python script/check-aaf-sidecar.py /opt/align/align-aaf --cli /usr/bin/align-cli
           pacman -Qkk align
       - uses: actions/upload-artifact@v4
         with:
@@ -343,6 +371,9 @@ jobs:
     runs-on: ubuntu-24.04
     container: fedora:latest
     steps:
+      - name: Install package test tools
+        run: dnf install -y python3 tar gzip
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v5
         with:
           name: installers-Linux
@@ -350,7 +381,7 @@ jobs:
         run: |
           dnf install -y ./Align-*-Fedora-x86_64.rpm
           align-cli --help >/dev/null
-          /opt/align/align-aaf --version
+          python3 script/check-aaf-sidecar.py /opt/align/align-aaf --cli /usr/bin/align-cli
           rpm -V align
           sha256sum -c ./*.sha256
 
