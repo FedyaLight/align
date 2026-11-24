@@ -351,24 +351,30 @@ impl Reader<'_> {
         let mut file = tempfile::Builder::new()
             .prefix(".aaf-audio-")
             .tempfile_in(dir)?;
-        // Match the original module's PCM WAV header and content-addressed names.
-        file.write_all(b"RIFF")?;
-        file.write_all(&riff_size.to_le_bytes())?;
-        file.write_all(b"WAVEfmt ")?;
-        file.write_all(&16u32.to_le_bytes())?;
-        file.write_all(&1u16.to_le_bytes())?;
-        file.write_all(&(channels as u16).to_le_bytes())?;
-        file.write_all(&rate.to_le_bytes())?;
-        file.write_all(&bytes_per_second.to_le_bytes())?;
-        file.write_all(&(alignment as u16).to_le_bytes())?;
-        file.write_all(&(bits as u16).to_le_bytes())?;
-        file.write_all(b"data")?;
-        file.write_all(&length.to_le_bytes())?;
-        io::copy(&mut stream, &mut file)?;
-        file.rewind()?;
-        let mut digest = Sha256::new();
-        io::copy(&mut file, &mut digest)?;
-        let destination = dir.join(format!("{:x}.wav", digest.finalize()));
+        // Match the original module's PCM WAV header and content-addressed
+        // names. The name hashes the bytes as they are written.
+        let digest = {
+            let mut output = Hashing {
+                inner: io::BufWriter::new(file.as_file_mut()),
+                digest: Sha256::new(),
+            };
+            output.write_all(b"RIFF")?;
+            output.write_all(&riff_size.to_le_bytes())?;
+            output.write_all(b"WAVEfmt ")?;
+            output.write_all(&16u32.to_le_bytes())?;
+            output.write_all(&1u16.to_le_bytes())?;
+            output.write_all(&(channels as u16).to_le_bytes())?;
+            output.write_all(&rate.to_le_bytes())?;
+            output.write_all(&bytes_per_second.to_le_bytes())?;
+            output.write_all(&(alignment as u16).to_le_bytes())?;
+            output.write_all(&(bits as u16).to_le_bytes())?;
+            output.write_all(b"data")?;
+            output.write_all(&length.to_le_bytes())?;
+            io::copy(&mut stream, &mut output)?;
+            output.flush()?;
+            std::mem::take(&mut output.digest).finalize()
+        };
+        let destination = dir.join(format!("{digest:x}.wav"));
         file.persist(&destination)?;
         absolute(&destination)?
             .into_os_string()
@@ -569,4 +575,22 @@ pub fn repair(manifest: &Path, source: &Path, destination: &Path) -> Result<Valu
         Ok(())
     })?;
     Ok(json!({"version": 1, "path": path, "replacements": changed}))
+}
+
+/// Writes through to `inner` and hashes exactly the bytes it accepted.
+struct Hashing<W> {
+    inner: W,
+    digest: Sha256,
+}
+
+impl<W: Write> Write for Hashing<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.digest.update(&buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }

@@ -459,6 +459,9 @@ struct Graph {
     named_subclips: HashMap<(MobId, String), MobId>,
     mxf_links: HashMap<PathBuf, Link>,
     mxf_ids: HashSet<MobId>,
+    /// Each edit of a stem gets its own media link, as the reference writer
+    /// makes them, but the stem's header is read and checked once.
+    wave_summaries: HashMap<(PathBuf, i32, i64), Vec<u8>>,
     timestamp: Vec<u8>,
 }
 
@@ -566,7 +569,15 @@ impl Graph {
     }
 
     fn wave(&mut self, path: &Path, rate: i32, frames: i64) -> Result<Link> {
-        let summary = wave_summary(path, rate, frames)?;
+        let key = (path.to_owned(), rate, frames);
+        let summary = match self.wave_summaries.get(&key) {
+            Some(summary) => summary.clone(),
+            None => {
+                let summary = wave_summary(path, rate, frames)?;
+                self.wave_summaries.insert(key, summary.clone());
+                summary
+            }
+        };
         let rate = integer(i64::from(rate));
         let mut desc = descriptor(0x2c, &rate, frames, &file_url(path)?)?;
         desc.props.data(0x3801, summary);
@@ -1265,6 +1276,7 @@ pub fn write(manifest: &Path, destination: &Path) -> Result<Value> {
             named_subclips: HashMap::new(),
             mxf_links: HashMap::new(),
             mxf_ids: HashSet::new(),
+            wave_summaries: HashMap::new(),
             timestamp: header.require(0x3b02)?.to_vec(),
         };
         for document in documents {

@@ -103,30 +103,49 @@ const PROBED_LIMIT: usize = 4096;
 /// asks again only once the file changes.
 fn probe_json(path: &Path) -> Result<Vec<u8>, DecodeError> {
     let revision = media_revision(path);
-    let lock = || {
-        PROBED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    };
-    if let Some(revision) = &revision
-        && let Some((cached, json)) = lock().get(path)
-        && cached == revision
+    if let Some(json) = revision
+        .as_deref()
+        .and_then(|revision| probed_json(path, revision))
     {
-        return Ok(json.clone());
+        return Ok(json);
     }
     let json = run_probe(path)?;
-    // A file that changed while ffprobe read it may have been read in
-    // either state; its header is not kept.
+    remember_probe_json(path, revision, &json);
+    Ok(json)
+}
+
+fn probed() -> std::sync::MutexGuard<'static, ProbedHeaders> {
+    PROBED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn probed_json(path: &Path, revision: &str) -> Option<Vec<u8>> {
+    probed()
+        .get(path)
+        .filter(|(cached, _)| cached == revision)
+        .map(|(_, json)| json.clone())
+}
+
+/// The header this run already read for the file as it is now.
+pub(crate) fn cached_probe_json(path: &Path) -> Option<Vec<u8>> {
+    probed_json(path, &media_revision(path)?)
+}
+
+/// Keeps a header read with the same ffprobe arguments, so later stages
+/// do not ask again. `revision` is the file's revision from before the
+/// read: a file that changed while ffprobe read it may have been read in
+/// either state, and its header is not kept.
+pub(crate) fn remember_probe_json(path: &Path, revision: Option<String>, json: &[u8]) {
     if let Some(revision) =
         revision.filter(|revision| media_revision(path).as_ref() == Some(revision))
     {
-        let mut probed = lock();
+        let mut probed = probed();
         if probed.len() >= PROBED_LIMIT {
             probed.clear();
         }
-        probed.insert(path.to_path_buf(), (revision, json.clone()));
+        probed.insert(path.to_path_buf(), (revision, json.to_vec()));
     }
-    Ok(json)
 }
 
 fn run_probe(path: &Path) -> Result<Vec<u8>, DecodeError> {
@@ -451,7 +470,7 @@ fn header_frame_duration(header: &FfVideoStream) -> Option<align_core::MediaTime
     align_core::canonical_frame_duration(header.avg_fps?, None)
 }
 
-fn media_revision(path: &Path) -> Option<String> {
+pub(crate) fn media_revision(path: &Path) -> Option<String> {
     align_core::cache::media_revision(path).ok()
 }
 

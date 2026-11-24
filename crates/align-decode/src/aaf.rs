@@ -788,30 +788,41 @@ pub fn timeline_manifest_with_frame_rate(
             metadata.insert(item.clip.url.clone(), value);
         }
         if !metadata.contains_key(&item.clip.url) {
-            let probe = crate::ff::ffprobe_bin()
-                .ok_or_else(|| fail("AAF picture export requires ffprobe"))?;
-            let mut output = tempfile::tempfile()?;
-            let mut child = crate::process::command(probe)
-                .args([
-                    "-v",
-                    "error",
-                    "-show_format",
-                    "-show_streams",
-                    "-of",
-                    "json",
-                ])
-                .arg(&item.clip.url)
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(output.try_clone()?))
-                .stderr(Stdio::inherit())
-                .spawn()?;
-            let status = crate::process::wait_cancellable(&mut child, cancel)?;
-            if !status.success() {
-                return Err(fail("AAF picture media inspection failed"));
-            }
-            use std::io::{Seek, SeekFrom};
-            output.seek(SeekFrom::Start(0))?;
-            let value: serde_json::Value = serde_json::from_reader(output)
+            // Inspection usually read this header already.
+            let header = match crate::ff::cached_probe_json(&item.clip.url) {
+                Some(header) => header,
+                None => {
+                    let probe = crate::ff::ffprobe_bin()
+                        .ok_or_else(|| fail("AAF picture export requires ffprobe"))?;
+                    let revision = crate::ff::media_revision(&item.clip.url);
+                    let mut output = tempfile::tempfile()?;
+                    let mut child = crate::process::command(probe)
+                        .args([
+                            "-v",
+                            "error",
+                            "-print_format",
+                            "json",
+                            "-show_format",
+                            "-show_streams",
+                        ])
+                        .arg(&item.clip.url)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::from(output.try_clone()?))
+                        .stderr(Stdio::inherit())
+                        .spawn()?;
+                    let status = crate::process::wait_cancellable(&mut child, cancel)?;
+                    if !status.success() {
+                        return Err(fail("AAF picture media inspection failed"));
+                    }
+                    use std::io::{Read, Seek, SeekFrom};
+                    output.seek(SeekFrom::Start(0))?;
+                    let mut header = Vec::new();
+                    output.read_to_end(&mut header)?;
+                    crate::ff::remember_probe_json(&item.clip.url, revision, &header);
+                    header
+                }
+            };
+            let value: serde_json::Value = serde_json::from_slice(&header)
                 .map_err(|error| AafError::Writer(error.to_string()))?;
             metadata.insert(item.clip.url.clone(), value);
         }
