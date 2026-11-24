@@ -7,6 +7,7 @@
 //! one-shot: an explicit choice for this run is not silently persisted.
 
 use serde::{Deserialize, Serialize};
+use std::io;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -34,6 +35,7 @@ pub fn config_file() -> PathBuf {
         .join("redirections.json")
 }
 
+/// The saved redirections. A missing or unreadable store reads as empty.
 pub fn load_from(path: &Path) -> Vec<PathRedirection> {
     std::fs::read(path)
         .ok()
@@ -41,13 +43,62 @@ pub fn load_from(path: &Path) -> Vec<PathRedirection> {
         .unwrap_or_default()
 }
 
-pub fn save_to(path: &Path, redirections: &[PathRedirection]) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+/// Applies `edit` to the saved redirections and returns the saved list.
+///
+/// The store stays locked from reading to replacing, so concurrent runs
+/// cannot drop each other's changes. It is replaced atomically, and only
+/// when `edit` changed the list.
+pub fn update(
+    path: &Path,
+    edit: impl FnOnce(&mut Vec<PathRedirection>),
+) -> io::Result<Vec<PathRedirection>> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut lock_name = path.file_name().unwrap_or_default().to_os_string();
+    lock_name.push(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(parent.join(lock_name))?;
+    lock.lock()?;
+    let saved = load_from(path);
+    let mut edited = saved.clone();
+    edit(&mut edited);
+    if edited != saved {
+        let bytes = serde_json::to_vec_pretty(&edited).map_err(io::Error::other)?;
+        crate::staged::write(path, &bytes)?;
     }
-    if let Ok(bytes) = serde_json::to_string_pretty(redirections) {
-        let _ = std::fs::write(path, bytes);
-    }
+    Ok(edited)
+}
+
+/// Saves the changes an editor made from `base` to `edited`, keeping what
+/// other runs saved meanwhile. An added redirection replaces a saved one
+/// with the same old prefix; the list is kept sorted by old prefix.
+pub fn save_edits(
+    path: &Path,
+    base: &[PathRedirection],
+    edited: &[PathRedirection],
+) -> io::Result<Vec<PathRedirection>> {
+    let removed: Vec<_> = base
+        .iter()
+        .filter(|entry| !edited.contains(entry))
+        .collect();
+    let added: Vec<_> = edited
+        .iter()
+        .filter(|entry| !base.contains(entry))
+        .collect();
+    update(path, |saved| {
+        saved.retain(|entry| {
+            !removed.contains(&entry)
+                && !added.iter().any(|new| new.from_prefix == entry.from_prefix)
+        });
+        saved.extend(added.into_iter().cloned());
+        saved.sort_by(|left, right| left.from_prefix.cmp(&right.from_prefix));
+    })
 }
 
 /// Rewrite `missing` through the longest matching prefix. Existence is
@@ -95,15 +146,59 @@ mod tests {
     }
 
     #[test]
-    fn store_roundtrips_through_json() {
-        let dir = std::env::temp_dir().join(format!("align-redirect-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("redirections.json");
-        assert!(load_from(&path).is_empty());
+    fn store_is_written_only_when_an_update_changes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Align").join("redirections.json");
+        assert!(update(&path, |_| {}).unwrap().is_empty());
+        assert!(!path.exists(), "an unchanged list is not written");
+
         let redirections = vec![PathRedirection::new("/old", PathBuf::from("/new"))];
-        save_to(&path, &redirections);
+        let added = redirections.clone();
+        assert_eq!(
+            update(&path, |saved| saved.extend(added)).unwrap(),
+            redirections
+        );
         assert_eq!(load_from(&path), redirections);
-        let _ = std::fs::remove_dir_all(&dir);
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        update(&path, |_| {}).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+
+    #[test]
+    fn concurrent_updates_keep_every_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("redirections.json");
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let path = &path;
+                scope.spawn(move || {
+                    let entry = PathRedirection::new(&format!("/old/{index}"), "/new".into());
+                    update(path, |saved| saved.push(entry)).unwrap();
+                });
+            }
+        });
+        assert_eq!(load_from(&path).len(), 8);
+    }
+
+    #[test]
+    fn saving_edits_keeps_redirections_saved_by_another_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("redirections.json");
+        let entry = |from: &str, to: &str| PathRedirection::new(from, PathBuf::from(to));
+        let base = update(&path, |saved| saved.push(entry("/a", "/new/a"))).unwrap();
+        // Another run adds /b while the editor removes /a and moves /c.
+        update(&path, |saved| {
+            saved.push(entry("/b", "/new/b"));
+            saved.push(entry("/c", "/old/c"));
+        })
+        .unwrap();
+        let edited = vec![entry("/c", "/new/c")];
+        let saved = save_edits(&path, &base, &edited).unwrap();
+        assert_eq!(saved, [entry("/b", "/new/b"), entry("/c", "/new/c")]);
+        assert_eq!(load_from(&path), saved);
     }
 
     #[test]

@@ -133,17 +133,14 @@ pub fn write_relinked_copy(
         return write_bundle(source, destination, &fixed, cancel);
     }
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent).map_err(|error| TimelineError::Write(error.to_string()))?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|error| TimelineError::Write(error.to_string()))?;
-    temporary
-        .write_all(&fixed)
-        .and_then(|()| temporary.as_file_mut().sync_all())
-        .map_err(|error| TimelineError::Write(error.to_string()))?;
-    temporary
-        .persist(destination)
-        .map_err(|error| TimelineError::Write(error.error.to_string()))?;
-    Ok(())
+    std::fs::create_dir_all(parent)
+        .and_then(|()| {
+            let staged = align_core::staged::StagedFile::new(destination)?;
+            std::fs::write(staged.path(), &fixed)?;
+            staged.sync()?;
+            staged.commit()
+        })
+        .map_err(|error| TimelineError::Write(error.to_string()))
 }
 
 /// Builds the bundle beside `destination`, then swaps it in. An existing

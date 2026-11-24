@@ -1,9 +1,15 @@
 //! Atomic file replacement.
 //!
-//! Every generated file (cache entries, rendered audio, timelines, remuxed
-//! media) is written to a temporary sibling and moved over its destination
-//! only once complete. Readers never observe a partial file, and a failed or
-//! cancelled write leaves any previous destination untouched.
+//! Generated files (cache entries, rendered audio, timelines, remuxed media,
+//! settings) are written to a temporary sibling and moved over their
+//! destination only once complete. Readers never observe a partial file, and
+//! a failed or cancelled write leaves any previous destination untouched.
+//!
+//! That is the guarantee every writer gets. Files a user keeps and cannot
+//! regenerate, such as fixed timelines and saved media copies, also call
+//! [`StagedFile::sync`] so their contents reach storage before they replace
+//! the destination. Project documents add their own ownership and locking
+//! rules in the desktop application.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -56,6 +62,15 @@ impl StagedFile {
     /// The file this one replaces on commit.
     pub fn destination(&self) -> &Path {
         &self.destination
+    }
+
+    /// Flushes the written contents to storage, so a crash after the commit
+    /// cannot leave the destination empty or partial.
+    pub fn sync(&self) -> io::Result<()> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(self.path())?
+            .sync_all()
     }
 
     /// Atomically replaces the destination. On Windows an existing file is

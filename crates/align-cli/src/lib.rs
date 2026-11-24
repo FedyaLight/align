@@ -172,10 +172,7 @@ type RelinkOptions = (
 
 fn relink_options(args: &RelinkArgs) -> Result<RelinkOptions, CliError> {
     let store = align_core::redirect::config_file();
-    if args.clear_redirects {
-        let _ = std::fs::remove_file(&store);
-    }
-    let mut redirects = align_core::redirect::load_from(&store);
+    let mut added = Vec::new();
     for flag in &args.redirect {
         let (old, new) =
             align_core::redirect::split_pair("--redirect", flag).map_err(CliError::Failure)?;
@@ -185,12 +182,29 @@ fn relink_options(args: &RelinkArgs) -> Result<RelinkOptions, CliError> {
                 new.display()
             )));
         }
-        let entry = align_core::redirect::PathRedirection::new(&old, new);
-        if !redirects.contains(&entry) {
-            redirects.push(entry);
-        }
+        added.push(align_core::redirect::PathRedirection::new(&old, new));
     }
-    align_core::redirect::save_to(&store, &redirects);
+    // Only an explicit change touches the saved list.
+    let redirects = if args.clear_redirects || !added.is_empty() {
+        align_core::redirect::update(&store, |saved| {
+            if args.clear_redirects {
+                saved.clear();
+            }
+            for entry in added {
+                if !saved.contains(&entry) {
+                    saved.push(entry);
+                }
+            }
+        })
+        .map_err(|error| {
+            CliError::Failure(format!(
+                "Could not save redirections to {}: {error}.",
+                store.display()
+            ))
+        })?
+    } else {
+        align_core::redirect::load_from(&store)
+    };
     let mut manual = Vec::new();
     for flag in &args.relink {
         let (name, path) =

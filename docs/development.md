@@ -89,9 +89,12 @@ extracted AAF audio across the temporary-to-saved boundary. Desktop workers
 report indexed results and use cancellation flags; generation checks reject
 stale UI updates.
 
-Every generated file is written through `align_core::staged`: a temporary
+Generated files are written through `align_core::staged`: a temporary
 sibling replaces the destination only once complete, so readers never see a
-partial file and a failed write keeps the previous one. Helper processes
+partial file and a failed write keeps the previous one. Files the user keeps,
+such as fixed timelines and saved AAF media, are also flushed to storage
+before they replace the destination. Project documents use the same pattern
+with their own ownership checks and autosave lock. Helper processes
 (FFmpeg, the AAF module) start through `align_decode::process`, which hides
 console windows on Windows and stops them on cancellation.
 

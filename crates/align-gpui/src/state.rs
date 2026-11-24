@@ -426,6 +426,9 @@ pub struct AppData {
     /// Path Fixer state. Saved prefix redirections load once when the app
     /// starts; exact file choices are session-local and survive re-syncs.
     pub redirects: Vec<align_core::redirect::PathRedirection>,
+    /// The saved list `redirects` was edited from, so saving applies only
+    /// this window's changes to what other runs may have saved since.
+    saved_redirects: Vec<align_core::redirect::PathRedirection>,
     pub manual_relinks: Vec<(String, PathBuf)>,
     pub omit_extensions: Vec<String>,
     pub prefer_proxies: bool,
@@ -505,6 +508,7 @@ impl Default for AppData {
             folder_inputs: HashSet::new(),
             timeline_choices: HashMap::new(),
             redirects: Vec::new(),
+            saved_redirects: Vec::new(),
             manual_relinks: Vec::new(),
             omit_extensions: Vec::new(),
             prefer_proxies: false,
@@ -529,8 +533,10 @@ impl Default for AppData {
 
 impl AppData {
     pub fn new() -> Self {
+        let redirects = align_core::redirect::load_from(&align_core::redirect::config_file());
         let mut data = Self {
-            redirects: align_core::redirect::load_from(&align_core::redirect::config_file()),
+            saved_redirects: redirects.clone(),
+            redirects,
             saved_export_settings: ExportSettings::load_saved(),
             ..Default::default()
         };
@@ -983,12 +989,14 @@ impl AppData {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let generation = self.generation.wrapping_add(1);
         let appearance = self.appearance;
-        let redirects = self.redirects.clone();
+        let redirects = std::mem::take(&mut self.redirects);
+        let saved_redirects = std::mem::take(&mut self.saved_redirects);
         let saved_export_settings = self.saved_export_settings.take();
         *self = Self {
             generation,
             appearance,
             redirects,
+            saved_redirects,
             saved_export_settings,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ..Default::default()
@@ -2233,8 +2241,25 @@ impl AppData {
         self.redirects.remove(index);
     }
 
-    pub fn save_path_redirections(&self) {
-        align_core::redirect::save_to(&align_core::redirect::config_file(), &self.redirects);
+    /// Saves the Path Fixer's additions and removals. Redirections another
+    /// run saved meanwhile are kept, and nothing is written without a change.
+    pub fn save_path_redirections(&mut self) {
+        if self.redirects == self.saved_redirects {
+            return;
+        }
+        let store = align_core::redirect::config_file();
+        match align_core::redirect::save_edits(&store, &self.saved_redirects, &self.redirects) {
+            Ok(saved) => {
+                self.saved_redirects.clone_from(&saved);
+                self.redirects = saved;
+            }
+            Err(error) => {
+                self.error = Some(format!(
+                    "Could not save redirections to {}: {error}",
+                    store.display()
+                ));
+            }
+        }
     }
 
     /// Media represented by the current session/result, for project-only
@@ -2266,6 +2291,7 @@ impl AppData {
 
     pub fn discard_path_redirection_edits(&mut self) {
         self.redirects = align_core::redirect::load_from(&align_core::redirect::config_file());
+        self.saved_redirects.clone_from(&self.redirects);
         self.path_fixer_dir = None;
     }
 

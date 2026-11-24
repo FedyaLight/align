@@ -155,30 +155,32 @@ fn copy_atomic(
     }
     let source_path = source;
     let mut source = std::fs::File::open(source)?;
-    let mut copy = tempfile::NamedTempFile::new_in(destination.parent().unwrap())?;
-    let mut buffer = vec![0; 1_048_576];
-    loop {
-        check_cancel(cancel)?;
-        let count = source.read(&mut buffer)?;
-        if count == 0 {
-            break;
+    let staged = align_core::staged::StagedFile::new(destination)?;
+    {
+        let mut copy = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(staged.path())?;
+        let mut buffer = vec![0; 1_048_576];
+        loop {
+            check_cancel(cancel)?;
+            let count = source.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            copy.write_all(&buffer[..count])?;
         }
-        copy.write_all(&buffer[..count])?;
+        copy.sync_all()?;
     }
-    copy.as_file().sync_all()?;
     check_cancel(cancel)?;
     if !protect_existing {
-        return copy
-            .persist(destination)
-            .map(drop)
-            .map_err(|error| error.error);
+        return staged.commit();
     }
-    match copy.persist_noclobber(destination) {
-        Ok(_) => Ok(()),
-        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+    match staged.commit_new() {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             reuse_retained_media(source_path, destination, cancel)
         }
-        Err(error) => Err(error.error),
+        result => result,
     }
 }
 
