@@ -17,6 +17,10 @@ pub(crate) struct ProjectSession {
     sequences: HashMap<usize, SequenceDefaults>,
     tracks: HashMap<usize, TrackOverrides>,
     constraints: HashMap<usize, Vec<SyncConstraint>>,
+    /// Clips each sequence places by camera clock. Projects without it,
+    /// like new ones, place none.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    camera_clock: HashMap<usize, BTreeSet<ClipId>>,
     manual_relinks: Vec<(String, PathBuf)>,
     omit_extensions: Vec<String>,
     prefer_proxies: bool,
@@ -96,6 +100,11 @@ impl AppData {
                         constraint.relink_clip(&clip.id, &next_id);
                     }
                 }
+                if let Some(chosen) = self.camera_clock_choices.get_mut(&sequence)
+                    && chosen.remove(&clip.id)
+                {
+                    chosen.insert(next_id.clone());
+                }
                 if let Some(tracks) = self.track_overrides.get_mut(&sequence) {
                     tracks.search.relink_clip(&clip.id, &next_id);
                     tracks.audio.relink_clip(&clip.id, &next_id);
@@ -118,6 +127,7 @@ impl AppData {
             sequences: self.sequence_settings.clone(),
             tracks: self.track_overrides.clone(),
             constraints: self.sequence_constraints.clone(),
+            camera_clock: self.camera_clock_choices.clone(),
             manual_relinks: self.manual_relinks.clone(),
             omit_extensions: self.omit_extensions.clone(),
             prefer_proxies: self.prefer_proxies,
@@ -157,6 +167,7 @@ impl AppData {
         self.sequence_settings = session.sequences;
         self.track_overrides = session.tracks;
         self.sequence_constraints = session.constraints;
+        self.camera_clock_choices = session.camera_clock;
         self.manual_relinks = session.manual_relinks;
         self.omit_extensions = session.omit_extensions;
         self.prefer_proxies = session.prefer_proxies;

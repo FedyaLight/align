@@ -16,6 +16,8 @@ pub enum BarMatchState {
     Pending,
     Matched,
     Unmatched,
+    /// Unmatched, placed by its camera's clock.
+    CameraClock,
 }
 
 #[derive(Clone, Debug)]
@@ -30,6 +32,8 @@ pub struct BarVisual {
     pub duration: f64,
     pub confidence: f64,
     pub match_state: BarMatchState,
+    /// For a clip placed by camera clock: the mark export writes with it.
+    pub camera_clock: Option<align_core::camera_clock::CameraClockMark>,
 }
 
 #[derive(Clone, Debug)]
@@ -174,6 +178,7 @@ pub fn provisional_bars(
                 } else {
                     BarMatchState::Pending
                 },
+                camera_clock: None,
             });
         }
         cursor += span + 1.0;
@@ -181,12 +186,19 @@ pub fn provisional_bars(
     out
 }
 
-/// Final bars from the same assembled timeline used by every exporter.
-/// This keeps timestamp/timecode placement, gaps and overlaps identical in
-/// the UI and the NLE output.
-pub fn final_bars(result: &align_core::SyncResult) -> FinalTimeline {
+/// Final bars from the same assembled timeline used by every exporter, with
+/// the camera-clock estimates export applies. This keeps timestamp/timecode
+/// placement, gaps and overlaps identical in the UI and the NLE output.
+pub fn final_bars(
+    result: &align_core::SyncResult,
+    camera_clock: &[align_core::camera_clock::CameraClockEstimate],
+) -> FinalTimeline {
     let unmatched: HashSet<ClipId> = result.unmatched.iter().cloned().collect();
-    let Ok(timeline) = ExportTimeline::from_result(result, true) else {
+    let options = align_core::export_model::ExportAssemblyOptions {
+        camera_clock: camera_clock.to_vec(),
+        ..Default::default()
+    };
+    let Ok(timeline) = ExportTimeline::from_result_with_options(result, options) else {
         return FinalTimeline {
             bars: Vec::new(),
             states: Vec::new(),
@@ -209,9 +221,12 @@ pub fn final_bars(result: &align_core::SyncResult) -> FinalTimeline {
             confidence: item.confidence,
             match_state: if item.matched {
                 BarMatchState::Matched
+            } else if item.camera_clock.is_some() {
+                BarMatchState::CameraClock
             } else {
                 BarMatchState::Unmatched
             },
+            camera_clock: item.camera_clock.clone(),
         })
         .collect();
     let states = preview
@@ -253,6 +268,11 @@ pub fn layout_bars(
             .iter()
             .map(|b| {
                 TimelineTrackRequest::new(b.id.clone(), b.source_key.clone(), b.start, b.duration)
+                    .assembled_at(
+                        b.camera_clock
+                            .as_ref()
+                            .and_then(|mark| mark.assembled_start),
+                    )
             })
             .collect();
         let assignments = allocate(&requests);
@@ -516,6 +536,7 @@ mod tests {
                 duration: 10.0,
                 confidence: 1.0,
                 match_state: BarMatchState::Matched,
+                camera_clock: None,
             },
             BarVisual {
                 id: "b".to_string(),
@@ -528,6 +549,7 @@ mod tests {
                 duration: 10.0,
                 confidence: 1.0,
                 match_state: BarMatchState::Matched,
+                camera_clock: None,
             },
         ];
         let lanes = layout_bars(bars, &HashMap::new());
@@ -549,6 +571,7 @@ mod tests {
             duration,
             confidence: 1.0,
             match_state: state,
+            camera_clock: None,
         };
         let lanes = layout_bars(
             vec![
@@ -666,7 +689,7 @@ mod tests {
         };
         let order =
             |bars: &[BarVisual]| bars.iter().map(|b| b.clip_id.0.clone()).collect::<Vec<_>>();
-        let automatic = final_bars(&result);
+        let automatic = final_bars(&result, &[]);
         assert_eq!(order(&automatic.bars), vec!["b", "c", "a"]);
         let starts: HashMap<_, _> = automatic
             .bars
@@ -691,7 +714,7 @@ mod tests {
             },
             ..result
         };
-        assert_eq!(order(&final_bars(&timed).bars), vec!["a", "c", "b"]);
+        assert_eq!(order(&final_bars(&timed, &[]).bars), vec!["a", "c", "b"]);
     }
 
     #[test]
@@ -708,6 +731,7 @@ mod tests {
             duration,
             confidence: 1.0,
             match_state: BarMatchState::Matched,
+            camera_clock: None,
         };
         let bars = vec![
             mk("a", 10.0, 2050.0),
@@ -768,6 +792,7 @@ mod tests {
             duration,
             confidence: 1.0,
             match_state: BarMatchState::Matched,
+            camera_clock: None,
         };
         let bars = vec![mk("a", 0.0, 10.0), mk("b", 5.0, 10.0)];
         let geometry = bar_row_geometry(&bars, 10.0);

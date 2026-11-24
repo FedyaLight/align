@@ -72,6 +72,8 @@ an existing edit.
   clips, including clips without a usable waveform match.
 - **Recording metadata:** recognize consecutive parts of a continuous recording
   and use recording timestamps to help resolve ambiguous audio matches.
+- **Camera clock:** on request, place an unmatched Sony clip approximately
+  between two clips of the same camera that sound synchronized.
 - **Existing edits:** preserve selected tracks' basic trims, duplicates,
   positions, and gaps while aligning other recordings.
 - **Clock drift:** render corrected audio from validated time mappings without

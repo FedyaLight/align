@@ -1744,6 +1744,7 @@ impl AlignApp {
                         name.clone()
                     }
                 }),
+                camera_clock: self.data.camera_clock_for_export(index),
             };
             let Ok(timeline) = ExportTimeline::from_result_with_options(result, options) else {
                 self.data.error = Some(format!("Sequence {} has nothing to export.", index + 1));
@@ -1917,6 +1918,18 @@ impl AlignApp {
             self.project_changed(cx);
             self.start_sync(cx);
         }
+    }
+
+    /// Apply or undo camera-clock placements of the visible sequence. The
+    /// timeline animates to the new layout; nothing is synchronized again.
+    fn set_camera_clock(&mut self, clips: Vec<ClipId>, apply: bool, cx: &mut Context<Self>) {
+        if self.data.has_active_job() {
+            return;
+        }
+        if self.update_timeline_layout(|data| data.set_camera_clock(&clips, apply)) {
+            self.project_changed(cx);
+        }
+        cx.notify();
     }
 
     fn set_lane_option<T>(

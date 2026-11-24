@@ -836,6 +836,7 @@ impl Library<'_> {
                         item.start,
                         item.timeline_duration,
                     )
+                    .assembled_at(item.assembled_start(MediaKind::Video))
                 })
                 .collect::<Vec<_>>(),
         );
@@ -852,6 +853,7 @@ impl Library<'_> {
                         item.start,
                         audio_duration(item),
                     )
+                    .assembled_at(item.assembled_start(MediaKind::Audio))
                 })
                 .collect::<Vec<_>>(),
         );

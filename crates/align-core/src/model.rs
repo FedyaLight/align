@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------- Clip IDs
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ClipId(pub String);
 
 impl ClipId {
@@ -553,6 +553,8 @@ pub struct TimelinePreviewItem {
     pub duration: f64,
     pub confidence: f64,
     pub matched: bool,
+    /// Set for an unmatched clip the camera clock placed.
+    pub camera_clock: Option<crate::camera_clock::CameraClockMark>,
 }
 
 /// Live match preview for progress callbacks.

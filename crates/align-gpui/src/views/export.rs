@@ -1624,6 +1624,29 @@ fn export_unmatched_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> 
         92.,
         menu,
     ));
+    let placed = data.camera_clock_export_count();
+    if placed > 0 {
+        let clips = if placed == 1 {
+            "1 clip".to_string()
+        } else {
+            format!("{placed} clips")
+        };
+        group = group.child(
+            div()
+                .px_1()
+                .pb_1()
+                .text_size(px(12.))
+                .text_color(rgb(theme.dim))
+                .child(if data.export.unmatched == P::Remove {
+                    format!("Remove also leaves out the {clips} placed by camera clock.")
+                } else {
+                    format!(
+                        "The {clips} placed by camera clock export named {} at their approximate place.",
+                        align_core::camera_clock::CAMERA_CLOCK_LABEL
+                    )
+                }),
+        );
+    }
     if reveals.unmatched_kept || reveals_closing.contains_key("export-unmatched-kept") {
         group = group.child(export_reveal(
             export_dependent_options(

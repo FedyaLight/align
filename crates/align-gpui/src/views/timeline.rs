@@ -286,10 +286,16 @@ pub(super) fn timeline_lanes(
                     .overflow_hidden()
                     .cursor_default();
                 if active {
-                    el = el.tooltip(hover_tip(
-                        format!("{} · {}", bar.url.display(), fmt_duration(bar.duration)),
-                        theme,
-                    ));
+                    let mut tip = format!("{} · {}", bar.url.display(), fmt_duration(bar.duration));
+                    if let Some(mark) = &bar.camera_clock {
+                        tip += &format!(
+                            "\nApproximately placed by camera clock between {} and {}, within about ±{:.1} s. Not synchronized.",
+                            data.clip_name(&mark.before),
+                            data.clip_name(&mark.after),
+                            mark.tolerance
+                        );
+                    }
+                    el = el.tooltip(hover_tip(tip, theme));
                 }
                 // Icon + name when wide enough.
                 // Bar label: icon pinned top-left, text pinned to the

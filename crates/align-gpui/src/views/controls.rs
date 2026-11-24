@@ -349,13 +349,15 @@ pub(super) fn ruler_ticks(duration: f64, px_per_sec: f64, origin: f64) -> Vec<f6
 }
 
 /// Clip fill tracks synchronization: pending while analysis runs, then
-/// matched or unmatched.
+/// matched or unmatched; an unmatched clip placed by its camera's clock has
+/// a color of its own.
 pub(super) fn clip_color(state: crate::lane::BarMatchState) -> u32 {
     use crate::lane::BarMatchState;
     match state {
         BarMatchState::Pending => 0x007AFF,
         BarMatchState::Matched => 0x34C759,
         BarMatchState::Unmatched => 0xFF9500,
+        BarMatchState::CameraClock => 0xAF52DE,
     }
 }
 

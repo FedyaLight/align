@@ -34,6 +34,26 @@ For an existing edit, enable Preserve basic editing on the tracks that should
 remain fixed. This preserves their trims, duplicates, positions, and gaps while
 other tracks align to them. See [format limits](formats.md) for unsupported edits.
 
+### Placing unmatched clips by camera clock
+
+Some unmatched clips can be placed approximately from their camera's own
+clock: the camera recorded its serial number and when each recording started,
+and two of its clips recorded before and after this one are synchronized by
+sound in the same group. When the result has such clips, a bar above the
+timeline offers them. **Review…** lists each clip with the two clips it is
+placed between and the expected accuracy, and the clips that cannot be placed
+with the reason. Place clips one at a time, from the clip's right-click menu,
+or with **Place All**; **Undo** or **Return to Unmatched** takes a clip back.
+
+A placed clip is purple on the timeline and stays unmatched: the place is an
+estimate, not a match. Export uses exactly what the timeline shows. The
+choice is kept per sequence in the project and applies again after reopening,
+another stage, or synchronizing again, wherever the clip still has an
+estimate. New projects and projects saved by earlier versions place nothing,
+and the choice is never part of the saved export defaults. See
+[camera clock placement](formats.md#camera-clock-placement) for which cameras
+qualify, how accurate the place is, and what each format writes.
+
 ### Save and reopen projects
 
 Align creates an autosave when synchronization starts and updates that same
@@ -232,6 +252,17 @@ align-cli export-json --unmatched order-only --disable-unmatched \
 - `--aaf-fps` sets the AAF composition rate, the timeline's by default. Picture
   is counted in composition frames, as editors read it, and every camera is a
   layer of one picture track; this option does not retime the footage.
+- `--camera-clock` places unmatched clips approximately by their camera's
+  clock, as described in [camera clock placement](formats.md#camera-clock-placement).
+  `--camera-clock-except CLIP` leaves one clip unmatched; give its file name,
+  its path when two folders share the name, or its clip ID, and repeat it for
+  more clips. Each placement, exception, and reason for leaving a clip
+  unmatched is printed on stderr. Without `--camera-clock` nothing is placed.
+
+`sync --summary` lists the clips the camera clock can place, under
+`cameraClock`, with the reasons for the others, so you can review them before
+exporting. `export` and `export-json` compute the same placements from the
+same result and stage.
 
 Labels, roles, sequence names, gap removal, and trimming are listed in
 `align-cli export --help`. DaVinci Resolve ignores clip names and color labels

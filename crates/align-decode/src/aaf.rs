@@ -467,13 +467,86 @@ pub fn audio_manifest(
 /// The audio manifest, linking the sound of `cameras` without stems as it
 /// is: an item of one of them without prepared stems refers to the file's
 /// own channels.
+/// Lanes of clips in start order (`order` breaks ties), each clip joining
+/// the first lane, of a clip `joins` accepts, whose last clip has ended. A
+/// clip the camera clock moved is packed at its assembled start first, so
+/// every other clip keeps its lane in the ordinary assembly; then it takes
+/// that lane if free at its own start, else the first free lane, else a new
+/// last one.
+fn pack_lanes<T>(
+    mut clips: Vec<(T, Option<u64>)>,
+    span: impl Fn(&T) -> (u64, u64),
+    order: impl Fn(&T, &T) -> std::cmp::Ordering,
+    joins: impl Fn(&T, &T) -> bool,
+) -> Vec<Vec<T>> {
+    let at = |(clip, assembled): &(T, Option<u64>)| assembled.unwrap_or(span(clip).0);
+    clips.sort_by(|a, b| at(a).cmp(&at(b)).then_with(|| order(&a.0, &b.0)));
+    let mut assembled: Vec<Vec<(T, Option<u64>)>> = Vec::new();
+    for entry in clips {
+        let start = at(&entry);
+        let lane = assembled.iter().position(|lane| {
+            let last = lane.last().expect("lanes are never empty");
+            joins(&lane[0].0, &entry.0) && at(last) + span(&last.0).1 <= start
+        });
+        match lane {
+            Some(index) => assembled[index].push(entry),
+            None => assembled.push(vec![entry]),
+        }
+    }
+    let mut lanes: Vec<Vec<T>> = Vec::with_capacity(assembled.len());
+    let mut moved = Vec::new();
+    for (index, lane) in assembled.into_iter().enumerate() {
+        let mut kept = Vec::with_capacity(lane.len());
+        for (clip, assembled) in lane {
+            match assembled {
+                Some(_) => moved.push((index, clip)),
+                None => kept.push(clip),
+            }
+        }
+        lanes.push(kept);
+    }
+    moved.sort_by(|a, b| {
+        span(&a.1)
+            .0
+            .cmp(&span(&b.1).0)
+            .then_with(|| order(&a.1, &b.1))
+    });
+    for (lane, clip) in moved {
+        let (start, length) = span(&clip);
+        let free = |lane: &Vec<T>| {
+            lane.first().is_none_or(|first| joins(first, &clip))
+                && lane.iter().all(|other| {
+                    let (other_start, other_length) = span(other);
+                    other_start + other_length <= start || start + length <= other_start
+                })
+        };
+        let index = if free(&lanes[lane]) {
+            lane
+        } else if let Some(index) = lanes.iter().position(free) {
+            index
+        } else {
+            lanes.push(Vec::new());
+            lanes.len() - 1
+        };
+        let lane = &mut lanes[index];
+        let at = lane.partition_point(|other| {
+            span(other).0 < start
+                || (span(other).0 == start && order(other, &clip) != std::cmp::Ordering::Greater)
+        });
+        lane.insert(at, clip);
+    }
+    lanes.retain(|lane| !lane.is_empty());
+    lanes
+}
+
 fn audio_manifest_linking(
     timeline: &align_core::export::ExportTimeline,
     cameras: &std::collections::HashSet<PathBuf>,
 ) -> Result<AudioManifest, AafError> {
     use std::collections::BTreeMap;
     let fail = |text: &str| AafError::Writer(text.to_owned());
-    let mut groups: BTreeMap<(String, u32, usize), Vec<AudioClip>> = BTreeMap::new();
+    type Placed = (AudioClip, Option<u64>);
+    let mut groups: BTreeMap<(String, u32, usize), Vec<Placed>> = BTreeMap::new();
     for island in &timeline.islands {
         for item in &island.clips {
             if item.clip.video.is_some()
@@ -507,6 +580,10 @@ fn audio_manifest_linking(
                 Ok(value.round() as u64)
             };
             let start = samples(item.timeline_start(align_core::MediaKind::Audio))?;
+            let assembled = item
+                .assembled_start(align_core::MediaKind::Audio)
+                .map(samples)
+                .transpose()?;
             let length = samples(item.precision_source_duration())?;
             let (source_in, frames) = if direct {
                 (
@@ -561,37 +638,28 @@ fn audio_manifest_linking(
                 groups
                     .entry((source.clone(), rate as u32, channel))
                     .or_default()
-                    .push(clip);
+                    .push((clip, assembled));
             }
         }
     }
     let mut tracks = Vec::new();
-    for ((source, sample_rate, channel), mut clips) in groups {
-        clips.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.path.cmp(&b.path)));
-        let mut lanes: Vec<AudioTrack> = Vec::new();
-        for clip in clips {
-            let lane = lanes.iter().position(|track| {
-                track
-                    .clips
-                    .last()
-                    .is_none_or(|last| last.start + last.length <= clip.start)
-            });
-            let index = lane.unwrap_or_else(|| {
-                lanes.push(AudioTrack {
-                    name: format!(
-                        "{} / channel {} / lane {}",
-                        source,
-                        channel + 1,
-                        lanes.len() + 1
-                    ),
+    for ((source, sample_rate, channel), clips) in groups {
+        let lanes = pack_lanes(
+            clips,
+            |clip| (clip.start, clip.length),
+            |a, b| a.path.cmp(&b.path),
+            |_, _| true,
+        );
+        tracks.extend(
+            lanes
+                .into_iter()
+                .enumerate()
+                .map(|(index, clips)| AudioTrack {
+                    name: format!("{} / channel {} / lane {}", source, channel + 1, index + 1),
                     sample_rate,
-                    clips: Vec::new(),
-                });
-                lanes.len() - 1
-            });
-            lanes[index].clips.push(clip);
-        }
-        tracks.extend(lanes);
+                    clips,
+                }),
+        );
     }
     if tracks.is_empty() {
         return Err(fail("No AAF audio tracks"));
@@ -733,32 +801,42 @@ pub fn timeline_manifest_with_frame_rate(
             json!({"start":start.round().max(0.0) as u64,
                 "fps":(1.0 / clock.as_seconds()).round() as u64,"drop":tc.drop_frame})
         });
-        pictures.push(
+        let assembled = item
+            .assembled_start(align_core::MediaKind::Video)
+            .map(frame)
+            .transpose()?;
+        pictures.push((
             json!({"name":item.preferred_source_key(align_core::MediaKind::Video).unwrap_or("Video"),
             "edit_rate":{"numerator":clock.timescale,"denominator":clock.value},
             "clips":[{"path":item.clip.url,"start":start,"source_in":source_in,"length":length,
                 "timecode":timecode,"metadata":metadata[&item.clip.url]}]}),
-        );
+            assembled,
+        ));
     }
-    pictures.sort_by_key(|track| track["clips"][0]["start"].as_u64().unwrap());
-    let mut lanes: Vec<serde_json::Value> = Vec::new();
-    for mut track in pictures {
-        let start = track["clips"][0]["start"].as_u64().unwrap();
-        let lane = lanes.iter_mut().find(|lane| {
-            let last = lane["clips"].as_array().unwrap().last().unwrap();
-            lane["name"] == track["name"]
-                && lane["edit_rate"] == track["edit_rate"]
-                && last["start"].as_u64().unwrap() + last["length"].as_u64().unwrap() <= start
-        });
-        if let Some(lane) = lane {
-            lane["clips"]
-                .as_array_mut()
-                .unwrap()
-                .push(track["clips"][0].take());
-        } else {
-            lanes.push(track);
-        }
-    }
+    let span = |track: &serde_json::Value| {
+        let clip = &track["clips"][0];
+        (
+            clip["start"].as_u64().unwrap(),
+            clip["length"].as_u64().unwrap(),
+        )
+    };
+    let lanes: Vec<serde_json::Value> = pack_lanes(
+        pictures,
+        span,
+        |_, _| std::cmp::Ordering::Equal,
+        |first, track| first["name"] == track["name"] && first["edit_rate"] == track["edit_rate"],
+    )
+    .into_iter()
+    .map(|mut lane| {
+        let clips: Vec<serde_json::Value> = lane
+            .iter_mut()
+            .map(|track| track["clips"][0].take())
+            .collect();
+        let mut track = lane.swap_remove(0);
+        track["clips"] = serde_json::Value::Array(clips);
+        track
+    })
+    .collect();
     // Linked camera sound shares its picture's media description.
     for clip in tracks.iter_mut().flat_map(|track| &mut track.clips) {
         if clip.channel.is_some() {
@@ -795,6 +873,47 @@ pub fn timeline_manifest_with_frame_rate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pictures of cameras A and B share lanes. Moving A's C3 by camera
+    /// clock into the time B0 plays must not move B0 off its lane.
+    #[test]
+    fn a_clip_moved_by_camera_clock_keeps_every_other_lane() {
+        let lanes = |moved: Option<(u64, u64)>| {
+            let mut clips = vec![
+                (("C1", 100), None),
+                (("C2", 400), None),
+                (("B0", 700), None),
+                (("C4", 900), None),
+                (("B1", 1_142), None),
+            ];
+            if let Some((start, assembled)) = moved {
+                clips.push((("C3", start), Some(assembled)));
+            } else {
+                clips.push((("C3", 961), None));
+            }
+            pack_lanes(
+                clips,
+                |&(_, start)| (start, 60),
+                |a, b| a.0.cmp(b.0),
+                |_, _| true,
+            )
+            .into_iter()
+            .map(|lane| lane.into_iter().map(|(name, _)| name).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+        };
+        let ordinary = lanes(None);
+        assert_eq!(ordinary, [vec!["C1", "C2", "B0", "C4", "C3", "B1"]]);
+        // Where its lane is taken, it opens a new last lane.
+        assert_eq!(
+            lanes(Some((690, 961))),
+            [vec!["C1", "C2", "B0", "C4", "B1"], vec!["C3"]]
+        );
+        // Where its lane is free, it stays on it.
+        assert_eq!(
+            lanes(Some((550, 961))),
+            [vec!["C1", "C2", "C3", "B0", "C4", "B1"]]
+        );
+    }
 
     #[test]
     fn picture_clock_and_separate_sound_survive_resolution() {

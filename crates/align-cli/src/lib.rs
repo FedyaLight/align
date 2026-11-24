@@ -109,6 +109,17 @@ struct ExportOptions {
     /// Placement policy for clips without a synchronization match.
     #[arg(long, value_enum, default_value_t = Unmatched::OrderTime)]
     unmatched: Unmatched,
+    /// Place unmatched clips approximately by their camera's clock: a camera
+    /// that records its serial number and start times (Sony), between two of
+    /// its clips that sound synchronized in one group. Placed clips are named
+    /// [CAMERA CLOCK] and stay unmatched for labels and --unmatched remove.
+    /// For an imported edit, only reports how its edits differ from the clock.
+    #[arg(long)]
+    camera_clock: bool,
+    /// With --camera-clock, leave this clip unmatched: its file name, path,
+    /// or clip ID. Repeat for more clips.
+    #[arg(long, value_name = "CLIP", requires = "camera_clock")]
+    camera_clock_except: Vec<String>,
     /// Place independent synchronization groups without overlaps.
     #[arg(long)]
     prevent_group_overlaps: bool,
@@ -642,13 +653,42 @@ fn sync_summary(result: &align_core::SyncResult) -> serde_json::Value {
             })
         })
         .collect();
-    json!({
+    let mut summary = json!({
         "sequence": result.project.imported_timeline.as_ref().map(|timeline| &timeline.name),
         "islands": islands,
         "unmatched": result.unmatched.iter().map(name).collect::<Vec<_>>(),
         "warnings": result.project.warnings,
         "maxAbsDriftPPM": result.matches.iter().map(|m| m.drift_ppm.abs()).reduce(f64::max),
-    })
+    });
+    let report = align_core::camera_clock::camera_clock(result, &[]);
+    if report != Default::default() {
+        let reason = |refusal: &align_core::camera_clock::CameraClockRefusal| {
+            refusal.describe(&|id| name(id))
+        };
+        let hints = align_core::camera_clock::imported_edit_hints(result, &report.estimates);
+        summary["cameraClock"] = json!({
+            "estimates": report.estimates.iter().map(|e| json!({
+                "clip": name(&e.clip_id),
+                "island": e.island,
+                "start": e.start,
+                "between": [name(&e.before), name(&e.after)],
+                "toleranceSeconds": e.tolerance,
+            })).collect::<Vec<_>>(),
+            "refusals": report.refusals.iter().map(|(id, refusal)| json!({
+                "clip": name(id),
+                "reason": reason(refusal),
+            })).collect::<Vec<_>>(),
+            "editHints": hints.iter().map(|hint| json!({
+                "clip": name(&hint.clip_id),
+                "edit": hint.edit_id,
+                "track": hint.track_label(),
+                "timelineStart": hint.timeline_start,
+                "cameraClockStart": hint.expected_start,
+                "toleranceSeconds": hint.tolerance,
+            })).collect::<Vec<_>>(),
+        });
+    }
+    summary
 }
 
 fn print_json(value: &impl serde::Serialize) -> Result<(), CliError> {
@@ -944,6 +984,9 @@ mod tests {
             "--media-bins",
             "--no-fcpxml-multicam",
             "--export-media",
+            "--camera-clock",
+            "--camera-clock-except",
+            "C0003.MP4",
             "--label-synced",
             "--label-unmatched",
             "--synced-symbol",
@@ -969,6 +1012,8 @@ mod tests {
                     no_fcpxml_timeline,
                     no_fcpxml_multicam,
                     export_media,
+                    camera_clock,
+                    camera_clock_except,
                     label_synced,
                     label_unmatched,
                     assign,
@@ -1012,6 +1057,20 @@ mod tests {
         assert!(!no_fcpxml_timeline);
         assert!(no_fcpxml_multicam);
         assert!(export_media);
+        assert!(camera_clock);
+        assert_eq!(camera_clock_except, ["C0003.MP4"]);
+        // An exception without the placement it excepts from is a usage error.
+        let error = Cli::try_parse_from([
+            "align-cli",
+            "export-json",
+            "--camera-clock-except",
+            "C0003.MP4",
+            "result.json",
+            "out",
+        ])
+        .err()
+        .expect("exception without --camera-clock");
+        assert_eq!(error.exit_code(), 2);
         assert!(label_synced);
         assert!(label_unmatched);
         assert_eq!(assign.synced_symbol.as_deref(), Some("✓"));

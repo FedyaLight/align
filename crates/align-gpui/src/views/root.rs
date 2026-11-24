@@ -6,7 +6,8 @@ use super::export::{ExportPanel, export_sidebar, export_sidebar_action, path_fix
 use super::menu_sidebar::app_menu_sidebar;
 use super::menus::{context_menu, menu_dismiss_layer, sequence_picker_panel};
 use super::operation::{
-    operation_bar, sequence_results_panel, stage_settings_panel, warning_banner, warning_details,
+    camera_clock_banner, camera_clock_panel, operation_bar, sequence_results_panel,
+    stage_settings_panel, warning_banner, warning_details,
 };
 use super::panels::{
     about_panel, agent_setup_panel, error_alert, feedback_notice, problem_report_panel,
@@ -45,6 +46,7 @@ impl Render for AlignApp {
             && !self.data.show_search_settings
             && !self.data.show_stage_settings
             && !self.data.show_sequence_results
+            && !self.data.show_camera_clock
             && !self.data.show_export;
         let mut root = div()
             .id("app-root")
@@ -138,6 +140,11 @@ impl Render for AlignApp {
                     cx.notify();
                     return;
                 }
+                if key == "escape" && this.data.show_camera_clock {
+                    this.data.show_camera_clock = false;
+                    cx.notify();
+                    return;
+                }
                 if this.data.show_export && this.export_inputs.any_focused(window, cx) {
                     return;
                 }
@@ -206,6 +213,11 @@ impl Render for AlignApp {
             if self.data.show_warning_details {
                 content = content.child(warning_details(&theme, &self.data));
             }
+        }
+        if !self.data.show_export
+            && let Some(banner) = camera_clock_banner(cx, &theme, &self.data)
+        {
+            content = content.child(banner);
         }
         if let Some(notice) = &self.projects.notice {
             content = content.child(
@@ -321,6 +333,13 @@ impl Render for AlignApp {
                 &theme,
                 "overlay-sequence-results",
                 sequence_results_panel(cx, &theme, &self.data),
+            ));
+        }
+        if modals_visible && self.data.show_camera_clock {
+            root = root.child(overlay(
+                &theme,
+                "overlay-camera-clock",
+                camera_clock_panel(cx, &theme, &self.data),
             ));
         }
         if modals_visible && self.data.show_search_settings {

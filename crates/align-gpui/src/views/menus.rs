@@ -167,6 +167,7 @@ pub(super) fn context_menu(
     if menu.stream_menu {
         return stream_menu_section(cx, theme, data, &menu, panel);
     }
+    panel = camera_clock_section(cx, theme, data, &menu.clip_id, panel);
     let options = data.correction_options_for(&menu.clip_id);
     if options.is_empty() {
         panel = panel.child(menu_header(theme, "No other alignments found".to_string()));
@@ -200,6 +201,69 @@ pub(super) fn context_menu(
         ));
     }
     panel
+}
+
+/// Camera-clock placement of one unmatched clip: apply or undo its
+/// estimate, or the reason it has none.
+fn camera_clock_section(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    data: &crate::state::AppData,
+    clip: &align_core::ClipId,
+    mut panel: Stateful<Div>,
+) -> Stateful<Div> {
+    let name = |id: &align_core::ClipId| data.clip_name(id);
+    if let Some(estimate) = data.camera_clock.estimate(clip) {
+        panel = panel.child(menu_header(
+            theme,
+            format!(
+                "Camera clock · between {} and {} · ±{:.1} s",
+                name(&estimate.before),
+                name(&estimate.after),
+                estimate.tolerance
+            ),
+        ));
+        let imported = data
+            .result
+            .as_ref()
+            .is_some_and(|result| result.project.imported_timeline.is_some());
+        if imported {
+            panel = panel.child(menu_note(theme, "Imported edits keep their placement."));
+        } else {
+            let applied = data.camera_clock_applied(clip);
+            let target = clip.clone();
+            panel = panel.child(menu_row(
+                cx,
+                theme,
+                "camera-clock-toggle",
+                if applied {
+                    "Return to Unmatched"
+                } else {
+                    "Place Approximately by Camera Clock"
+                },
+                false,
+                move |this, _, _, cx| {
+                    this.data.menu = None;
+                    this.set_camera_clock(vec![target.clone()], !applied, cx);
+                },
+            ));
+        }
+    } else if let Some(refusal) = data.camera_clock.refusal(clip) {
+        panel = panel.child(menu_header(theme, "Camera clock".to_string()));
+        panel = panel.child(menu_note(theme, refusal.describe(&name)));
+    }
+    panel
+}
+
+/// Dim wrapped text under a menu header.
+fn menu_note(theme: &Theme, text: impl Into<SharedString>) -> impl IntoElement {
+    div()
+        .flex_shrink_0()
+        .px_3()
+        .pb_1()
+        .text_xs()
+        .text_color(rgb(theme.dim))
+        .child(text.into())
 }
 
 pub(super) fn stream_menu_section(

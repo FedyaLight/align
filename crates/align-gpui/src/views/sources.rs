@@ -269,6 +269,15 @@ pub(super) fn file_list(
                 parts.push(format!("TC {tc}"));
             }
             parts.push(clip.state.status_text());
+            if let Some(id) = &clip.clip_id
+                && let Some(estimate) = data.camera_clock.estimate(id)
+            {
+                parts.push(if data.camera_clock_applied(id) {
+                    format!("≈ camera clock ±{:.1} s", estimate.tolerance)
+                } else {
+                    "camera clock available".to_string()
+                });
+            }
             parts.join(" · ")
         };
         let state_icon: Option<(&str, u32)> = match &clip.state {

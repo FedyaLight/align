@@ -551,3 +551,197 @@ fn manually_saved_project_can_be_resaved_after_json_reformatting() {
         SearchAccuracy::Deep
     );
 }
+
+/// A recorder and camera clips C1, C2 and C4 synchronized by sound. C3 is
+/// unmatched in the waveform stage; the timecode stage, selected, places it.
+fn camera_clock_shoot(root: &Path) -> SyncResult {
+    use align_core::{
+        AudioSummary, Clip, ClipId, ClipPlacement, MappingPoint, MatchEvidence, MatchSummary,
+        MediaKind, MediaTime, RecordingTimestampSource, SyncIsland, SyncProject, SyncStage,
+        SyncStageKind, TimeMap, VideoSummary,
+    };
+    const T0: i64 = 1_741_082_400;
+    let camera = |name: &str, offset: i64, duration: f64| Clip {
+        id: ClipId::new(name),
+        url: root.join(format!("{name}.MP4")),
+        kind: MediaKind::Video,
+        duration: MediaTime::seconds(duration),
+        audio: vec![AudioSummary {
+            sample_rate: 48_000.0,
+            channels: 2,
+            bit_depth: Some(16),
+            is_float: Some(false),
+            source_timecode: None,
+        }],
+        video: Some(VideoSummary {
+            width: 1920,
+            height: 1080,
+            frame_duration: Some(MediaTime::new(1, 25)),
+            source_timecode: None,
+            frame_rate_mode: None,
+        }),
+        recorded_at: Some(T0 + offset),
+        recorded_at_source: Some(RecordingTimestampSource::EmbeddedMetadata),
+        source_identifier: Some("device:Sony:ILME-FX3:4711".into()),
+        media_span: None,
+    };
+    let recorder = Clip {
+        id: ClipId::new("R"),
+        url: root.join("R.WAV"),
+        kind: MediaKind::Audio,
+        video: None,
+        recorded_at: None,
+        recorded_at_source: None,
+        source_identifier: None,
+        ..camera("R", 0, 1200.0)
+    };
+    let clips = vec![
+        recorder,
+        camera("C1", 0, 60.0),
+        camera("C2", 300, 60.0),
+        camera("C3", 600, 90.0),
+        camera("C4", 800, 60.0),
+    ];
+    let place = |name: &str, start: f64| {
+        let duration = clips.iter().find(|c| c.id.0 == name).unwrap().duration;
+        ClipPlacement {
+            clip_id: ClipId::new(name),
+            mapping: TimeMap {
+                points: vec![
+                    MappingPoint {
+                        source: MediaTime::seconds(0.0),
+                        island: MediaTime::seconds(start),
+                    },
+                    MappingPoint {
+                        source: duration,
+                        island: MediaTime::seconds(start + duration.as_seconds()),
+                    },
+                ],
+            },
+            confidence: 0.9,
+        }
+    };
+    let matched = |name: &str, evidence| MatchSummary {
+        left: ClipId::new("R"),
+        right: ClipId::new(name),
+        drift_ppm: 0.0,
+        offset: MediaTime::seconds(0.0),
+        confidence: 0.9,
+        anchors: 3,
+        covered: MediaTime::seconds(60.0),
+        residual: MediaTime::seconds(0.0),
+        evidence: Some(evidence),
+    };
+    let sound: Vec<_> = ["C1", "C2", "C4"]
+        .into_iter()
+        .map(|name| matched(name, MatchEvidence::Waveform))
+        .collect();
+    let mut placements = vec![
+        place("R", 0.0),
+        place("C1", 100.0),
+        place("C2", 400.0),
+        place("C4", 899.6),
+    ];
+    let waveform = SyncStage {
+        kind: SyncStageKind::Waveform,
+        islands: vec![SyncIsland {
+            id: 0,
+            placements: placements.clone(),
+        }],
+        unmatched: vec![ClipId::new("C3")],
+        matches: sound.clone(),
+    };
+    placements.push(place("C3", 700.0));
+    let mut with_timecode = sound;
+    with_timecode.push(matched("C3", MatchEvidence::Timecode));
+    let timecode = SyncStage {
+        kind: SyncStageKind::Timecode,
+        islands: vec![SyncIsland { id: 0, placements }],
+        unmatched: Vec::new(),
+        matches: with_timecode,
+    };
+    let mut result = SyncResult {
+        search_overrides: HashMap::new(),
+        stopped: false,
+        stages: vec![waveform, timecode],
+        selected_stage: None,
+        search_accuracy: Default::default(),
+        preserve_editing_tracks: Default::default(),
+        project: SyncProject {
+            clips,
+            warnings: Vec::new(),
+            imported_timeline: None,
+        },
+        islands: Vec::new(),
+        unmatched: Vec::new(),
+        matches: Vec::new(),
+        temporal_policy: Default::default(),
+    };
+    assert!(result.select_stage(1));
+    result
+}
+
+#[test]
+fn camera_clock_choices_follow_stage_changes_and_the_project() {
+    use crate::lane::BarMatchState;
+    let (_temp, root) = fixture();
+    let c3 = align_core::ClipId::new("C3");
+    let state = |data: &AppData| {
+        data.lanes
+            .iter()
+            .flat_map(|lane| &lane.clips)
+            .find(|bar| bar.clip_id == c3)
+            .map(|bar| (bar.match_state, bar.start))
+    };
+    let mut data = AppData::default();
+    data.apply_result(camera_clock_shoot(&root));
+    assert_eq!(state(&data).unwrap().0, BarMatchState::Matched);
+    assert!(!data.set_camera_clock(std::slice::from_ref(&c3), true));
+
+    // The waveform stage offers an estimate; nothing applies it unasked.
+    assert!(data.select_sync_stage(0));
+    assert_eq!(state(&data).unwrap().0, BarMatchState::Unmatched);
+    assert!(data.camera_clock_for_export(0).is_empty());
+    assert!(data.set_camera_clock(std::slice::from_ref(&c3), true));
+    let (placed, start) = state(&data).unwrap();
+    assert_eq!(placed, BarMatchState::CameraClock);
+    // Export applies the estimate the preview shows.
+    let exported = data.camera_clock_for_export(0);
+    assert_eq!(exported.len(), 1);
+    assert!((exported[0].start - start).abs() < 1e-6);
+
+    // Another stage synchronizes C3; returning restores the placement.
+    assert!(data.select_sync_stage(1));
+    assert_eq!(state(&data).unwrap().0, BarMatchState::Matched);
+    assert!(data.camera_clock_for_export(0).is_empty());
+    assert!(data.select_sync_stage(0));
+    assert_eq!(state(&data).unwrap().0, BarMatchState::CameraClock);
+
+    let writer = Writer::default();
+    let destination = Destination::autosave(&root.join("projects"));
+    let placements = Arc::new(Placements::from_run(
+        std::slice::from_ref(data.result.as_ref().unwrap()),
+        Revisions::new(),
+    ));
+    save(&writer, &destination, &data, Some(placements));
+    let reopened = restore(&destination.path);
+    assert_eq!(state(&reopened).unwrap().0, BarMatchState::CameraClock);
+
+    // A project saved before camera-clock placement opens without it.
+    let mut session = serde_json::to_value(data.project_session()).unwrap();
+    assert!(
+        session
+            .as_object_mut()
+            .unwrap()
+            .remove("cameraClock")
+            .is_some()
+    );
+    let mut older = AppData::default();
+    older.restore_project(
+        serde_json::from_value(session).unwrap(),
+        vec![data.result.clone().unwrap()],
+        Vec::new(),
+        false,
+    );
+    assert_eq!(state(&older).unwrap().0, BarMatchState::Unmatched);
+}

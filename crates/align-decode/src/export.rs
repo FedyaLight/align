@@ -1047,7 +1047,9 @@ fn source_content_tag(path: &Path, cancel: &AtomicBool) -> Result<String, Export
 
 /// Keep each complete camera file and replace its scratch audio with the
 /// first (uppermost) overlapping recorder clip. Shorter recorder clips are
-/// padded with silence instead of shortening the camera file.
+/// padded with silence instead of shortening the camera file. A clip the
+/// camera clock placed gets no file: its offset to the recorder is an
+/// estimate, which a new media file would present as a synchronization.
 fn media_file_plans(timeline: &ExportTimeline, directory: &Path) -> Vec<MediaFilePlan> {
     let combined = timeline.combined_island(1.0);
     let mut planned_video = HashSet::new();
@@ -1058,6 +1060,7 @@ fn media_file_plans(timeline: &ExportTimeline, directory: &Path) -> Vec<MediaFil
         .filter(|item| item.clip.video.is_some())
     {
         if video.is_retimed(align_core::MediaKind::Video)
+            || video.camera_clock.is_some()
             || !planned_video.insert(video.clip.id.0.clone())
         {
             continue;
@@ -1709,6 +1712,34 @@ mod tests {
         assert!((plan.video_duration - 10.0).abs() < 1e-9);
         assert!((plan.leading_silence - 2.0).abs() < 1e-9);
         assert!((plan.recorder_duration - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn media_plan_skips_clips_placed_by_the_camera_clock() {
+        let mut estimated = item("estimated", MediaKind::Video, 30.0, 10.0);
+        estimated.camera_clock = Some(align_core::camera_clock::CameraClockMark {
+            before: ClipId::new("camera"),
+            after: ClipId::new("camera"),
+            tolerance: 1.0,
+            assembled_start: None,
+        });
+        let clips = vec![
+            item("camera", MediaKind::Video, 0.0, 10.0),
+            estimated,
+            item("audio", MediaKind::Audio, 0.0, 60.0),
+        ];
+        let timeline = ExportTimeline::new(
+            vec![ExportIsland {
+                id: 0,
+                clips,
+                duration: 60.0,
+            }],
+            MediaTime::new(1, 25),
+            "test",
+        );
+        let plans = media_file_plans(&timeline, Path::new("/out"));
+        let videos: Vec<_> = plans.iter().map(|plan| plan.video_url.clone()).collect();
+        assert_eq!(videos, [PathBuf::from("/camera.mov")]);
     }
 
     #[test]

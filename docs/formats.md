@@ -126,6 +126,77 @@ new WAV files. It does not alter source recordings. This is clock correction,
 not a general-purpose creative time-stretch tool. See
 [drift correction](drift.md) for interpretation and export behavior.
 
+## Camera clock placement
+
+Placing unmatched clips by camera clock is off until it is applied, in the
+desktop app for each clip or with `--camera-clock`.
+
+**Which clips.** An unmatched clip qualifies when its file holds Sony
+NonRealTimeMeta metadata with the camera's serial number and recording time
+(`Device serialNo` and `CreationDate`), as Sony cameras write inside MP4 and
+MXF files. The separate `M01.XML` file beside a clip is not read. Some models
+write a placeholder serial number (0, 4294967295, or all F); their clips do
+not qualify, because two such cameras would look the same. Other cameras do
+not record a serial number Align reads, so their clips are not placed. Clips
+of the same camera are recognized by manufacturer, model, and serial number
+together; folders, file dates, and the model alone never count.
+
+**Where it is placed.** Among the camera's clips synchronized by sound, Align
+takes the nearest one recorded before the unmatched clip and the nearest one
+recorded after it. Each has an offset between its recording time and its
+place in the group; the clip's offset is interpolated between the two, so
+steady clock drift between them is accounted for. The clip's time source
+decides how its recording time is read: Automatic and REC START take it as
+the start, REC STOP as the end. A clip or anchor whose time source is Timecode
+is not used, because timecode need not run continuously between clips. Clips
+placed by timecode or file links are not anchors, and a placed clip is never
+an anchor for another.
+
+**Accuracy.** Recording times are whole seconds, so two of them can be off by
+up to a second against each other. The tolerance shown is that second plus
+how far the two anchors disagree, and it is an expectation, not a guarantee:
+a camera whose start delay varies, or a clock set between recordings, can
+put a clip further off. Anchors that disagree by more than two seconds place
+nothing between them.
+
+**When a clip is not placed.** A clip stays unmatched, with the reason shown,
+when its time source is Timecode, it has no recording time, no clip of the
+camera recorded before or after it is synchronized by sound, the nearest
+clips before and after it are in different groups or the camera has clips
+from another group between them, the anchors disagree, it would not fit
+between the anchors or would overlap another synchronized or placed clip of
+the camera, or its pairing or alignment with a clip it would play alongside
+was rejected.
+
+**In exports.**
+
+- A placed clip is named `[CAMERA CLOCK]` before any unmatched label, and
+  keeps the unmatched color, role, and **Disable in timeline** settings.
+- With Cut and remove options off, no other clip moves or changes track. The
+  clip's former place after its group stays empty. It joins its camera's
+  track when that track is free there, else the first free track, else a new
+  track after the others.
+- **Remove** unmatched clips removes placed clips too. **By order only**
+  still places them by the camera clock.
+- **Cut gaps empty on all tracks** keeps the time a placed clip covers, so
+  the clips after it in its group, and the later groups, end up that much
+  later than without it. **Cut recorder audio with no camera** keeps a
+  recorder clip that a placed clip overlaps. Trimming and **Remove clips
+  shorter than** treat it like any clip.
+- The Premiere replaced-audio sequence keeps a placed clip's own camera sound
+  instead of the recorder's. Clean-audio camera files are not created for
+  placed clips.
+- For an imported XML, FCPXML, or AAF edit, edits keep their placement. Align
+  compares where each edit of a clip starts with where the camera clock puts
+  the same frame, accounting for the edit's source in point, speed, and its
+  track's offset, and reports the difference. It does so only when that track
+  has synchronized edits from the clip's group that agree within a frame; an
+  edit played in reverse is not compared. A clip without an edit stays among
+  the sources.
+
+Estimates are not stored in saved results: they are computed again from the
+result's selected stage and time-source settings each time.
+
 ## Media ownership
 
 | Data | Location | Lifetime |

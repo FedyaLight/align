@@ -492,7 +492,9 @@ fn tf(value: bool) -> &'static str {
 }
 
 /// Recorder-audio replacement island (Premiere second sequence): camera
-/// audio removed, top overlapping recorder clip trimmed per video clip.
+/// audio removed, top overlapping recorder clip trimmed per video clip. A
+/// clip the camera clock placed keeps its own sound: its offset to the
+/// recorder is an estimate, not a match.
 fn replaced_island(island: &ExportIsland) -> Option<ExportIsland> {
     let videos: Vec<&ExportItem> = island
         .clips
@@ -520,6 +522,7 @@ fn replaced_island(island: &ExportIsland) -> Option<ExportIsland> {
                     item.start,
                     audio_duration(item),
                 )
+                .assembled_at(item.assembled_start(MediaKind::Audio))
             })
             .collect::<Vec<_>>(),
     );
@@ -535,6 +538,12 @@ fn replaced_island(island: &ExportIsland) -> Option<ExportIsland> {
 
     let mut replacements = Vec::new();
     for video in &videos {
+        if video.camera_clock.is_some() {
+            if !video.clip.audio.is_empty() {
+                replacements.push(own_sound(video));
+            }
+            continue;
+        }
         let video_end = video.start + video.timeline_duration;
         let mut recorder: Option<&ExportItem> = None;
         for lane in &lanes {
@@ -602,9 +611,10 @@ fn replaced_island(island: &ExportIsland) -> Option<ExportIsland> {
             transition_after: None,
             audio_transition_after: None,
             linked_audio_edit: None,
+            camera_clock: None,
         });
     }
-    if replacements.is_empty() {
+    if replacements.iter().all(|item| item.camera_clock.is_some()) {
         return None;
     }
     let mut clips: Vec<ExportItem> = videos.into_iter().cloned().collect();
@@ -614,6 +624,23 @@ fn replaced_island(island: &ExportIsland) -> Option<ExportIsland> {
         clips,
         duration: island.duration,
     })
+}
+
+/// A camera clip's own sound as an audio item linked to its picture.
+fn own_sound(video: &ExportItem) -> ExportItem {
+    let mut sound = video.clone();
+    let timecode = sound
+        .clip
+        .video
+        .take()
+        .and_then(|video| video.source_timecode);
+    if let Some(audio) = sound.clip.audio.first_mut()
+        && audio.source_timecode.is_none()
+    {
+        audio.source_timecode = timecode;
+    }
+    sound.clip.kind = MediaKind::Audio;
+    sound
 }
 
 fn audio_duration(item: &ExportItem) -> f64 {
@@ -772,7 +799,15 @@ fn tracks_for<'a>(entries: &[TrackEntry<'a>], media_type: MediaKind) -> Vec<Vec<
             .collect();
         (source(&track), vec![track, mirrored])
     }));
-    units.sort_by(|a, b| a.0.cmp(&b.0));
+    // A track only clips the camera clock moved needed comes last, so the
+    // tracks of the ordinary assembly keep their numbers.
+    let moved = |tracks: &[Vec<TrackEntry<'a>>]| {
+        tracks
+            .iter()
+            .flatten()
+            .all(|entry| entry.item.camera_clock.is_some())
+    };
+    units.sort_by(|a, b| moved(&a.1).cmp(&moved(&b.1)).then_with(|| a.0.cmp(&b.0)));
     units.into_iter().flat_map(|(_, tracks)| tracks).collect()
 }
 

@@ -39,6 +39,7 @@ def main():
         ('embedded-stereo', 'check-aaf-embedded-smoke.py', [cli, root / 'embedded-stereo', '--channels', '2'], None),
         ('mixed-clocks', 'check-aaf-embedded-smoke.py', [cli, root / 'mixed-clocks', '--channels', '2', '--mixed-clocks'], None),
         ('result-lifecycle', 'check-result-lifecycle.py', [cli, root / 'result-lifecycle'], None),
+        ('camera-clock', 'check-camera-clock-smoke.py', [cli, root / 'camera-clock'], None),
     ]
     report = {'cli': str(cli), 'sha256': hashlib.sha256(cli.read_bytes()).hexdigest(),
         'python': sys.executable, 'ffmpeg': shutil.which('ffmpeg'),
