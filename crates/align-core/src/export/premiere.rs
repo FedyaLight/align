@@ -257,24 +257,13 @@ pub fn combine_project_documents(
     Ok(xml)
 }
 
-/// Prefix every `id` attribute and every element that refers to one.
+/// Prefix every `id` attribute and every element that refers to one. Each
+/// pass copies the document once.
 fn prefix_document_ids(fragment: &str, prefix: &str) -> String {
     let mut out = fragment.replace(" id=\"", &format!(" id=\"{prefix}"));
     for element in ["linkclipref", "masterclipid"] {
         let open = format!("<{element}>");
-        let close = format!("</{element}>");
-        let mut cursor = 0;
-        while let Some(start) = out[cursor..]
-            .find(&open)
-            .map(|offset| cursor + offset + open.len())
-        {
-            out.insert_str(start, prefix);
-            cursor = out[start + prefix.len()..]
-                .find(&close)
-                .map_or(out.len(), |offset| {
-                    start + prefix.len() + offset + close.len()
-                });
-        }
+        out = out.replace(&open, &format!("{open}{prefix}"));
     }
     out
 }
@@ -298,6 +287,8 @@ struct Document {
 struct Layout {
     ids: HashMap<ClipKey, String>,
     positions: HashMap<ClipKey, (usize, usize)>,
+    /// The audio channels laid out for each clip instance, in channel order.
+    audio_channels: HashMap<String, Vec<usize>>,
 }
 
 impl Document {
@@ -376,7 +367,21 @@ impl Document {
         ));
         let mut positions = track_positions(&video_tracks, MediaKind::Video);
         positions.extend(track_positions(&audio_tracks, MediaKind::Audio));
-        let layout = Layout { ids, positions };
+        let mut audio_channels: HashMap<String, Vec<usize>> = HashMap::new();
+        for (instance, _, channel) in ids.keys().filter(|key| key.1 == MediaKind::Audio) {
+            audio_channels
+                .entry(instance.clone())
+                .or_default()
+                .push(*channel);
+        }
+        for channels in audio_channels.values_mut() {
+            channels.sort_unstable();
+        }
+        let layout = Layout {
+            ids,
+            positions,
+            audio_channels,
+        };
 
         for track in &video_tracks {
             xml += &self.track(track, MediaKind::Video, &layout, None);
@@ -708,7 +713,11 @@ fn links(
     format: TimelineExportFormat,
     layout: &Layout,
 ) -> Vec<LinkReference> {
-    let Layout { ids, positions } = layout;
+    let Layout {
+        ids,
+        positions,
+        audio_channels,
+    } = layout;
     let video_key = (entry.item.instance_id.clone(), MediaKind::Video, 0);
     let (Some(video_id), Some(video_position)) = (ids.get(&video_key), positions.get(&video_key))
     else {
@@ -730,12 +739,15 @@ fn links(
             })
             .collect();
     };
-    let mut linked_audio: Vec<_> = ids
-        .iter()
-        .filter(|(k, _)| k.0 == entry.item.instance_id && k.1 == MediaKind::Audio)
-        .filter_map(|(key, id)| Some((key.2, id, *positions.get(key)?)))
+    let linked_audio: Vec<_> = audio_channels
+        .get(&entry.item.instance_id)
+        .into_iter()
+        .flatten()
+        .filter_map(|&channel| {
+            let key = (entry.item.instance_id.clone(), MediaKind::Audio, channel);
+            Some((channel, ids.get(&key)?, *positions.get(&key)?))
+        })
         .collect();
-    linked_audio.sort_by_key(|&(channel, _, _)| channel);
     let Some((_, first_audio, _)) = linked_audio.first() else {
         return Vec::new();
     };
