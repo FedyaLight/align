@@ -296,6 +296,7 @@ impl ExportOptions {
 }
 
 /// One synchronized timeline to export.
+#[derive(Clone, Copy)]
 pub struct ExportRequest<'a> {
     pub backend: &'a dyn MediaBackend,
     pub timeline: &'a ExportTimeline,
@@ -410,28 +411,33 @@ fn export_batch(
         .enumerate()
         .map(|(index, timeline)| directory.join(sequence_folder(index, &timeline.name)))
         .collect();
-    let plans = timelines
+    let requests = timelines
         .iter()
         .zip(&sequence_dirs)
-        .map(|(timeline, directory)| {
-            SequenceExport::prepare(
-                ExportRequest {
-                    backend,
-                    timeline,
-                    directory,
-                    options,
-                    cancel,
-                },
-                true,
-                policy,
-            )
+        .map(|(timeline, directory)| ExportRequest {
+            backend,
+            timeline,
+            directory,
+            options,
+            cancel,
         });
-    // For protected exports, check every sequence before writing deliverables.
-    // CLI exports keep their existing one-sequence-at-a-time preparation.
+    // For protected exports, check every sequence before keeping any media,
+    // and prepare every sequence before writing deliverables. CLI exports
+    // keep their one-sequence-at-a-time preparation.
     let plans: Box<dyn Iterator<Item = Result<_, _>>> = if policy == OutputPolicy::Protect {
-        Box::new(plans.collect::<Result<Vec<_>, _>>()?.into_iter().map(Ok))
+        let checked = requests
+            .map(|request| Ok((request, SequenceExport::check(request, true, policy)?)))
+            .collect::<Result<Vec<_>, ExportError>>()?;
+        Box::new(
+            checked
+                .into_iter()
+                .map(|(request, combined)| SequenceExport::stage(request, combined, policy))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(Ok),
+        )
     } else {
-        Box::new(plans)
+        Box::new(requests.map(|request| SequenceExport::prepare(request, true, policy)))
     };
     let mut artifacts = Vec::new();
     let mut batch = BatchDocuments::default();
@@ -508,6 +514,17 @@ impl<'a> SequenceExport<'a> {
         batch: bool,
         policy: OutputPolicy,
     ) -> Result<Self, ExportError> {
+        let combined = Self::check(request, batch, policy)?;
+        Self::stage(request, combined, policy)
+    }
+
+    /// Validates the request and checks its deliverables for conflicts,
+    /// without creating anything. Returns the combined timeline.
+    fn check(
+        request: ExportRequest<'a>,
+        batch: bool,
+        policy: OutputPolicy,
+    ) -> Result<ExportTimeline, ExportError> {
         let ExportRequest {
             timeline,
             directory,
@@ -529,10 +546,33 @@ impl<'a> SequenceExport<'a> {
         {
             policy.check(&document_path(directory, format))?;
         }
-        std::fs::create_dir_all(directory).map_err(ExportError::Write)?;
         // Combine up front, so the plan sees the starts the writers round.
         // Drift mappings are shift-invariant (relative source/island coords).
-        let mut combined = timeline.combined();
+        let combined = timeline.combined();
+        if options.include_media_files && policy == OutputPolicy::Protect {
+            // Media file names follow their camera files, which keeping
+            // session media does not move: a conflict is found before
+            // anything is copied.
+            for plan in media_file_plans(&combined, &directory.join("Media Files")) {
+                policy.check(&plan.url)?;
+            }
+        }
+        Ok(combined)
+    }
+
+    /// Keeps session media and plans the prepared audio and media files.
+    fn stage(
+        request: ExportRequest<'a>,
+        mut combined: ExportTimeline,
+        policy: OutputPolicy,
+    ) -> Result<Self, ExportError> {
+        let ExportRequest {
+            directory,
+            options,
+            cancel,
+            ..
+        } = request;
+        std::fs::create_dir_all(directory).map_err(ExportError::Write)?;
         crate::media_assets::preserve_export(
             &mut combined,
             directory,
@@ -589,27 +629,7 @@ impl<'a> SequenceExport<'a> {
             .iter()
             .partition(|job| matches!(job.kind, AudioJobKind::Drift { .. }));
         for phase in [drift, stems] {
-            for pair in phase.chunks(2) {
-                check_cancel(cancel)?;
-                for job in pair {
-                    progress.report(&job.media, ExportJobKind::Audio);
-                }
-                if let [first, second] = pair {
-                    std::thread::scope(|scope| {
-                        let other = scope.spawn(|| second.render(backend, cancel, policy));
-                        let first_result = first.render(backend, cancel, policy);
-                        let second_result = other.join().expect("audio render worker panicked");
-                        first_result?;
-                        progress.complete(&first.media, ExportJobKind::Audio);
-                        second_result?;
-                        progress.complete(&second.media, ExportJobKind::Audio);
-                        Ok::<_, ExportError>(())
-                    })?;
-                } else {
-                    pair[0].render(backend, cancel, policy)?;
-                    progress.complete(&pair[0].media, ExportJobKind::Audio);
-                }
-            }
+            render_audio_jobs(phase, backend, cancel, policy, &mut progress)?;
         }
         check_cancel(cancel)?;
 
@@ -644,6 +664,72 @@ impl<'a> SequenceExport<'a> {
         }
         Ok(artifacts)
     }
+}
+
+/// Audio files rendered at once. Each render streams one source through its
+/// own decoder and writer.
+const AUDIO_RENDER_WORKERS: usize = 2;
+
+/// Renders `jobs` on a queue, longest first, so a worker that finishes a
+/// short file starts the next one instead of waiting for its partner. The
+/// first failure stops new jobs; the earliest failed job's error is returned.
+fn render_audio_jobs(
+    mut jobs: Vec<&AudioJob>,
+    backend: &dyn MediaBackend,
+    cancel: &AtomicBool,
+    policy: OutputPolicy,
+    progress: &mut Progress<'_>,
+) -> Result<(), ExportError> {
+    enum Event {
+        Started(usize),
+        Finished(usize, Result<(), ExportError>),
+    }
+    // Stable, so equal estimates keep the plan's order.
+    jobs.sort_by(|left, right| right.seconds().total_cmp(&left.seconds()));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let (sender, events) = std::sync::mpsc::channel();
+    let mut first_error: Option<(usize, ExportError)> = None;
+    std::thread::scope(|scope| {
+        for _ in 0..AUDIO_RENDER_WORKERS.min(jobs.len()) {
+            let sender = sender.clone();
+            let (jobs, next, failed) = (&jobs, &next, &failed);
+            scope.spawn(move || {
+                while !failed.load(Ordering::Relaxed) {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(job) = jobs.get(index) else {
+                        break;
+                    };
+                    let result = check_cancel(cancel).and_then(|()| {
+                        let _ = sender.send(Event::Started(index));
+                        job.render(backend, cancel, policy)
+                    });
+                    if result.is_err() {
+                        failed.store(true, Ordering::Relaxed);
+                    }
+                    let _ = sender.send(Event::Finished(index, result));
+                }
+            });
+        }
+        drop(sender);
+        for event in events {
+            match event {
+                Event::Started(index) => progress.report(&jobs[index].media, ExportJobKind::Audio),
+                Event::Finished(index, Ok(())) => {
+                    progress.complete(&jobs[index].media, ExportJobKind::Audio);
+                }
+                Event::Finished(index, Err(error)) => {
+                    if first_error
+                        .as_ref()
+                        .is_none_or(|(earliest, _)| index < *earliest)
+                    {
+                        first_error = Some((index, error));
+                    }
+                }
+            }
+        }
+    });
+    first_error.map_or(Ok(()), |(_, error)| Err(error))
 }
 
 struct Progress<'a> {
@@ -916,6 +1002,17 @@ impl AudioPlan {
 
 impl AudioJob {
     /// Renders the files this job still lacks; existing files are reused.
+    /// Source seconds the job decodes, to start the longest jobs first.
+    fn seconds(&self) -> f64 {
+        match &self.kind {
+            AudioJobKind::Drift { points, .. } => match (points.first(), points.last()) {
+                (Some(first), Some(last)) => last.0 - first.0,
+                _ => 0.0,
+            },
+            AudioJobKind::Stems { duration, .. } => *duration,
+        }
+    }
+
     fn render(
         &self,
         backend: &dyn MediaBackend,
@@ -1204,16 +1301,16 @@ fn export_media_file(
     Ok(plan.url.clone())
 }
 
-/// Writes the timeline documents. AAF is written separately, from the
-/// prepared audio manifest.
+/// Writes the timeline documents from the prepared timeline, which is
+/// already combined into the one sequence every writer exports. AAF is
+/// written separately, from the prepared audio manifest.
 fn write_artifacts(
-    timeline: &ExportTimeline,
+    combined: &ExportTimeline,
     directory: &Path,
     options: &ExportOptions,
     policy: OutputPolicy,
     mut batch: Option<&mut BatchDocuments>,
 ) -> Result<Vec<ExportArtifact>, ExportError> {
-    let combined = timeline.combined();
     let media_bins = options.media_bins;
     let premiere = PremiereOptions {
         replaced_sequence: options.include_replaced_sequence,
@@ -1228,24 +1325,24 @@ fn write_artifacts(
         let bytes = match format {
             TimelineExportFormat::Aaf => continue,
             TimelineExportFormat::ResolveOTIO => {
-                align_core::export::otio::data(&combined, media_bins)
+                align_core::export::otio::data(combined, media_bins)
                     .map_err(ExportError::Document)?
             }
             TimelineExportFormat::ResolveScript => {
                 align_core::export::script::write().as_bytes().to_vec()
             }
             TimelineExportFormat::ResolveXML | TimelineExportFormat::PremiereXML => {
-                let xml = align_core::export::premiere::write(&combined, format, premiere);
+                let xml = align_core::export::premiere::write(combined, format, premiere);
                 if format == TimelineExportFormat::PremiereXML
                     && let Some(batch) = batch.as_deref_mut()
                 {
-                    batch.premiere.push((timeline.name.clone(), xml));
+                    batch.premiere.push((combined.name.clone(), xml));
                     continue;
                 }
                 xml.into_bytes()
             }
             TimelineExportFormat::FinalCutProXML => {
-                let xml = align_core::export::fcpxml::write(&combined, fcpxml);
+                let xml = align_core::export::fcpxml::write(combined, fcpxml);
                 if let Some(batch) = batch.as_deref_mut() {
                     batch.final_cut.push(xml);
                     continue;
@@ -1528,7 +1625,8 @@ mod tests {
                 Err(ExportError::Conflict(path)) if path == previous
             ));
             assert_eq!(std::fs::read(&previous).unwrap(), b"previous export");
-            assert!(!first.exists());
+            // A conflict anywhere is found before any sequence is set up.
+            assert!(!first.parent().unwrap().exists());
             std::fs::remove_file(previous).unwrap();
         }
 

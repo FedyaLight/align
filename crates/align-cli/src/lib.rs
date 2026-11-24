@@ -902,7 +902,7 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
             for result in &mut results {
                 select_stage(result, stage)?;
             }
-            let pipeline = Pipeline::default_backend();
+            let pipeline = Pipeline::without_cache();
             let cancel = std::sync::atomic::AtomicBool::new(false);
             let artifacts = export.execute(pipeline.backend(), &results, &output, &cancel)?;
             print_json(&artifacts)

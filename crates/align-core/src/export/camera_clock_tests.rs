@@ -50,12 +50,11 @@ fn two_groups(crossing: bool) -> SyncResult {
     result
 }
 
-/// The timeline the writers get: export combines it to plan prepared
-/// audio, then again to write.
+/// The timeline the writers get: export combines it once, plans prepared
+/// audio on it and writes it.
 fn timeline(result: &SyncResult, options: ExportAssemblyOptions) -> ExportTimeline {
     ExportTimeline::from_result_with_options(result, options)
         .expect("timeline")
-        .combined()
         .combined()
 }
 

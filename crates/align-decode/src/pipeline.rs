@@ -327,6 +327,15 @@ impl Pipeline {
         Self::new(default_backend_kind())
     }
 
+    /// The default backend for work that reads no analysis, such as export
+    /// and path repair: the analysis cache is neither opened nor pruned.
+    pub fn without_cache() -> Self {
+        Self {
+            backend: crate::backend::create(default_backend_kind()),
+            cache: None,
+        }
+    }
+
     pub fn backend(&self) -> &dyn MediaBackend {
         &*self.backend
     }
@@ -594,10 +603,11 @@ impl Pipeline {
                     let mut out =
                         PipelineProgress::basic(Phase::Refine, event.completed, event.total, None);
                     out.preview = Some(
-                        match candidates
-                            .iter()
-                            .find(|m| m.left == event.left && m.right == event.right)
-                        {
+                        match event.refined.as_ref().or_else(|| {
+                            candidates
+                                .iter()
+                                .find(|m| m.left == event.left && m.right == event.right)
+                        }) {
                             Some(candidate) => preview(candidate, stage),
                             None => align_core::MatchPreview {
                                 left: event.left.clone(),
@@ -1549,12 +1559,18 @@ fn solve_stages(
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<(Vec<align_core::SyncStage>, usize, bool), PipelineError> {
     let mut stages: Vec<align_core::SyncStage> = Vec::new();
+    let mut solved: Option<&Vec<align_core::PairwiseMatch>> = None;
     for (kind, matches) in evidence {
         if cancelled(cancel) {
             if stages.is_empty() {
                 return Err(PipelineError::Cancelled);
             }
             break;
+        }
+        // Without file spans or timecode a stage adds no evidence, and the
+        // same matches would solve to the stage already kept.
+        if solved.replace(matches) == Some(matches) {
+            continue;
         }
         let stage = solve_stage(kind, clips, matches, match_policy);
         if stages

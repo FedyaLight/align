@@ -1592,7 +1592,7 @@ impl AlignApp {
         let cancel = self.data.cancel.clone();
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<PathRepairMsg>();
         std::thread::spawn(move || {
-            let pipeline = Pipeline::default_backend();
+            let pipeline = Pipeline::without_cache();
             let result = pipeline
                 .write_fixed_timeline_copy(&inputs, &options, &destination, &cancel)
                 .map_err(|error| error.to_string());
@@ -1773,7 +1773,7 @@ impl AlignApp {
         let media = self.data.export.media_files;
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<ExportMsg>();
         std::thread::spawn(move || {
-            let pipeline = Pipeline::default_backend();
+            let pipeline = Pipeline::without_cache();
             let mut progress = |p: align_decode::export::ExportJobProgress| {
                 let label = match &p.current {
                     Some(path) if p.kind == align_decode::export::ExportJobKind::Media => {
