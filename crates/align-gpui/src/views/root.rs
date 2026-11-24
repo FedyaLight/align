@@ -27,6 +27,14 @@ use super::{
 impl Render for AlignApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::current(window.appearance());
+        // Moving timeline bars are drawn at their current place each frame
+        // until their move is over.
+        let now = Instant::now();
+        self.timeline_transitions
+            .retain(|_, transition| !transition.finished(now));
+        if !self.timeline_transitions.is_empty() {
+            window.request_animation_frame();
+        }
         // Fit width excludes the label column and content padding.
         let fit_width =
             (f32::from(window.viewport_size().width) - crate::lane::LABEL_WIDTH - 16.0).max(100.0);

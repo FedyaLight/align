@@ -1,16 +1,16 @@
 //! Timeline preview: toolbar, ruler, and lanes.
 
-use super::animation::{entrance, timeline_bar_motion};
+use super::animation::entrance;
 use super::controls::{
     RULER_LABEL_W, ZoomDrag, ZoomDragGhost, clip_color, fmt_duration, fmt_timecode, hover_tip,
     ruler_ticks, waveform_columns,
 };
 use super::{
-    AlignApp, AnimationExt, AudioAnalysisSource, ClipId, Context, DragMoveEvent, FluentBuilder,
-    HashMap, InteractiveElement, IntoElement, MediaKind, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
-    TIMELINE_ROW_H, Theme, TimelineTransition, div, point, poses_differ, px, rgb, rgba, svg_icon,
-    timeline_duration, timeline_poses,
+    AlignApp, AnimationExt, AudioAnalysisSource, Context, DragMoveEvent, FluentBuilder, HashMap,
+    InteractiveElement, IntoElement, MediaKind, MouseButton, MouseDownEvent, MouseMoveEvent,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, TIMELINE_ROW_H, Theme,
+    TimelineTransition, div, point, poses_differ, px, rgb, rgba, svg_icon, timeline_duration,
+    timeline_poses,
 };
 use gpui::AppContext as _;
 
@@ -20,7 +20,7 @@ pub(super) fn timeline_preview(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &crate::state::AppData,
-    timeline_transitions: &HashMap<ClipId, TimelineTransition>,
+    timeline_transitions: &HashMap<String, TimelineTransition>,
     fit_width: f32,
     active: bool,
 ) -> impl IntoElement {
@@ -111,7 +111,7 @@ pub(super) fn timeline_lanes(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &crate::state::AppData,
-    timeline_transitions: &HashMap<ClipId, TimelineTransition>,
+    timeline_transitions: &HashMap<String, TimelineTransition>,
     fit_width: f32,
     active: bool,
 ) -> impl IntoElement {
@@ -120,8 +120,14 @@ pub(super) fn timeline_lanes(
     let duration = timeline_duration(data);
     let zoom = data.zoom();
     let (px_per_sec, timeline_w) = timeline_scale(duration, zoom, fit_width);
-    let tick_times = ruler_ticks(duration, px_per_sec, data.ruler_timecode.unwrap_or(0.));
+    let tick_times = ruler_ticks(
+        duration,
+        px_per_sec,
+        data.ruler_timecode.map_or(0., |clock| clock.start),
+    );
     let target_poses = (!timeline_transitions.is_empty()).then(|| timeline_poses(data));
+    let now = std::time::Instant::now();
+    let row_stride = TIMELINE_ROW_H + 1.;
 
     // Labels stay fixed while only the ruler and clips scroll horizontally.
     // This also makes a normal two-finger/vertical wheel pan the timeline:
@@ -142,7 +148,7 @@ pub(super) fn timeline_lanes(
     for &at in &tick_times {
         let x = (at * px_per_sec) as f32;
         let label = match data.ruler_timecode {
-            Some(start) => fmt_timecode(start, at),
+            Some(clock) => fmt_timecode(clock, at),
             None => fmt_duration(at),
         };
         ticks = ticks
@@ -266,13 +272,36 @@ pub(super) fn timeline_lanes(
                 let color = clip_color(bar.match_state);
                 let ink = 0xFFFFFF;
                 let clip_id = bar.clip_id.clone();
+                // A bar that moved to this layout glides from where it was.
+                // Its last frame is this layout, so it is drawn the same way
+                // once the move is over.
+                let (left, shown_width, top) = timeline_transitions
+                    .get(&bar.id)
+                    .filter(|transition| {
+                        target_poses
+                            .as_ref()
+                            .and_then(|poses| poses.get(&bar.id))
+                            .is_some_and(|pose| !poses_differ(transition.to, *pose))
+                    })
+                    .map_or((x, width, 0.), |transition| {
+                        let progress = transition.progress(now);
+                        let from_x = transition.from.x * timeline_w;
+                        let from_width = (transition.from.width * timeline_w).max(2.);
+                        (
+                            from_x + (x - from_x) * progress,
+                            from_width + (width - from_width) * progress,
+                            (transition.from.lane - lane_index as f32)
+                                * row_stride
+                                * (1. - progress),
+                        )
+                    });
                 // Keep narrow slivers square; cap other corner radii at 4 px.
                 let mut el = div()
-                    .id(SharedString::from(format!("bar-{}", bar.clip_id.0)))
+                    .id(SharedString::from(format!("bar-{}", bar.id)))
                     .absolute()
-                    .left(px(x))
-                    .top(px(6.0))
-                    .w(px(width))
+                    .left(px(left))
+                    .top(px(6.0 + top))
+                    .w(px(shown_width))
                     .h(px(TIMELINE_ROW_H - 12.0));
                 if width >= 8.0 {
                     el = el.rounded_md();
@@ -379,33 +408,13 @@ pub(super) fn timeline_lanes(
                         cx.notify();
                     }),
                 );
-                let transition =
-                    timeline_transitions
-                        .get(&bar.clip_id)
-                        .copied()
-                        .filter(|transition| {
-                            target_poses
-                                .as_ref()
-                                .and_then(|poses| poses.get(&bar.clip_id))
-                                .is_some_and(|pose| !poses_differ(transition.to, *pose))
-                        });
-                if let Some(transition) = transition {
-                    track = track.child(timeline_bar_motion(
-                        el,
-                        &bar.clip_id,
-                        transition,
-                        x,
-                        width,
-                        timeline_w,
-                        lane_index as f32,
-                    ));
-                } else {
-                    track = track.child(el.with_animation(
-                        SharedString::from(format!("timeline-clip-enter-{}", bar.clip_id.0)),
-                        entrance(220),
-                        |el, progress| el.opacity(progress),
-                    ));
-                }
+                // The same element every frame, moving or not, so a bar fades
+                // in only when it first appears.
+                track = track.child(el.with_animation(
+                    SharedString::from(format!("timeline-clip-enter-{}", bar.id)),
+                    entrance(220),
+                    |el, progress| el.opacity(progress),
+                ));
             }
             tracks = tracks.child(track);
         }

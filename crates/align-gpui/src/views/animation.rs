@@ -2,10 +2,9 @@
 
 use super::settings::QUALITY_MENU_WIDTH;
 use super::{
-    Animation, AnimationExt, ClipId, DROPDOWN_MS, Duration, ExportSelect, IntoElement,
-    ParentElement, SELECTION_CONTROL_CLOSE_MS, SETTINGS_MOTION_MS, SIDEBAR_CLOSE_MS,
-    SettingsSelect, SharedString, Styled, TIMELINE_MOVE_MS, TIMELINE_ROW_H, TimelineTransition,
-    div, px,
+    Animation, AnimationExt, DROPDOWN_MS, Duration, ExportSelect, IntoElement, ParentElement,
+    SELECTION_CONTROL_CLOSE_MS, SETTINGS_MOTION_MS, SIDEBAR_CLOSE_MS, SettingsSelect, SharedString,
+    Styled, div, px,
 };
 
 /// Strong UI ease-out: cubic-bezier(0.23, 1, 0.32, 1).
@@ -261,40 +260,6 @@ pub(super) fn toolbar_entrance<E: IntoElement + 'static>(
         })
 }
 
-pub(super) fn timeline_bar_motion<E: IntoElement + Styled + 'static>(
-    child: E,
-    clip_id: &ClipId,
-    transition: TimelineTransition,
-    target_x: f32,
-    target_width: f32,
-    timeline_width: f32,
-    target_lane: f32,
-) -> impl IntoElement {
-    let row_stride = TIMELINE_ROW_H + 1.;
-    let from_x = transition.from.x * timeline_width;
-    let from_width = (transition.from.width * timeline_width).max(2.);
-    crate::motion::Slide {
-        child: Some(child),
-        x: from_x - target_x,
-        y: (transition.from.lane - target_lane) * row_stride,
-    }
-    .with_animation(
-        SharedString::from(format!(
-            "timeline-clip-{}-{}",
-            clip_id.0, transition.generation
-        )),
-        entrance(TIMELINE_MOVE_MS),
-        move |mut slide, progress| {
-            slide.x = (from_x - target_x) * (1. - progress);
-            slide.y = (transition.from.lane - target_lane) * row_stride * (1. - progress);
-            slide.child = slide
-                .child
-                .map(|child| child.w(px(from_width + (target_width - from_width) * progress)));
-            slide
-        },
-    )
-}
-
 pub(super) fn export_reveal<E: IntoElement + 'static>(
     child: E,
     id: &'static str,
@@ -354,7 +319,7 @@ mod motion_tests {
     use crate::views::controls::{ruler_ticks, waveform_columns};
     use crate::views::{
         AppData, ExportReveals, ExportTarget, Instant, PROGRESS_MOVE_MS, ProgressMotion,
-        TimelinePose, middle_ellipsis, poses_differ,
+        TIMELINE_MOVE_MS, TimelinePose, TimelineTransition, middle_ellipsis, poses_differ,
     };
 
     #[test]
@@ -399,6 +364,57 @@ mod motion_tests {
     }
 
     #[test]
+    fn ruler_timecode_counts_the_timeline_frames() {
+        use crate::lane::RulerClock;
+        use crate::views::controls::fmt_timecode;
+        let pal = RulerClock {
+            start: 0.,
+            frame_duration: 1. / 25.,
+        };
+        // A tick on a whole second just short of it in binary arithmetic.
+        assert_eq!(fmt_timecode(pal, 360. - 1e-9), "00:06:00:00");
+        let thirty = RulerClock {
+            start: 10.,
+            frame_duration: 1. / 30.,
+        };
+        assert_eq!(fmt_timecode(thirty, 0.5), "00:00:10:15");
+    }
+
+    #[test]
+    fn every_edit_of_one_source_has_its_own_timeline_pose() {
+        use crate::lane::{BarMatchState, BarVisual, LaneVisual};
+        let edit = |id: &str, start: f64| BarVisual {
+            id: id.into(),
+            clip_id: align_core::ClipId::new("same-file"),
+            url: "/v/take.mov".into(),
+            source_key: "/v".into(),
+            name: "take.mov".into(),
+            kind: align_core::MediaKind::Video,
+            start,
+            duration: 2.,
+            confidence: 1.,
+            match_state: BarMatchState::Matched,
+            camera_clock: None,
+        };
+        let mut data = AppData::default();
+        data.lanes = vec![LaneVisual {
+            id: "V1".into(),
+            kind: align_core::MediaKind::Video,
+            number: 1,
+            source_key: "/v".into(),
+            source_name: String::new(),
+            stream_channels: Vec::new(),
+            clips: vec![edit("imported-video-1", 0.), edit("imported-video-2", 4.)],
+        }];
+        let poses = crate::views::timeline_poses(&data);
+        assert_eq!(poses.len(), 2);
+        assert!(poses_differ(
+            poses["imported-video-1"],
+            poses["imported-video-2"]
+        ));
+    }
+
+    #[test]
     fn timeline_transition_reaches_the_new_position_and_size() {
         let started = Instant::now();
         let from = TimelinePose {
@@ -411,17 +427,12 @@ mod motion_tests {
             width: 0.3,
             lane: 0.,
         };
-        let transition = TimelineTransition {
-            from,
-            to,
-            generation: 1,
-            started,
-        };
+        let transition = TimelineTransition { from, to, started };
         assert!(!poses_differ(transition.presented(started), from));
-        assert!(!poses_differ(
-            transition.presented(started + Duration::from_millis(TIMELINE_MOVE_MS)),
-            to
-        ));
+        let end = started + Duration::from_millis(TIMELINE_MOVE_MS);
+        assert!(!poses_differ(transition.presented(end), to));
+        // A finished move is dropped; its bar is then drawn at `to`.
+        assert!(!transition.finished(started) && transition.finished(end));
     }
 
     #[test]

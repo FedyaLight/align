@@ -361,12 +361,22 @@ pub(super) fn clip_color(state: crate::lane::BarMatchState) -> u32 {
     }
 }
 
-pub(super) fn fmt_timecode(start: f64, at: f64) -> String {
-    let t = start + at;
-    let h = (t / 3600.0).floor() as i64 % 24;
-    let m = (t.rem_euclid(3600.0) / 60.0).floor() as i64;
-    let s = t.rem_euclid(60.0).floor() as i64;
-    let f = ((t - t.floor()) * 25.0).floor() as i64 % 25;
+/// The timecode `at` seconds into the ruler, in the timeline's frames
+/// (non-drop). The position is rounded to the nearest frame, so a tick on a
+/// whole second never shows the frame before it.
+pub(super) fn fmt_timecode(clock: crate::lane::RulerClock, at: f64) -> String {
+    let frame_duration = if clock.frame_duration > 0. {
+        clock.frame_duration
+    } else {
+        1. / 25.
+    };
+    let per_second = ((1. / frame_duration).round() as i64).max(1);
+    let frames = ((clock.start + at) / frame_duration).round() as i64;
+    let seconds = frames.div_euclid(per_second);
+    let f = frames.rem_euclid(per_second);
+    let h = seconds.div_euclid(3600).rem_euclid(24);
+    let m = seconds.rem_euclid(3600) / 60;
+    let s = seconds.rem_euclid(60);
     format!("{h:02}:{m:02}:{s:02}:{f:02}")
 }
 

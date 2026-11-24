@@ -216,16 +216,25 @@ struct TimelinePose {
 struct TimelineTransition {
     from: TimelinePose,
     to: TimelinePose,
-    generation: u64,
     started: Instant,
 }
 
 impl TimelineTransition {
+    /// Eased progress from `from` (0) to `to` (1).
+    fn progress(self, now: Instant) -> f32 {
+        motion_ease(
+            (now.duration_since(self.started).as_secs_f32()
+                / Duration::from_millis(TIMELINE_MOVE_MS).as_secs_f32())
+            .clamp(0., 1.),
+        )
+    }
+
+    fn finished(self, now: Instant) -> bool {
+        now.duration_since(self.started) >= Duration::from_millis(TIMELINE_MOVE_MS)
+    }
+
     fn presented(self, now: Instant) -> TimelinePose {
-        let progress = (now.duration_since(self.started).as_secs_f32()
-            / Duration::from_millis(TIMELINE_MOVE_MS).as_secs_f32())
-        .clamp(0., 1.);
-        let progress = motion_ease(progress);
+        let progress = self.progress(now);
         TimelinePose {
             x: self.from.x + (self.to.x - self.from.x) * progress,
             width: self.from.width + (self.to.width - self.from.width) * progress,
@@ -243,7 +252,9 @@ fn timeline_duration(data: &AppData) -> f64 {
         .max(1.0)
 }
 
-fn timeline_poses(data: &AppData) -> HashMap<ClipId, TimelinePose> {
+/// Each bar's pose by its unique id: one source file can appear in several
+/// edits of an imported timeline.
+fn timeline_poses(data: &AppData) -> HashMap<String, TimelinePose> {
     let duration = timeline_duration(data);
     let mut poses = HashMap::new();
     for (lane_index, lane) in data.lanes.iter().enumerate() {
@@ -255,7 +266,7 @@ fn timeline_poses(data: &AppData) -> HashMap<ClipId, TimelinePose> {
                     clip.duration.min((next.start - clip.start).max(0.))
                 });
             poses.insert(
-                clip.clip_id.clone(),
+                clip.id.clone(),
                 TimelinePose {
                     x: (clip.start / duration) as f32,
                     width: (visible_duration / duration) as f32,
@@ -505,8 +516,8 @@ pub struct AlignApp {
     selection_controls_exit: Exit,
     export_reveals_closing: HashMap<&'static str, u64>,
     export_reveal_generation: u64,
-    timeline_transitions: HashMap<ClipId, TimelineTransition>,
-    timeline_motion_generation: u64,
+    /// Bars moving to a new layout, by bar id, until their move finishes.
+    timeline_transitions: HashMap<String, TimelineTransition>,
     progress_motion: ProgressMotion,
     update_state: UpdateState,
     show_problem_report: bool,
@@ -559,7 +570,6 @@ impl AlignApp {
             export_reveals_closing: HashMap::new(),
             export_reveal_generation: 0,
             timeline_transitions: HashMap::new(),
-            timeline_motion_generation: 0,
             progress_motion: ProgressMotion::new(),
             update_state: UpdateState::default(),
             show_problem_report: false,
@@ -1001,35 +1011,32 @@ impl AlignApp {
         .detach();
     }
 
-    fn record_timeline_layout_change(&mut self, before: HashMap<ClipId, TimelinePose>) {
+    fn record_timeline_layout_change(&mut self, before: HashMap<String, TimelinePose>) {
+        let now = Instant::now();
         let after = timeline_poses(&self.data);
         self.timeline_transitions
-            .retain(|clip_id, _| after.contains_key(clip_id));
+            .retain(|bar, transition| after.contains_key(bar) && !transition.finished(now));
         let changes: Vec<_> = after
-            .iter()
-            .filter_map(|(clip_id, &to)| {
-                let from = before.get(clip_id).copied()?;
-                poses_differ(from, to).then(|| (clip_id.clone(), from, to))
+            .into_iter()
+            .filter_map(|(bar, to)| {
+                let from = before.get(&bar).copied()?;
+                poses_differ(from, to).then_some((bar, from, to))
             })
             .collect();
         if changes.is_empty() || crate::motion::reduced_motion() {
             return;
         }
-        self.timeline_motion_generation += 1;
-        let generation = self.timeline_motion_generation;
-        let now = Instant::now();
-        for (clip_id, previous, to) in changes {
+        for (bar, previous, to) in changes {
             let from = self
                 .timeline_transitions
-                .get(&clip_id)
+                .get(&bar)
                 .copied()
                 .map_or(previous, |transition| transition.presented(now));
             self.timeline_transitions.insert(
-                clip_id,
+                bar,
                 TimelineTransition {
                     from,
                     to,
-                    generation,
                     started: now,
                 },
             );
@@ -1382,7 +1389,7 @@ impl AlignApp {
 
     fn update_export_options(&mut self, cx: &mut Context<Self>, update: impl FnOnce(&mut AppData)) {
         let before = ExportReveals::new(&self.data).entries();
-        update(&mut self.data);
+        self.update_timeline_layout(update);
         let select_is_available = match self.export_select {
             Some(ExportSelect::AafFrameRate) => {
                 self.data.export.targets.contains(&ExportTarget::Aaf)

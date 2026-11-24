@@ -78,7 +78,40 @@ impl LiveMatch {
 pub struct FinalTimeline {
     pub bars: Vec<BarVisual>,
     pub states: Vec<(ClipId, f64, MatchEvidence)>,
-    pub ruler_timecode: Option<f64>,
+    pub ruler_timecode: Option<RulerClock>,
+}
+
+/// The timecode at the start of the ruler and the timeline's frame rate,
+/// which its frame digits count.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RulerClock {
+    pub start: f64,
+    pub frame_duration: f64,
+}
+
+impl RulerClock {
+    pub fn of(timeline: &ExportTimeline) -> Option<Self> {
+        Some(Self {
+            start: timeline.ruler_timecode_start()?,
+            frame_duration: timeline.frame_duration.as_seconds(),
+        })
+    }
+}
+
+/// The strongest kind of evidence that synchronized `clip`: waveform, then
+/// file spans, then timecode.
+pub fn match_evidence(result: &align_core::SyncResult, clip: &ClipId) -> MatchEvidence {
+    result
+        .matches
+        .iter()
+        .filter(|m| m.left == *clip || m.right == *clip)
+        .filter_map(|m| m.evidence)
+        .min_by_key(|evidence| match evidence {
+            MatchEvidence::Waveform => 0,
+            MatchEvidence::SpannedMetadata => 1,
+            MatchEvidence::Timecode => 2,
+        })
+        .unwrap_or(MatchEvidence::Waveform)
 }
 
 /// Provisional groups from live previews: BFS over candidate edges,
@@ -201,7 +234,7 @@ pub fn final_bars(
             ruler_timecode: None,
         };
     };
-    let ruler_timecode = timeline.ruler_timecode_start();
+    let ruler_timecode = RulerClock::of(&timeline);
     let preview = timeline.preview_items(&unmatched);
     let bars = preview
         .iter()
@@ -229,18 +262,11 @@ pub fn final_bars(
         .iter()
         .filter(|item| item.matched)
         .map(|item| {
-            let evidence = result
-                .matches
-                .iter()
-                .filter(|m| m.left == item.clip_id || m.right == item.clip_id)
-                .filter_map(|m| m.evidence)
-                .min_by_key(|evidence| match evidence {
-                    MatchEvidence::Waveform => 0,
-                    MatchEvidence::SpannedMetadata => 1,
-                    MatchEvidence::Timecode => 2,
-                })
-                .unwrap_or(MatchEvidence::Waveform);
-            (item.clip_id.clone(), item.confidence, evidence)
+            (
+                item.clip_id.clone(),
+                item.confidence,
+                match_evidence(result, &item.clip_id),
+            )
         })
         .collect();
     FinalTimeline {

@@ -384,7 +384,7 @@ pub struct AppData {
     pub selection: HashSet<PathBuf>,
     pub island_count: usize,
     pub lanes: Vec<LaneVisual>,
-    pub ruler_timecode: Option<f64>,
+    pub ruler_timecode: Option<lane::RulerClock>,
     pub live_matches: HashMap<String, LiveMatch>,
     pub visible_matches: Vec<LiveMatch>,
     /// Progress is applied in batches; the provisional layout follows once
@@ -2481,7 +2481,7 @@ fn sorted_live_matches(map: &HashMap<String, LiveMatch>) -> Vec<LiveMatch> {
 type ImportedPreview = (
     Vec<BarVisual>,
     Vec<(ClipId, f64, MatchEvidence)>,
-    Option<f64>,
+    Option<lane::RulerClock>,
 );
 
 fn imported_preview(result: &SyncResult) -> ImportedPreview {
@@ -2515,11 +2515,20 @@ fn imported_preview(result: &SyncResult) -> ImportedPreview {
             }
         })
         .collect();
+    // Like the ordinary preview: matched clips, with the evidence that
+    // synchronized them.
     let states = bars
         .iter()
-        .map(|b| (b.clip_id.clone(), b.confidence, MatchEvidence::Waveform))
+        .filter(|bar| bar.match_state == lane::BarMatchState::Matched)
+        .map(|bar| {
+            (
+                bar.clip_id.clone(),
+                bar.confidence,
+                lane::match_evidence(result, &bar.clip_id),
+            )
+        })
         .collect();
-    (bars, states, timeline.ruler_timecode_start())
+    (bars, states, lane::RulerClock::of(&timeline))
 }
 
 fn elapsed_label(elapsed: std::time::Duration) -> String {
@@ -2880,6 +2889,55 @@ mod tests {
             },
         ];
         result.selected_stage = Some(1);
+        // The same result imported from an editor's timeline, synchronized
+        // by timecode: rows read the same states, with that evidence.
+        let mut imported = result.clone();
+        imported.matches[0].evidence = Some(MatchEvidence::Timecode);
+        let edit =
+            |name: &str, kind: MediaKind, duration: f64, start: f64| align_core::TimelineEdit {
+                id: format!("edit-{name}"),
+                name: None,
+                clip_id: ClipId::new(name),
+                media_type: kind,
+                source_in: MediaTime::seconds(0.0),
+                source_out: MediaTime::seconds(duration),
+                timeline_start: MediaTime::seconds(start),
+                timeline_end: MediaTime::seconds(start + duration),
+                retime: Default::default(),
+                fcp7: Default::default(),
+                audio_source_channel: None,
+                fcpxml_audio_role: None,
+                track_index: 1,
+                audio_track_index: None,
+                flags: Default::default(),
+                audio_enabled: None,
+                audio_track_enabled: None,
+                audio_track_locked: None,
+                transition_after: None,
+                audio_transition_after: None,
+                linked_audio_edit: None,
+            };
+        imported.project.imported_timeline = Some(align_core::ImportedTimeline {
+            aaf_track_numbers: Vec::new(),
+            name: "Edit".into(),
+            frame_duration: MediaTime::new(1, 25),
+            edits: vec![
+                edit("a.mov", MediaKind::Video, 10.0, 0.0),
+                edit("b.wav", MediaKind::Audio, 10.0, 0.0),
+                edit("c.wav", MediaKind::Audio, 5.0, 20.0),
+            ],
+        });
+        let mut imported_data = AppData::default();
+        imported_data.apply_result(imported);
+        let states: HashMap<_, _> = imported_data
+            .clips
+            .iter()
+            .map(|r| (r.name.clone(), format!("{:?}", r.state)))
+            .collect();
+        assert!(states["a.mov"].contains("evidence: Timecode"), "{states:?}");
+        assert!(states["b.wav"].contains("evidence: Timecode"), "{states:?}");
+        assert_eq!(states["c.wav"], "Unmatched");
+
         let mut data = AppData {
             sync_started: Some(std::time::Instant::now()),
             ..AppData::default()

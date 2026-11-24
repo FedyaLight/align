@@ -8,7 +8,7 @@ use super::export::check_row;
 use super::menu_sidebar::app_menu_button;
 use super::timeline::timeline_preview;
 use super::{
-    AlignApp, ClipId, ClipState, Context, FluentBuilder, HashMap, InteractiveElement, IntoElement,
+    AlignApp, ClipState, Context, FluentBuilder, HashMap, InteractiveElement, IntoElement,
     MediaKind, ParentElement, SharedString, StatefulInteractiveElement, Styled, Theme,
     TimelineTransition, div, kind_badge, px, rgb, rgba, svg_icon,
 };
@@ -19,7 +19,7 @@ pub(super) fn main_content(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &crate::state::AppData,
-    timeline_transitions: &HashMap<ClipId, TimelineTransition>,
+    timeline_transitions: &HashMap<String, TimelineTransition>,
     fit_width: f32,
     active: bool,
     selection_controls_closing: bool,

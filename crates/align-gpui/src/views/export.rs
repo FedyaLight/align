@@ -1685,8 +1685,10 @@ fn export_cleanup_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
         "Cut gaps empty on all tracks".to_string(),
         !busy,
         |this, _, _, cx| {
-            this.data.export.cut_common_gaps = !this.data.export.cut_common_gaps;
-            this.data.relayout_result();
+            this.update_timeline_layout(|data| {
+                data.export.cut_common_gaps = !data.export.cut_common_gaps;
+                data.relayout_result();
+            });
             cx.notify();
         },
     ));
@@ -1698,8 +1700,10 @@ fn export_cleanup_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
         "Cut recorder audio with no camera".to_string(),
         !busy,
         |this, _, _, cx| {
-            this.data.export.cut_lone_recorder = !this.data.export.cut_lone_recorder;
-            this.data.relayout_result();
+            this.update_timeline_layout(|data| {
+                data.export.cut_lone_recorder = !data.export.cut_lone_recorder;
+                data.relayout_result();
+            });
             cx.notify();
         },
     ));
@@ -1715,15 +1719,18 @@ fn export_cleanup_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
                 enabled: !busy,
             },
             |this, _, _, cx| {
-                this.data.export.cut_shorter_than =
-                    (this.data.export.cut_shorter_than - 1.0).max(0.0);
-                this.data.relayout_result();
+                this.update_timeline_layout(|data| {
+                    data.export.cut_shorter_than = (data.export.cut_shorter_than - 1.0).max(0.0);
+                    data.relayout_result();
+                });
                 cx.notify();
             },
             |this, _, _, cx| {
-                this.data.export.cut_shorter_than =
-                    (this.data.export.cut_shorter_than + 1.0).min(3_600.0);
-                this.data.relayout_result();
+                this.update_timeline_layout(|data| {
+                    data.export.cut_shorter_than =
+                        (data.export.cut_shorter_than + 1.0).min(3_600.0);
+                    data.relayout_result();
+                });
                 cx.notify();
             },
         ));
@@ -1738,15 +1745,19 @@ fn export_cleanup_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
                 enabled: !busy,
             },
             |this, _, _, cx| {
-                this.data.export.trim_starts =
-                    ((this.data.export.trim_starts - 0.1).max(0.0) * 10.0).round() / 10.0;
-                this.data.relayout_result();
+                this.update_timeline_layout(|data| {
+                    data.export.trim_starts =
+                        ((data.export.trim_starts - 0.1).max(0.0) * 10.0).round() / 10.0;
+                    data.relayout_result();
+                });
                 cx.notify();
             },
             |this, _, _, cx| {
-                this.data.export.trim_starts =
-                    ((this.data.export.trim_starts + 0.1).min(3_600.0) * 10.0).round() / 10.0;
-                this.data.relayout_result();
+                this.update_timeline_layout(|data| {
+                    data.export.trim_starts =
+                        ((data.export.trim_starts + 0.1).min(3_600.0) * 10.0).round() / 10.0;
+                    data.relayout_result();
+                });
                 cx.notify();
             },
         ));
@@ -1761,15 +1772,19 @@ fn export_cleanup_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
                 enabled: !busy,
             },
             |this, _, _, cx| {
-                this.data.export.trim_ends =
-                    ((this.data.export.trim_ends - 0.1).max(0.0) * 10.0).round() / 10.0;
-                this.data.relayout_result();
+                this.update_timeline_layout(|data| {
+                    data.export.trim_ends =
+                        ((data.export.trim_ends - 0.1).max(0.0) * 10.0).round() / 10.0;
+                    data.relayout_result();
+                });
                 cx.notify();
             },
             |this, _, _, cx| {
-                this.data.export.trim_ends =
-                    ((this.data.export.trim_ends + 0.1).min(3_600.0) * 10.0).round() / 10.0;
-                this.data.relayout_result();
+                this.update_timeline_layout(|data| {
+                    data.export.trim_ends =
+                        ((data.export.trim_ends + 0.1).min(3_600.0) * 10.0).round() / 10.0;
+                    data.relayout_result();
+                });
                 cx.notify();
             },
         ));
@@ -1793,8 +1808,10 @@ fn export_timeline_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> D
         "Prevent overlaps".to_string(),
         !busy,
         |this, _, _, cx| {
-            this.data.export.prevent_group_overlaps = !this.data.export.prevent_group_overlaps;
-            this.data.relayout_result();
+            this.update_timeline_layout(|data| {
+                data.export.prevent_group_overlaps = !data.export.prevent_group_overlaps;
+                data.relayout_result();
+            });
             cx.notify();
         },
     ));
