@@ -1690,57 +1690,26 @@ impl AppData {
 
     // ---------------- camera clock
 
+    /// The visible or exported report of `result`, with the sequence's
+    /// choices blocking the estimates they contradict.
     fn clock_report(
         &self,
         result: &SyncResult,
         sequence: usize,
     ) -> align_core::camera_clock::CameraClockReport {
-        use align_core::camera_clock::{CameraClockRefusal, camera_clock};
         let constraints = self
             .sequence_constraints
             .get(&sequence)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let mut report = camera_clock(result, constraints);
-        if result.project.imported_timeline.is_some() {
-            return report;
-        }
-        let options = self.export.assembly_options();
-        let kept: Option<HashSet<_>> = if options.unmatched == UnmatchedPlacement::Remove {
-            Some(HashSet::new())
-        } else if options.cut_remove.is_active() && !report.estimates.is_empty() {
-            let timeline = align_core::export_model::ExportTimeline::from_result_with_options(
-                result,
-                align_core::export_model::ExportAssemblyOptions {
-                    camera_clock: report.estimates.clone(),
-                    ..options
-                },
-            );
-            Some(
-                timeline
-                    .into_iter()
-                    .flat_map(|t| t.islands)
-                    .flat_map(|i| i.clips)
-                    .filter(|item| item.camera_clock.is_some())
-                    .map(|item| item.clip.id)
-                    .collect(),
-            )
-        } else {
-            None
-        };
-        if let Some(kept) = kept {
-            report.estimates.retain(|e| {
-                if kept.contains(&e.clip_id) {
-                    true
-                } else {
-                    report
-                        .refusals
-                        .push((e.clip_id.clone(), CameraClockRefusal::RemovedByAssembly));
-                    false
-                }
-            });
-        }
-        if let Some(chosen) = self.camera_clock_choices.get(&sequence) {
+        let mut report = align_core::camera_clock::for_export(
+            result,
+            constraints,
+            &self.export.assembly_options(),
+        );
+        if result.project.imported_timeline.is_none()
+            && let Some(chosen) = self.camera_clock_choices.get(&sequence)
+        {
             report.apply_conflicts(chosen);
         }
         report

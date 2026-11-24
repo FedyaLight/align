@@ -79,20 +79,40 @@ fn excepted_clips(results: &[SyncResult], names: &[String]) -> Result<HashSet<Cl
 }
 
 /// The estimates `--camera-clock` applies to one result, reported on stderr
-/// with the clips it leaves unmatched and why.
+/// with the clips it leaves unmatched and why. Which estimates export can
+/// apply is decided as in the desktop app.
 fn camera_clock_estimates(
     result: &SyncResult,
     excepted: &HashSet<ClipId>,
-    unmatched: UnmatchedPlacement,
+    options: &align_core::export_model::ExportAssemblyOptions,
 ) -> Vec<CameraClockEstimate> {
-    let report = align_core::camera_clock::camera_clock(result, &[]);
+    use align_core::camera_clock::CameraClockRefusal;
+    let report = align_core::camera_clock::for_export(result, &[], options);
     let names = align_core::camera_clock::clip_names(result);
     let name = |id: &ClipId| names.get(id).cloned().unwrap_or_else(|| id.0.clone());
+    let mut removed = 0;
     for (id, refusal) in &report.refusals {
+        if *refusal != CameraClockRefusal::RemovedByAssembly {
+            eprintln!(
+                "camera clock: {} stays unmatched. {}",
+                name(id),
+                refusal.describe(&name)
+            );
+        } else if excepted.contains(id) {
+            eprintln!(
+                "camera clock: {} stays unmatched (--camera-clock-except).",
+                name(id)
+            );
+        } else if options.unmatched == UnmatchedPlacement::Remove {
+            removed += 1;
+        } else {
+            eprintln!("camera clock: cleanup leaves out {}.", name(id));
+        }
+    }
+    if removed > 0 {
         eprintln!(
-            "camera clock: {} stays unmatched. {}",
-            name(id),
-            refusal.describe(&name)
+            "camera clock: --unmatched remove leaves out {removed} clip{} the camera clock would place.",
+            if removed == 1 { "" } else { "s" }
         );
     }
     let (applied, skipped): (Vec<_>, Vec<_>) = report
@@ -123,16 +143,6 @@ fn camera_clock_estimates(
                 name(&hint.clip_id),
                 hint.track_label(),
                 hint.tolerance
-            );
-        }
-        return Vec::new();
-    }
-    if unmatched == UnmatchedPlacement::Remove {
-        if !applied.is_empty() {
-            eprintln!(
-                "camera clock: --unmatched remove leaves out {} clip{} the camera clock would place.",
-                applied.len(),
-                if applied.len() == 1 { "" } else { "s" }
             );
         }
         return Vec::new();
@@ -172,39 +182,37 @@ impl ExportOptions {
         let excepted = excepted_clips(results, &camera_clock_except)?;
         let mut timelines = Vec::with_capacity(result_count);
         for (index, result) in results.iter().enumerate() {
-            let estimates = if camera_clock {
-                camera_clock_estimates(result, &excepted, unmatched.core())
-            } else {
-                Vec::new()
+            let mut options = align_core::export_model::ExportAssemblyOptions {
+                unmatched: unmatched.core(),
+                prevent_group_overlaps,
+                disable_unmatched,
+                label_synced,
+                label_unmatched,
+                cut_remove: cut_remove.core()?,
+                synced_symbol: assign.synced_symbol.clone(),
+                synced_symbol_suffix: assign.synced_symbol_suffix,
+                synced_color: assign.synced_color.clone(),
+                synced_role: assign.synced_role.clone(),
+                unmatched_symbol: assign.unmatched_symbol.clone(),
+                unmatched_symbol_suffix: assign.unmatched_symbol_suffix,
+                unmatched_color: assign.unmatched_color.clone(),
+                unmatched_role: assign.unmatched_role.clone(),
+                sequence_name: assign.sequence_name.as_ref().map(|name| {
+                    if result_count > 1 {
+                        format!("{name} {}", index + 1)
+                    } else {
+                        name.clone()
+                    }
+                }),
+                camera_clock: Vec::new(),
             };
-            let timeline = align_core::export_model::ExportTimeline::from_result_with_options(
-                result,
-                align_core::export_model::ExportAssemblyOptions {
-                    unmatched: unmatched.core(),
-                    prevent_group_overlaps,
-                    disable_unmatched,
-                    label_synced,
-                    label_unmatched,
-                    cut_remove: cut_remove.core()?,
-                    synced_symbol: assign.synced_symbol.clone(),
-                    synced_symbol_suffix: assign.synced_symbol_suffix,
-                    synced_color: assign.synced_color.clone(),
-                    synced_role: assign.synced_role.clone(),
-                    unmatched_symbol: assign.unmatched_symbol.clone(),
-                    unmatched_symbol_suffix: assign.unmatched_symbol_suffix,
-                    unmatched_color: assign.unmatched_color.clone(),
-                    unmatched_role: assign.unmatched_role.clone(),
-                    sequence_name: assign.sequence_name.as_ref().map(|name| {
-                        if result_count > 1 {
-                            format!("{name} {}", index + 1)
-                        } else {
-                            name.clone()
-                        }
-                    }),
-                    camera_clock: estimates.clone(),
-                },
-            )
-            .map_err(|e| CliError::Failure(e.to_string()))?;
+            if camera_clock {
+                options.camera_clock = camera_clock_estimates(result, &excepted, &options);
+            }
+            let estimates = options.camera_clock.clone();
+            let timeline =
+                align_core::export_model::ExportTimeline::from_result_with_options(result, options)
+                    .map_err(|e| CliError::Failure(e.to_string()))?;
             if !estimates.is_empty() {
                 let names = align_core::camera_clock::clip_names(result);
                 let name = |id: &ClipId| names.get(id).cloned().unwrap_or_else(|| id.0.clone());

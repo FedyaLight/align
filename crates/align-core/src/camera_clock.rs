@@ -244,6 +244,60 @@ fn overlaps(a: (f64, f64), b: (f64, f64)) -> bool {
     a.0 < b.1 && b.0 < a.1
 }
 
+/// The report for export with `options`, decided the same way for the
+/// desktop preview, the desktop export and the command line. An estimate
+/// export's assembly would drop is withdrawn as a `RemovedByAssembly`
+/// refusal: every estimate when unmatched clips are removed, otherwise those
+/// the cleanup settings remove once every estimate is applied. Imported
+/// timelines keep their edits, and their report is returned unchanged.
+pub fn for_export(
+    result: &SyncResult,
+    constraints: &[SyncConstraint],
+    options: &crate::export::model::ExportAssemblyOptions,
+) -> CameraClockReport {
+    use crate::export::model::{ExportAssemblyOptions, ExportTimeline, UnmatchedPlacement};
+    let mut report = camera_clock(result, constraints);
+    if result.project.imported_timeline.is_some() {
+        return report;
+    }
+    let kept: Option<HashSet<ClipId>> = if options.unmatched == UnmatchedPlacement::Remove {
+        Some(HashSet::new())
+    } else if options.cut_remove.is_active() && !report.estimates.is_empty() {
+        let timeline = ExportTimeline::from_result_with_options(
+            result,
+            ExportAssemblyOptions {
+                camera_clock: report.estimates.clone(),
+                ..options.clone()
+            },
+        );
+        Some(
+            timeline
+                .into_iter()
+                .flat_map(|t| t.islands)
+                .flat_map(|i| i.clips)
+                .filter(|item| item.camera_clock.is_some())
+                .map(|item| item.clip.id)
+                .collect(),
+        )
+    } else {
+        None
+    };
+    if let Some(kept) = kept {
+        report.estimates.retain(|estimate| {
+            if kept.contains(&estimate.clip_id) {
+                true
+            } else {
+                report.refusals.push((
+                    estimate.clip_id.clone(),
+                    CameraClockRefusal::RemovedByAssembly,
+                ));
+                false
+            }
+        });
+    }
+    report
+}
+
 /// Estimates every unmatched clip of a camera with a serial number from the
 /// active stage of `result`. `constraints` are the user's rejected pairs and
 /// alignments for this sequence.
