@@ -402,6 +402,9 @@ fn main() {
         }
     }
     let _session_cleanup = SessionCleanup;
+    // Reading the system preference starts a helper process on macOS and
+    // Linux; do it while the window is being created, not in its first frame.
+    std::thread::spawn(motion::reduced_motion);
     let projects = project::Preferences::load(&settings::file());
     let writer = project::Writer::default();
     let project_writer = writer.clone();

@@ -182,6 +182,11 @@ pub fn provisional_bars(
     confidences: &HashMap<ClipId, f64>,
 ) -> Vec<BarVisual> {
     let groups = provisional_groups(clips, matches);
+    let refined: HashSet<&ClipId> = matches
+        .values()
+        .filter(|m| m.refined)
+        .flat_map(|m| [&m.left, &m.right])
+        .collect();
     let mut cursor = 0.0;
     let mut out = Vec::new();
     for items in &groups {
@@ -193,9 +198,7 @@ pub fn provisional_bars(
             let Some(clip) = clips.get(id) else {
                 continue;
             };
-            let matched = matches
-                .values()
-                .any(|m| m.refined && (m.left == *id || m.right == *id));
+            let matched = refined.contains(id);
             out.push(BarVisual {
                 id: id.0.clone(),
                 clip_id: id.clone(),

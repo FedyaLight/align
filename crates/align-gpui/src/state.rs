@@ -1304,17 +1304,24 @@ impl AppData {
             clip.id.clone(),
             clip.audio.iter().map(|a| a.channels).collect(),
         );
-        self.clips.push(ClipRow {
-            clip_id: Some(clip.id.clone()),
-            url: clip.url.clone(),
-            name: file_name(&clip.url),
-            kind: Some(clip.kind),
-            duration: Some(clip.duration.as_seconds()),
-            timecode: clip.source_timecode().map(|t| t.text.clone()),
-            state: ClipState::Analyzing,
-        });
-        self.clips
-            .sort_by(|a, b| a.url.to_string_lossy().cmp(&b.url.to_string_lossy()));
+        // The rows stay sorted by path, so each discovery is inserted in
+        // place instead of sorting the whole list again.
+        let key = clip.url.to_string_lossy();
+        let at = self
+            .clips
+            .partition_point(|row| row.url.to_string_lossy() <= key);
+        self.clips.insert(
+            at,
+            ClipRow {
+                clip_id: Some(clip.id.clone()),
+                url: clip.url.clone(),
+                name: file_name(&clip.url),
+                kind: Some(clip.kind),
+                duration: Some(clip.duration.as_seconds()),
+                timecode: clip.source_timecode().map(|t| t.text.clone()),
+                state: ClipState::Analyzing,
+            },
+        );
         self.layout_stale = true;
     }
 
