@@ -839,14 +839,18 @@ impl Pipeline {
         // parsers): Sony tail → BWF bext → filesystem fallback. Only
         // *differences* of embedded timestamps steer matching, and the BWF
         // date resolves in UTC (see meta.rs) — consistent per machine.
-        let bwf = align_core::meta::read_bwf(url);
+        // Broadcast Wave metadata only exists in WAVE files, Sony metadata
+        // only in camera files.
+        let bwf = (!probe.has_video)
+            .then(|| align_core::meta::read_bwf(url))
+            .flatten();
         let sony = probe
             .has_video
             .then(|| align_core::meta::read_sony_tail(url))
             .flatten();
         let (recorded_at, recorded_at_source) = sony
-            .as_deref()
-            .and_then(align_core::meta::sony_recording_date)
+            .as_ref()
+            .and_then(align_core::meta::SonyMetadata::recording_date)
             .map(|t| (Some(t), Some(RecordingTimestampSource::EmbeddedMetadata)))
             .or_else(|| {
                 bwf.as_ref().and_then(|b| {
@@ -880,8 +884,8 @@ impl Pipeline {
             // Prefer container timecode, then Sony sidecar timecode with the sequence rate.
             let fallback = v.frame_duration.unwrap_or(MediaTime::new(1, 25));
             let source_timecode = v.source_timecode.clone().or_else(|| {
-                sony.as_deref()
-                    .and_then(|xml| align_core::meta::sony_timecode(xml, fallback))
+                sony.as_ref()
+                    .and_then(|sony| sony.timecode(fallback))
                     .map(|timecode| align_core::SourceTimecode {
                         derived: true,
                         ..timecode
@@ -954,7 +958,9 @@ impl Pipeline {
             video,
             recorded_at,
             recorded_at_source,
-            source_identifier: sony.as_deref().and_then(align_core::meta::sony_device_id),
+            source_identifier: sony
+                .as_ref()
+                .and_then(align_core::meta::SonyMetadata::device_id),
             media_span: bwf.and_then(|b| b.media_span),
         })
     }
