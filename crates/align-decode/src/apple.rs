@@ -92,6 +92,17 @@ fn load_tracks(
         .collect())
 }
 
+/// The number of audio streams `inspect` reports for a file other than MXF,
+/// without its video and timecode probes: an All Mix decode asks for it on
+/// every window.
+fn audio_stream_count(path: &Path) -> Result<usize, DecodeError> {
+    if let Some(wave) = crate::pcm::PcmTrack::inspection_wave(path) {
+        return Ok(wave.probe().audio_streams.len());
+    }
+    let asset = open_asset(path)?;
+    Ok(audio_tracks(&asset)?.len())
+}
+
 fn audio_tracks(asset: &AVURLAsset) -> Result<Vec<Retained<AVAssetTrack>>, DecodeError> {
     // SAFETY: framework-provided media-type constant (copied pointer).
     let mt_opt = unsafe { AVMediaTypeAudio };
@@ -821,8 +832,26 @@ impl MediaBackend for AppleNativeBackend {
             });
         }
 
-        let mut reusable =
+        let reusable =
             revision.filter(|_| audio_streams.len() == 1 && audio_streams[0].is_float.is_none());
+        // Fingerprinting reuses the opened asset whether or not the opening
+        // is read for LTC, which a file with timecode skips.
+        if let (Some(prepared), Some(stamp)) = (prepared, reusable) {
+            let asset = asset.clone();
+            let file = path.to_owned();
+            prepared.remember(
+                path,
+                stamp,
+                Box::new(move |source, sink| {
+                    let tracks = audio_tracks(&asset)?;
+                    let track = tracks
+                        .get(source.stream_index())
+                        .ok_or(DecodeError::InvalidPcm)?;
+                    let (reader, rate) = reader_for_track(&asset, track, None)?;
+                    fingerprint_reader(&file, reader, rate, source, sink)
+                }),
+            );
+        }
         let report = ProbeReport {
             duration_seconds: seconds,
             audio_streams,
@@ -835,22 +864,6 @@ impl MediaBackend for AppleNativeBackend {
                 let track = audio.get(index).ok_or(DecodeError::InvalidPcm)?;
                 let (session, rate) = reader_for_track(&asset, track, Some((0., 3.)))?;
                 native_blocks(path, session, rate, consume)?;
-                if let (Some(prepared), Some(stamp)) = (prepared, reusable.take()) {
-                    let asset = asset.clone();
-                    let file = path.to_owned();
-                    prepared.remember(
-                        path,
-                        stamp,
-                        Box::new(move |source, sink| {
-                            let tracks = audio_tracks(&asset)?;
-                            let track = tracks
-                                .get(source.stream_index())
-                                .ok_or(DecodeError::InvalidPcm)?;
-                            let (reader, rate) = reader_for_track(&asset, track, None)?;
-                            fingerprint_reader(&file, reader, rate, source, sink)
-                        }),
-                    );
-                }
                 Ok(())
             }),
         })
@@ -875,7 +888,7 @@ impl MediaBackend for AppleNativeBackend {
             return crate::portable::PortableBackend.decode_mono_8k(path, source, consume);
         }
         if source == AudioAnalysisSource::AllMixed {
-            let stream_count = self.inspect(path)?.audio_streams.len();
+            let stream_count = audio_stream_count(path)?;
             return crate::mix::decode_all_streams_mono_8k(self, path, stream_count, consume);
         }
         if let Some(result) = self.local_mono_8k(path, source, consume) {
@@ -901,7 +914,7 @@ impl MediaBackend for AppleNativeBackend {
             );
         }
         if source == AudioAnalysisSource::AllMixed {
-            let stream_count = self.inspect(path)?.audio_streams.len();
+            let stream_count = audio_stream_count(path)?;
             return crate::mix::decode_all_streams_window_16k(
                 self,
                 path,

@@ -616,7 +616,7 @@ impl Pipeline {
             .map(|c| (c.id.clone(), c.url.clone()))
             .collect();
         let provider = BackendWindowProvider {
-            worker_cap: self.decode_worker_cap(clips.iter().map(|c| c.url.as_path())),
+            worker_cap: self.decode_worker_cap(&clips),
             decode: self.backend.window_decoder(),
             clips: clip_paths,
         };
@@ -793,17 +793,26 @@ impl Pipeline {
         None
     }
 
-    fn decode_worker_cap<'a>(&self, mut paths: impl Iterator<Item = &'a Path>) -> usize {
-        // AVFoundation uses blocking native readers with four reservations.
+    fn decode_worker_cap(&self, clips: &[Clip]) -> usize {
         // Other video containers need external decoders with their own threads.
-        if self.backend.kind() == BackendKind::AppleNative
-            || paths
-                .any(|p| crate::portable::is_video_container(p) && !crate::isobmff::is_candidate(p))
-        {
-            4
-        } else {
-            8
-        }
+        let external = clips.iter().any(|clip| {
+            crate::portable::is_video_container(&clip.url)
+                && !crate::isobmff::is_candidate(&clip.url)
+        });
+        // AVFoundation keeps four window readers; a window past them is read
+        // by the portable engine instead. Its windows stay at four workers
+        // unless every clip's windows come from the PCM readers the native
+        // engine uses for WAV files and linear PCM movies.
+        let avfoundation = self.backend.kind() == BackendKind::AppleNative
+            && !clips.iter().all(|clip| {
+                clip.url
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+                    || (crate::isobmff::is_candidate(&clip.url)
+                        && (0..clip.audio.len())
+                            .all(|stream| crate::pcm::PcmTrack::open(&clip.url, stream).is_some()))
+            });
+        if external || avfoundation { 4 } else { 8 }
     }
 
     /// Inspects files on bounded workers. Outcomes keep input order, so clips
