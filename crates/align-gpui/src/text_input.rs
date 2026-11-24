@@ -16,6 +16,11 @@ use gpui::{
 
 use crate::theme::Theme;
 
+/// Emitted when typing, pasting or deleting changes the text.
+pub struct Edited;
+
+impl gpui::EventEmitter<Edited> for TextInput {}
+
 actions!(
     align_text_input,
     [
@@ -320,6 +325,7 @@ impl EntityInputHandler for TextInput {
         let cursor = range.start + new_text.len();
         self.selected_range = cursor..cursor;
         self.marked_range = None;
+        cx.emit(Edited);
         cx.notify();
     }
 
@@ -350,6 +356,7 @@ impl EntityInputHandler for TextInput {
             .map(|selection| self.range_from_utf16(selection))
             .map(|selection| range.start + selection.start..range.start + selection.end)
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        cx.emit(Edited);
         cx.notify();
     }
 

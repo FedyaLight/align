@@ -128,6 +128,15 @@ pub(super) fn timeline_lanes(
     let target_poses = (!timeline_transitions.is_empty()).then(|| timeline_poses(data));
     let now = std::time::Instant::now();
     let row_stride = TIMELINE_ROW_H + 1.;
+    // Bars more than a screen away from the visible part keep their element,
+    // so nothing fades in again, but not their waveform, icon, name or
+    // tooltip, which are built again once they come near.
+    let view_width = f32::from(data.timeline_scroll.bounds().size.width);
+    let view_left = -f32::from(data.timeline_scroll.offset().x);
+    let near_view = |left: f32, width: f32| {
+        view_width <= 0.
+            || (left + width >= view_left - view_width && left <= view_left + 2. * view_width)
+    };
 
     // Labels stay fixed while only the ruler and clips scroll horizontally.
     // This also makes a normal two-finger/vertical wheel pan the timeline:
@@ -177,6 +186,34 @@ pub(super) fn timeline_lanes(
             });
     }
     tracks = tracks.child(ticks);
+    // One canvas draws the gridlines of every row at the ruler ticks, under
+    // the bars, in the color of the row separators it crosses.
+    let grid_color = rgb(theme.separator);
+    let grid_x: Vec<f32> = tick_times
+        .iter()
+        .map(|&at| (at * px_per_sec) as f32)
+        .collect();
+    tracks = tracks.relative().child(
+        gpui::canvas(
+            |_, _, _| (),
+            move |bounds, (), window, _| {
+                for &x in &grid_x {
+                    window.paint_quad(gpui::fill(
+                        gpui::Bounds::new(
+                            bounds.origin + point(px(x), px(0.)),
+                            gpui::size(px(1.), bounds.size.height),
+                        ),
+                        grid_color,
+                    ));
+                }
+            },
+        )
+        .absolute()
+        .left(px(0.))
+        .top(px(RULER_H))
+        .w(px(timeline_w))
+        .h(px(data.lanes.len() as f32 * row_stride)),
+    );
 
     // Rows.
     for (lane_index, lane) in data.lanes.iter().enumerate() {
@@ -253,19 +290,6 @@ pub(super) fn timeline_lanes(
                 .w(px(timeline_w))
                 .h(px(TIMELINE_ROW_H))
                 .flex_shrink_0();
-            // Vertical gridlines at ruler ticks.
-            for &at in &tick_times {
-                let x = (at * px_per_sec) as f32;
-                track = track.child(
-                    div()
-                        .absolute()
-                        .left(px(x))
-                        .top(px(0.))
-                        .w(px(1.))
-                        .h_full()
-                        .bg(rgb(theme.separator)),
-                );
-            }
             let geometry = bar_row_geometry(&lane.clips, px_per_sec);
             for (bar, (x, width)) in lane.clips.iter().zip(geometry.iter()) {
                 let (x, width) = (*x, *width);
@@ -314,7 +338,8 @@ pub(super) fn timeline_lanes(
                     .px_1()
                     .overflow_hidden()
                     .cursor_default();
-                if active {
+                let near = near_view(left, shown_width);
+                if active && near {
                     let mut tip = format!("{} · {}", bar.url.display(), fmt_duration(bar.duration));
                     if let Some(mark) = &bar.camera_clock {
                         tip += &format!(
@@ -332,7 +357,7 @@ pub(super) fn timeline_lanes(
                 // exact bounds, so long names shape a real "…" instead of
                 // hard-clipping past the bar edge. `el` itself is
                 // absolutely positioned, hence a valid anchor.
-                if width >= 24.0 {
+                if width >= 24.0 && near {
                     if let Some(waveform) = data.waveform_previews.get(&bar.clip_id) {
                         let (columns, bar_width) = waveform_columns(waveform, width);
                         let preview = gpui::canvas(
@@ -357,8 +382,7 @@ pub(super) fn timeline_lanes(
                             },
                         )
                         .absolute()
-                        .inset_0()
-                        .overflow_hidden();
+                        .inset_0();
                         el = el.child(preview);
                     }
                     let video = matches!(bar.kind, MediaKind::Video);

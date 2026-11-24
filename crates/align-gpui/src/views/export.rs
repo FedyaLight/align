@@ -1200,7 +1200,6 @@ pub(super) fn export_sheet(
         .min_h(px(0.))
         .overflow_y_scroll()
         .track_scroll(scroll)
-        .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
         .pb_2();
     columns = columns.child(export_formats_section(cx, sheet_context));
     let mut settings = div().flex().flex_col().gap_3();
@@ -1234,7 +1233,7 @@ pub(super) fn export_sheet(
         if data.export.correct_drift || data.export.media_files {
             sheet = sheet.child(
                 div()
-                    .w(px(420.))
+                    .w_full()
                     .h(px(8.))
                     .rounded_full()
                     .bg(rgb(theme.border))
@@ -1825,7 +1824,8 @@ fn export_audio_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Div 
     } = sheet;
     let mut group = div().flex().flex_col();
     group = group.child(export_section_title(theme, "Audio"));
-    let on = data.export.correct_drift && data.has_drift();
+    // Shown only when the result has drift.
+    let on = data.export.correct_drift;
     group = group.child(check_row(
         cx,
         theme,

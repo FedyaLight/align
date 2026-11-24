@@ -411,6 +411,11 @@ pub struct AppData {
     camera_clock_choices: HashMap<usize, BTreeSet<ClipId>>,
     /// Estimates and refusals for the visible result, recomputed with it.
     pub camera_clock: align_core::camera_clock::CameraClockReport,
+    /// Derived with `camera_clock` whenever it is, so views read them
+    /// instead of recomputing the report on every frame.
+    camera_clock_export_count: usize,
+    camera_clock_applied: HashSet<ClipId>,
+    camera_clock_hints: Vec<align_core::camera_clock::EditClockHint>,
     pub show_camera_clock: bool,
     pub audio_stream_channels: HashMap<ClipId, Vec<usize>>,
     /// Timeline waveforms live only for this process and are regenerated
@@ -497,6 +502,9 @@ impl Default for AppData {
             sequence_constraints: HashMap::new(),
             camera_clock_choices: HashMap::new(),
             camera_clock: Default::default(),
+            camera_clock_export_count: 0,
+            camera_clock_applied: HashSet::new(),
+            camera_clock_hints: Vec::new(),
             show_camera_clock: false,
             audio_stream_channels: HashMap::new(),
             waveform_previews: HashMap::new(),
@@ -1600,6 +1608,7 @@ impl AppData {
         self.pending_count = 0;
         let stopped = result.stopped;
         self.result = Some(result);
+        self.refresh_camera_clock_views();
         self.operation = Operation::Ready;
         self.progress = 1.0;
         let total = self.clips.len();
@@ -1783,23 +1792,17 @@ impl AppData {
     }
 
     pub fn camera_clock_applied(&self, clip: &ClipId) -> bool {
-        self.visible_camera_clock()
-            .iter()
-            .any(|estimate| &estimate.clip_id == clip)
+        self.camera_clock_applied.contains(clip)
     }
 
     /// Clips placed by camera clock across the sequences export writes.
     pub fn camera_clock_export_count(&self) -> usize {
-        (0..self.sequence_results.len().max(1))
-            .map(|position| self.camera_clock_for_export(position).len())
-            .sum()
+        self.camera_clock_export_count
     }
 
     /// Edit hints for an imported visible result.
-    pub fn camera_clock_hints(&self) -> Vec<align_core::camera_clock::EditClockHint> {
-        self.result.as_ref().map_or_else(Vec::new, |result| {
-            align_core::camera_clock::imported_edit_hints(result, &self.camera_clock.estimates)
-        })
+    pub fn camera_clock_hints(&self) -> &[align_core::camera_clock::EditClockHint] {
+        &self.camera_clock_hints
     }
 
     pub fn clip_name(&self, clip: &ClipId) -> String {
@@ -1888,24 +1891,36 @@ impl AppData {
         let Some(result) = &self.result else {
             return;
         };
-        if result.project.imported_timeline.is_some() {
-            return;
+        if result.project.imported_timeline.is_none() {
+            self.camera_clock = self.clock_report(result, self.current_sequence_key());
+            let final_timeline = lane::final_bars(result, self.clock_preview_options());
+            self.ruler_timecode = final_timeline.ruler_timecode;
+            self.lanes = lane::layout_bars(final_timeline.bars, &self.audio_stream_channels);
         }
-        self.camera_clock = self.clock_report(result, self.current_sequence_key());
-        let final_timeline = lane::final_bars(result, self.clock_preview_options());
-        self.ruler_timecode = final_timeline.ruler_timecode;
-        self.lanes = lane::layout_bars(final_timeline.bars, &self.audio_stream_channels);
+        self.refresh_camera_clock_views();
+    }
+
+    /// Recomputes what the views show about camera-clock placement, after
+    /// the report, the choices or the assembly options changed.
+    fn refresh_camera_clock_views(&mut self) {
+        self.camera_clock_export_count = (0..self.sequence_results.len().max(1))
+            .map(|position| self.camera_clock_for_export(position).len())
+            .sum();
+        self.camera_clock_applied = self
+            .visible_camera_clock()
+            .into_iter()
+            .map(|estimate| estimate.clip_id)
+            .collect();
+        self.camera_clock_hints = self.result.as_ref().map_or_else(Vec::new, |result| {
+            align_core::camera_clock::imported_edit_hints(result, &self.camera_clock.estimates)
+        });
     }
 
     /// Clips sharing the lane's source track, even when the compact preview
     /// has packed a non-overlapping source into the same visual row.
     fn lane_group(&self, lane_id: &str) -> Option<(String, HashSet<ClipId>)> {
         let lane = self.lanes.iter().find(|l| l.id == lane_id)?;
-        let kind_name = match lane.kind {
-            MediaKind::Video => "video",
-            MediaKind::Audio => "audio",
-        };
-        let key = format!("{kind_name}:{}", lane.source_key);
+        let key = lane_key(lane);
         let ids: HashSet<ClipId> = self
             .lanes
             .iter()
@@ -1922,10 +1937,11 @@ impl AppData {
         lane_id: &str,
         select: impl FnOnce(&TrackOverrides) -> &ScopedOverride<T>,
     ) -> Option<T> {
-        let (key, _) = self.lane_group(lane_id)?;
+        // Drawn for every lane on every frame: only the key is needed.
+        let lane = self.lanes.iter().find(|l| l.id == lane_id)?;
         select(self.current_track_overrides()?)
             .by_key
-            .get(&key)
+            .get(&lane_key(lane))
             .copied()
     }
 
@@ -2475,6 +2491,15 @@ fn sorted_live_matches(map: &HashMap<String, LiveMatch>) -> Vec<LiveMatch> {
     let mut rows: Vec<LiveMatch> = map.values().cloned().collect();
     rows.sort_by(|a, b| LiveMatch::id(&a.left, &a.right).cmp(&LiveMatch::id(&b.left, &b.right)));
     rows
+}
+
+/// The track-override key of the source track a lane shows.
+fn lane_key(lane: &lane::LaneVisual) -> String {
+    let kind_name = match lane.kind {
+        MediaKind::Video => "video",
+        MediaKind::Audio => "audio",
+    };
+    format!("{kind_name}:{}", lane.source_key)
 }
 
 /// Preview items for imported timelines.

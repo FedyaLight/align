@@ -46,7 +46,9 @@ pub(super) fn toolbar(
         "btn-add",
         "icons/plus.svg",
         "Add Media",
-        true,
+        // Media added during a job would be dropped; the job's own bar
+        // offers Cancel.
+        !busy,
         |this, _, _, cx| this.add_media(cx),
     ));
     let trash_tip = if data.selection.is_empty() {
@@ -60,7 +62,7 @@ pub(super) fn toolbar(
         "btn-clear",
         "icons/trash.svg",
         trash_tip,
-        !data.clips.is_empty(),
+        !data.clips.is_empty() && !busy,
         |this, _, _, cx| this.delete_or_clear(cx),
     ));
     bar = bar.child(div().w(px(12.)));

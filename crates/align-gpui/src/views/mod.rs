@@ -350,23 +350,28 @@ impl PathFixerInputs {
             omit_extensions: cx.new(|cx| TextInput::new(cx, "jpg, png")),
         }
     }
-
-    fn any_focused(&self, window: &Window, cx: &App) -> bool {
-        self.old_folder.read(cx).is_focused(window)
-            || self.omit_extensions.read(cx).is_focused(window)
-    }
 }
 
 impl ExportInputs {
     fn new(cx: &mut Context<AlignApp>) -> Self {
+        // The export defaults section compares these fields with the saved
+        // defaults, so the window redraws when one is edited.
+        let mut field = |placeholder| {
+            let input = cx.new(|cx| TextInput::new(cx, placeholder));
+            cx.subscribe(&input, |_, _, _: &crate::text_input::Edited, cx| {
+                cx.notify();
+            })
+            .detach();
+            input
+        };
         Self {
-            sequence_name: cx.new(|cx| TextInput::new(cx, "Keep source name")),
-            synced_symbol: cx.new(|cx| TextInput::new(cx, "e.g. [SYNCED]")),
-            synced_color: cx.new(|cx| TextInput::new(cx, "e.g. Green")),
-            synced_role: cx.new(|cx| TextInput::new(cx, "e.g. Dialogue")),
-            unmatched_symbol: cx.new(|cx| TextInput::new(cx, "e.g. [UNSYNCED]")),
-            unmatched_color: cx.new(|cx| TextInput::new(cx, "e.g. Rose")),
-            unmatched_role: cx.new(|cx| TextInput::new(cx, "e.g. Dialogue")),
+            sequence_name: field("Keep source name"),
+            synced_symbol: field("e.g. [SYNCED]"),
+            synced_color: field("e.g. Green"),
+            synced_role: field("e.g. Dialogue"),
+            unmatched_symbol: field("e.g. [UNSYNCED]"),
+            unmatched_color: field("e.g. Rose"),
+            unmatched_role: field("e.g. Dialogue"),
         }
     }
 
@@ -540,6 +545,24 @@ impl AlignApp {
         self.projects.busy
     }
 
+    /// A dialog, menu or popover covers the window. The export sidebar is
+    /// not one: the timeline beside it previews its options.
+    fn dialog_open(&self) -> bool {
+        self.show_problem_report
+            || self.app_menu.is_some()
+            || self.data.menu.is_some()
+            || self.data.show_path_fixer
+            || self.data.error.is_some()
+            || !self.data.sequence_pickers.is_empty()
+            || self.data.show_about
+            || self.data.show_agent_setup
+            || self.data.show_search_quality
+            || self.data.show_search_settings
+            || self.data.show_stage_settings
+            || self.data.show_sequence_results
+            || self.data.show_camera_clock
+    }
+
     pub fn new(
         projects: crate::project::Preferences,
         writer: crate::project::Writer,
@@ -587,7 +610,7 @@ impl AlignApp {
     /// Clear the session, or remove the selected sources. A cleared session
     /// starts the next job from the export defaults.
     pub(crate) fn delete_or_clear(&mut self, cx: &mut Context<Self>) {
-        if self.projects.busy {
+        if self.projects.busy || self.data.has_active_job() {
             return;
         }
         let clearing = self.data.selection.is_empty();
@@ -673,6 +696,9 @@ impl AlignApp {
     }
 
     pub(crate) fn add_media(&mut self, cx: &mut Context<Self>) {
+        if self.data.has_active_job() {
+            return;
+        }
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: true,

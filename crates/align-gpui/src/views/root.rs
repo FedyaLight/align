@@ -41,21 +41,15 @@ impl Render for AlignApp {
         // While a modal or context menu is open the content below keeps
         // its layout but loses hover/cursor feedback (clicks are already
         // swallowed by the overlay layers).
-        let content_active = !self.projects.busy
-            && !self.show_problem_report
-            && self.app_menu.is_none()
-            && self.data.menu.is_none()
-            && !self.data.show_path_fixer
-            && self.data.error.is_none()
-            && self.data.sequence_pickers.is_empty()
-            && !self.data.show_about
-            && !self.data.show_agent_setup
-            && !self.data.show_search_quality
-            && !self.data.show_search_settings
-            && !self.data.show_stage_settings
-            && !self.data.show_sequence_results
-            && !self.data.show_camera_clock
-            && !self.data.show_export;
+        let content_active = !self.projects.busy && !self.dialog_open() && !self.data.show_export;
+        // Keys belong to the open dialog: export fields behind it give up
+        // focus, and once a dialog closes the window takes focus back from
+        // its fields.
+        if (self.dialog_open() && self.export_inputs.any_focused(window, cx))
+            || !self.focus_handle.contains_focused(window, cx)
+        {
+            window.focus(&self.focus_handle);
+        }
         let mut root = div()
             .id("app-root")
             .relative()
@@ -121,13 +115,6 @@ impl Render for AlignApp {
                     this.close_settings_select(cx);
                     return;
                 }
-                if key == "escape"
-                    && this.data.show_export
-                    && !matches!(this.data.operation, Operation::Exporting)
-                {
-                    this.close_export_sidebar(cx);
-                    return;
-                }
                 if key == "escape" && this.data.show_search_quality {
                     this.close_search_quality(cx);
                     return;
@@ -153,10 +140,39 @@ impl Render for AlignApp {
                     cx.notify();
                     return;
                 }
-                if this.data.show_export && this.export_inputs.any_focused(window, cx) {
+                if key == "escape" && this.data.show_stage_settings {
+                    this.data.show_stage_settings = false;
+                    cx.notify();
                     return;
                 }
-                if this.data.show_path_fixer && this.path_fixer_inputs.any_focused(window, cx) {
+                // With changes the settings close through Apply.
+                if key == "escape" && this.data.show_search_settings && !this.data.settings_changed
+                {
+                    this.finish_search_settings(cx);
+                    return;
+                }
+                if key == "escape" && this.data.error.is_some() {
+                    this.data.dismiss_error();
+                    cx.notify();
+                    return;
+                }
+                if key == "escape" && this.data.sequence_pickers.pop_front().is_some() {
+                    cx.notify();
+                    return;
+                }
+                // The timeline behind an open dialog does not move.
+                if this.dialog_open() {
+                    return;
+                }
+                // Last, so a dialog over the sidebar closes first.
+                if key == "escape"
+                    && this.data.show_export
+                    && !matches!(this.data.operation, Operation::Exporting)
+                {
+                    this.close_export_sidebar(cx);
+                    return;
+                }
+                if this.data.show_export && this.export_inputs.any_focused(window, cx) {
                     return;
                 }
                 if this.data.lanes.is_empty() {
