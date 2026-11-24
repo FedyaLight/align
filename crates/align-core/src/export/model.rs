@@ -1687,6 +1687,8 @@ impl ExportTimeline {
                 }),
                 start: item.start,
                 duration: item.timeline_duration,
+                source_in: item.source_in,
+                source_out: item.source_out,
                 confidence: item.confidence,
                 matched: !unmatched.contains(&item.clip.id),
                 camera_clock: item.camera_clock.clone(),

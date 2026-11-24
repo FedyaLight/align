@@ -23,7 +23,15 @@ open "/Applications/Align.app"
 While Align analyzes, clips on the timeline are striped: their place is not
 confirmed yet. Afterwards a synchronized clip has a link in its top-right
 corner and an unmatched clip a warning sign. A clip too narrow for the mark
-shows its state by color only.
+shows its state by color only. A wide clip that only timecode synchronized
+also reads **TC Sync** beside its link.
+
+Rest the pointer on a clip to see how it got its place and only the values
+the result has for it: confidence and drift for a waveform match, where the
+clip sits on the timeline, its source timecode where that place starts, and
+what the camera clock says about it. When an imported edit plays part of a
+recording, or the same recording more than once, the card also shows the
+part each use plays and which use it is.
 
 The export sheet starts from Align's defaults. **Save as Default** keeps the
 current export options for new sessions and later launches; the destination

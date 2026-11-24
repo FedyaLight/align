@@ -2492,43 +2492,24 @@ fn imported_preview(result: &SyncResult) -> ImportedPreview {
         return (fallback.bars, fallback.states, fallback.ruler_timecode);
     };
     let unmatched: HashSet<ClipId> = result.unmatched.iter().cloned().collect();
+    let evidence = lane::match_evidence(result);
+    // Imported edits are never placed by camera clock: they keep their own.
     let bars: Vec<BarVisual> = timeline
         .preview_items(&unmatched)
         .into_iter()
-        .map(|item| {
+        .map(|mut item| {
             let state = if unmatched.contains(&item.clip_id) {
                 lane::BarMatchState::Unmatched
             } else {
                 lane::BarMatchState::Matched
             };
-            BarVisual {
-                id: item.id.clone(),
-                clip_id: item.clip_id.clone(),
-                url: item.url.clone(),
-                source_key: item.source_key.clone(),
-                name: item.name.clone(),
-                kind: item.kind,
-                start: item.start,
-                duration: item.duration,
-                confidence: item.confidence,
-                match_state: state,
-                camera_clock: None,
-            }
+            item.camera_clock = None;
+            BarVisual::settled(item, state, &evidence)
         })
         .collect();
     // Like the ordinary preview: matched clips, with the evidence that
     // synchronized them.
-    let states = bars
-        .iter()
-        .filter(|bar| bar.match_state == lane::BarMatchState::Matched)
-        .map(|bar| {
-            (
-                bar.clip_id.clone(),
-                bar.confidence,
-                lane::match_evidence(result, &bar.clip_id),
-            )
-        })
-        .collect();
+    let states = lane::matched_states(&bars);
     (bars, states, lane::RulerClock::of(&timeline))
 }
 
@@ -3070,6 +3051,9 @@ mod tests {
             duration: 10.0,
             confidence: 0.0,
             match_state: BarMatchState::Unmatched,
+            evidence: None,
+            source_in: 0.0,
+            source_out: 0.0,
             camera_clock: None,
         };
         let mut packed_other_source = bar("c.wav");
@@ -3206,6 +3190,9 @@ mod tests {
                     duration: 2.0,
                     confidence: 0.9,
                     match_state: BarMatchState::Matched,
+                    evidence: None,
+                    source_in: 0.0,
+                    source_out: 0.0,
                     camera_clock: None,
                 }],
             }],
