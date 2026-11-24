@@ -1,7 +1,7 @@
 //! Long-drift fallback for an ambiguous offset histogram. Fit lines in
 //! (source time, target time), counting independent time cells as support.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
     ANCHOR_BUCKET_FRAMES, Anchor, BUCKET_WIDTH_FRAMES, Fit, Record, SECONDS_PER_FRAME, policy,
@@ -13,9 +13,11 @@ const MODES_PER_SECTION: usize = 4;
 const MAX_POINTS: usize = 16_384;
 const INLIER_SECONDS: f64 = 0.16;
 
+/// Hashed in the innermost record-pair loop. Every result is sorted before
+/// it is used, so the hasher never affects the outcome.
 pub(super) struct Candidate {
-    buckets: HashSet<i64>,
-    points: Option<HashMap<(u32, i64), Anchor>>,
+    buckets: FxHashSet<i64>,
+    points: Option<FxHashMap<(u32, i64), Anchor>>,
 }
 
 impl Candidate {
@@ -33,7 +35,7 @@ impl Candidate {
         }
         Some(Self {
             buckets: buckets.into_iter().collect(),
-            points: Some(HashMap::new()),
+            points: Some(FxHashMap::default()),
         })
     }
 
@@ -77,8 +79,8 @@ impl Candidate {
             return None;
         }
         let section = |x: f64| (((x - first) / span * SECTIONS as f64) as usize).min(SECTIONS - 1);
-        let mut cells: [HashMap<i64, (f64, f64, usize)>; SECTIONS] =
-            std::array::from_fn(|_| HashMap::new());
+        let mut cells: [FxHashMap<i64, (f64, f64, usize)>; SECTIONS] =
+            std::array::from_fn(|_| FxHashMap::default());
         for &((_, bucket), p) in &points {
             let cell = cells[section(p.left)].entry(bucket).or_default();
             cell.0 += p.left;
