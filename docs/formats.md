@@ -162,8 +162,9 @@ nothing between them.
 **When a clip is not placed.** A clip stays unmatched, with the reason shown,
 when its time source is Timecode, it has no recording time, no clip of the
 camera recorded before or after it is synchronized by sound, the nearest
-clips before and after it are in different groups or the camera has clips
-from another group between them, the anchors disagree, it would not fit
+clips before and after it are in different groups, the camera has clips
+from another group between them, or another group's neighboring clips of the
+camera also surround its time, the anchors disagree, it would not fit
 between the anchors or would overlap another synchronized or placed clip of
 the camera, or its pairing or alignment with a clip it would play alongside
 was rejected. When sound anchors reveal a backward adjustment, Align also
@@ -177,10 +178,11 @@ blocks a conflicting rejected estimate. Place All resolves ties by clip ID.
   keeps the unmatched color, role, and **Disable in timeline** settings.
 - With cleanup off, other clips keep their positions and track numbers.
   The placed clip uses its original track if free, another compatible track,
-  or a new track after the others. In the Final Cut multicam, an overlapping
-  take gets a separate angle.
-- A vacated slot at the end stays empty. Premiere XML, Resolve XML and FCPXML
-  specify the sequence duration. OTIO writes a trailing gap. AAF carries the
+  or a new track after the others. In the Final Cut multicam and on its
+  connected lanes, a clip that would overlap another once both are on the
+  sequence's frames gets a separate angle or lane.
+- A vacated slot stays empty unless Cut closes it (below). Premiere XML,
+  Resolve XML and FCPXML specify the sequence duration. OTIO writes a trailing gap. AAF carries the
   original end in the composition timecode and fills the vacated media span.
   The Resolve script imports the OTIO for picture timelines.
 - **Remove** unmatched clips removes placed clips too. **By order only**
@@ -191,18 +193,22 @@ blocks a conflicting rejected estimate. Place All resolves ties by clip ID.
   recorder clip that a placed clip overlaps. Trimming and **Remove clips
   shorter than** treat it like any clip. Cleanup operates on the new placement
   and allows the sequence to end at the last surviving clip. The desktop
-  preview uses these assembly settings for an accepted estimate. Switching to Remove suspends that choice until
-  the clip is included again.
+  preview uses these assembly settings only while an accepted estimate
+  applies. Switching to Remove suspends that choice until the clip is
+  included again. **Cut gaps empty on all tracks** also closes the place a
+  placed clip left, so the clips after it move up by it.
 - The Premiere replaced-audio sequence keeps a placed clip's own camera sound
-  instead of the recorder's. Clean-audio camera files are not created for
-  placed clips.
+  instead of the recorder's. A stereo pair of recorder tracks it leaves empty
+  stays an empty stereo pair, or is dropped when it is the last track.
+  Clean-audio camera files are not created for placed clips.
 - For an imported XML, FCPXML, or AAF edit, edits keep their placement. Align
   compares where each edit of a clip starts with where the camera clock puts
   the same frame, accounting for the edit's source in point, speed, and its
   track's offset, and reports the difference. It does so only when that track
   has synchronized edits from the clip's group that agree within a frame; an
-  edit played in reverse is not compared. A clip without an edit stays among
-  the sources.
+  edit played in reverse is not compared. An FCPXML edit is on V1 or A1 in the
+  primary storyline and on V2 or A2 in the first connected lane. A clip
+  without an edit stays among the sources.
 
 Estimates are not stored in saved results: they are computed again from the
 result's selected stage and time-source settings each time.

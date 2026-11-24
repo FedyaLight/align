@@ -260,13 +260,19 @@ fn common_gap_removal_keeps_the_time_an_estimate_covers() {
         common_gaps: true,
         ..Default::default()
     };
+    // Where C4 plays after the group's first clip: the place C3 left is
+    // closed with the common gaps, so only the group's own time counts.
     let c4_start = |options: ExportAssemblyOptions| {
-        timeline(&result, options).islands[0]
-            .clips
-            .iter()
-            .find(|item| item.clip.id == c4.id)
-            .unwrap()
-            .start
+        let timeline = timeline(&result, options);
+        let start = |id: &ClipId| {
+            timeline.islands[0]
+                .clips
+                .iter()
+                .find(|item| &item.clip.id == id)
+                .unwrap()
+                .start
+        };
+        start(&c4.id) - start(&ClipId::new("C1"))
     };
     let ordinary = c4_start(ExportAssemblyOptions {
         cut_remove: cut,
@@ -317,4 +323,291 @@ fn the_replaced_sequence_keeps_an_estimated_clips_own_sound() {
         "recorder audio replaced the estimated clip's: {sound:?}"
     );
     assert!(sound.iter().any(|(file, ..)| file == "R.WAV"));
+}
+
+/// Camera B's B0 ends at 55.050 s and the estimate puts C3 at 55.055 s, in
+/// the same folder: apart in seconds, but on the 25 fps grid B0 runs to
+/// frame 1377 and C3 starts on frame 1376.
+fn rounding_seam() -> SyncResult {
+    let clip = |name: &str, at: i64, seconds: f64| {
+        camera_clip(
+            name,
+            Some(crate::camera_clock::tests::CAMERA),
+            T0 + at,
+            seconds,
+        )
+    };
+    let b0 = camera_clip("B0", Some("device:Sony:ILCE-7M4:9001"), T0 + 45, 10.025);
+    let r = recorder("R", 200.0);
+    let mut result = crate::camera_clock::tests::result(
+        vec![vec![
+            (r, 0.0),
+            (clip("C1", 10, 10.0), 10.0),
+            (clip("C2", 30, 10.0), 30.055),
+            (b0, 45.025),
+            (clip("C4", 80, 10.0), 80.055),
+        ]],
+        vec![clip("C3", 55, 12.0)],
+        Default::default(),
+    );
+    result.matches.retain(|m| m.right.0 != "B0");
+    result
+}
+
+#[test]
+fn the_written_grid_decides_whether_an_estimate_fits_its_angle_or_lane() {
+    let result = rounding_seam();
+    let estimates = camera_clock(&result, &[]).estimates;
+    assert!((estimates[0].start - 55.055).abs() < 1e-6, "{estimates:?}");
+    let estimated = timeline(&result, applied(&result));
+
+    // The multicam: no angle plays two clips over each other.
+    let xml = super::fcpxml::write(&estimated, FcpxmlOptions::default());
+    let seconds = |text: &str| {
+        let text = text.trim_end_matches('s');
+        text.split_once('/').map_or_else(
+            || text.parse::<f64>().unwrap(),
+            |(n, d)| n.parse::<f64>().unwrap() / d.parse::<f64>().unwrap(),
+        )
+    };
+    let attribute = |line: &str, name: &str| {
+        let after = line.split_once(&format!(" {name}=\"")).unwrap().1;
+        seconds(after.split('"').next().unwrap())
+    };
+    let mut angles: Vec<Vec<(String, f64, f64)>> = Vec::new();
+    let mut inside = false;
+    for line in xml.lines().map(str::trim) {
+        if line.starts_with("<mc-angle") {
+            angles.push(Vec::new());
+            inside = true;
+        } else if line.starts_with("</mc-angle") {
+            inside = false;
+        } else if line.starts_with("<asset-clip") && inside {
+            let start = attribute(line, "offset");
+            let name = line
+                .split("name=\"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap();
+            angles.last_mut().unwrap().push((
+                name.to_string(),
+                start,
+                start + attribute(line, "duration"),
+            ));
+        }
+    }
+    assert!(
+        angles
+            .iter()
+            .flatten()
+            .any(|(name, ..)| name.contains("C3"))
+    );
+    for angle in &angles {
+        for (i, a) in angle.iter().enumerate() {
+            for b in &angle[i + 1..] {
+                assert!(
+                    a.2 <= b.1 + 1e-6 || b.2 <= a.1 + 1e-6,
+                    "overlap in an angle: {a:?} {b:?}"
+                );
+            }
+        }
+    }
+
+    // The synchronized timeline: no track plays two clips over each other.
+    for format in [
+        TimelineExportFormat::FinalCutProXML,
+        TimelineExportFormat::PremiereXML,
+    ] {
+        let (text, extension) = if format == TimelineExportFormat::PremiereXML {
+            (
+                super::premiere::write(&estimated, format, PremiereOptions::default()),
+                "xml",
+            )
+        } else {
+            (
+                super::fcpxml::write(&estimated, FcpxmlOptions::TIMELINE),
+                "fcpxml",
+            )
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(format!("timeline.{extension}"));
+        std::fs::write(&path, text).unwrap();
+        let draft = crate::xml::read_timeline(&path, None).unwrap();
+        let mut tracks: BTreeMap<(String, usize), Vec<(f64, f64)>> = BTreeMap::new();
+        for edit in &draft.edits {
+            tracks
+                .entry((format!("{:?}", edit.media_type), edit.track_index))
+                .or_default()
+                .push((edit.timeline_start, edit.timeline_end));
+        }
+        for (track, spans) in &mut tracks {
+            spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for pair in spans.windows(2) {
+                assert!(
+                    pair[0].1 <= pair[1].0 + 1e-6,
+                    "{format:?} {track:?}: {pair:?}"
+                );
+            }
+        }
+    }
+}
+
+/// `slot_first()` with C3 shortened to ten seconds and groups of another
+/// camera, each a recorder and one clip of it at `(recorded, start in group,
+/// recorder seconds)`.
+fn short_slot(others: &[(i64, f64, f64)]) -> SyncResult {
+    let mut result = slot_first();
+    for clip in result.project.clips.iter_mut().filter(|c| c.id.0 == "C3") {
+        clip.duration = crate::MediaTime::seconds(10.0);
+    }
+    for (index, (recorded, start, length)) in others.iter().enumerate() {
+        let id = index + 1;
+        let r = recorder(&format!("R{id}"), *length);
+        let b = camera_clip(
+            &format!("B{id}"),
+            Some("device:Sony:ILCE-7M4:9001"),
+            T0 + recorded,
+            120.0f64.min(length - start),
+        );
+        result.matches.push(sound(&r, &b, MatchEvidence::Waveform));
+        result.islands.push(SyncIsland {
+            id,
+            placements: vec![placement(&r, 0.0), placement(&b, *start)],
+        });
+        result.project.clips.extend([r, b]);
+    }
+    result
+}
+
+/// With Remove common gaps the place an estimated clip left is empty time
+/// and closes, at the start or between groups; where other material plays
+/// at the same time it stays. Without Cut & Remove the place is kept.
+#[test]
+fn common_gap_removal_closes_the_place_an_estimate_left() {
+    let cut = ExportAssemblyOptions {
+        cut_remove: CutRemoveOptions {
+            common_gaps: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let starts = |result: &SyncResult, options: ExportAssemblyOptions| -> BTreeMap<String, f64> {
+        timeline(result, options).islands[0]
+            .clips
+            .iter()
+            .map(|item| (item.clip.id.0.clone(), item.start))
+            .collect()
+    };
+    // Whether the place closes: another camera's group recorded before and
+    // after C3, or one recording the whole time C3 would play.
+    for (name, result, closes) in [
+        ("first", short_slot(&[]), true),
+        (
+            "between",
+            short_slot(&[(100, 20.0, 300.0), (2000, 50.0, 300.0)]),
+            true,
+        ),
+        ("alongside", short_slot(&[(595, 5.0, 300.0)]), false),
+    ] {
+        let estimates = camera_clock(&result, &[]).estimates;
+        assert_eq!(estimates.len(), 1, "{name}");
+        let applied = |options: &ExportAssemblyOptions| ExportAssemblyOptions {
+            camera_clock: estimates.clone(),
+            ..options.clone()
+        };
+        let ordinary = starts(&result, cut.clone());
+        let estimated = starts(&result, applied(&cut));
+        let slot = ordinary["C3"];
+        for (clip, start) in estimated.iter().filter(|(clip, _)| *clip != "C3") {
+            // Whatever plays after the place moves up by it and its gap.
+            let later = closes && ordinary[clip] >= slot + 10.0;
+            let expected = ordinary[clip] - if later { 11.0 } else { 0.0 };
+            assert!(
+                (start - expected).abs() < 1e-6,
+                "{name}: {clip} at {start}, expected {expected}"
+            );
+        }
+        if name == "first" {
+            // The sequence a user imports opens with the group, not an
+            // empty ten seconds.
+            let opening = written(
+                &timeline(&result, applied(&cut)),
+                TimelineExportFormat::PremiereXML,
+            )
+            .values()
+            .flatten()
+            .map(|(_, start)| *start)
+            .min();
+            assert_eq!(opening, Some(0));
+        }
+        // The place stays when nothing asks to close it.
+        let ordinary = starts(&result, Default::default());
+        let kept = starts(&result, applied(&Default::default()));
+        for clip in kept.keys().filter(|c| *c != "C3") {
+            assert_eq!(kept[clip], ordinary[clip], "{name}: {clip}");
+        }
+    }
+}
+
+/// The audio tracks of the replaced sequence as written: whether each is a
+/// channel of a stereo track, and how many clips it holds.
+fn replaced_audio_tracks(timeline: &ExportTimeline) -> Vec<(bool, usize)> {
+    let xml = super::premiere::write(
+        timeline,
+        TimelineExportFormat::PremiereXML,
+        PremiereOptions {
+            replaced_sequence: true,
+            ..Default::default()
+        },
+    );
+    let audio = xml
+        .split("id=\"sequence-2\"")
+        .nth(1)
+        .and_then(|sequence| sequence.split("<audio>").nth(1))
+        .expect("replaced sequence");
+    audio
+        .split("\n            <track")
+        .skip(1)
+        .map(|track| {
+            (
+                track.starts_with(" premiereTrackType=\"Stereo\""),
+                track.matches("<clipitem ").count(),
+            )
+        })
+        .collect()
+}
+
+/// Under C3's ordinary place a stereo recorder plays in the replaced
+/// sequence. Once C3 plays its own sound, mono or none, the pair it left
+/// is not two empty mono tracks.
+#[test]
+fn the_replaced_sequence_does_not_leave_mono_tracks_where_an_estimate_left_a_stereo_pair() {
+    let result = short_slot(&[(595, 5.0, 300.0)]);
+    let ordinary = replaced_audio_tracks(&timeline(&result, Default::default()));
+    assert!(ordinary.iter().all(|&(stereo, _)| stereo), "{ordinary:?}");
+    let own_sound = |channels: Option<usize>| {
+        let mut result = result.clone();
+        for clip in result.project.clips.iter_mut().filter(|c| c.id.0 == "C3") {
+            match channels {
+                Some(channels) => clip.audio[0].channels = channels,
+                None => clip.audio.clear(),
+            }
+        }
+        replaced_audio_tracks(&timeline(&result, applied(&result)))
+    };
+
+    // The other tracks keep their numbers: the vacated pair stays a pair,
+    // and C3's mono sound is a track of its own after it.
+    let mono = own_sound(Some(1));
+    let mut expected = ordinary.clone();
+    let vacated = expected.len() - 2;
+    expected[vacated] = (true, 0);
+    expected[vacated + 1] = (true, 0);
+    expected.push((false, 1));
+    assert_eq!(mono, expected);
+
+    // Without sound the pair at the end only shifts nothing, and goes.
+    assert_eq!(own_sound(None), ordinary[..vacated]);
 }

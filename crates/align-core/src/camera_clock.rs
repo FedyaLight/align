@@ -433,7 +433,19 @@ fn estimate_one(
             && p.clock
                 .is_some_and(|at| (before_clock..=after_clock).contains(&at))
     });
-    if after.island != island || elsewhere {
+    // Another group of the camera whose own neighbouring anchors bracket the
+    // time is as plausible a home, even when its anchors lie outside the
+    // chosen pair. Coordinates of different groups are never compared.
+    let competing =
+        chronological
+            .iter()
+            .zip(chronological.iter().skip(1))
+            .any(|((earlier, a), (later, b))| {
+                a.island == b.island
+                    && a.island != island
+                    && (earlier.min(*later)..=earlier.max(*later)).contains(&clock)
+            });
+    if after.island != island || elsewhere || competing {
         return Err(CameraClockRefusal::AmbiguousGroup);
     }
     // How much more time sound puts between the anchors than the camera
@@ -638,6 +650,10 @@ pub fn imported_edit_hints(
     let aaf_numbers = legacy.as_deref().or_else(|| {
         (!imported.aaf_track_numbers.is_empty()).then_some(imported.aaf_track_numbers.as_slice())
     });
+    // FCPXML numbers its primary storyline 0 and connected lanes from 1; the
+    // editors show the primary as track 1 and lane n as track n + 1. Other
+    // formats start at 1. Only an FCPXML import has a zero track.
+    let primary_is_zero = aaf_numbers.is_none() && sides.iter().any(|side| side.track == 0);
     // Group time minus sequence time, per (media, track, group).
     let mut offsets: HashMap<(MediaKind, usize, usize), Vec<f64>> = HashMap::new();
     for side in sides.iter().filter(|side| !side.backward) {
@@ -683,6 +699,7 @@ pub fn imported_edit_hints(
                         .checked_sub(1)
                         .and_then(|index| numbers.get(index))
                         .copied(),
+                    None if primary_is_zero => Some(side.track + 1),
                     None => Some(side.track.max(1)),
                 },
                 timeline_start: side.timeline_start,
@@ -1086,6 +1103,56 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn refuses_when_another_group_brackets_the_time_too() {
+        // Group 1 puts the clock at 120 s thirty seconds in, group 2 fifty:
+        // the second pair of anchors lies outside the first yet covers the
+        // same time.
+        let clip = |name, at| camera_clip(name, Some(CAMERA), T0 + at, 20.0);
+        let c3 = camera_clip("C3", Some(CAMERA), T0 + 120, 5.0);
+        let competing = result(
+            vec![
+                vec![
+                    (recorder("R1", 500.0), 0.0),
+                    (clip("A", 100), 10.0),
+                    (clip("B", 150), 60.0),
+                ],
+                vec![
+                    (recorder("R2", 500.0), 0.0),
+                    (clip("C", 80), 10.0),
+                    (clip("D", 160), 90.0),
+                ],
+            ],
+            vec![c3.clone()],
+            TemporalPolicy::default(),
+        );
+        assert_eq!(
+            camera_clock(&competing, &[]).refusal(&c3.id),
+            Some(&CameraClockRefusal::AmbiguousGroup)
+        );
+
+        // With the second group recorded elsewhere on the clock, the first
+        // still places the clip.
+        let apart = result(
+            vec![
+                vec![
+                    (recorder("R1", 500.0), 0.0),
+                    (clip("A", 100), 10.0),
+                    (clip("B", 150), 60.0),
+                ],
+                vec![
+                    (recorder("R2", 500.0), 0.0),
+                    (clip("C", 200), 10.0),
+                    (clip("D", 260), 70.0),
+                ],
+            ],
+            vec![c3.clone()],
+            TemporalPolicy::default(),
+        );
+        let report = camera_clock(&apart, &[]);
+        assert_eq!(report.estimate(&c3.id).map(|e| e.start), Some(30.0));
+    }
+
     fn edit(
         id: &str,
         clip: &str,
@@ -1157,7 +1224,8 @@ pub(crate) mod tests {
                 edit("r", "R", MediaKind::Audio, 0, 300.0, 3600.0),
                 c3,
                 backward,
-                // V2 holds no synchronized clip of the group.
+                // Connected lane 1 is V2, not the primary storyline's V1.
+                edit("c2-v2", "C2", MediaKind::Video, 1, 5.0, 3620.0),
                 edit("c3-v2", "C3", MediaKind::Video, 1, 0.0, 5000.0),
             ],
         });
@@ -1180,6 +1248,7 @@ pub(crate) mod tests {
             vec![
                 ("c3", "V1".to_string(), 2240.0, false),
                 ("c3-a", "A1".to_string(), -260.0, true),
+                ("c3-v2", "V2".to_string(), 1_085_240.0, false),
             ]
         );
     }

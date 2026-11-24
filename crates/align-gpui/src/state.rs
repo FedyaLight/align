@@ -1722,15 +1722,15 @@ impl AppData {
         report
     }
 
+    /// The preview follows export's assembly only while a chosen estimate
+    /// applies; otherwise it is the ordinary one, whatever choices are kept.
     fn clock_preview_options(&self) -> align_core::export_model::ExportAssemblyOptions {
-        if !self
-            .camera_clock_choices
-            .contains_key(&self.current_sequence_key())
-        {
+        let camera_clock = self.chosen_camera_clock();
+        if camera_clock.is_empty() {
             return Default::default();
         }
         align_core::export_model::ExportAssemblyOptions {
-            camera_clock: self.chosen_camera_clock(),
+            camera_clock,
             ..self.export.assembly_options()
         }
     }
@@ -1803,21 +1803,47 @@ impl AppData {
 
     /// Apply or undo the estimates of `clips` for the visible sequence and
     /// lay the timeline out again. Returns whether anything changed.
+    ///
+    /// A saved choice without an estimate here, such as a clip the cleanup
+    /// settings remove, is kept to be restored when the estimate returns,
+    /// but it never blocks a visible one. Placing a clip withdraws the saved
+    /// choices it contradicts, and returning one to unmatched withdraws
+    /// those it was holding back, so no undo places another clip unasked.
     pub fn set_camera_clock(&mut self, clips: &[ClipId], apply: bool) -> bool {
         let sequence = self.current_sequence_key();
-        let chosen = self.camera_clock_choices.entry(sequence).or_default();
-        let mut changed = false;
+        let mut chosen = self
+            .camera_clock_choices
+            .remove(&sequence)
+            .unwrap_or_default();
+        let mut applied: BTreeSet<ClipId> = self
+            .camera_clock
+            .chosen(&chosen)
+            .into_iter()
+            .map(|estimate| estimate.clip_id)
+            .collect();
+        let before = chosen.clone();
+        let mut returned = BTreeSet::new();
         for clip in clips.iter().collect::<BTreeSet<_>>() {
-            changed |= if apply {
-                self.camera_clock.estimate(clip).is_some()
-                    && self.camera_clock.conflict(clip, chosen).is_none()
-                    && chosen.insert(clip.clone())
-            } else {
-                chosen.remove(clip)
-            };
+            if apply {
+                if self.camera_clock.estimate(clip).is_some()
+                    && self.camera_clock.conflict(clip, &applied).is_none()
+                {
+                    chosen.insert(clip.clone());
+                    applied.insert(clip.clone());
+                    let placed = BTreeSet::from([clip.clone()]);
+                    chosen.retain(|other| self.camera_clock.conflict(other, &placed).is_none());
+                }
+            } else if chosen.remove(clip) {
+                applied.remove(clip);
+                returned.insert(clip.clone());
+            }
         }
-        if chosen.is_empty() {
-            self.camera_clock_choices.remove(&sequence);
+        chosen.retain(|other| {
+            applied.contains(other) || self.camera_clock.conflict(other, &returned).is_none()
+        });
+        let changed = chosen != before;
+        if !chosen.is_empty() {
+            self.camera_clock_choices.insert(sequence, chosen);
         }
         if changed {
             self.exported_files.clear();

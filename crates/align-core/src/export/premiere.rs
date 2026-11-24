@@ -323,7 +323,16 @@ impl Document {
             })
             .collect();
         let audio_entries = audio_entries(island, include_embedded_audio, &self.stereo_files);
-        let stereo = audio_entries.iter().any(|entry| entry.stereo);
+        let (audio_tracks, audio_kinds) = if let Some(ordinary) = ordinary {
+            let original =
+                self::audio_entries(ordinary, include_embedded_audio, &self.stereo_files);
+            place_audio(&tracks_for(&original, MediaKind::Audio), &audio_entries)
+        } else {
+            let tracks = tracks_for(&audio_entries, MediaKind::Audio);
+            let kinds = tracks.iter().map(|track| track_kind(track)).collect();
+            (tracks, kinds)
+        };
+        let stereo = audio_kinds.iter().any(Option::is_some);
         // Premiere writes each channel of a stereo track as a track of its
         // own, and joins them where the sequence says it explodes tracks.
         let exploded = if stereo {
@@ -358,13 +367,6 @@ impl Document {
             rate.xml("              ")).unwrap();
 
         let video_tracks = tracks_for(&video_entries, MediaKind::Video);
-        let audio_tracks = if let Some(ordinary) = ordinary {
-            let original =
-                self::audio_entries(ordinary, include_embedded_audio, &self.stereo_files);
-            place_audio(&tracks_for(&original, MediaKind::Audio), &audio_entries)
-        } else {
-            tracks_for(&audio_entries, MediaKind::Audio)
-        };
         let mut ids = identifiers(&video_tracks, MediaKind::Video, 1, clip_id_prefix);
         ids.extend(identifiers(
             &audio_tracks,
@@ -377,7 +379,7 @@ impl Document {
         let layout = Layout { ids, positions };
 
         for track in &video_tracks {
-            xml += &self.track(track, MediaKind::Video, &layout);
+            xml += &self.track(track, MediaKind::Video, &layout, None);
         }
         let audio_depth = if island.clips.iter().any(|i| i.corrected_audio_url.is_some()) {
             32
@@ -397,19 +399,23 @@ impl Document {
             }
             xml += "            </outputs>\n";
         }
-        for track in &audio_tracks {
-            xml += &self.track(track, MediaKind::Audio, &layout);
+        for (track, kind) in audio_tracks.iter().zip(&audio_kinds) {
+            xml += &self.track(track, MediaKind::Audio, &layout, *kind);
         }
         xml += "          </audio>\n        </media>\n      </sequence>\n";
         xml
     }
 
-    /// One `<track>` of clipitems and transitions.
-    fn track(&mut self, track: &[TrackEntry], media_type: MediaKind, layout: &Layout) -> String {
-        let stereo = track
-            .first()
-            .filter(|entry| entry.stereo)
-            .map(|entry| entry.source_channel);
+    /// One `<track>` of clipitems and transitions; `kind` is the channel of
+    /// a stereo track, which an empty track keeps.
+    fn track(
+        &mut self,
+        track: &[TrackEntry],
+        media_type: MediaKind,
+        layout: &Layout,
+        kind: Option<usize>,
+    ) -> String {
+        let stereo = kind;
         let mut xml = match stereo {
             Some(channel) => format!(
                 "            <track premiereTrackType=\"Stereo\" currentExplodedTrackIndex=\"{}\" totalExplodedTrackCount=\"2\">\n",
@@ -496,6 +502,14 @@ fn stereo_files(island: &ExportIsland) -> HashSet<String> {
         }
     }
     &stereo - &single
+}
+
+/// The channel a track plays of a stereo clip, if its clips are stereo.
+fn track_kind(track: &[TrackEntry]) -> Option<usize> {
+    track
+        .first()
+        .filter(|entry| entry.stereo)
+        .map(|entry| entry.source_channel)
 }
 
 fn tf(value: bool) -> &'static str {
@@ -797,13 +811,12 @@ fn audio_entries<'a>(
 fn place_audio<'a>(
     ordinary: &[Vec<TrackEntry>],
     entries: &[TrackEntry<'a>],
-) -> Vec<Vec<TrackEntry<'a>>> {
+) -> (Vec<Vec<TrackEntry<'a>>>, Vec<Option<usize>>) {
     let mut positions = HashMap::new();
     let stereo_channel = |e: &TrackEntry| e.stereo.then_some(e.source_channel);
-    let mut types = Vec::new();
+    let mut types: Vec<Option<usize>> = Vec::new();
     for (lane, track) in ordinary.iter().enumerate() {
-        let first = track[0];
-        types.push(stereo_channel(&first));
+        types.push(track_kind(track));
         for entry in track {
             positions.insert(
                 (entry.item.instance_id.as_str(), entry.source_channel),
@@ -864,7 +877,17 @@ fn place_audio<'a>(
                 .total_cmp(&b.item.timeline_start(MediaKind::Audio))
         });
     }
-    tracks
+    // A stereo pair whose clips all moved away stays an empty pair, which
+    // keeps every other track's number; at the end it shifts none.
+    while let [.., left, right] = &tracks[..]
+        && left.is_empty()
+        && right.is_empty()
+        && types[types.len() - 2..] == [Some(1), Some(2)]
+    {
+        tracks.truncate(tracks.len() - 2);
+        types.truncate(types.len() - 2);
+    }
+    (tracks, types)
 }
 
 /// Tracks of `entries`. The channels of stereo clips take pairs of

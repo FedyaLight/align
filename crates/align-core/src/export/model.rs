@@ -1302,8 +1302,15 @@ impl ExportTimeline {
             return Err(TimelineExportError::NoSynchronizedIslands);
         }
         let Some(imported) = &result.project.imported_timeline else {
-            let vacated_islands =
+            let mut vacated_islands =
                 place_by_camera_clock(&mut groups, result, &clips_by_id, &options);
+            // The place a moved clip left holds no material of its own, and
+            // Remove common gaps closes empty time, so the layout never
+            // reserves it.
+            if options.cut_remove.common_gaps {
+                groups.retain(|group| !vacated_islands.contains(&group.id));
+                vacated_islands.clear();
+            }
             let islands = apply_cut_remove(groups, options.cut_remove);
             if islands.is_empty() {
                 return Err(TimelineExportError::NoSynchronizedIslands);

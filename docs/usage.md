@@ -43,7 +43,9 @@ sound in the same group. When the result has such clips, a bar above the
 timeline offers them. **Review…** lists each clip with the two clips it is
 placed between and the expected accuracy, and the clips that cannot be placed
 with the reason. Place clips one at a time, from the clip's right-click menu,
-or with **Place All**; **Undo** or **Return to Unmatched** takes a clip back.
+or with **Place All**; **Undo** or **Return to Unmatched** takes a clip back,
+and with it a kept choice it was holding back, so another clip is not placed
+unasked.
 
 A placed clip is purple on the timeline and stays unmatched: the place is an
 estimate, not a match. Export uses exactly what the timeline shows. The

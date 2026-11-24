@@ -28,6 +28,10 @@ pub struct TimelineTrackRequest {
     /// Where the ordinary assembly put this clip, when the camera clock
     /// moved it to `start`.
     pub assembled_start: Option<f64>,
+    /// Where the writer puts the clip once its times are on the format's
+    /// own frame or sample grid, when that differs from `start..start +
+    /// duration`. Only a clip the camera clock moved is placed by it.
+    pub written: Option<(f64, f64)>,
 }
 
 impl TimelineTrackRequest {
@@ -43,11 +47,17 @@ impl TimelineTrackRequest {
             start,
             duration,
             assembled_start: None,
+            written: None,
         }
     }
 
     pub fn assembled_at(mut self, start: Option<f64>) -> Self {
         self.assembled_start = start;
+        self
+    }
+
+    pub fn written_at(mut self, start: f64, end: f64) -> Self {
+        self.written = Some((start, end));
         self
     }
 }
@@ -91,7 +101,10 @@ pub fn allocate(requests: &[TimelineTrackRequest]) -> HashMap<String, usize> {
         .collect();
     let mut out = pack(&assembled);
     let mut occupied: Vec<Vec<(f64, f64)>> = Vec::new();
-    let span = |r: &TimelineTrackRequest| (r.start, r.start + r.duration.max(0.0));
+    let span = |r: &TimelineTrackRequest| {
+        r.written
+            .unwrap_or((r.start, r.start + r.duration.max(0.0)))
+    };
     for r in requests.iter().filter(|r| r.assembled_start.is_none()) {
         let lane = out[&r.id];
         if occupied.len() <= lane {

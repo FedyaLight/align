@@ -239,6 +239,20 @@ def main():
     removed_clips, _ = premiere_clips(removed['premiereXML'])
     assert not any(file == 'C3.MOV' for file, _ in removed_clips), 'Remove kept C3'
 
+    # Remove common gaps closes the place C3 left: its twelve seconds and the
+    # second after them, and nothing else moves.
+    cut_before, _ = premiere_clips(export('cut-ordinary', '--cut-common-gaps')[0]['premiereXML'])
+    cut_after, _ = premiere_clips(export('cut-camera-clock', '--camera-clock',
+        '--cut-common-gaps')[0]['premiereXML'])
+    closed = (12 + 1) * FPS
+    for key, spans in without(cut_before, 'C3.MOV').items():
+        # A start between two frames may round either way after the move.
+        assert len(spans) == len(cut_after[key]) and all(
+            t == u and abs(s - closed - v) <= 1
+            for (t, s), (u, v) in zip(spans, cut_after[key])), ('place kept', key)
+    cut_origin = cut_after[('R.WAV', 'audio')][0][1]
+    assert abs((cut_after[('C3.MOV', 'video')][0][1] - cut_origin) / FPS - estimated) <= 1 / FPS
+
     otio_before = otio_clips(ordinary['resolveOTIO'])
     otio_after = otio_clips(placed['resolveOTIO'])
     assert without(otio_before, 'C3.MOV') == without(otio_after, 'C3.MOV'), 'OTIO clip moved'
