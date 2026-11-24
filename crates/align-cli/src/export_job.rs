@@ -137,13 +137,6 @@ fn camera_clock_estimates(
         }
         return Vec::new();
     }
-    for estimate in &applied {
-        eprintln!(
-            "camera clock: {} placed. {}",
-            name(&estimate.clip_id),
-            align_core::camera_clock::describe_estimate(estimate, &name)
-        );
-    }
     applied
 }
 
@@ -208,10 +201,35 @@ impl ExportOptions {
                             name.clone()
                         }
                     }),
-                    camera_clock: estimates,
+                    camera_clock: estimates.clone(),
                 },
             )
             .map_err(|e| CliError::Failure(e.to_string()))?;
+            if !estimates.is_empty() {
+                let names = align_core::camera_clock::clip_names(result);
+                let name = |id: &ClipId| names.get(id).cloned().unwrap_or_else(|| id.0.clone());
+                let placed: HashSet<_> = timeline
+                    .islands
+                    .iter()
+                    .flat_map(|i| &i.clips)
+                    .filter(|item| item.camera_clock.is_some())
+                    .map(|item| &item.clip.id)
+                    .collect();
+                for estimate in &estimates {
+                    if placed.contains(&estimate.clip_id) {
+                        eprintln!(
+                            "camera clock: {} placed. {}",
+                            name(&estimate.clip_id),
+                            align_core::camera_clock::describe_estimate(estimate, &name)
+                        );
+                    } else {
+                        eprintln!(
+                            "camera clock: cleanup leaves out {}.",
+                            name(&estimate.clip_id)
+                        );
+                    }
+                }
+            }
             timelines.push(timeline);
         }
         let mut formats = if aaf {

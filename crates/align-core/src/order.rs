@@ -483,6 +483,7 @@ mod tests {
             clip("b1", "/b/002.wav", 1),
         ];
         let timeline = ImportedTimeline {
+            aaf_track_numbers: Vec::new(),
             name: "Order".to_string(),
             frame_duration: MediaTime::new(1, 25),
             edits: vec![
@@ -588,6 +589,7 @@ mod tests {
         );
 
         let timeline = ImportedTimeline {
+            aaf_track_numbers: Vec::new(),
             name: "Linear".to_string(),
             frame_duration: MediaTime::new(1, 25),
             edits: vec![

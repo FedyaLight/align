@@ -215,6 +215,21 @@ impl Default for ExportSettings {
 }
 
 impl ExportSettings {
+    pub fn assembly_options(&self) -> align_core::export_model::ExportAssemblyOptions {
+        align_core::export_model::ExportAssemblyOptions {
+            unmatched: self.unmatched,
+            prevent_group_overlaps: self.prevent_group_overlaps,
+            cut_remove: align_core::export_model::CutRemoveOptions {
+                common_gaps: self.cut_common_gaps,
+                lone_recorder: self.cut_lone_recorder,
+                shorter_than: self.cut_shorter_than,
+                trim_starts: self.trim_starts,
+                trim_ends: self.trim_ends,
+            },
+            ..Default::default()
+        }
+    }
+
     /// The settings-file key of the saved export defaults.
     const KEY: &'static str = "exportDefaults";
 
@@ -994,7 +1009,11 @@ impl AppData {
     }
 
     pub fn apply_export_settings(&mut self, settings: &ExportSettings) {
+        let changed = self.export.assembly_options() != settings.assembly_options();
         self.export.clone_from(settings);
+        if changed {
+            self.relayout_result();
+        }
     }
 
     /// What a new job starts from: the saved defaults, else Align's.
@@ -1492,14 +1511,13 @@ impl AppData {
             })
             .collect();
 
-        self.camera_clock =
-            align_core::camera_clock::camera_clock(&result, self.current_constraints());
+        self.camera_clock = self.clock_report(&result, self.current_sequence_key());
         // Final bars (sync-graph branch) or export-model preview when an
         // imported timeline reshaped the sequence.
         let (bars, states, ruler) = if result.project.imported_timeline.is_some() {
             imported_preview(&result)
         } else {
-            let final_timeline = lane::final_bars(&result, &self.chosen_camera_clock());
+            let final_timeline = lane::final_bars(&result, self.clock_preview_options());
             (
                 final_timeline.bars,
                 final_timeline.states,
@@ -1612,6 +1630,7 @@ impl AppData {
             return false;
         }
         constraints.push(constraint);
+        self.relayout_result();
         true
     }
 
@@ -1627,6 +1646,7 @@ impl AppData {
             return false;
         }
         constraints.push(constraint);
+        self.relayout_result();
         true
     }
 
@@ -1645,6 +1665,75 @@ impl AppData {
     }
 
     // ---------------- camera clock
+
+    fn clock_report(
+        &self,
+        result: &SyncResult,
+        sequence: usize,
+    ) -> align_core::camera_clock::CameraClockReport {
+        use align_core::camera_clock::{CameraClockRefusal, camera_clock};
+        let constraints = self
+            .sequence_constraints
+            .get(&sequence)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut report = camera_clock(result, constraints);
+        if result.project.imported_timeline.is_some() {
+            return report;
+        }
+        let options = self.export.assembly_options();
+        let kept: Option<HashSet<_>> = if options.unmatched == UnmatchedPlacement::Remove {
+            Some(HashSet::new())
+        } else if options.cut_remove.is_active() && !report.estimates.is_empty() {
+            let timeline = align_core::export_model::ExportTimeline::from_result_with_options(
+                result,
+                align_core::export_model::ExportAssemblyOptions {
+                    camera_clock: report.estimates.clone(),
+                    ..options
+                },
+            );
+            Some(
+                timeline
+                    .into_iter()
+                    .flat_map(|t| t.islands)
+                    .flat_map(|i| i.clips)
+                    .filter(|item| item.camera_clock.is_some())
+                    .map(|item| item.clip.id)
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        if let Some(kept) = kept {
+            report.estimates.retain(|e| {
+                if kept.contains(&e.clip_id) {
+                    true
+                } else {
+                    report
+                        .refusals
+                        .push((e.clip_id.clone(), CameraClockRefusal::RemovedByAssembly));
+                    false
+                }
+            });
+        }
+        if let Some(chosen) = self.camera_clock_choices.get(&sequence) {
+            report.apply_conflicts(chosen);
+        }
+        report
+    }
+
+    fn clock_preview_options(&self) -> align_core::export_model::ExportAssemblyOptions {
+        if !self
+            .camera_clock_choices
+            .contains_key(&self.current_sequence_key())
+        {
+            return Default::default();
+        }
+        align_core::export_model::ExportAssemblyOptions {
+            camera_clock: self.chosen_camera_clock(),
+            ..self.export.assembly_options()
+        }
+    }
 
     /// Estimates the visible result applies: the chosen clips that still
     /// have one. Imported edits keep their placement, so none apply there.
@@ -1682,8 +1771,7 @@ impl AppData {
         if result.project.imported_timeline.is_some() {
             return Vec::new();
         }
-        let constraints = self.constraints_for_sequence(sequence);
-        align_core::camera_clock::camera_clock(result, &constraints).chosen(chosen)
+        self.clock_report(result, sequence).chosen(chosen)
     }
 
     pub fn camera_clock_applied(&self, clip: &ClipId) -> bool {
@@ -1719,9 +1807,11 @@ impl AppData {
         let sequence = self.current_sequence_key();
         let chosen = self.camera_clock_choices.entry(sequence).or_default();
         let mut changed = false;
-        for clip in clips {
+        for clip in clips.iter().collect::<BTreeSet<_>>() {
             changed |= if apply {
-                self.camera_clock.estimate(clip).is_some() && chosen.insert(clip.clone())
+                self.camera_clock.estimate(clip).is_some()
+                    && self.camera_clock.conflict(clip, chosen).is_none()
+                    && chosen.insert(clip.clone())
             } else {
                 chosen.remove(clip)
             };
@@ -1737,14 +1827,15 @@ impl AppData {
     }
 
     /// Rebuild the visible timeline from the current result and choices.
-    fn relayout_result(&mut self) {
+    pub(crate) fn relayout_result(&mut self) {
         let Some(result) = &self.result else {
             return;
         };
         if result.project.imported_timeline.is_some() {
             return;
         }
-        let final_timeline = lane::final_bars(result, &self.visible_camera_clock());
+        self.camera_clock = self.clock_report(result, self.current_sequence_key());
+        let final_timeline = lane::final_bars(result, self.clock_preview_options());
         self.ruler_timecode = final_timeline.ruler_timecode;
         self.lanes = lane::layout_bars(final_timeline.bars, &self.audio_stream_channels);
     }
@@ -2321,7 +2412,7 @@ type ImportedPreview = (
 fn imported_preview(result: &SyncResult) -> ImportedPreview {
     use align_core::export_model::ExportTimeline;
     let Ok(timeline) = ExportTimeline::from_result(result, true) else {
-        let fallback = lane::final_bars(result, &[]);
+        let fallback = lane::final_bars(result, Default::default());
         return (fallback.bars, fallback.states, fallback.ruler_timecode);
     };
     let unmatched: HashSet<ClipId> = result.unmatched.iter().cloned().collect();
@@ -2429,6 +2520,7 @@ mod tests {
                 clips: Vec::new(),
                 warnings: Vec::new(),
                 imported_timeline: Some(align_core::ImportedTimeline {
+                    aaf_track_numbers: Vec::new(),
                     name: name.into(),
                     frame_duration: align_core::MediaTime::new(1, 25),
                     edits: Vec::new(),

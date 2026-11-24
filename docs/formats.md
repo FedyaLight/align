@@ -135,8 +135,8 @@ desktop app for each clip or with `--camera-clock`.
 NonRealTimeMeta metadata with the camera's serial number and recording time
 (`Device serialNo` and `CreationDate`), as Sony cameras write inside MP4 and
 MXF files. The separate `M01.XML` file beside a clip is not read. Some models
-write a placeholder serial number (0, 4294967295, or all F); their clips do
-not qualify, because two such cameras would look the same. Other cameras do
+write all zeros, 4294967295, or all F as a placeholder serial number. Two
+such cameras would look the same, so their clips do not qualify. Other cameras do
 not record a serial number Align reads, so their clips are not placed. Clips
 of the same camera are recognized by manufacturer, model, and serial number
 together; folders, file dates, and the model alone never count.
@@ -166,23 +166,33 @@ clips before and after it are in different groups or the camera has clips
 from another group between them, the anchors disagree, it would not fit
 between the anchors or would overlap another synchronized or placed clip of
 the camera, or its pairing or alignment with a clip it would play alongside
-was rejected.
+was rejected. When sound anchors reveal a backward adjustment, Align also
+excludes dates that could belong to either side of the adjustment, allowing
+for the unrecorded interval and whole-second rounding. Accepting one estimate
+blocks a conflicting rejected estimate. Place All resolves ties by clip ID.
 
 **In exports.**
 
 - A placed clip is named `[CAMERA CLOCK]` before any unmatched label, and
   keeps the unmatched color, role, and **Disable in timeline** settings.
-- With Cut and remove options off, no other clip moves or changes track. The
-  clip's former place after its group stays empty. It joins its camera's
-  track when that track is free there, else the first free track, else a new
-  track after the others.
+- With cleanup off, other clips keep their positions and track numbers.
+  The placed clip uses its original track if free, another compatible track,
+  or a new track after the others. In the Final Cut multicam, an overlapping
+  take gets a separate angle.
+- A vacated slot at the end stays empty. Premiere XML, Resolve XML and FCPXML
+  specify the sequence duration. OTIO writes a trailing gap. AAF carries the
+  original end in the composition timecode and fills the vacated media span.
+  The Resolve script imports the OTIO for picture timelines.
 - **Remove** unmatched clips removes placed clips too. **By order only**
   still places them by the camera clock.
 - **Cut gaps empty on all tracks** keeps the time a placed clip covers, so
   the clips after it in its group, and the later groups, end up that much
   later than without it. **Cut recorder audio with no camera** keeps a
   recorder clip that a placed clip overlaps. Trimming and **Remove clips
-  shorter than** treat it like any clip.
+  shorter than** treat it like any clip. Cleanup operates on the new placement
+  and allows the sequence to end at the last surviving clip. The desktop
+  preview uses these assembly settings for an accepted estimate. Switching to Remove suspends that choice until
+  the clip is included again.
 - The Premiere replaced-audio sequence keeps a placed clip's own camera sound
   instead of the recorder's. Clean-audio camera files are not created for
   placed clips.

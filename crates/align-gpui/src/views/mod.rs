@@ -1700,7 +1700,7 @@ impl AlignApp {
         let Some(result) = self.data.result.clone() else {
             return;
         };
-        use align_core::export_model::{CutRemoveOptions, ExportAssemblyOptions, ExportTimeline};
+        use align_core::export_model::{ExportAssemblyOptions, ExportTimeline};
         let sequence_name = ExportInputs::value(&self.export_inputs.sequence_name, cx);
         let synced_symbol = ExportInputs::value(&self.export_inputs.synced_symbol, cx);
         let synced_color = ExportInputs::value(&self.export_inputs.synced_color, cx);
@@ -1717,18 +1717,9 @@ impl AlignApp {
         let mut timelines = Vec::with_capacity(result_count);
         for (index, result) in results.iter().enumerate() {
             let options = ExportAssemblyOptions {
-                unmatched: self.data.export.unmatched,
-                prevent_group_overlaps: self.data.export.prevent_group_overlaps,
                 disable_unmatched: self.data.export.disable_unmatched,
                 label_synced: self.data.export.label_synced,
                 label_unmatched: self.data.export.label_unmatched,
-                cut_remove: CutRemoveOptions {
-                    common_gaps: self.data.export.cut_common_gaps,
-                    lone_recorder: self.data.export.cut_lone_recorder,
-                    shorter_than: self.data.export.cut_shorter_than,
-                    trim_starts: self.data.export.trim_starts,
-                    trim_ends: self.data.export.trim_ends,
-                },
                 synced_symbol: synced_symbol.clone(),
                 synced_symbol_suffix: self.data.export.synced_symbol_suffix,
                 synced_color: synced_color.clone(),
@@ -1745,6 +1736,7 @@ impl AlignApp {
                     }
                 }),
                 camera_clock: self.data.camera_clock_for_export(index),
+                ..self.data.export.assembly_options()
             };
             let Ok(timeline) = ExportTimeline::from_result_with_options(result, options) else {
                 self.data.error = Some(format!("Sequence {} has nothing to export.", index + 1));

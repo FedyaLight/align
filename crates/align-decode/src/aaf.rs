@@ -20,6 +20,10 @@ pub struct AudioTrack {
 }
 #[derive(Debug, Serialize)]
 pub struct AudioClip {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserved_start: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub path: PathBuf,
     pub start: u64,
     pub source_in: u64,
@@ -129,7 +133,15 @@ impl ImportedAudio {
         })?;
         let mut edits = Vec::new();
         let mut frame_duration = None;
+        let mut aaf_track_numbers = Vec::new();
+        let (mut picture_number, mut sound_number) = (0, 0);
         for (track_index, track) in sequence.tracks.into_iter().enumerate() {
+            let track_number = match track.media_kind {
+                ImportedKind::Picture => &mut picture_number,
+                ImportedKind::Sound => &mut sound_number,
+            };
+            *track_number += 1;
+            aaf_track_numbers.push(*track_number);
             let (numerator, denominator) = track.clock();
             let rate = numerator as f64 / denominator as f64;
             if track.media_kind == ImportedKind::Picture {
@@ -176,6 +188,7 @@ impl ImportedAudio {
             ));
         }
         Ok(TimelineDraft {
+            aaf_track_numbers,
             source_url: path.to_path_buf(),
             name: sequence.name,
             // Audio AAF has no picture edit rate. Use the application's default
@@ -548,6 +561,7 @@ fn audio_manifest_linking(
     type Placed = (AudioClip, Option<u64>);
     let mut groups: BTreeMap<(String, u32, usize), Vec<Placed>> = BTreeMap::new();
     for island in &timeline.islands {
+        let reserve_tail = island.reserved_end().is_some();
         for item in &island.clips {
             if item.clip.video.is_some()
                 || item.linked_audio_edit.is_some()
@@ -615,6 +629,8 @@ fn audio_manifest_linking(
                 }
                 let clip = match stems.get(channel) {
                     None => AudioClip {
+                        reserved_start: assembled.filter(|_| reserve_tail),
+                        display_name: item.camera_clock.as_ref().and(item.display_name.clone()),
                         path: item.clip.url.clone(),
                         start,
                         source_in,
@@ -625,6 +641,8 @@ fn audio_manifest_linking(
                         metadata: None,
                     },
                     Some(stem) => AudioClip {
+                        reserved_start: assembled.filter(|_| reserve_tail),
+                        display_name: item.camera_clock.as_ref().and(item.display_name.clone()),
                         path: stem.clone(),
                         start,
                         source_in,
@@ -725,6 +743,10 @@ pub fn timeline_manifest_with_frame_rate(
     } else {
         audio_manifest_linking(&audio, &cameras)?.tracks
     };
+    let reserve_tail = timeline
+        .islands
+        .iter()
+        .any(|island| island.reserved_end().is_some());
     let mut pictures = Vec::new();
     let mut metadata = std::collections::HashMap::new();
     for item in timeline.islands.iter().flat_map(|island| &island.clips) {
@@ -809,7 +831,7 @@ pub fn timeline_manifest_with_frame_rate(
             json!({"name":item.preferred_source_key(align_core::MediaKind::Video).unwrap_or("Video"),
             "edit_rate":{"numerator":clock.timescale,"denominator":clock.value},
             "clips":[{"path":item.clip.url,"start":start,"source_in":source_in,"length":length,
-                "timecode":timecode,"metadata":metadata[&item.clip.url]}]}),
+                "reserved_start":assembled.filter(|_| reserve_tail),"display_name":item.camera_clock.as_ref().and(item.display_name.as_ref()), "timecode":timecode,"metadata":metadata[&item.clip.url]}]}),
             assembled,
         ));
     }

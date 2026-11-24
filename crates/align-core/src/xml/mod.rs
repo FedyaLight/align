@@ -284,6 +284,7 @@ pub struct DraftTransition {
 
 #[derive(Clone, Debug)]
 pub struct TimelineDraft {
+    pub aaf_track_numbers: Vec<usize>,
     pub source_url: PathBuf,
     pub name: String,
     pub frame_duration: MediaTime,
@@ -464,6 +465,7 @@ impl TimelineDraft {
             })
             .collect();
         let draft = Self {
+            aaf_track_numbers: self.aaf_track_numbers.clone(),
             source_url: self.source_url.clone(),
             name: self.name.clone(),
             frame_duration: self.frame_duration,
@@ -648,6 +650,7 @@ impl TimelineDraft {
             });
         }
         ImportedTimeline {
+            aaf_track_numbers: self.aaf_track_numbers.clone(),
             name: self.name.clone(),
             frame_duration: self.frame_duration,
             edits: resolved,

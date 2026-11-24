@@ -409,6 +409,10 @@ pub struct SyncProject {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportedTimeline {
+    /// Display number within its media kind for each AAF track, in file order.
+    /// Editing and saved overrides continue to use the original track index.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aaf_track_numbers: Vec<usize>,
     pub name: String,
     pub frame_duration: MediaTime,
     pub edits: Vec<TimelineEdit>,

@@ -697,6 +697,7 @@ pub(super) fn read_fcp7(
         return Err(ImportError::NoMedia(filename));
     }
     Ok(TimelineDraft {
+        aaf_track_numbers: Vec::new(),
         source_url: path.to_path_buf(),
         name,
         frame_duration: sequence_rate,

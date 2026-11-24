@@ -191,13 +191,9 @@ pub fn provisional_bars(
 /// placement, gaps and overlaps identical in the UI and the NLE output.
 pub fn final_bars(
     result: &align_core::SyncResult,
-    camera_clock: &[align_core::camera_clock::CameraClockEstimate],
+    options: align_core::export_model::ExportAssemblyOptions,
 ) -> FinalTimeline {
     let unmatched: HashSet<ClipId> = result.unmatched.iter().cloned().collect();
-    let options = align_core::export_model::ExportAssemblyOptions {
-        camera_clock: camera_clock.to_vec(),
-        ..Default::default()
-    };
     let Ok(timeline) = ExportTimeline::from_result_with_options(result, options) else {
         return FinalTimeline {
             bars: Vec::new(),
@@ -689,7 +685,7 @@ mod tests {
         };
         let order =
             |bars: &[BarVisual]| bars.iter().map(|b| b.clip_id.0.clone()).collect::<Vec<_>>();
-        let automatic = final_bars(&result, &[]);
+        let automatic = final_bars(&result, Default::default());
         assert_eq!(order(&automatic.bars), vec!["b", "c", "a"]);
         let starts: HashMap<_, _> = automatic
             .bars
@@ -714,7 +710,10 @@ mod tests {
             },
             ..result
         };
-        assert_eq!(order(&final_bars(&timed, &[]).bars), vec!["a", "c", "b"]);
+        assert_eq!(
+            order(&final_bars(&timed, Default::default()).bars),
+            vec!["a", "c", "b"]
+        );
     }
 
     #[test]

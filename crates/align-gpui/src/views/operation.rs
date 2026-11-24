@@ -382,10 +382,18 @@ pub(super) fn camera_clock_banner(
                 if differing == 1 { "s" } else { "" }
             )
         }
-    } else {
-        if estimates.is_empty() {
+    } else if estimates.is_empty() {
+        if !data.camera_clock.refusals.iter().any(|(_, reason)| {
+            matches!(
+                reason,
+                align_core::camera_clock::CameraClockRefusal::RemovedByAssembly
+            )
+        }) {
             return None;
         }
+        "Camera-clock placement is unavailable with the current unmatched or cleanup settings."
+            .into()
+    } else {
         let placed = estimates
             .iter()
             .filter(|e| data.camera_clock_applied(&e.clip_id))

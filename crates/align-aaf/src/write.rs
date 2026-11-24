@@ -39,6 +39,8 @@ struct Track<T> {
 
 #[derive(Deserialize)]
 struct Range {
+    reserved_start: Option<i64>,
+    display_name: Option<String>,
     path: PathBuf,
     start: i64,
     source_in: i64,
@@ -58,6 +60,37 @@ impl Range {
             "Overlapping or out-of-bounds AAF clip"
         );
         self.end()
+    }
+
+    fn extent(&self) -> Result<i64> {
+        self.reserved_start
+            .unwrap_or(self.start)
+            .max(self.start)
+            .checked_add(self.length)
+            .context("AAF reserved range overflow")
+    }
+
+    /// The vacated slot counted in composition units with the same rounding
+    /// and source-file limit as the ordinary edit.
+    fn reserved_end(
+        &self,
+        span: i64,
+        native: &Clock,
+        clock: &Clock,
+        available: i64,
+        round: Round,
+    ) -> Result<i64> {
+        let Some(start) = self.reserved_start else {
+            return Ok(0);
+        };
+        ensure!(start >= 0, "Negative AAF reserved position");
+        let end = start
+            .checked_add(span)
+            .context("AAF reserved range overflow")?;
+        let limit = units(start, native, clock, Round::Nearest)?
+            .checked_add(available)
+            .context("AAF reserved range overflow")?;
+        Ok(units(end, native, clock, round)?.min(limit))
     }
 
     fn end(&self) -> Result<i64> {
@@ -423,6 +456,7 @@ struct Mob {
 
 struct Graph {
     mobs: Vec<Mob>,
+    named_subclips: HashMap<(MobId, String), MobId>,
     mxf_links: HashMap<PathBuf, Link>,
     mxf_ids: HashSet<MobId>,
     timestamp: Vec<u8>,
@@ -902,6 +936,33 @@ fn edit_sequence(kind: Kind, edits: Vec<Edit>, length: i64, below: bool) -> Resu
 }
 
 impl Graph {
+    /// Give this event a visible name while retaining the real master (and
+    /// its material UMID for OP-Atom). Other edits can use it by either name.
+    fn event_mob(&mut self, link: &Link, name: Option<&str>) -> Result<MobId> {
+        let Some(name) = name else {
+            return Ok(link.master);
+        };
+        let key = (link.master, name.to_owned());
+        if let Some(id) = self.named_subclips.get(&key) {
+            return Ok(*id);
+        }
+        let mut slots = Vec::new();
+        for (index, track) in link.tracks.iter().enumerate() {
+            let id = u32::try_from(index + 1)?;
+            let source = clip(track.kind, track.length, link.master, id, 0);
+            slots.push(slot(id, "", &track.rate, track.channel, source)?);
+        }
+        let id = new_id();
+        let mut subclip = mob(COMPOSITION, id, name, &self.timestamp, slots)?;
+        subclip.props.data(
+            USAGE,
+            uuid::uuid!("0d010102-0101-0500-060e-2b3404010101").to_bytes_le(),
+        );
+        self.add(id, subclip);
+        self.named_subclips.insert(key, id);
+        Ok(id)
+    }
+
     fn sound(
         &mut self,
         track: Track<AudioClip>,
@@ -918,6 +979,7 @@ impl Graph {
         let mut edits = Vec::new();
         let mut cursor = 0;
         let mut previous_end = 0;
+        let mut reserved_end = 0;
         for clip in track.clips {
             let range = clip.range;
             range.check(cursor, clip.source_frames)?;
@@ -941,14 +1003,19 @@ impl Graph {
                             && source.rate == native
                     })
                     .context("AAF camera sound has no such channel")?;
-                (link.master, u32::try_from(index + 1)?, source.length)
+                (
+                    self.event_mob(link, range.display_name.as_deref())?,
+                    u32::try_from(index + 1)?,
+                    source.length,
+                )
             } else {
                 ensure!(
                     clip.channels == 1,
                     "AAF audio requires one lossless mono stem per channel"
                 );
+                let link = self.wave(&path, rate, clip.source_frames)?;
                 (
-                    self.wave(&path, rate, clip.source_frames)?.master,
+                    self.event_mob(&link, range.display_name.as_deref())?,
                     1,
                     clip.source_frames,
                 )
@@ -976,6 +1043,13 @@ impl Graph {
                 master,
                 slot_id,
             });
+            reserved_end = reserved_end.max(range.reserved_end(
+                span,
+                &native,
+                clock,
+                file_end - source_in,
+                Round::Up,
+            )?);
             previous_end = end;
         }
         slot(
@@ -983,7 +1057,7 @@ impl Graph {
             &track.name,
             clock,
             None,
-            edit_sequence(Kind::Sound, edits, previous_end, false)?,
+            edit_sequence(Kind::Sound, edits, previous_end.max(reserved_end), false)?,
         )
     }
 
@@ -1029,11 +1103,18 @@ impl Graph {
                     end > start,
                     "AAF picture clip is shorter than a composition frame"
                 );
+                duration = duration.max(range.reserved_end(
+                    range.length,
+                    &native,
+                    clock,
+                    file_end - source_in,
+                    Round::Nearest,
+                )?);
                 edits.push(Edit {
                     start,
                     end,
                     source_in,
-                    master: link.master,
+                    master: self.event_mob(link, range.display_name.as_deref())?,
                     slot_id: u32::try_from(index + 1)?,
                 });
             }
@@ -1092,7 +1173,7 @@ impl Graph {
                     .context("Missing AAF picture edit rate")?
                     .clock()?;
                 for clip in &track.clips {
-                    duration = duration.max(integer(clip.range.end()?) / &rate);
+                    duration = duration.max(integer(clip.range.extent()?) / &rate);
                 }
             }
             for track in &doc.tracks {
@@ -1101,7 +1182,8 @@ impl Graph {
                     .filter(|rate| *rate > 0)
                     .context("Invalid AAF sample rate")?;
                 for clip in &track.clips {
-                    duration = duration.max(integer(clip.range.end()?) / integer(i64::from(rate)));
+                    duration =
+                        duration.max(integer(clip.range.extent()?) / integer(i64::from(rate)));
                 }
             }
             let code = Timecode {
@@ -1180,6 +1262,7 @@ pub fn write(manifest: &Path, destination: &Path) -> Result<Value> {
         ident.save(&mut file.inner, &ident_path)?;
         let mut graph = Graph {
             mobs: Vec::new(),
+            named_subclips: HashMap::new(),
             mxf_links: HashMap::new(),
             mxf_ids: HashSet::new(),
             timestamp: header.require(0x3b02)?.to_vec(),

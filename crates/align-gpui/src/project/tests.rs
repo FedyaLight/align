@@ -694,7 +694,12 @@ fn camera_clock_choices_follow_stage_changes_and_the_project() {
             .map(|bar| (bar.match_state, bar.start))
     };
     let mut data = AppData::default();
-    data.apply_result(camera_clock_shoot(&root));
+    let mut shoot = camera_clock_shoot(&root);
+    // A recorder dated by the file places the ordinary C3 slot first.
+    shoot.project.clips[0].recorded_at = Some(1_800_000_000);
+    shoot.project.clips[0].recorded_at_source =
+        Some(align_core::RecordingTimestampSource::FileSystem);
+    data.apply_result(shoot);
     assert_eq!(state(&data).unwrap().0, BarMatchState::Matched);
     assert!(!data.set_camera_clock(std::slice::from_ref(&c3), true));
 
@@ -708,7 +713,16 @@ fn camera_clock_choices_follow_stage_changes_and_the_project() {
     // Export applies the estimate the preview shows.
     let exported = data.camera_clock_for_export(0);
     assert_eq!(exported.len(), 1);
-    assert!((exported[0].start - start).abs() < 1e-6);
+    assert!((exported[0].start + 91.0 - start).abs() < 1e-6);
+
+    let mut settings = data.export.clone();
+    settings.unmatched = align_core::export_model::UnmatchedPlacement::Remove;
+    data.apply_export_settings(&settings);
+    assert!(data.camera_clock_for_export(0).is_empty());
+    assert!(state(&data).is_none());
+    settings.unmatched = align_core::export_model::UnmatchedPlacement::ByOrderOnly;
+    data.apply_export_settings(&settings);
+    assert_eq!(state(&data), Some((placed, exported[0].start)));
 
     // Another stage synchronizes C3; returning restores the placement.
     assert!(data.select_sync_stage(1));
@@ -744,4 +758,79 @@ fn camera_clock_choices_follow_stage_changes_and_the_project() {
         false,
     );
     assert_eq!(state(&older).unwrap().0, BarMatchState::Unmatched);
+}
+
+#[test]
+fn rejected_clock_choices_hold_for_place_all_one_at_a_time_and_reopen() {
+    use crate::lane::CorrectionOption;
+    use align_core::ClipId;
+    let (_temp, root) = fixture();
+    let mut shoot = camera_clock_shoot(&root);
+    assert!(shoot.select_stage(0));
+    shoot.stages.clear();
+    shoot.selected_stage = None;
+    // A second camera records at the same times against the same recorder.
+    for mut clip in shoot
+        .project
+        .clips
+        .clone()
+        .into_iter()
+        .filter(|c| c.video.is_some())
+    {
+        clip.id.0.push('b');
+        clip.url = root.join(format!("{}.MP4", clip.id.0));
+        clip.source_identifier = Some("device:Sony:ILME-FX3:4712".into());
+        shoot.project.clips.push(clip);
+    }
+    for mut p in shoot.islands[0]
+        .placements
+        .clone()
+        .into_iter()
+        .filter(|p| p.clip_id.0 != "R")
+    {
+        p.clip_id.0.push('b');
+        shoot.islands[0].placements.push(p);
+    }
+    for mut m in shoot.matches.clone() {
+        m.right.0.push('b');
+        shoot.matches.push(m);
+    }
+    let ids = [ClipId::new("C3"), ClipId::new("C3b")];
+    shoot.unmatched.push(ids[1].clone());
+    for (pair, offset, count) in [(true, 0.0, 1), (false, 1.0, 1), (false, 3.0, 2)] {
+        let mut data = AppData::default();
+        data.apply_result(shoot.clone());
+        let correction = CorrectionOption {
+            id: "pair".into(),
+            left: ids[1].clone(),
+            right: ids[0].clone(),
+            other_name: "C3".into(),
+            offset,
+        };
+        if pair {
+            data.reject_pair(&correction);
+        } else {
+            data.reject_alignment(&correction);
+        }
+        assert!(data.set_camera_clock(&ids, true));
+        assert_eq!(data.camera_clock_for_export(0).len(), count);
+        if count == 1 {
+            assert!(data.camera_clock.refusal(&ids[1]).is_some());
+        }
+        data.set_camera_clock(&ids, false);
+        assert!(data.set_camera_clock(&ids[1..], true));
+        assert_eq!(data.set_camera_clock(&ids[..1], true), count == 2);
+        // A project may already contain both choices from before the conflict.
+        let mut session = serde_json::to_value(data.project_session()).unwrap();
+        session["cameraClock"]["0"] = serde_json::json!(ids);
+        data.restore_project(
+            serde_json::from_value(session).unwrap(),
+            vec![shoot.clone()],
+            vec![],
+            false,
+        );
+        assert_eq!(data.camera_clock_for_export(0).len(), count);
+        assert!(data.camera_clock_applied(&ids[0]));
+        assert_eq!(data.camera_clock_applied(&ids[1]), count == 2);
+    }
 }

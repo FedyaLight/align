@@ -708,10 +708,54 @@ impl Library<'_> {
             "    <media id=\"{MULTICAM_ID}\" name=\"{} – Multicam\">\n      <multicam format=\"{SEQUENCE_FORMAT_ID}\">\n",
             xml_text::escape(&self.timeline.name)
         );
-        for (angle_index, key) in keys.iter().enumerate() {
-            let mut items = angle_groups[key].clone();
+        let mut angles = Vec::new();
+        let mut moved = Vec::new();
+        for key in keys {
+            let mut items = angle_groups.remove(&key).unwrap();
+            let original = angles.len();
+            items.retain(|item| {
+                if item.camera_clock.is_some() {
+                    moved.push((original, *item));
+                    false
+                } else {
+                    true
+                }
+            });
+            angles.push((key, items));
+        }
+        let original_count = angles.len();
+        moved.sort_by(|(_, a), (_, b)| {
+            a.start
+                .total_cmp(&b.start)
+                .then_with(|| a.clip.id.cmp(&b.clip.id))
+        });
+        for (original, item) in moved {
+            let key = &angles[original].0;
+            let free = |items: &[&ExportItem]| {
+                items.iter().all(|other| {
+                    other.maximum_timeline_end() <= item.minimum_timeline_start()
+                        || item.maximum_timeline_end() <= other.minimum_timeline_start()
+                })
+            };
+            let angle = if free(&angles[original].1) {
+                original
+            } else if let Some(index) =
+                (original_count..angles.len()).find(|&i| angles[i].0 == *key && free(&angles[i].1))
+            {
+                index
+            } else {
+                angles.push((key.clone(), Vec::new()));
+                angles.len() - 1
+            };
+            angles[angle].1.push(item);
+        }
+        for (angle_index, (key, mut items)) in angles.into_iter().enumerate() {
             items.sort_by(|a, b| a.start.total_cmp(&b.start));
-            let angle_name = xml_text::escape(&angle_name(key, &items));
+            let mut name = angle_name(&key, &items);
+            if angle_index >= original_count {
+                name = format!("{name} · Camera clock {}", angle_index - original_count + 1);
+            }
+            let angle_name = xml_text::escape(&name);
             writeln!(
                 xml,
                 "        <mc-angle name=\"{angle_name}\" angleID=\"a{}\">",

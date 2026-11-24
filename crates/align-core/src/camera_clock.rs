@@ -49,6 +49,8 @@ pub struct CameraClockEstimate {
 /// Why an unmatched clip with a camera serial number has no estimate.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CameraClockRefusal {
+    /// Active assembly settings remove the estimated clip.
+    RemovedByAssembly,
     /// Its time source is Timecode, which excludes the recording time.
     TimecodeOnly,
     /// The camera recorded no start time, or only the file date is known.
@@ -57,6 +59,8 @@ pub enum CameraClockRefusal {
     NoAnchor { before: bool, after: bool },
     /// The camera's clips around it are in different groups.
     AmbiguousGroup,
+    /// The same recording time occurred on both sides of a clock reset.
+    RepeatedTime,
     /// The anchors' synchronized positions disagree with the camera clock.
     AnchorConflict {
         before: ClipId,
@@ -77,6 +81,9 @@ impl CameraClockRefusal {
     /// A sentence for the user, naming clips with `name`.
     pub fn describe(&self, name: &dyn Fn(&ClipId) -> String) -> String {
         match self {
+            Self::RemovedByAssembly => {
+                "The active unmatched or cleanup settings remove this clip.".into()
+            }
             Self::TimecodeOnly => {
                 "Its time source is Timecode, so the recording time is not used.".into()
             }
@@ -88,6 +95,10 @@ impl CameraClockRefusal {
                     _ => "after it",
                 };
                 format!("No clip of this camera recorded {side} is synchronized by sound.")
+            }
+            Self::RepeatedTime => {
+                "This recording time could fall on either side of a backward clock adjustment."
+                    .into()
             }
             Self::AmbiguousGroup => {
                 "This camera's clips recorded around it are in different groups.".into()
@@ -127,6 +138,7 @@ impl CameraClockRefusal {
 pub struct CameraClockReport {
     pub estimates: Vec<CameraClockEstimate>,
     pub refusals: Vec<(ClipId, CameraClockRefusal)>,
+    incompatible: HashMap<ClipId, BTreeSet<ClipId>>,
 }
 
 impl CameraClockReport {
@@ -143,11 +155,49 @@ impl CameraClockReport {
     /// The estimates of the chosen clips. A choice without an estimate in
     /// this report applies nothing.
     pub fn chosen(&self, clips: &BTreeSet<ClipId>) -> Vec<CameraClockEstimate> {
+        let mut accepted = BTreeSet::new();
+        for clip in clips {
+            if self.estimate(clip).is_some() && self.conflict(clip, &accepted).is_none() {
+                accepted.insert(clip.clone());
+            }
+        }
         self.estimates
             .iter()
-            .filter(|e| clips.contains(&e.clip_id))
+            .filter(|e| accepted.contains(&e.clip_id))
             .cloned()
             .collect()
+    }
+
+    /// Show which remaining choices are blocked by the current selection.
+    pub fn apply_conflicts(&mut self, chosen: &BTreeSet<ClipId>) {
+        let accepted = self.chosen(chosen).into_iter().map(|e| e.clip_id).collect();
+        let incompatible = &self.incompatible;
+        self.estimates.retain(|e| {
+            if let Some(other) = incompatible
+                .get(&e.clip_id)
+                .and_then(|ids| ids.intersection(&accepted).next())
+            {
+                self.refusals.push((
+                    e.clip_id.clone(),
+                    CameraClockRefusal::RejectedAlignment(other.clone()),
+                ));
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// The selected estimate whose rejected alignment prevents this choice.
+    pub fn conflict<'a>(
+        &'a self,
+        clip: &ClipId,
+        selected: &BTreeSet<ClipId>,
+    ) -> Option<&'a ClipId> {
+        self.incompatible
+            .get(clip)?
+            .iter()
+            .find(|other| selected.contains(*other))
     }
 }
 
@@ -245,6 +295,14 @@ pub fn camera_clock(result: &SyncResult, constraints: &[SyncConstraint]) -> Came
         let Some(camera) = clip.source_identifier.as_deref() else {
             continue;
         };
+        // Saved results may contain a placeholder from an older inspector.
+        if !camera
+            .strip_prefix("device:")
+            .and_then(|id| id.rsplit_once(':'))
+            .is_some_and(|(_, serial)| crate::meta::valid_camera_serial(serial))
+        {
+            continue;
+        }
         let camera_clips: Vec<&Placed> = placed
             .iter()
             .filter(|p| p.clip.source_identifier.as_deref() == Some(camera))
@@ -264,6 +322,31 @@ pub fn camera_clock(result: &SyncResult, constraints: &[SyncConstraint]) -> Came
             (e.island, (e.start, e.start + duration))
         })
         .collect();
+    for (i, a) in report.estimates.iter().enumerate() {
+        for (j, b) in report.estimates.iter().enumerate().skip(i + 1) {
+            if a.island == b.island
+                && overlaps(spans[i].1, spans[j].1)
+                && (SyncConstraint::rejects_pair(constraints, &a.clip_id, &b.clip_id)
+                    || SyncConstraint::rejects_alignment(
+                        constraints,
+                        &a.clip_id,
+                        &b.clip_id,
+                        a.start - b.start,
+                    ))
+            {
+                report
+                    .incompatible
+                    .entry(a.clip_id.clone())
+                    .or_default()
+                    .insert(b.clip_id.clone());
+                report
+                    .incompatible
+                    .entry(b.clip_id.clone())
+                    .or_default()
+                    .insert(a.clip_id.clone());
+            }
+        }
+    }
     let camera = |id: &ClipId| clips[id].source_identifier.as_deref();
     let mut overlapping: Vec<(usize, ClipId)> = Vec::new();
     for (i, a) in report.estimates.iter().enumerate() {
@@ -311,6 +394,26 @@ fn estimate_one(
         .iter()
         .filter_map(|p| Some((p.clock?, *p)))
         .filter(|(_, p)| p.sound);
+    // Only sound supplies chronology. Sorting by the recording date first
+    // would interleave takes from before and after a backward adjustment.
+    let mut chronological: Vec<_> = anchors.clone().collect();
+    chronological.sort_by(|a, b| {
+        a.1.island
+            .cmp(&b.1.island)
+            .then_with(|| a.1.start.total_cmp(&b.1.start))
+    });
+    for ((earlier, a), (later, b)) in chronological.iter().zip(chronological.iter().skip(1)) {
+        let elapsed = b.start - a.start;
+        // The adjustment could have happened anywhere in the unobserved
+        // gap. Project each clock to the opposite end of that gap.
+        if a.island == b.island
+            && elapsed - (later - earlier) > ANCHOR_AGREEMENT
+            && clock >= later - elapsed - STAMP_RESOLUTION
+            && clock <= earlier + elapsed + STAMP_RESOLUTION
+        {
+            return Err(CameraClockRefusal::RepeatedTime);
+        }
+    }
     let before = anchors
         .clone()
         .filter(|(at, _)| *at <= clock)
@@ -398,8 +501,9 @@ pub struct EditClockHint {
     pub clip_id: ClipId,
     pub edit_id: String,
     pub media: MediaKind,
-    /// Zero-based imported track.
+    /// Imported track number (zero denotes the FCPXML primary storyline).
     pub track_index: usize,
+    display_track: Option<usize>,
     /// Seconds in the imported sequence's own time.
     pub timeline_start: f64,
     pub expected_start: f64,
@@ -422,7 +526,10 @@ impl EditClockHint {
             MediaKind::Video => 'V',
             MediaKind::Audio => 'A',
         };
-        format!("{kind}{}", self.track_index + 1)
+        self.display_track.map_or_else(
+            || format!("AAF slot {}", self.track_index),
+            |number| format!("{kind}{number}"),
+        )
     }
 }
 
@@ -436,6 +543,34 @@ struct EditSide<'a> {
     source_in: f64,
     timeline_start: f64,
     backward: bool,
+}
+
+/// Older AAF imports used global slot indices and IDs of the form
+/// aaf-sequence-slot-edit. Recover per-kind numbers up to the first
+/// missing slot; beyond it only the global number is known.
+fn legacy_aaf_numbers(sides: &[EditSide]) -> Option<Vec<usize>> {
+    let mut slots = std::collections::BTreeMap::new();
+    for side in sides {
+        let mut fields = side.id.strip_prefix("aaf-")?.split('-');
+        fields.next()?.parse::<usize>().ok()?;
+        let track = fields.next()?.parse::<usize>().ok()?.checked_add(1)?;
+        fields.next()?.parse::<usize>().ok()?;
+        if track != side.track || fields.next().is_some() {
+            return None;
+        }
+        slots.insert(track, side.media);
+    }
+    let mut counts = HashMap::new();
+    let mut numbers = Vec::new();
+    for (index, kind) in slots {
+        if index != numbers.len() + 1 {
+            break;
+        }
+        let number = counts.entry(kind).or_insert(0);
+        *number += 1;
+        numbers.push(*number);
+    }
+    Some(numbers)
 }
 
 fn edit_sides(imported: &ImportedTimeline) -> Vec<EditSide<'_>> {
@@ -495,6 +630,14 @@ pub fn imported_edit_hints(
         })
         .collect();
     let sides = edit_sides(imported);
+    let legacy = if imported.aaf_track_numbers.is_empty() {
+        legacy_aaf_numbers(&sides)
+    } else {
+        None
+    };
+    let aaf_numbers = legacy.as_deref().or_else(|| {
+        (!imported.aaf_track_numbers.is_empty()).then_some(imported.aaf_track_numbers.as_slice())
+    });
     // Group time minus sequence time, per (media, track, group).
     let mut offsets: HashMap<(MediaKind, usize, usize), Vec<f64>> = HashMap::new();
     for side in sides.iter().filter(|side| !side.backward) {
@@ -534,6 +677,14 @@ pub fn imported_edit_hints(
                 edit_id: side.id.to_string(),
                 media: side.media,
                 track_index: side.track,
+                display_track: match aaf_numbers {
+                    Some(numbers) => side
+                        .track
+                        .checked_sub(1)
+                        .and_then(|index| numbers.get(index))
+                        .copied(),
+                    None => Some(side.track.max(1)),
+                },
                 timeline_start: side.timeline_start,
                 expected_start: estimate.start + side.source_in - offset,
                 tolerance: estimate.tolerance,
@@ -718,6 +869,24 @@ pub(crate) mod tests {
             vec![c3],
             TemporalPolicy::default(),
         )
+    }
+
+    #[test]
+    fn repeated_camera_dates_cannot_identify_a_take() {
+        let camera = |name, clock| camera_clip(name, Some(CAMERA), T0 + clock, 5.0);
+        let result = result(
+            vec![vec![
+                (recorder("R", 100.0), 0.0),
+                (camera("C1", 5), 5.0),
+                (camera("C2", 48), 48.0),
+                (camera("C4", 20), 62.0),
+                (camera("C5", 42), 84.0),
+            ]],
+            vec![camera("C3", 33)],
+            Default::default(),
+        );
+        let report = camera_clock(&result, &[]);
+        assert!(report.refusal(&ClipId::new("C3")).is_some(), "{report:?}");
     }
 
     #[test]
@@ -980,6 +1149,7 @@ pub(crate) mod tests {
         let mut backward = edit("c3-reverse", "C3", MediaKind::Video, 0, 0.0, 4100.0);
         backward.retime.plays_backward = true;
         result.project.imported_timeline = Some(ImportedTimeline {
+            aaf_track_numbers: Vec::new(),
             name: "Edit".into(),
             frame_duration: MediaTime::new(1, 25),
             edits: vec![

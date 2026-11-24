@@ -76,6 +76,7 @@ pub fn data(timeline: &ExportTimeline, media_bins: bool) -> Result<Vec<u8>, Stri
             MediaKind::Video,
             rate,
             &link_groups,
+            if i == 0 { island.reserved_end() } else { None },
         ));
     }
     for (i, track) in audio_tracks.iter().enumerate() {
@@ -85,6 +86,7 @@ pub fn data(timeline: &ExportTimeline, media_bins: bool) -> Result<Vec<u8>, Stri
             MediaKind::Audio,
             rate,
             &link_groups,
+            None,
         ));
     }
     let root = json!({
@@ -154,6 +156,7 @@ fn track_json(
     kind: MediaKind,
     rate: f64,
     link_groups: &HashMap<&str, usize>,
+    reserved_end: Option<f64>,
 ) -> Value {
     let mut cursor = 0.0;
     let mut children = Vec::new();
@@ -200,6 +203,9 @@ fn track_json(
             children.push(transition_json(t, rate));
         }
         cursor = cursor.max(item_start + timeline_duration(entry, kind) - trim_end);
+    }
+    if let Some(end) = reserved_end {
+        children.push(gap(end - cursor, rate));
     }
     let mut resolve_meta = BTreeMap::from([("Locked".to_string(), json!(false))]);
     if kind == MediaKind::Audio {

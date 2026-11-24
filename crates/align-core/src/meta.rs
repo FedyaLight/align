@@ -699,7 +699,7 @@ pub fn sony_recording_date(xml: &str) -> Option<i64> {
 }
 
 /// `device:manufacturer:model:serial`, rejecting empty or sentinel serials
-/// ("0", u32::MAX, and all-F).
+/// (all zeros, u32::MAX, and all-F).
 pub fn sony_device_id(xml: &str) -> Option<String> {
     let elements = sony_elements(xml);
     let (_, (element, _)) = elements
@@ -709,15 +709,14 @@ pub fn sony_device_id(xml: &str) -> Option<String> {
     let manufacturer = attr_local(&element.attrs, "manufacturer")?;
     let model = attr_local(&element.attrs, "modelName")?;
     let serial = attr_local(&element.attrs, "serialNo")?;
-    let normalized = serial.trim().to_uppercase();
-    if normalized.is_empty()
-        || normalized == "0"
-        || normalized == "4294967295"
-        || normalized.bytes().all(|b| b == b'F')
-    {
-        return None;
-    }
-    Some(format!("device:{manufacturer}:{model}:{serial}"))
+    valid_camera_serial(serial).then(|| format!("device:{manufacturer}:{model}:{serial}"))
+}
+
+pub(crate) fn valid_camera_serial(serial: &str) -> bool {
+    let serial = serial.trim();
+    !serial.bytes().all(|b| b == b'0')
+        && serial != "4294967295"
+        && !serial.bytes().all(|b| b.eq_ignore_ascii_case(&b'F'))
 }
 
 /// Minimal ISO 8601 (`YYYY-MM-DDTHH:MM:SS[.frac][Z|±HH[:MM]]`) → Unix.

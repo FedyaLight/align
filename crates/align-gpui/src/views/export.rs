@@ -1605,6 +1605,7 @@ fn export_unmatched_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> 
             move |this, _, _, cx| {
                 this.update_export_options(cx, |data| {
                     data.export.unmatched = placement;
+                    data.relayout_result();
                 });
             },
         ));
@@ -1637,14 +1638,10 @@ fn export_unmatched_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> 
                 .pb_1()
                 .text_size(px(12.))
                 .text_color(rgb(theme.dim))
-                .child(if data.export.unmatched == P::Remove {
-                    format!("Remove also leaves out the {clips} placed by camera clock.")
-                } else {
-                    format!(
-                        "The {clips} placed by camera clock export named {} at their approximate place.",
-                        align_core::camera_clock::CAMERA_CLOCK_LABEL
-                    )
-                }),
+                .child(format!(
+                    "Camera-clock placement applies to {clips}. Exported names begin with {}.",
+                    align_core::camera_clock::CAMERA_CLOCK_LABEL
+                )),
         );
     }
     if reveals.unmatched_kept || reveals_closing.contains_key("export-unmatched-kept") {
@@ -1689,6 +1686,7 @@ fn export_cleanup_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
         !busy,
         |this, _, _, cx| {
             this.data.export.cut_common_gaps = !this.data.export.cut_common_gaps;
+            this.data.relayout_result();
             cx.notify();
         },
     ));
@@ -1701,6 +1699,7 @@ fn export_cleanup_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
         !busy,
         |this, _, _, cx| {
             this.data.export.cut_lone_recorder = !this.data.export.cut_lone_recorder;
+            this.data.relayout_result();
             cx.notify();
         },
     ));
@@ -1718,11 +1717,13 @@ fn export_cleanup_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
             |this, _, _, cx| {
                 this.data.export.cut_shorter_than =
                     (this.data.export.cut_shorter_than - 1.0).max(0.0);
+                this.data.relayout_result();
                 cx.notify();
             },
             |this, _, _, cx| {
                 this.data.export.cut_shorter_than =
                     (this.data.export.cut_shorter_than + 1.0).min(3_600.0);
+                this.data.relayout_result();
                 cx.notify();
             },
         ));
@@ -1739,11 +1740,13 @@ fn export_cleanup_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
             |this, _, _, cx| {
                 this.data.export.trim_starts =
                     ((this.data.export.trim_starts - 0.1).max(0.0) * 10.0).round() / 10.0;
+                this.data.relayout_result();
                 cx.notify();
             },
             |this, _, _, cx| {
                 this.data.export.trim_starts =
                     ((this.data.export.trim_starts + 0.1).min(3_600.0) * 10.0).round() / 10.0;
+                this.data.relayout_result();
                 cx.notify();
             },
         ));
@@ -1760,11 +1763,13 @@ fn export_cleanup_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
             |this, _, _, cx| {
                 this.data.export.trim_ends =
                     ((this.data.export.trim_ends - 0.1).max(0.0) * 10.0).round() / 10.0;
+                this.data.relayout_result();
                 cx.notify();
             },
             |this, _, _, cx| {
                 this.data.export.trim_ends =
                     ((this.data.export.trim_ends + 0.1).min(3_600.0) * 10.0).round() / 10.0;
+                this.data.relayout_result();
                 cx.notify();
             },
         ));
@@ -1789,6 +1794,7 @@ fn export_timeline_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> D
         !busy,
         |this, _, _, cx| {
             this.data.export.prevent_group_overlaps = !this.data.export.prevent_group_overlaps;
+            this.data.relayout_result();
             cx.notify();
         },
     ));
