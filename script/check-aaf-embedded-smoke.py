@@ -10,8 +10,9 @@ import struct
 import subprocess
 import wave
 from fractions import Fraction
-from urllib.parse import unquote, urlparse
 import aaf2
+
+from align_paths import locator_path
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('cli', type=Path)
@@ -77,10 +78,7 @@ with aaf2.open(artifacts[0]['url']) as container:
     for mob in container.content.mobs:
         if isinstance(mob, aaf2.mobs.SourceMob) and mob.descriptor is not None:
             for locator in mob.descriptor['Locator'].value or []:
-                path = unquote(urlparse(locator['URLString'].value).path)
-                if os.name == 'nt' and len(path) >= 3 and path[0] == '/' and path[2] == ':':
-                    path = path[1:]
-                locators.append(Path(path))
+                locators.append(locator_path(locator['URLString'].value))
     assert locators and all(path.is_file() for path in locators), 'export lost session media'
 edits = value['project']['importedTimeline']['edits']
 assert [edit['audioSourceChannel'] for edit in edits] == list(range(args.channels))

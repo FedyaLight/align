@@ -9,19 +9,12 @@ import random
 import shutil
 import struct
 import subprocess
-from urllib.parse import unquote, urlparse
 import wave
 import xml.etree.ElementTree as ET
 
 import aaf2
 
-
-def local_path(value):
-    if value.startswith('file:'):
-        value = unquote(urlparse(value).path)
-        if os.name == 'nt' and len(value) > 2 and value[0] == '/' and value[2] == ':':
-            value = value[1:]
-    return Path(value)
+from align_paths import locator_path
 
 
 def check_references(artifacts):
@@ -53,7 +46,7 @@ def check_references(artifacts):
         elif path.suffix == '.py':
             compile(path.read_text(encoding='utf-8'), str(path), 'exec')
     assert references, 'No media references checked'
-    missing = [value for value in references if not local_path(value).is_file()]
+    missing = [value for value in references if not locator_path(value).is_file()]
     assert not missing, f'Export references missing media: {missing}'
     return len(references)
 

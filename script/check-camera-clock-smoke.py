@@ -20,9 +20,10 @@ import random
 import shutil
 import struct
 import subprocess
-import urllib.parse
 import wave
 import xml.etree.ElementTree as ElementTree
+
+from align_paths import locator_path
 
 RATE = 48000
 FPS = 25
@@ -91,7 +92,7 @@ def premiere_clips(path, sequence_id="sequence-1"):
     for file in root.iter('file'):
         url = file.findtext('pathurl')
         if url:
-            files[file.get('id')] = Path(urllib.parse.unquote(urllib.parse.urlparse(url).path)).name
+            files[file.get('id')] = locator_path(url).name
     clips, names, positions = {}, {}, {}
     media = sequence.find('media')
     for kind in ('video', 'audio'):
@@ -156,7 +157,7 @@ def aaf_events(path):
                         master = media.mob if isinstance(media, aaf2.components.SourceClip) else event.mob
                         source = master.slot_at(event.slot_id).segment.components[0].mob
                         uri = source.descriptor['Locator'].value[0]['URLString'].value
-                        events.append((Path(urllib.parse.unquote(urllib.parse.urlparse(uri).path)),
+                        events.append((locator_path(uri),
                             event.mob.name, event.slot_id, master.name))
     return events
 

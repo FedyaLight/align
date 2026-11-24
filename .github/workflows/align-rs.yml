@@ -1,7 +1,12 @@
 name: align-rs
 
 on:
+  # Pushes run on main and release tags only: a pull request from a branch
+  # of this repository already runs below, so a branch push would start a
+  # second full matrix for the same commit. Tag pushes ignore path filters.
   push:
+    branches: [main]
+    tags: ["v*"]
     paths:
       - "crates/**"
       - "Cargo.toml"
