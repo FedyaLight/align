@@ -1211,15 +1211,24 @@ impl Pipeline {
                     }
                 };
             let mut batched = Vec::new();
+            let cache_keys: Vec<_> = sources
+                .iter()
+                .map(|source| accuracy.cache_key(&source.cache_key()))
+                .collect();
+            // One entry per stream, so its keys are hashed once per pass.
+            let entries: Vec<_> = cache_keys
+                .iter()
+                .map(|key| {
+                    sampled
+                        .as_ref()
+                        .map(|(cache, sample)| cache.entry(sample, key))
+                })
+                .collect();
             // A warm or partly warm movie only decodes the variants it needs.
             let cold = (2..=16).contains(&sources.len())
-                && sources.iter().all(|source| {
-                    sampled.as_ref().is_none_or(|(cache, sample)| {
-                        !cache
-                            .entry(sample, &accuracy.cache_key(&source.cache_key()))
-                            .exists()
-                    })
-                });
+                && entries
+                    .iter()
+                    .all(|entry| entry.as_ref().is_none_or(|entry| !entry.exists()));
             if cold {
                 let mut states: Vec<_> = sources.iter().map(|_| start()).collect();
                 match self
@@ -1239,14 +1248,10 @@ impl Pipeline {
                 }
             }
             let mut batched = batched.into_iter();
-            for source in sources {
+            for (source, entry) in sources.into_iter().zip(&entries) {
                 let state = batched.next();
                 let variant = (|| -> Result<Variant, PipelineError> {
-                    let cache_key = accuracy.cache_key(&source.cache_key());
-                    let entry = sampled
-                        .as_ref()
-                        .map(|(cache, sample)| cache.entry(sample, &cache_key));
-                    if let Some(entry) = &entry
+                    if let Some(entry) = entry
                         && let Some(cached) = entry.load()
                     {
                         // Older Balanced entries may have only landmarks.
@@ -1292,14 +1297,14 @@ impl Pipeline {
                     }
                     let flux = extractor.take_flux();
                     let fingerprints = extractor.finish();
-                    if let Some(entry) = &entry {
+                    if let Some(entry) = entry {
                         entry.save(&fingerprints);
                         if !flux.is_empty() {
                             entry.save_flux(&flux);
                         }
                     }
                     let waveform = preview.map(WaveformPreview::finish);
-                    if let (Some(waveform), Some(entry)) = (&waveform, &entry) {
+                    if let (Some(waveform), Some(entry)) = (&waveform, entry) {
                         entry.save_waveform(waveform);
                     }
                     Ok(Variant {

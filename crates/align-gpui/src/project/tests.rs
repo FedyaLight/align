@@ -289,6 +289,28 @@ fn projects_saved_with_reversed_fcp7_numbering_keep_their_sequence_settings() {
 }
 
 #[test]
+fn opening_an_autosave_restarts_its_expiry() {
+    let (_temp, root) = fixture();
+    let writer = Writer::default();
+    let destination = Destination::autosave(&root);
+    save(&writer, &destination, &AppData::default(), None);
+    let old =
+        FileTimes::new().set_modified(SystemTime::now() - RETENTION + Duration::from_secs(60));
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&destination.path)
+        .unwrap()
+        .set_times(old)
+        .unwrap();
+
+    assert!(open(&destination.path).unwrap().destination.managed);
+    // A week after it was last written, but only minutes after it was opened.
+    let later = SystemTime::now() + Duration::from_secs(120);
+    assert_eq!(managed_projects(&root, later).len(), 1);
+    assert!(destination.path.is_file());
+}
+
+#[test]
 fn startup_expiry_keeps_manual_documents_copies_and_non_project_files() {
     let (_temp, root) = fixture();
     let project_dir = root.join("projects");

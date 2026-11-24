@@ -106,20 +106,28 @@ fn clear_analysis_cache(cx: &mut App) {
             );
             return;
         }
-        let cache = align_core::FingerprintCache::new(None);
-        let statistics = cache.statistics();
-        cache.clear();
-        let status = if statistics.file_count == 0 {
-            "Analysis cache is already empty.".into()
-        } else {
-            format!(
-                "Cleared {} cached analysis file{} ({:.1} MB).",
-                statistics.file_count,
-                if statistics.file_count == 1 { "" } else { "s" },
-                statistics.total_bytes as f64 / 1_048_576.0
-            )
-        };
-        this.set_analysis_cache_status(status, cx);
+        // Reading and removing every entry can take a while on a large cache.
+        let cleared = cx.background_executor().spawn(async {
+            let cache = align_core::FingerprintCache::new(None);
+            let statistics = cache.statistics();
+            cache.clear();
+            statistics
+        });
+        cx.spawn(async move |view, cx| {
+            let statistics = cleared.await;
+            let status = if statistics.file_count == 0 {
+                "Analysis cache is already empty.".into()
+            } else {
+                format!(
+                    "Cleared {} cached analysis file{} ({:.1} MB).",
+                    statistics.file_count,
+                    if statistics.file_count == 1 { "" } else { "s" },
+                    statistics.total_bytes as f64 / 1_048_576.0
+                )
+            };
+            let _ = view.update(cx, |this, cx| this.set_analysis_cache_status(status, cx));
+        })
+        .detach();
     });
 }
 
@@ -133,20 +141,31 @@ fn clear_current_analysis_cache(cx: &mut App) {
             return;
         }
         let media = this.data.current_cache_media();
-        let removed = align_core::FingerprintCache::new(None).clear_media(&media);
-        let status = if media.is_empty() {
-            "Analyze this project before clearing its cache.".into()
-        } else if removed.file_count == 0 {
-            "Current project analysis cache is already empty.".into()
-        } else {
-            format!(
-                "Cleared {} cached analysis file{} for this project ({:.1} MB).",
-                removed.file_count,
-                if removed.file_count == 1 { "" } else { "s" },
-                removed.total_bytes as f64 / 1_048_576.0
-            )
-        };
-        this.set_analysis_cache_status(status, cx);
+        if media.is_empty() {
+            this.set_analysis_cache_status(
+                "Analyze this project before clearing its cache.".into(),
+                cx,
+            );
+            return;
+        }
+        let cleared = cx
+            .background_executor()
+            .spawn(async move { align_core::FingerprintCache::new(None).clear_media(&media) });
+        cx.spawn(async move |view, cx| {
+            let removed = cleared.await;
+            let status = if removed.file_count == 0 {
+                "Current project analysis cache is already empty.".into()
+            } else {
+                format!(
+                    "Cleared {} cached analysis file{} for this project ({:.1} MB).",
+                    removed.file_count,
+                    if removed.file_count == 1 { "" } else { "s" },
+                    removed.total_bytes as f64 / 1_048_576.0
+                )
+            };
+            let _ = view.update(cx, |this, cx| this.set_analysis_cache_status(status, cx));
+        })
+        .detach();
     });
 }
 

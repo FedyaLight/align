@@ -62,7 +62,7 @@ Align creates an autosave when synchronization starts and updates that same
 project as you work. **File → Project Autosave** can turn this off or choose a
 different folder for new projects. The default is **Align** inside your system
 Documents folder. At startup, Align removes its autosaves that have gone seven
-days without an update.
+days without being opened or updated.
 
 Use **File → Recent Projects** or **Open Project…** to reopen a `.align` file.
 The Windows installer registers Align to open these files in Explorer.
@@ -281,8 +281,8 @@ align-cli clear-cache --older-than-days 30
 ```
 
 The on-disk analysis cache stores fingerprints, waveform previews, spectral
-flux, LTC detections, and portable video timing. Align keeps entries for 7 days
-by default. Open **File → Analysis Cache** from the macOS menu bar or the
+flux, LTC detections, and portable video timing. By default Align removes an
+entry once it has gone 7 days unused. Open **File → Analysis Cache** from the macOS menu bar or the
 **Menu** sidebar on Windows and Linux to change retention, clear entries for
 the current project, or clear all entries.
 

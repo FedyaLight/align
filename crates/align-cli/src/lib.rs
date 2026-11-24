@@ -70,7 +70,7 @@ enum Command {
     },
     /// Clear the persistent fingerprint cache, print freed stats JSON.
     ClearCache {
-        /// Only clear entries older than this many days (default: all).
+        /// Only clear entries unused for this many days (default: all).
         #[arg(long, value_name = "N")]
         older_than_days: Option<u64>,
     },

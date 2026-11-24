@@ -347,11 +347,16 @@ pub fn open(path: &Path) -> io::Result<Opened> {
         .unwrap_or_default();
     changed.sort_unstable();
     changed.dedup();
+    let managed = document.header.owns(&path);
+    if managed {
+        // Opening counts as use: autosaves expire after a week unused.
+        let _ = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(SystemTime::now()));
+    }
     Ok(Opened {
-        destination: Destination {
-            managed: document.header.owns(&path),
-            path,
-        },
+        destination: Destination { managed, path },
         title: document.header.title,
         session: document.session,
         placements: document.placements,
