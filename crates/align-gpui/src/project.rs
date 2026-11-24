@@ -306,7 +306,7 @@ pub fn open(path: &Path) -> io::Result<Opened> {
         ));
     }
     let mut file = File::open(&path)?;
-    let document = read_document(&mut file)?;
+    let mut document = read_document(&mut file)?;
     if !document.header.supported() {
         return Err(io::Error::other(
             "This Align project format is unsupported.",
@@ -332,6 +332,7 @@ pub fn open(path: &Path) -> io::Result<Opened> {
             "The project contains an invalid media path.",
         ));
     }
+    document.session.adopt_fcp7_document_order();
     let mut changed: Vec<_> = document
         .session
         .inputs

@@ -887,6 +887,14 @@ pub fn timeline_sequence_summaries(
     }
 }
 
+/// Number of top-level sequences when `path` is an FCP 7 XML document,
+/// which numbers them in document order.
+pub fn fcp7_sequence_count(path: &Path) -> Option<usize> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let doc = XmlDoc::parse(&text).ok()?;
+    (!doc.root_name().eq_ignore_ascii_case("fcpxml")).then(|| top_sequences(&doc).len())
+}
+
 /// Rewrite only media locations in FCP 7 XML or FCPXML. Unchanged events are
 /// copied verbatim by quick-xml; elements containing a changed location are
 /// re-escaped without rebuilding the timeline document.

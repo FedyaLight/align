@@ -242,6 +242,53 @@ fn repeated_checkpoints_keep_the_latest_sequence_settings_after_reopen() {
 }
 
 #[test]
+fn projects_saved_with_reversed_fcp7_numbering_keep_their_sequence_settings() {
+    let (_temp, root) = fixture();
+    let writer = Writer::default();
+    let destination = Destination::autosave(&root);
+    let source = root.join("edits.xml");
+    fs::write(
+        &source,
+        "<xmeml><sequence><name>Morning</name></sequence><sequence><name>Evening</name></sequence></xmeml>",
+    ).unwrap();
+    let mut data = AppData::default();
+    let token = data.import_cancel.clone();
+    let paths = data.begin_import(vec![source.clone()]);
+    let inputs = paths
+        .into_iter()
+        .map(|path| crate::state::InputPath::inspect(path, &token))
+        .collect();
+    data.finish_import(&token, inputs);
+    data.choose_all_sequences();
+    data.settings_scope = SettingsScope::CurrentSequence;
+    assert!(data.set_scoped_search_accuracy(Some(SearchAccuracy::Exhaustive)));
+    save(&writer, &destination, &data, None);
+
+    // Earlier versions numbered FCP 7 sequences from the last one, so key 0
+    // was "Evening", and did not write the order marker.
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&destination.path).unwrap()).unwrap();
+    document["session"]
+        .as_object_mut()
+        .unwrap()
+        .remove("fcp7DocumentOrder")
+        .unwrap();
+    fs::write(&destination.path, serde_json::to_vec(&document).unwrap()).unwrap();
+
+    let reopened = restore(&destination.path);
+    assert_eq!(reopened.sequence_key_for_position(0), 1);
+    assert_eq!(reopened.sequence_key_for_position(1), 0);
+    assert_eq!(
+        reopened.effective_settings_for(1).search_accuracy,
+        SearchAccuracy::Exhaustive
+    );
+    assert_eq!(
+        reopened.effective_settings_for(0).search_accuracy,
+        SearchAccuracy::Balanced
+    );
+}
+
+#[test]
 fn startup_expiry_keeps_manual_documents_copies_and_non_project_files() {
     let (_temp, root) = fixture();
     let project_dir = root.join("projects");
