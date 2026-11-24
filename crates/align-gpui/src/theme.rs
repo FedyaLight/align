@@ -1,13 +1,15 @@
 //! Application theme: light and dark palettes following the system
 //! appearance (`Window::appearance()`, re-rendered automatically on change).
-//! Signal colors (matched/unmatched/pending bars) stay identical in both
-//! modes; window chrome adapts to the selected appearance.
+//! Window chrome adapts to the selected appearance; timeline clips keep one
+//! hue per state in both modes, in a shade chosen for each (`ClipPalette`).
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use gpui::WindowAppearance;
 use serde::{Deserialize, Serialize};
+
+use crate::lane::BarMatchState;
 
 static CURRENT_APPEARANCE: AtomicU8 = AtomicU8::new(0);
 
@@ -100,6 +102,52 @@ pub struct Theme {
     pub blue: u32,
     /// Audio lane labels.
     pub cyan: u32,
+    /// Timeline clips.
+    pub clip: ClipPalette,
+}
+
+/// Timeline clip colors. Each state keeps its hue in both modes. Light mode
+/// uses deeper, saturated fills; dark mode quieter ones, as light as the
+/// ink allows, so clips still stand apart from the dark window.
+#[derive(Clone, Copy, Debug)]
+pub struct ClipPalette {
+    /// Clips the analysis is still placing.
+    pub pending: u32,
+    /// Synchronized clips, and refined ones the solve has not confirmed.
+    pub matched: u32,
+    pub unmatched: u32,
+    /// Unmatched clips placed by their camera's clock.
+    pub camera_clock: u32,
+    /// Name, media icon and status mark.
+    pub ink: u32,
+    /// Waveform columns over the fill (RGBA).
+    pub wave: u32,
+    /// Stripes over a clip the analysis has not settled (RGBA).
+    pub hatch: u32,
+}
+
+/// Opacity of the fill laid behind a clip's name and status mark. It mutes
+/// the waveform and stripes there, so the ink keeps its contrast; elsewhere
+/// they show as before.
+const CLIP_BACKDROP_ALPHA: u32 = 0xD9;
+
+impl ClipPalette {
+    /// The fill tracks synchronization: pending while analysis runs, then
+    /// matched or unmatched; an unmatched clip placed by its camera's clock
+    /// has a color of its own.
+    pub fn fill(&self, state: BarMatchState) -> u32 {
+        match state {
+            BarMatchState::Pending => self.pending,
+            BarMatchState::Refined | BarMatchState::Matched => self.matched,
+            BarMatchState::Unmatched => self.unmatched,
+            BarMatchState::CameraClock => self.camera_clock,
+        }
+    }
+
+    /// The fill behind the ink (RGBA).
+    pub fn backdrop(&self, state: BarMatchState) -> u32 {
+        (self.fill(state) << 8) | CLIP_BACKDROP_ALPHA
+    }
 }
 
 impl Theme {
@@ -139,6 +187,15 @@ impl Theme {
             orange: 0xFF9500,
             blue: 0x007AFF,
             cyan: 0x32ADE6,
+            clip: ClipPalette {
+                pending: 0x0060DE,
+                matched: 0x1C7536,
+                unmatched: 0xB44800,
+                camera_clock: 0x9343C4,
+                ink: 0xFFFFFF,
+                wave: 0xFFFFFF4D,
+                hatch: 0xFFFFFF2E,
+            },
         }
     }
 
@@ -162,6 +219,15 @@ impl Theme {
             orange: 0xFF9F0A,
             blue: 0x0A84FF,
             cyan: 0x64D2FF,
+            clip: ClipPalette {
+                pending: 0x2F6BC7,
+                matched: 0x2B7C44,
+                unmatched: 0xB75308,
+                camera_clock: 0x9055BD,
+                ink: 0xFFFFFF,
+                wave: 0xFFFFFF42,
+                hatch: 0xFFFFFF2E,
+            },
         }
     }
 }
@@ -184,8 +250,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn secondary_text_remains_readable_on_both_surfaces() {
+    /// WCAG contrast ratio of two opaque RGB colors.
+    fn contrast(a: u32, b: u32) -> f64 {
         fn luminance(color: u32) -> f64 {
             let channel = |shift: u32| {
                 let c = ((color >> shift) & 255u32) as f64 / 255.0;
@@ -197,10 +263,54 @@ mod tests {
             };
             0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
         }
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn secondary_text_remains_readable_on_both_surfaces() {
         for theme in [Theme::light(), Theme::dark()] {
             for surface in [theme.bg, theme.panel] {
-                let (a, b) = (luminance(theme.dim), luminance(surface));
-                assert!((a.max(b) + 0.05) / (a.min(b) + 0.05) >= 4.5);
+                assert!(contrast(theme.dim, surface) >= 4.5);
+            }
+        }
+    }
+
+    #[test]
+    fn clip_ink_stays_readable_over_the_waveform_in_every_state() {
+        // An RGBA layer over an opaque color, blended per channel as the
+        // window composites it.
+        fn over(base: u32, layer: u32) -> u32 {
+            let alpha = (layer & 255) as f64 / 255.0;
+            [16, 8, 0].into_iter().fold(0, |color, shift| {
+                let below = ((base >> shift) & 255) as f64;
+                let above = ((layer >> (shift + 8)) & 255) as f64;
+                color | ((below + (above - below) * alpha).round() as u32) << shift
+            })
+        }
+        let states = [
+            BarMatchState::Pending,
+            BarMatchState::Refined,
+            BarMatchState::Matched,
+            BarMatchState::Unmatched,
+            BarMatchState::CameraClock,
+        ];
+        for theme in [Theme::light(), Theme::dark()] {
+            let clip = theme.clip;
+            for state in states {
+                let fill = clip.fill(state);
+                let striped = if state.unsettled() {
+                    over(fill, clip.hatch)
+                } else {
+                    fill
+                };
+                // The brightest spot under the name or status mark: a
+                // waveform column, over a stripe when there is one.
+                let under_ink = over(over(striped, clip.wave), clip.backdrop(state));
+                assert!(contrast(clip.ink, fill) >= 4.5, "{state:?} {theme:?}");
+                assert!(contrast(clip.ink, under_ink) >= 4.5, "{state:?} {theme:?}");
+                // The clip stands apart from the window around it.
+                assert!(contrast(fill, theme.bg) >= 3.0, "{state:?} {theme:?}");
             }
         }
     }

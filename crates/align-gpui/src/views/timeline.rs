@@ -2,8 +2,8 @@
 
 use super::animation::entrance;
 use super::controls::{
-    RULER_LABEL_W, ZoomDrag, ZoomDragGhost, clip_color, clip_status_icon, fmt_duration,
-    fmt_timecode, hover_tip, ruler_ticks, waveform_columns,
+    RULER_LABEL_W, ZoomDrag, ZoomDragGhost, clip_status_icon, fmt_duration, fmt_timecode,
+    hover_tip, ruler_ticks, waveform_columns,
 };
 use super::{
     AlignApp, AnimationExt, AudioAnalysisSource, Context, DragMoveEvent, FluentBuilder, HashMap,
@@ -50,13 +50,13 @@ pub(super) fn timeline_preview(
 
 /// Static stripes over a clip the analysis has not settled yet. Nothing
 /// moves, so they read the same with reduced motion.
-fn unsettled_hatch(rounded: bool) -> impl IntoElement {
+fn unsettled_hatch(rounded: bool, color: u32) -> impl IntoElement {
     gpui::canvas(
         |_, _, _| (),
         move |bounds, (), window, _| {
             // The pattern is measured in device pixels.
             let scale = window.scale_factor();
-            let stripes = gpui::pattern_slash(rgba(0xFFFFFF2E).into(), 2.0 * scale, 4.0 * scale);
+            let stripes = gpui::pattern_slash(rgba(color).into(), 2.0 * scale, 4.0 * scale);
             let mut quad = gpui::fill(bounds, stripes);
             if rounded {
                 // The bar's corner inside its 1 px border.
@@ -320,8 +320,12 @@ pub(super) fn timeline_lanes(
             let geometry = bar_row_geometry(&lane.clips, px_per_sec);
             for (bar, (x, width)) in lane.clips.iter().zip(geometry.iter()) {
                 let (x, width) = (*x, *width);
-                let color = clip_color(bar.match_state);
-                let ink = 0xFFFFFF;
+                let palette = theme.clip;
+                let color = palette.fill(bar.match_state);
+                let ink = palette.ink;
+                // Behind the name and status mark, the waveform and stripes
+                // are muted by the fill, so the ink stays readable.
+                let backdrop = rgba(palette.backdrop(bar.match_state));
                 let clip_id = bar.clip_id.clone();
                 // A bar that moved to this layout glides from where it was.
                 // Its last frame is this layout, so it is drawn the same way
@@ -382,7 +386,7 @@ pub(super) fn timeline_lanes(
                 // A clip the analysis has not settled is hatched at any
                 // width, under its waveform.
                 if near && bar.match_state.unsettled() {
-                    el = el.child(unsettled_hatch(rounded));
+                    el = el.child(unsettled_hatch(rounded, palette.hatch));
                 }
                 // Icon + name when wide enough.
                 // Bar label: icon pinned top-left, text pinned to the
@@ -393,6 +397,7 @@ pub(super) fn timeline_lanes(
                 if width >= 24.0 && near {
                     if let Some(waveform) = data.waveform_previews.get(&bar.clip_id) {
                         let (columns, bar_width) = waveform_columns(waveform, width);
+                        let wave = rgba(palette.wave);
                         let preview = gpui::canvas(
                             |_, _, _| (),
                             move |bounds, (), window, _| {
@@ -408,15 +413,43 @@ pub(super) fn timeline_lanes(
                                         origin,
                                         gpui::size(px((bar_width - 1.0).max(1.0)), px(h)),
                                     );
-                                    window.paint_quad(
-                                        gpui::fill(rect, rgba(0xFFFFFF42)).corner_radii(radius),
-                                    );
+                                    window.paint_quad(gpui::fill(rect, wave).corner_radii(radius));
                                 }
                             },
                         )
                         .absolute()
                         .inset_0();
                         el = el.child(preview);
+                    }
+                    if width >= 64.0 {
+                        // The backdrop starts under the media icon and ends
+                        // just past the name; the name keeps its place and
+                        // the width it may take before it is cut short.
+                        el = el.child(
+                            div()
+                                .absolute()
+                                .left(px(5.0))
+                                .right(px(2.0))
+                                .top(px(0.))
+                                .bottom(px(0.))
+                                .flex()
+                                .flex_col()
+                                .justify_center()
+                                .items_start()
+                                .child(
+                                    div()
+                                        .max_w_full()
+                                        .pl(px(22.0))
+                                        .pr(px(2.0))
+                                        .rounded(px(4.0))
+                                        .bg(backdrop)
+                                        .text_xs()
+                                        .truncate()
+                                        .whitespace_nowrap()
+                                        .text_color(rgb(ink))
+                                        .child(bar.name.clone()),
+                                ),
+                        );
                     }
                     let video = matches!(bar.kind, MediaKind::Video);
                     let icon_path = if video {
@@ -431,27 +464,6 @@ pub(super) fn timeline_lanes(
                             .top(px(17.0))
                             .child(svg_icon(icon_path, 13.0, ink)),
                     );
-                    if width >= 64.0 {
-                        el = el.child(
-                            div()
-                                .absolute()
-                                .left(px(27.0))
-                                .right(px(4.0))
-                                .top(px(0.))
-                                .bottom(px(0.))
-                                .flex()
-                                .flex_col()
-                                .justify_center()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .truncate()
-                                        .whitespace_nowrap()
-                                        .text_color(rgb(ink))
-                                        .child(bar.name.clone()),
-                                ),
-                        );
-                    }
                 }
                 // The status mark sits apart from the media icon, in the
                 // corner, or centered across a bar too narrow for the
@@ -467,6 +479,8 @@ pub(super) fn timeline_lanes(
                             .top(px(STATUS_INSET))
                             .right(px(status_right))
                             .size(px(STATUS_ICON))
+                            .rounded(px(2.0))
+                            .bg(backdrop)
                             .child(svg_icon(icon, STATUS_ICON, ink)),
                     );
                 }
