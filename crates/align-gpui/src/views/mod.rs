@@ -912,8 +912,13 @@ impl AlignApp {
                 crate::project::record_revision(&mut revisions, &path);
             }
             let revisions = std::sync::Mutex::new(revisions);
-            let pipeline = Pipeline::default_backend();
             let sequence_count = input_sets.len();
+            // Sequences of one project inspect and analyse shared media once.
+            let pipeline = if sequence_count > 1 {
+                Pipeline::default_backend().remembering_analysis()
+            } else {
+                Pipeline::default_backend()
+            };
             let mut results = Vec::with_capacity(sequence_count);
             for (sequence_index, (inputs, (constraints, options, targets, target_urls))) in
                 input_sets.into_iter().zip(run_settings).enumerate()

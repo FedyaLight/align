@@ -170,6 +170,17 @@ type RelinkOptions = (
     Vec<String>,
 );
 
+/// The pipeline for `sequences` synchronizations of one command: sequences
+/// of one project inspect and analyse the media they share once.
+fn batch_pipeline(sequences: usize) -> Pipeline {
+    let pipeline = Pipeline::default_backend();
+    if sequences > 1 {
+        pipeline.remembering_analysis()
+    } else {
+        pipeline
+    }
+}
+
 fn relink_options(args: &RelinkArgs) -> Result<RelinkOptions, CliError> {
     let store = align_core::redirect::config_file();
     let mut added = Vec::new();
@@ -784,10 +795,10 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
                 return Err(CliError::Usage);
             }
             let sequence = sequence_index(sequence)?;
-            let pipeline = Pipeline::default_backend();
             let progress = progress_printer();
             let cancel = std::sync::atomic::AtomicBool::new(false);
             let input_sets = input_sets(&paths, sequence, all_sequences, &cancel)?;
+            let pipeline = batch_pipeline(input_sets.len());
             let mut options = settings.pipeline_options();
             let (redirects, manual, omit) = relink_options(&relink)?;
             options.redirects = redirects;
@@ -865,10 +876,10 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
                 ));
             }
             let sequence = sequence_index(sequence)?;
-            let pipeline = Pipeline::default_backend();
             let progress = progress_printer();
             let cancel = std::sync::atomic::AtomicBool::new(false);
             let input_sets = input_sets(&paths, sequence, all_sequences, &cancel)?;
+            let pipeline = batch_pipeline(input_sets.len());
             let mut options = settings.pipeline_options();
             let (redirects, manual, omit) = relink_options(&relink)?;
             options.redirects = redirects;

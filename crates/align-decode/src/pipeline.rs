@@ -285,6 +285,33 @@ fn cancelled(flag: &std::sync::atomic::AtomicBool) -> bool {
 pub struct Pipeline {
     backend: Box<dyn MediaBackend>,
     cache: Option<FingerprintCache>,
+    /// Inspections and analyses kept for this pipeline's later runs, such
+    /// as the other sequences of one batch, whether or not the disk cache
+    /// is on.
+    analyses: Option<std::sync::Mutex<Remembered>>,
+}
+
+#[derive(Default)]
+struct Remembered {
+    /// Each file's inspection, LTC included, by path and revision.
+    inspections: HashMap<(PathBuf, String), Clip>,
+    analyses: HashMap<AnalysisKey, Analysis>,
+}
+
+/// A file revision and the analysis asked of it.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct AnalysisKey {
+    path: PathBuf,
+    revision: String,
+    variant: String,
+    flux: bool,
+    waveform: bool,
+}
+
+struct Analysis {
+    fingerprints: Vec<align_core::Fingerprint>,
+    flux: Vec<u8>,
+    waveform: Option<Vec<f32>>,
 }
 
 impl Pipeline {
@@ -320,7 +347,11 @@ impl Pipeline {
             }
             cache
         });
-        Self { backend, cache }
+        Self {
+            backend,
+            cache,
+            analyses: None,
+        }
     }
 
     pub fn default_backend() -> Self {
@@ -333,7 +364,16 @@ impl Pipeline {
         Self {
             backend: crate::backend::create(default_backend_kind()),
             cache: None,
+            analyses: None,
         }
+    }
+
+    /// Keeps each file's inspection and analysis for later runs of this
+    /// pipeline, so the sequences of one batch inspect and analyse media
+    /// they share once. They stay in memory as long as the pipeline.
+    pub fn remembering_analysis(mut self) -> Self {
+        self.analyses = Some(Default::default());
+        self
     }
 
     pub fn backend(&self) -> &dyn MediaBackend {
@@ -798,6 +838,22 @@ impl Pipeline {
                 if cancelled(cancel) {
                     return Some(Err(PipelineError::Cancelled));
                 }
+                let remembered = self.analyses.as_ref().and_then(|remembered| {
+                    let revision = align_core::cache::media_revision(url).ok()?;
+                    Some((remembered, (url.clone(), revision)))
+                });
+                if let Some((remembered, key)) = &remembered
+                    && let Some(clip) = remembered
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .inspections
+                        .get(key)
+                        .cloned()
+                {
+                    publish(false, url, None);
+                    publish(true, url, Some(clip.clone()));
+                    return Some(Ok(clip));
+                }
                 let inspection = if local_only {
                     let inspection = self.backend.local_inspection(url)?;
                     publish(false, url, None);
@@ -810,6 +866,13 @@ impl Pipeline {
                 let outcome = inspection
                     .map_err(PipelineError::Decode)
                     .and_then(|i| self.inspect_one(url, i));
+                if let (Some((remembered, key)), Ok(clip)) = (remembered, &outcome) {
+                    remembered
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .inspections
+                        .insert(key, clip.clone());
+                }
                 publish(true, url, outcome.as_ref().ok().cloned());
                 Some(outcome)
             },
@@ -1197,18 +1260,50 @@ impl Pipeline {
                 };
             let mut variants = Vec::with_capacity(sources.len());
             let mut failure = None;
-            let decoder_cache = self.decoder_cache(&clip.url);
-            let cache = decoder_cache.as_ref().or(self.cache.as_ref());
-            let sampled = cache.and_then(|cache| {
-                let sample = align_core::cache::MediaSample::read(&clip.url).ok()?;
-                Some((cache, sample))
-            });
             // Producing a sidecar during a cold decode is independent of whether
             // this project has a short take that can use it right now.
             let hops = flux_limit(clip);
             let flux_cacheable = accuracy.is_balanced()
                 && hops.saturating_sub(2) <= align_core::fingerprint::MAX_FLUX_HOPS;
             let use_flux = flux_enabled && flux_cacheable;
+            let remembered = self.analyses.as_ref().and_then(|remembered| {
+                let revision = align_core::cache::media_revision(&clip.url).ok()?;
+                Some((remembered, revision))
+            });
+            let analysis_key = |revision: &str, source: &AudioAnalysisSource| AnalysisKey {
+                path: clip.url.clone(),
+                revision: revision.to_string(),
+                variant: accuracy.cache_key(&source.cache_key()),
+                flux: use_flux,
+                waveform: generate_waveform_previews,
+            };
+            if let Some((remembered, revision)) = &remembered {
+                let analyses = &remembered
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .analyses;
+                let known: Option<Vec<Variant>> = sources
+                    .iter()
+                    .map(|source| {
+                        let analysis = analyses.get(&analysis_key(revision, source))?;
+                        Some(Variant {
+                            source: *source,
+                            fingerprints: analysis.fingerprints.clone(),
+                            flux: analysis.flux.clone(),
+                            waveform: analysis.waveform.clone(),
+                        })
+                    })
+                    .collect();
+                if let Some(known) = known {
+                    return Ok(known);
+                }
+            }
+            let decoder_cache = self.decoder_cache(&clip.url);
+            let cache = decoder_cache.as_ref().or(self.cache.as_ref());
+            let sampled = cache.and_then(|cache| {
+                let sample = align_core::cache::MediaSample::read(&clip.url).ok()?;
+                Some((cache, sample))
+            });
             let start = || {
                 let mut extractor = FingerprintExtractor::with_accuracy(accuracy);
                 if use_flux || (flux_cacheable && sampled.is_some()) {
@@ -1338,6 +1433,22 @@ impl Pipeline {
                     Err(error) => {
                         failure.get_or_insert(error);
                     }
+                }
+            }
+            if let Some((remembered, revision)) = &remembered {
+                let analyses = &mut remembered
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .analyses;
+                for variant in &variants {
+                    analyses.insert(
+                        analysis_key(revision, &variant.source),
+                        Analysis {
+                            fingerprints: variant.fingerprints.clone(),
+                            flux: variant.flux.clone(),
+                            waveform: variant.waveform.clone(),
+                        },
+                    );
                 }
             }
             match failure {
@@ -2216,6 +2327,7 @@ mod tests {
                 Some(dir.join(".cache")),
                 "failing-inspect",
             )),
+            analyses: None,
         };
         (dir, pipe)
     }
@@ -2464,6 +2576,104 @@ mod tests {
         }
     }
 
+    /// The portable backend, counting the decodes that analyse whole files
+    /// (fingerprints) and the ones that read their openings (LTC).
+    #[derive(Default)]
+    struct CountingAnalysis {
+        whole: std::sync::atomic::AtomicUsize,
+        openings: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MediaBackend for std::sync::Arc<CountingAnalysis> {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Portable
+        }
+
+        fn inspect(&self, path: &Path) -> Result<crate::backend::ProbeReport, crate::DecodeError> {
+            crate::portable::PortableBackend.inspect(path)
+        }
+
+        fn decode_mono_8k(
+            &self,
+            path: &Path,
+            source: AudioAnalysisSource,
+            consume: &mut dyn FnMut(&[f32]) -> Result<(), crate::DecodeError>,
+        ) -> Result<(), crate::DecodeError> {
+            self.whole
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::portable::PortableBackend.decode_mono_8k(path, source, consume)
+        }
+
+        fn decode_window_16k(
+            &self,
+            path: &Path,
+            start: f64,
+            duration: f64,
+            source: AudioAnalysisSource,
+        ) -> Result<(f64, Vec<f32>), crate::DecodeError> {
+            crate::portable::PortableBackend.decode_window_16k(path, start, duration, source)
+        }
+
+        fn decode_native(
+            &self,
+            path: &Path,
+            stream: usize,
+            range: Option<(f64, Option<f64>)>,
+            consume: &mut dyn FnMut(crate::backend::NativeBlock) -> Result<(), crate::DecodeError>,
+        ) -> Result<f64, crate::DecodeError> {
+            self.openings
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::portable::PortableBackend.decode_native(path, stream, range, consume)
+        }
+
+        fn decode_native_i32(
+            &self,
+            path: &Path,
+            stream: usize,
+            range: Option<(f64, Option<f64>)>,
+            consume: &mut dyn FnMut(
+                crate::backend::NativeBlockI32,
+            ) -> Result<(), crate::DecodeError>,
+        ) -> Result<f64, crate::DecodeError> {
+            crate::portable::PortableBackend.decode_native_i32(path, stream, range, consume)
+        }
+    }
+
+    #[test]
+    fn a_batch_pipeline_analyses_shared_media_once_without_the_disk_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = noise(12 * 44100, 0xBA7C);
+        let a = write_delayed_wav(dir.path(), "a.wav", &body, 0.0);
+        let b = write_delayed_wav(dir.path(), "b.wav", &body, 1.5);
+        let counts = std::sync::Arc::new(CountingAnalysis::default());
+        let pipe = Pipeline {
+            backend: Box::new(counts.clone()),
+            cache: None,
+            analyses: None,
+        }
+        .remembering_analysis();
+        let inputs = [PipelineInput::Media(a), PipelineInput::Media(b)];
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let run = || {
+            pipe.synchronize(&inputs, &[], &PipelineOptions::default(), None, &cancel)
+                .unwrap()
+        };
+        let decodes = || {
+            use std::sync::atomic::Ordering::Relaxed;
+            (counts.whole.load(Relaxed), counts.openings.load(Relaxed))
+        };
+        let first = run();
+        let analysed = decodes();
+        assert!(analysed.0 > 0 && analysed.1 > 0, "{analysed:?}");
+        let second = run();
+        assert_eq!(decodes(), analysed);
+        assert_eq!(first.islands.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&second).unwrap()
+        );
+    }
+
     fn faulty_pipeline(dir: &Path, backend: FaultyAnalysis) -> Pipeline {
         Pipeline {
             backend: Box::new(backend),
@@ -2471,6 +2681,7 @@ mod tests {
                 Some(dir.join(".cache")),
                 "faulty-test",
             )),
+            analyses: None,
         }
     }
 
