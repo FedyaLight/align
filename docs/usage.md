@@ -20,6 +20,11 @@ open "/Applications/Align.app"
 3. Synchronize. Review the resulting groups, unmatched clips, and warnings.
 4. Choose an export destination and the options appropriate for your editor.
 
+While Align analyzes, clips on the timeline are striped: their place is not
+confirmed yet. Afterwards a synchronized clip has a link in its top-right
+corner and an unmatched clip a warning sign. A clip too narrow for the mark
+shows its state by color only.
+
 The export sheet starts from Align's defaults. **Save as Default** keeps the
 current export options for new sessions and later launches; the destination
 and sequence name are not saved. **Revert to Saved** and **Use Align Defaults**
@@ -47,14 +52,14 @@ or with **Place All**; **Undo** or **Return to Unmatched** takes a clip back,
 and with it a kept choice it was holding back, so another clip is not placed
 unasked.
 
-A placed clip is purple on the timeline and stays unmatched: the place is an
-estimate, not a match. Export uses exactly what the timeline shows. The
-choice is kept per sequence in the project and applies again after reopening,
-another stage, or synchronizing again, wherever the clip still has an
-estimate. New projects and projects saved by earlier versions place nothing,
-and the choice is never part of the saved export defaults. See
-[camera clock placement](formats.md#camera-clock-placement) for which cameras
-qualify, how accurate the place is, and what each format writes.
+A placed clip is purple on the timeline, with a clock instead of the link, and
+stays unmatched: the place is an estimate, not a match. Export uses exactly
+what the timeline shows. The choice is kept per sequence in the project and
+applies again after reopening, another stage, or synchronizing again, wherever
+the clip still has an estimate. New projects and projects saved by earlier
+versions place nothing, and the choice is never part of the saved export
+defaults. See [camera clock placement](formats.md#camera-clock-placement) for
+which cameras qualify, how accurate the place is, and what each format writes.
 
 ### Save and reopen projects
 

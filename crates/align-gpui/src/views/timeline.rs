@@ -2,8 +2,8 @@
 
 use super::animation::entrance;
 use super::controls::{
-    RULER_LABEL_W, ZoomDrag, ZoomDragGhost, clip_color, fmt_duration, fmt_timecode, hover_tip,
-    ruler_ticks, waveform_columns,
+    RULER_LABEL_W, ZoomDrag, ZoomDragGhost, clip_color, clip_status_icon, fmt_duration,
+    fmt_timecode, hover_tip, ruler_ticks, waveform_columns,
 };
 use super::{
     AlignApp, AnimationExt, AudioAnalysisSource, Context, DragMoveEvent, FluentBuilder, HashMap,
@@ -15,6 +15,12 @@ use super::{
 use gpui::AppContext as _;
 
 // ---------------- timeline preview (toolbar + ruler + lanes)
+
+/// Size of a clip's status mark in its top-right corner.
+const STATUS_ICON: f32 = 10.0;
+/// Gap between the status mark and the clip's top and right edges. The
+/// mark ends above the name's line, so it never covers the name.
+const STATUS_INSET: f32 = 4.0;
 
 pub(super) fn timeline_preview(
     cx: &mut Context<AlignApp>,
@@ -40,6 +46,27 @@ pub(super) fn timeline_preview(
         root = root.opacity(0.5);
     }
     root
+}
+
+/// Static stripes over a clip the analysis has not settled yet. Nothing
+/// moves, so they read the same with reduced motion.
+fn unsettled_hatch(rounded: bool) -> impl IntoElement {
+    gpui::canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            // The pattern is measured in device pixels.
+            let scale = window.scale_factor();
+            let stripes = gpui::pattern_slash(rgba(0xFFFFFF2E).into(), 2.0 * scale, 4.0 * scale);
+            let mut quad = gpui::fill(bounds, stripes);
+            if rounded {
+                // The bar's corner inside its 1 px border.
+                quad = quad.corner_radii(px(5.0));
+            }
+            window.paint_quad(quad);
+        },
+    )
+    .absolute()
+    .inset_0()
 }
 
 /// Draggable zoom slider:
@@ -327,7 +354,8 @@ pub(super) fn timeline_lanes(
                     .top(px(6.0 + top))
                     .w(px(shown_width))
                     .h(px(TIMELINE_ROW_H - 12.0));
-                if width >= 8.0 {
+                let rounded = width >= 8.0;
+                if rounded {
                     el = el.rounded_md();
                 }
                 el = el
@@ -350,6 +378,11 @@ pub(super) fn timeline_lanes(
                         );
                     }
                     el = el.tooltip(hover_tip(tip, theme));
+                }
+                // A clip the analysis has not settled is hatched at any
+                // width, under its waveform.
+                if near && bar.match_state.unsettled() {
+                    el = el.child(unsettled_hatch(rounded));
                 }
                 // Icon + name when wide enough.
                 // Bar label: icon pinned top-left, text pinned to the
@@ -419,6 +452,23 @@ pub(super) fn timeline_lanes(
                                 ),
                         );
                     }
+                }
+                // The status mark sits apart from the media icon, in the
+                // corner, or centered across a bar too narrow for the
+                // corner's gap (inside its 1 px borders).
+                let status_right = ((width - 2.0 - STATUS_ICON) / 2.0).min(STATUS_INSET);
+                if near
+                    && status_right >= 1.0
+                    && let Some(icon) = clip_status_icon(bar.match_state)
+                {
+                    el = el.child(
+                        div()
+                            .absolute()
+                            .top(px(STATUS_INSET))
+                            .right(px(status_right))
+                            .size(px(STATUS_ICON))
+                            .child(svg_icon(icon, STATUS_ICON, ink)),
+                    );
                 }
                 el = el.on_mouse_down(
                     MouseButton::Right,

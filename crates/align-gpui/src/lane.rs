@@ -13,11 +13,23 @@ use align_core::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BarMatchState {
+    /// Still being analyzed, with no refined match yet.
     Pending,
+    /// Still being analyzed, with a refined match that the solve has not
+    /// confirmed yet.
+    Refined,
+    /// Synchronized in the finished result.
     Matched,
     Unmatched,
     /// Unmatched, placed by its camera's clock.
     CameraClock,
+}
+
+impl BarMatchState {
+    /// Whether the analysis is still deciding where the clip goes.
+    pub fn unsettled(self) -> bool {
+        matches!(self, Self::Pending | Self::Refined)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -176,6 +188,7 @@ pub fn provisional_groups(
 }
 
 /// Provisional bars: cursor-packed groups (1 s gaps), refined edges green.
+/// None of them is synchronized yet: only the finished result says so.
 pub fn provisional_bars(
     clips: &HashMap<ClipId, LiveClip>,
     matches: &HashMap<String, LiveMatch>,
@@ -210,7 +223,7 @@ pub fn provisional_bars(
                 duration: clip.duration,
                 confidence: confidences.get(id).copied().unwrap_or(0.0),
                 match_state: if matched {
-                    BarMatchState::Matched
+                    BarMatchState::Refined
                 } else {
                     BarMatchState::Pending
                 },
@@ -536,6 +549,33 @@ mod tests {
         assert!((starts.remove("a").unwrap() - 5.0).abs() < 1e-9);
         assert!((starts.remove("b").unwrap() - 3.0).abs() < 1e-9);
         assert!((starts.remove("c").unwrap() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn provisional_bars_are_never_synchronized() {
+        // A refined pair is still a candidate: the solve can drop it, so the
+        // live preview must not show either clip as synchronized.
+        let clips: HashMap<ClipId, LiveClip> =
+            ["a", "b", "c"].iter().map(|id| live_clip(id)).collect();
+        let matches = HashMap::from([(
+            LiveMatch::id(&clip_id("a"), &clip_id("b")),
+            LiveMatch {
+                left: clip_id("a"),
+                right: clip_id("b"),
+                offset: 2.0,
+                confidence: 0.9,
+                refined: true,
+            },
+        )]);
+        let states: HashMap<String, BarMatchState> =
+            provisional_bars(&clips, &matches, &HashMap::new())
+                .into_iter()
+                .map(|bar| (bar.id, bar.match_state))
+                .collect();
+        assert_eq!(states["a"], BarMatchState::Refined);
+        assert_eq!(states["b"], BarMatchState::Refined);
+        assert_eq!(states["c"], BarMatchState::Pending);
+        assert!(states.values().all(|state| state.unsettled()));
     }
 
     #[test]

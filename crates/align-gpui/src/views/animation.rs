@@ -489,6 +489,38 @@ mod motion_tests {
     }
 
     #[test]
+    fn settled_clip_states_carry_distinct_embedded_marks() {
+        // Each settled state reads without color; an unsettled one is
+        // hatched instead, so it never shows the synchronized link.
+        use crate::lane::BarMatchState;
+        use crate::views::controls::clip_status_icon;
+        use gpui::AssetSource as _;
+        let settled = [
+            BarMatchState::Matched,
+            BarMatchState::Unmatched,
+            BarMatchState::CameraClock,
+        ];
+        let marks: std::collections::HashSet<&str> = settled
+            .iter()
+            .map(|state| clip_status_icon(*state).expect("settled clips carry a mark"))
+            .collect();
+        assert_eq!(marks.len(), settled.len());
+        for mark in &marks {
+            assert!(
+                crate::icons::EmbeddedAssets
+                    .load(mark)
+                    .is_ok_and(|bytes| bytes.is_some()),
+                "{mark} is not embedded"
+            );
+            // The media-kind icon sits beside it and must not repeat.
+            assert!(!["icons/film.svg", "icons/waveform.svg"].contains(mark));
+        }
+        for state in [BarMatchState::Pending, BarMatchState::Refined] {
+            assert!(state.unsettled() && clip_status_icon(state).is_none());
+        }
+    }
+
+    #[test]
     fn waveform_columns_fill_a_non_divisible_clip_width() {
         let waveform: Vec<f32> = (0..512).map(|value| value as f32 / 511.0).collect();
         let width = 748.0;

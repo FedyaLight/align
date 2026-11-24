@@ -355,9 +355,23 @@ pub(super) fn clip_color(state: crate::lane::BarMatchState) -> u32 {
     use crate::lane::BarMatchState;
     match state {
         BarMatchState::Pending => 0x007AFF,
-        BarMatchState::Matched => 0x34C759,
+        BarMatchState::Refined | BarMatchState::Matched => 0x34C759,
         BarMatchState::Unmatched => 0xFF9500,
         BarMatchState::CameraClock => 0xAF52DE,
+    }
+}
+
+/// The corner mark that says without color what a settled clip's fill
+/// says: a link only for a clip the result synchronized, a clock for a
+/// camera-clock estimate, a warning for an unmatched clip. A clip still
+/// being analyzed is hatched instead.
+pub(super) fn clip_status_icon(state: crate::lane::BarMatchState) -> Option<&'static str> {
+    use crate::lane::BarMatchState;
+    match state {
+        BarMatchState::Pending | BarMatchState::Refined => None,
+        BarMatchState::Matched => Some("icons/link.svg"),
+        BarMatchState::Unmatched => Some("icons/warn.svg"),
+        BarMatchState::CameraClock => Some("icons/clock.svg"),
     }
 }
 

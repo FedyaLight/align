@@ -26,6 +26,12 @@ const CHECK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 1
 /// Warning triangle.
 const WARN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path fill="white" fill-rule="evenodd" d="M8 1.5L15 14H1L8 1.5zm0 3.2L3.4 12h9.2L8 4.7zM7.2 7h1.6v3.4H7.2V7zm0 4.2h1.6v1.6H7.2v-1.6z"/></svg>"#;
 
+/// Chain link (a synchronized clip).
+const LINK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path transform="rotate(-45 8 8)" d="M6.5 5H4.5a3 3 0 0 0 0 6h2M9.5 5h2a3 3 0 0 1 0 6h-2M5.5 8h5" stroke="white" stroke-width="1.7" fill="none" stroke-linecap="round"/></svg>"#;
+
+/// Clock face (a clip placed by its camera's clock).
+const CLOCK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g stroke="white" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.25"/><path d="M8 4.5V8l2.5 1.75"/></g></svg>"#;
+
 /// Fit-to-window corners.
 const FIT: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M2.25 6V2.25H6M10 2.25h3.75V6M13.75 10v3.75H10M6 13.75H2.25V10" stroke="white" stroke-width="1.45" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
 
@@ -75,6 +81,8 @@ impl AssetSource for EmbeddedAssets {
             "icons/plus.svg" => PLUS.as_bytes(),
             "icons/check.svg" => CHECK.as_bytes(),
             "icons/warn.svg" => WARN.as_bytes(),
+            "icons/link.svg" => LINK.as_bytes(),
+            "icons/clock.svg" => CLOCK.as_bytes(),
             "icons/fit.svg" => FIT.as_bytes(),
             "icons/zoom-in.svg" => ZOOM_IN.as_bytes(),
             "icons/zoom-out.svg" => ZOOM_OUT.as_bytes(),
@@ -137,6 +145,8 @@ mod tests {
             "icons/plus.svg",
             "icons/check.svg",
             "icons/warn.svg",
+            "icons/link.svg",
+            "icons/clock.svg",
             "icons/fit.svg",
             "icons/zoom-in.svg",
             "icons/zoom-out.svg",
