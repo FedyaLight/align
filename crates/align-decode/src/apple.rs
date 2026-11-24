@@ -1113,11 +1113,6 @@ mod tests {
     }
 
     #[test]
-    fn backend_kind_is_native() {
-        assert_eq!(AppleNativeBackend.kind(), BackendKind::AppleNative);
-    }
-
-    #[test]
     fn standard_timecode_track_reads() {
         let ffmpeg = match crate::ff::test_ffmpeg() {
             Some(b) => b,

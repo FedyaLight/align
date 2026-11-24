@@ -297,12 +297,12 @@ impl ExportOptions {
 
 /// One synchronized timeline to export.
 #[derive(Clone, Copy)]
-pub struct ExportRequest<'a> {
-    pub backend: &'a dyn MediaBackend,
-    pub timeline: &'a ExportTimeline,
-    pub directory: &'a Path,
-    pub options: &'a ExportOptions,
-    pub cancel: &'a AtomicBool,
+struct ExportRequest<'a> {
+    backend: &'a dyn MediaBackend,
+    timeline: &'a ExportTimeline,
+    directory: &'a Path,
+    options: &'a ExportOptions,
+    cancel: &'a AtomicBool,
 }
 
 /// One export action containing several independently synchronized sequences.
@@ -492,13 +492,6 @@ fn sequence_folder(index: usize, name: &str) -> String {
         index + 1,
         if safe.is_empty() { "Untitled" } else { safe }
     )
-}
-
-pub fn export_prepared(
-    request: ExportRequest<'_>,
-    progress: Option<&mut dyn FnMut(ExportJobProgress)>,
-) -> Result<Vec<ExportArtifact>, ExportError> {
-    SequenceExport::prepare(request, false, OutputPolicy::Replace)?.write(progress, None)
 }
 
 struct SequenceExport<'a> {
@@ -1475,10 +1468,10 @@ mod tests {
             "frames",
         );
         let out = dir.path().join("out");
-        let artifacts = export_prepared(
-            ExportRequest {
+        let artifacts = export_prepared_many(
+            ExportBatchRequest {
                 backend: &crate::portable::PortableBackend,
-                timeline: &timeline,
+                timelines: std::slice::from_ref(&timeline),
                 directory: &out,
                 options: &ExportOptions {
                     formats: vec![
@@ -1694,10 +1687,10 @@ mod tests {
             ..ExportOptions::default()
         };
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        export_prepared(
-            ExportRequest {
+        export_prepared_many(
+            ExportBatchRequest {
                 backend: &crate::portable::PortableBackend,
-                timeline: &timeline,
+                timelines: std::slice::from_ref(&timeline),
                 directory: &out,
                 options: &options(vec![
                     TimelineExportFormat::ResolveScript,

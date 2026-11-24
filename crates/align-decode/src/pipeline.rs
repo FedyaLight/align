@@ -3248,10 +3248,10 @@ mod tests {
         }
         for keep_unmatched in [true, false] {
             let timeline = ExportTimeline::from_result(&result, keep_unmatched).unwrap();
-            let artifacts = crate::export::export_prepared(
-                crate::export::ExportRequest {
+            let artifacts = crate::export::export_prepared_many(
+                crate::export::ExportBatchRequest {
                     backend: &crate::portable::PortableBackend,
-                    timeline: &timeline,
+                    timelines: std::slice::from_ref(&timeline),
                     directory: &dir.join(format!("export-{keep_unmatched}")),
                     options: &crate::export::ExportOptions {
                         formats: vec![TimelineExportFormat::ResolveOTIO],
@@ -3283,7 +3283,7 @@ mod tests {
 
     #[test]
     fn known_clock_drift_survives_pipeline_and_export() {
-        use crate::export::{ExportOptions, ExportRequest, export_prepared};
+        use crate::export::{ExportBatchRequest, ExportOptions, export_prepared_many};
         use align_core::export::{ExportTimeline, TimelineExportFormat};
         let body = noise(120 * 44100, 0xD21F7);
         for (tag, clock_rate) in [
@@ -3352,10 +3352,10 @@ mod tests {
             }
             let timeline = ExportTimeline::from_result(&result, true).unwrap();
             let output = dir.join("export");
-            export_prepared(
-                ExportRequest {
+            export_prepared_many(
+                ExportBatchRequest {
                     backend: &crate::portable::PortableBackend,
-                    timeline: &timeline,
+                    timelines: std::slice::from_ref(&timeline),
                     directory: &output,
                     options: &ExportOptions {
                         formats: vec![TimelineExportFormat::ResolveOTIO],
@@ -3894,11 +3894,11 @@ mod tests {
 
     #[test]
     fn clip_ids_are_canonical() {
+        // Saved results, projects and corrections name clips by this id:
+        // the first 12 bytes of SHA-256 of "path\0duration-micros".
         let a = clip_id_for("/v/a.wav", 20_000_000);
-        let b = clip_id_for("/v/a.wav", 20_000_001);
-        assert_ne!(a, b);
-        assert_eq!(a.0.len(), 24);
-        assert_eq!(clip_id_for("/v/a.wav", 20_000_000), a);
+        assert_eq!(a.0, "60a48d05f560130698148106");
+        assert_ne!(clip_id_for("/v/a.wav", 20_000_001), a);
     }
 
     #[test]

@@ -477,13 +477,13 @@ fn embedded_aaf_project_reextracts_same_media_or_keeps_a_safe_stale_result() {
             .unwrap();
         assert_eq!(rerun.project.clips[0].id, id);
         use align_core::export::TimelineExportFormat;
-        use align_decode::export::{ExportOptions, ExportRequest, export_prepared};
+        use align_decode::export::{ExportBatchRequest, ExportOptions, export_prepared_many};
         let output = root.join("export");
         let timeline = ExportTimeline::from_result(&result, true).unwrap();
-        let export = export_prepared(
-            ExportRequest {
+        let export = export_prepared_many(
+            ExportBatchRequest {
                 backend: pipe.backend(),
-                timeline: &timeline,
+                timelines: std::slice::from_ref(&timeline),
                 directory: &output,
                 options: &ExportOptions {
                     formats: vec![TimelineExportFormat::ResolveOTIO],

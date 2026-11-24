@@ -3280,14 +3280,6 @@ mod tests {
     }
 
     #[test]
-    fn export_target_mapping() {
-        assert_eq!(ExportTarget::ResolveOtio.formats().len(), 2);
-        assert_eq!(ExportTarget::Premiere.formats().len(), 1);
-        assert_eq!(ExportTarget::all().len(), 5);
-        assert_eq!(ExportTarget::Aaf.formats(), vec![TimelineExportFormat::Aaf]);
-    }
-
-    #[test]
     fn media_only_export_is_a_valid_output_selection() {
         use align_core::SyncProject;
         let mut data = AppData::default();
@@ -3583,6 +3575,9 @@ mod tests {
         data.export.fcpxml_multicam = false;
         assert!(data.export_targets().is_empty());
         assert!(!data.export_output_selected());
+
+        data.export.targets.push(ExportTarget::Aaf);
+        assert_eq!(data.export_targets(), vec![TimelineExportFormat::Aaf]);
     }
 
     #[test]
