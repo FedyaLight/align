@@ -1924,6 +1924,18 @@ impl AlignApp {
         cx.notify();
     }
 
+    /// Return every camera-clock placement of the visible sequence to
+    /// unmatched, including saved choices the current settings hide.
+    fn clear_camera_clock(&mut self, cx: &mut Context<Self>) {
+        if self.data.has_active_job() {
+            return;
+        }
+        if self.update_timeline_layout(AppData::clear_camera_clock) {
+            self.project_changed(cx);
+        }
+        cx.notify();
+    }
+
     fn set_lane_option<T>(
         &mut self,
         update: fn(&mut AppData, T, &str) -> bool,

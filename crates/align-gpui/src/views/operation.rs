@@ -520,7 +520,6 @@ pub(super) fn camera_clock_panel(
             .filter(|id| data.camera_clock_applied(id))
             .count();
         let busy = data.has_active_job();
-        let place_all = all.clone();
         panel = panel.child(
             div()
                 .flex()
@@ -532,15 +531,15 @@ pub(super) fn camera_clock_panel(
                     "camera-clock-place-all",
                     "Place All",
                     !busy && placed < all.len(),
-                    move |this, _, _, cx| this.set_camera_clock(place_all.clone(), true, cx),
+                    move |this, _, _, cx| this.set_camera_clock(all.clone(), true, cx),
                 ))
                 .child(button(
                     cx,
                     theme,
                     "camera-clock-undo-all",
                     "Return All to Unmatched",
-                    !busy && placed > 0,
-                    move |this, _, _, cx| this.set_camera_clock(all.clone(), false, cx),
+                    !busy && data.has_camera_clock_choice(),
+                    |this, _, _, cx| this.clear_camera_clock(cx),
                 )),
         );
         for (index, estimate) in estimates.iter().enumerate() {

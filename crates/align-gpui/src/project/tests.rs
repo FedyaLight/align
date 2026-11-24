@@ -872,6 +872,57 @@ fn competing_camera_clock(root: &Path, c3: f64, c3b: f64) -> SyncResult {
 }
 
 #[test]
+fn clearing_camera_clock_forgets_choices_cleanup_hides_and_keeps_other_sequences() {
+    use align_core::ClipId;
+    let (_temp, root) = fixture();
+    let mut data = AppData::default();
+    data.apply_result(competing_camera_clock(&root, 20.0, 2.0));
+    let long = ClipId::new("C3");
+    let short = ClipId::new("C3b");
+    assert!(!data.has_camera_clock_choice());
+    assert!(!data.clear_camera_clock());
+    assert!(data.set_camera_clock(&[long.clone(), short.clone()], true));
+    assert!(data.has_camera_clock_choice());
+
+    // Cleanup hides the short clip's estimate but keeps its choice.
+    let mut settings = data.export.clone();
+    settings.cut_shorter_than = 5.0;
+    data.apply_export_settings(&settings);
+    assert!(!data.camera_clock_applied(&short));
+
+    // Another sequence's choice, as a saved project would carry it.
+    let mut session = serde_json::to_value(data.project_session()).unwrap();
+    let choices = session["cameraClock"].as_object_mut().unwrap();
+    assert_eq!(choices.len(), 1);
+    choices.insert("7".into(), serde_json::json!(["C3"]));
+    data.restore_project(
+        serde_json::from_value(session).unwrap(),
+        vec![data.result.clone().unwrap()],
+        Vec::new(),
+        false,
+    );
+    data.apply_export_settings(&settings);
+    assert!(data.camera_clock_applied(&long));
+    data.exported_files.push(root.join("export.xml"));
+
+    assert!(data.clear_camera_clock());
+    assert!(!data.has_camera_clock_choice());
+    assert!(data.exported_files.is_empty());
+    assert!(!data.camera_clock_applied(&long));
+    assert!(data.camera_clock_for_export(0).is_empty());
+    let saved = serde_json::to_value(data.project_session()).unwrap();
+    let saved: Vec<&String> = saved["cameraClock"].as_object().unwrap().keys().collect();
+    assert_eq!(saved, ["7"]);
+
+    // Nothing hidden comes back when cleanup is turned off.
+    settings.cut_shorter_than = 0.0;
+    data.apply_export_settings(&settings);
+    assert!(!data.camera_clock_applied(&short));
+    assert!(!data.camera_clock_applied(&long));
+    assert!(!data.clear_camera_clock());
+}
+
+#[test]
 fn returning_a_clock_choice_does_not_place_the_clip_it_held_back() {
     use crate::lane::CorrectionOption;
     use align_core::ClipId;

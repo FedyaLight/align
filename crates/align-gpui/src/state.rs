@@ -1852,6 +1852,29 @@ impl AppData {
         changed
     }
 
+    /// Whether the visible sequence keeps any saved placement choice, even
+    /// one the current settings hide or that has no estimate right now.
+    pub fn has_camera_clock_choice(&self) -> bool {
+        self.camera_clock_choices
+            .get(&self.current_sequence_key())
+            .is_some_and(|chosen| !chosen.is_empty())
+    }
+
+    /// Forget every saved placement choice of the visible sequence, hidden
+    /// ones included, and lay the timeline out again. Other sequences keep
+    /// theirs. Returns whether anything changed.
+    pub fn clear_camera_clock(&mut self) -> bool {
+        let changed = self
+            .camera_clock_choices
+            .remove(&self.current_sequence_key())
+            .is_some_and(|chosen| !chosen.is_empty());
+        if changed {
+            self.exported_files.clear();
+            self.relayout_result();
+        }
+        changed
+    }
+
     /// Rebuild the visible timeline from the current result and choices.
     pub(crate) fn relayout_result(&mut self) {
         let Some(result) = &self.result else {
