@@ -84,7 +84,6 @@ ln -s "Align.app/Contents/MacOS/Align" "$OUT_DIR/align-cli"
 ln -s Align "$APP_MACOS/align-cli"
 cp "$ROOT_DIR/THIRD_PARTY_NOTICES.txt" "$OUT_DIR/THIRD_PARTY_NOTICES.txt"
 cp "$ROOT_DIR/LICENSE" "$OUT_DIR/LICENSE"
-chmod +x "$OUT_DIR/align-cli" "$APP_MACOS/align-cli"
 cp -p "$BIN_DIR/align-aaf" "$APP_MACOS/align-aaf"
 ln -s Align.app/Contents/MacOS/align-aaf "$OUT_DIR/align-aaf"
 for folder in "$RESOURCES" "$OUT_DIR"; do
@@ -97,16 +96,17 @@ if [[ -n "$RELEASE_LICENSES" ]]; then
 fi
 
 
-# Both entry points discover adjacent sidecars.
+# Both entry points discover adjacent sidecars. The folder's links run the
+# bundle's signed tools, and dyld finds their libraries beside the bundle
+# copies, so the folder holds no second copy of FFmpeg.
 if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
   for tool in ffmpeg ffprobe; do
     cp "$FFMPEG_DIR/$tool" "$APP_MACOS/$tool"
-    cp "$FFMPEG_DIR/$tool" "$OUT_DIR/$tool"
-    chmod +x "$APP_MACOS/$tool" "$OUT_DIR/$tool"
+    chmod +x "$APP_MACOS/$tool"
+    ln -s "Align.app/Contents/MacOS/$tool" "$OUT_DIR/$tool"
   done
   for lib in ${dylibs[@]+"${dylibs[@]}"}; do
     cp "$lib" "$APP_MACOS/"
-    cp "$lib" "$OUT_DIR/"
   done
   cp "$FFMPEG_DIR/FFMPEG-LICENSE.txt" "$RESOURCES/FFMPEG-LICENSE.txt"
   cp "$FFMPEG_DIR/FFMPEG-LICENSE.txt" "$OUT_DIR/FFMPEG-LICENSE.txt"
@@ -201,6 +201,9 @@ codesign -dv --verbose=2 "$APP_BUNDLE" 2>&1 | head -5
 
 echo "==> smoke test"
 "$OUT_DIR/align-cli" --help >/dev/null
+if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
+  for tool in ffmpeg ffprobe; do "$OUT_DIR/$tool" -version >/dev/null; done
+fi
 python3 "$ROOT_DIR/script/check-aaf-sidecar.py" "$APP_MACOS/align-aaf"
 if [[ "$ALIGN_SKIP_LAUNCH_CHECK" != "1" ]]; then
   "$APP_MACOS/$APP_NAME" >"$PACKAGE_TMP/launch.log" 2>&1 &

@@ -29,6 +29,8 @@ The installers share Align's look: the DMG window has a drag-to-Applications
 layout, the Windows installer shows an animated splash (`Support/Installer`),
 and the Linux `.run` files open a GTK 4 installer (`Support/Linux/installer.c`)
 in the app's dark theme that installs the native package through polkit.
+Without a display or GTK 4 they install the package through `pkexec` with
+DNF or pacman instead.
 `script/render-installer-artwork.swift` regenerates the Windows artwork and icon
 on macOS. The Windows executable carries the app icon and version details
 (`crates/align-gpui/build.rs`). Windows installs update through the Velopack
@@ -109,7 +111,8 @@ and packaging rejects tools for another architecture or minimum version, or
 linking to libraries outside the bundle and macOS system directories. The tools
 share adjacent FFmpeg libraries via `@loader_path` on macOS and `$ORIGIN`
 on Linux (the Linux build requires `patchelf`). The build manifest's component hashes
-describe the tools as built; macOS packaging re-signs its copies. The build has no video decoders: video is only parsed for timing.
+describe the tools as built; macOS packaging re-signs the copies in the app
+bundle, and the package folder links to them. The build has no video decoders: video is only parsed for timing.
 On Windows, the tools are linked statically against the MinGW-w64 runtime,
 including the winpthreads library that provides FFmpeg's clock and sleep
 functions, so they need only Windows system DLLs and run without MSYS2 or
