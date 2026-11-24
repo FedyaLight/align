@@ -1017,16 +1017,21 @@ struct MediaFilePlan {
     url: PathBuf,
 }
 
+/// Identifies the source revision a prepared file was rendered from, with
+/// the same revision the analysis cache uses: inode and change time on Unix,
+/// the file's change time on Windows.
 fn source_revision_tag(path: &Path, cancel: &AtomicBool) -> Result<String, ExportError> {
     check_cancel(cancel)?;
-    #[cfg(unix)]
-    {
-        let revision = align_core::cache::media_revision(path).map_err(ExportError::read(path))?;
-        Ok(blake3::hash(revision.as_bytes()).to_hex()[..32].to_string())
-    }
-    // Without an inode/change-time stamp, retain strict content invalidation.
+    let revision = align_core::cache::media_revision(path);
+    // A Windows volume without change times (FAT, some network shares)
+    // falls back to hashing the contents.
     #[cfg(not(unix))]
-    source_content_tag(path, cancel)
+    let Ok(revision) = revision else {
+        return source_content_tag(path, cancel);
+    };
+    #[cfg(unix)]
+    let revision = revision.map_err(ExportError::read(path))?;
+    Ok(blake3::hash(revision.as_bytes()).to_hex()[..32].to_string())
 }
 
 #[cfg(not(unix))]
@@ -1266,7 +1271,6 @@ mod tests {
         AudioSummary, Clip, ClipId, MediaKind, MediaTime, VideoFrameRateMode, VideoSummary,
     };
 
-    #[cfg(unix)]
     #[test]
     fn source_revision_invalidates_restored_mtime_and_honors_cancel() {
         let dir = tempfile::tempdir().unwrap();
