@@ -323,9 +323,10 @@ pub(super) fn timeline_lanes(
                 let palette = theme.clip;
                 let color = palette.fill(bar.match_state);
                 let ink = palette.ink;
-                // Behind the name and status mark, the waveform and stripes
-                // are muted by the fill, so the ink stays readable.
-                let backdrop = rgba(palette.backdrop(bar.match_state));
+                // Where the palette asks for it, the fill is laid again
+                // behind the name and status mark, muting the waveform and
+                // stripes there so the ink stays readable.
+                let backdrop = palette.backdrop(bar.match_state).map(rgba);
                 let clip_id = bar.clip_id.clone();
                 // A bar that moved to this layout glides from where it was.
                 // Its last frame is this layout, so it is drawn the same way
@@ -422,7 +423,7 @@ pub(super) fn timeline_lanes(
                         el = el.child(preview);
                     }
                     if width >= 64.0 {
-                        // The backdrop starts under the media icon and ends
+                        // A backdrop starts under the media icon and ends
                         // just past the name; the name keeps its place and
                         // the width it may take before it is cut short.
                         el = el.child(
@@ -441,8 +442,9 @@ pub(super) fn timeline_lanes(
                                         .max_w_full()
                                         .pl(px(22.0))
                                         .pr(px(2.0))
-                                        .rounded(px(4.0))
-                                        .bg(backdrop)
+                                        .when_some(backdrop, |name, backdrop| {
+                                            name.rounded(px(4.0)).bg(backdrop)
+                                        })
                                         .text_xs()
                                         .truncate()
                                         .whitespace_nowrap()
@@ -479,8 +481,9 @@ pub(super) fn timeline_lanes(
                             .top(px(STATUS_INSET))
                             .right(px(status_right))
                             .size(px(STATUS_ICON))
-                            .rounded(px(2.0))
-                            .bg(backdrop)
+                            .when_some(backdrop, |mark, backdrop| {
+                                mark.rounded(px(2.0)).bg(backdrop)
+                            })
                             .child(svg_icon(icon, STATUS_ICON, ink)),
                     );
                 }

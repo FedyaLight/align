@@ -1,7 +1,7 @@
 //! Application theme: light and dark palettes following the system
 //! appearance (`Window::appearance()`, re-rendered automatically on change).
 //! Window chrome adapts to the selected appearance; timeline clips keep one
-//! hue per state in both modes, in a shade chosen for each (`ClipPalette`).
+//! hue per state in both modes, in a palette of each mode (`ClipPalette`).
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -107,8 +107,8 @@ pub struct Theme {
 }
 
 /// Timeline clip colors. Each state keeps its hue in both modes. Light mode
-/// uses deeper, saturated fills; dark mode quieter ones, as light as the
-/// ink allows, so clips still stand apart from the dark window.
+/// uses the system colors; dark mode quieter fills, as light as the ink
+/// allows over the waveform, so clips still stand apart from the dark window.
 #[derive(Clone, Copy, Debug)]
 pub struct ClipPalette {
     /// Clips the analysis is still placing.
@@ -124,12 +124,11 @@ pub struct ClipPalette {
     pub wave: u32,
     /// Stripes over a clip the analysis has not settled (RGBA).
     pub hatch: u32,
+    /// Opacity of the fill laid again behind a clip's name and status mark,
+    /// muting the waveform and stripes there so the ink keeps its contrast;
+    /// elsewhere they show as usual. `None` lays nothing.
+    pub backdrop_alpha: Option<u8>,
 }
-
-/// Opacity of the fill laid behind a clip's name and status mark. It mutes
-/// the waveform and stripes there, so the ink keeps its contrast; elsewhere
-/// they show as before.
-const CLIP_BACKDROP_ALPHA: u32 = 0xD9;
 
 impl ClipPalette {
     /// The fill tracks synchronization: pending while analysis runs, then
@@ -144,9 +143,10 @@ impl ClipPalette {
         }
     }
 
-    /// The fill behind the ink (RGBA).
-    pub fn backdrop(&self, state: BarMatchState) -> u32 {
-        (self.fill(state) << 8) | CLIP_BACKDROP_ALPHA
+    /// The fill behind the ink (RGBA), if the palette lays one.
+    pub fn backdrop(&self, state: BarMatchState) -> Option<u32> {
+        self.backdrop_alpha
+            .map(|alpha| (self.fill(state) << 8) | u32::from(alpha))
     }
 }
 
@@ -188,13 +188,14 @@ impl Theme {
             blue: 0x007AFF,
             cyan: 0x32ADE6,
             clip: ClipPalette {
-                pending: 0x0060DE,
-                matched: 0x1C7536,
-                unmatched: 0xB44800,
-                camera_clock: 0x9343C4,
+                pending: 0x007AFF,
+                matched: 0x34C759,
+                unmatched: 0xFF9500,
+                camera_clock: 0xAF52DE,
                 ink: 0xFFFFFF,
-                wave: 0xFFFFFF4D,
+                wave: 0xFFFFFF42,
                 hatch: 0xFFFFFF2E,
+                backdrop_alpha: None,
             },
         }
     }
@@ -227,6 +228,7 @@ impl Theme {
                 ink: 0xFFFFFF,
                 wave: 0xFFFFFF42,
                 hatch: 0xFFFFFF2E,
+                backdrop_alpha: Some(0xD9),
             },
         }
     }
@@ -277,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn clip_ink_stays_readable_over_the_waveform_in_every_state() {
+    fn dark_clip_ink_stays_readable_over_the_waveform_in_every_state() {
         // An RGBA layer over an opaque color, blended per channel as the
         // window composites it.
         fn over(base: u32, layer: u32) -> u32 {
@@ -295,23 +297,25 @@ mod tests {
             BarMatchState::Unmatched,
             BarMatchState::CameraClock,
         ];
-        for theme in [Theme::light(), Theme::dark()] {
-            let clip = theme.clip;
-            for state in states {
-                let fill = clip.fill(state);
-                let striped = if state.unsettled() {
-                    over(fill, clip.hatch)
-                } else {
-                    fill
-                };
-                // The brightest spot under the name or status mark: a
-                // waveform column, over a stripe when there is one.
-                let under_ink = over(over(striped, clip.wave), clip.backdrop(state));
-                assert!(contrast(clip.ink, fill) >= 4.5, "{state:?} {theme:?}");
-                assert!(contrast(clip.ink, under_ink) >= 4.5, "{state:?} {theme:?}");
-                // The clip stands apart from the window around it.
-                assert!(contrast(fill, theme.bg) >= 3.0, "{state:?} {theme:?}");
-            }
+        let theme = Theme::dark();
+        let clip = theme.clip;
+        for state in states {
+            let fill = clip.fill(state);
+            let striped = if state.unsettled() {
+                over(fill, clip.hatch)
+            } else {
+                fill
+            };
+            let backdrop = clip
+                .backdrop(state)
+                .expect("dark clips mute the waveform under their ink");
+            // The brightest spot under the name or status mark: a waveform
+            // column, over a stripe when there is one.
+            let under_ink = over(over(striped, clip.wave), backdrop);
+            assert!(contrast(clip.ink, fill) >= 4.5, "{state:?}");
+            assert!(contrast(clip.ink, under_ink) >= 4.5, "{state:?}");
+            // The clip stands apart from the window around it.
+            assert!(contrast(fill, theme.bg) >= 3.0, "{state:?}");
         }
     }
 
