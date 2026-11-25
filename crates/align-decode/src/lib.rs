@@ -24,6 +24,8 @@ pub mod process;
 pub mod provider;
 pub mod remux;
 pub mod render;
+#[cfg(any(not(unix), test))]
+mod source_digest;
 pub mod sym;
 pub mod timeline;
 

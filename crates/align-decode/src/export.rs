@@ -9,8 +9,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-#[cfg(not(unix))]
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -134,7 +132,7 @@ impl ExportError {
         }
     }
 
-    fn read(path: &Path) -> impl FnOnce(io::Error) -> Self {
+    pub(crate) fn read(path: &Path) -> impl FnOnce(io::Error) -> Self {
         let file = file_name(path);
         move |source| Self::Read { file, source }
     }
@@ -174,7 +172,7 @@ impl From<WaitError> for ExportError {
     }
 }
 
-fn check_cancel(cancel: &AtomicBool) -> Result<(), ExportError> {
+pub(crate) fn check_cancel(cancel: &AtomicBool) -> Result<(), ExportError> {
     if cancel.load(Ordering::Relaxed) {
         Err(ExportError::Cancelled)
     } else {
@@ -1107,37 +1105,28 @@ struct MediaFilePlan {
     url: PathBuf,
 }
 
-/// Identifies the source revision a prepared file was rendered from, with
-/// the same revision the analysis cache uses: inode and change time on Unix,
-/// the file's change time on Windows.
+/// Identifies the source revision a prepared file was rendered from.
+///
+/// Unix hashes the inode and change-time stamp from [`align_core::cache::media_revision`].
+/// Windows returns the source's full BLAKE3 content digest (matching v0.3.5
+/// sidecar names) and avoids re-reading unchanged local NTFS/ReFS sources by
+/// caching the digest against a strong USN close-record checkpoint scoped by
+/// volume serial, USN journal id, and 128-bit file id.
 fn source_revision_tag(path: &Path, cancel: &AtomicBool) -> Result<String, ExportError> {
     check_cancel(cancel)?;
-    let revision = align_core::cache::media_revision(path);
-    // A Windows volume without change times (FAT, some network shares)
-    // falls back to hashing the contents.
-    #[cfg(not(unix))]
-    let Ok(revision) = revision else {
-        return source_content_tag(path, cancel);
-    };
     #[cfg(unix)]
-    let revision = revision.map_err(ExportError::read(path))?;
-    Ok(blake3::hash(revision.as_bytes()).to_hex()[..32].to_string())
-}
-
-#[cfg(not(unix))]
-fn source_content_tag(path: &Path, cancel: &AtomicBool) -> Result<String, ExportError> {
-    let mut file = std::fs::File::open(path).map_err(ExportError::read(path))?;
-    let mut hash = blake3::Hasher::new();
-    let mut buffer = vec![0u8; 1024 * 1024];
-    loop {
-        check_cancel(cancel)?;
-        let n = file.read(&mut buffer).map_err(ExportError::read(path))?;
-        if n == 0 {
-            break;
-        }
-        hash.update(&buffer[..n]);
+    {
+        let revision = align_core::cache::media_revision(path).map_err(ExportError::read(path))?;
+        Ok(blake3::hash(revision.as_bytes()).to_hex()[..32].to_string())
     }
-    Ok(hash.finalize().to_hex()[..32].to_string())
+    #[cfg(windows)]
+    {
+        crate::source_digest::source_revision_tag(path, cancel)
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        crate::source_digest::hash_file_path(path, cancel)
+    }
 }
 
 /// Keep each complete camera file and replace its scratch audio with the
