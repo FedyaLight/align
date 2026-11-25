@@ -33,11 +33,11 @@ what the camera clock says about it. When an imported edit plays part of a
 recording, or the same recording more than once, the card also shows the
 part each use plays and which use it is.
 
-The export sheet starts from Align's defaults. **Save as Default** keeps the
-current export options for new sessions and later launches; the destination
-and sequence name are not saved. **Revert to Saved** and **Use Align Defaults**
-load either set back into the sheet. The command line does not
-read these saved defaults.
+In the export sheet, open **Defaults** and choose **Save as Default** to use
+the current export options in new sessions and later launches. The destination
+and sequence name are not saved. Choose **Saved** or **Built-in** to load those
+options into the current sheet without changing what is saved. These defaults
+apply only to the desktop app.
 
 Search accuracy controls how much analysis work is performed. Start with
 Balanced; higher levels take more time and memory. Match threshold controls the
