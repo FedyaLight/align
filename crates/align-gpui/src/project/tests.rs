@@ -623,7 +623,7 @@ fn manually_saved_project_can_be_resaved_after_json_reformatting() {
 
 /// A recorder and camera clips C1, C2 and C4 synchronized by sound. C3 is
 /// unmatched in the waveform stage; the timecode stage, selected, places it.
-fn camera_clock_shoot(root: &Path) -> SyncResult {
+pub(crate) fn camera_clock_shoot(root: &Path) -> SyncResult {
     use align_core::{
         AudioSummary, Clip, ClipId, ClipPlacement, MappingPoint, MatchEvidence, MatchSummary,
         MediaKind, MediaTime, RecordingTimestampSource, SyncIsland, SyncProject, SyncStage,

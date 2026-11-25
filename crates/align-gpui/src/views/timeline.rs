@@ -1,9 +1,10 @@
 //! Timeline preview: toolbar, ruler, and lanes.
 
 use super::animation::entrance;
+use super::clip_details::clip_tip;
 use super::controls::{
-    RULER_LABEL_W, ZoomDrag, ZoomDragGhost, clip_status_icon, fmt_duration, fmt_ruler_label,
-    hover_tip, ruler_ticks, waveform_columns,
+    RULER_LABEL_W, ZoomDrag, ZoomDragGhost, clip_status_icon, fmt_ruler_label, hover_tip,
+    ruler_ticks, waveform_columns,
 };
 use super::{
     AlignApp, AnimationExt, AudioAnalysisSource, Context, DragMoveEvent, FluentBuilder, HashMap,
@@ -12,6 +13,7 @@ use super::{
     TimelineTransition, div, point, poses_differ, px, rgb, rgba, svg_icon, timeline_duration,
     timeline_poses,
 };
+use align_core::MatchEvidence;
 use gpui::AppContext as _;
 
 // ---------------- timeline preview (toolbar + ruler + lanes)
@@ -21,6 +23,8 @@ const STATUS_ICON: f32 = 10.0;
 /// Gap between the status mark and the clip's top and right edges. The
 /// mark ends above the name's line, so it never covers the name.
 const STATUS_INSET: f32 = 4.0;
+/// Narrowest clip that says beside its mark that timecode synchronized it.
+const TC_BADGE_MIN_WIDTH: f32 = 120.0;
 
 pub(super) fn timeline_preview(
     cx: &mut Context<AlignApp>,
@@ -149,6 +153,7 @@ pub(super) fn timeline_lanes(
     let (px_per_sec, timeline_w) = timeline_scale(duration, zoom, fit_width);
     let tick_times = ruler_ticks(duration, px_per_sec, data.ruler_timecode.unwrap_or(0.));
     let target_poses = (!timeline_transitions.is_empty()).then(|| timeline_poses(data));
+    let app = cx.entity();
     let now = std::time::Instant::now();
     let row_stride = TIMELINE_ROW_H + 1.;
     // Bars more than a screen away from the visible part keep their element,
@@ -366,16 +371,7 @@ pub(super) fn timeline_lanes(
                     .cursor_default();
                 let near = near_view(left, shown_width);
                 if active && near {
-                    let mut tip = format!("{} · {}", bar.url.display(), fmt_duration(bar.duration));
-                    if let Some(mark) = &bar.camera_clock {
-                        tip += &format!(
-                            "\nApproximately placed by camera clock between {} and {}, within about ±{:.1} s. Not synchronized.",
-                            data.clip_name(&mark.before),
-                            data.clip_name(&mark.after),
-                            mark.tolerance
-                        );
-                    }
-                    el = el.tooltip(hover_tip(tip, theme));
+                    el = el.tooltip(clip_tip(app.clone(), bar.id.clone(), theme));
                 }
                 // A clip the analysis has not settled is hatched at any
                 // width, under its waveform.
@@ -478,6 +474,32 @@ pub(super) fn timeline_lanes(
                                 mark.rounded(px(2.0)).bg(backdrop)
                             })
                             .child(svg_icon(icon, STATUS_ICON, ink)),
+                    );
+                }
+                // A clip synchronized by timecode alone says so beside the
+                // link, on the same line above the name.
+                if near
+                    && width >= TC_BADGE_MIN_WIDTH
+                    && bar.match_state == crate::lane::BarMatchState::Matched
+                    && bar.evidence == Some(MatchEvidence::Timecode)
+                {
+                    el = el.child(
+                        div()
+                            .absolute()
+                            .top(px(STATUS_INSET - 1.0))
+                            .right(px(STATUS_INSET + STATUS_ICON + 3.0))
+                            .h(px(STATUS_ICON + 2.0))
+                            .px(px(3.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(3.0))
+                            .bg(rgba(0x00000038))
+                            .text_size(px(9.0))
+                            .line_height(px(STATUS_ICON + 2.0))
+                            .font_weight(gpui::FontWeight(600.0))
+                            .whitespace_nowrap()
+                            .text_color(rgb(ink))
+                            .child("TC"),
                     );
                 }
                 el = el.on_mouse_down(

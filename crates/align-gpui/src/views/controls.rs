@@ -424,8 +424,24 @@ pub(super) fn clip_status_icon(state: crate::lane::BarMatchState) -> Option<&'st
 /// nearest second takes up the binary error of the tick's position.
 pub(super) fn fmt_ruler_label(origin: Option<f64>, at: f64) -> String {
     let total = (origin.unwrap_or(0.) + at).round() as i64;
+    fmt_clock_seconds(total, origin.is_some())
+}
+
+/// A clip position shares the ruler's clock and retains subsecond precision.
+pub(super) fn fmt_timeline_position(origin: Option<f64>, at: f64) -> String {
+    let millis = ((origin.unwrap_or(0.) + at) * 1000.).round() as i64;
+    let clock = fmt_clock_seconds(millis.div_euclid(1000), origin.is_some());
+    let fraction = millis.rem_euclid(1000);
+    if fraction == 0 {
+        clock
+    } else {
+        format!("{clock}.{fraction:03}")
+    }
+}
+
+fn fmt_clock_seconds(total: i64, wrap_at_midnight: bool) -> String {
     let hours = total.div_euclid(3600);
-    let hours = if origin.is_some() {
+    let hours = if wrap_at_midnight {
         hours.rem_euclid(24)
     } else {
         hours

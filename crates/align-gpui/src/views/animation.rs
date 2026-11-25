@@ -378,6 +378,9 @@ mod motion_tests {
             duration: 2.,
             confidence: 1.,
             match_state: BarMatchState::Matched,
+            evidence: None,
+            source_in: 0.0,
+            source_out: 0.0,
             camera_clock: None,
         };
         let mut data = AppData::default();

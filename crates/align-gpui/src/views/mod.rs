@@ -31,6 +31,7 @@ use crate::updater::{self, UpdateState};
 use crate::{MinimizeWindow, ToggleFullscreen, ZoomWindow};
 
 mod animation;
+mod clip_details;
 mod controls;
 mod export;
 mod menu_sidebar;
