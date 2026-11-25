@@ -1359,7 +1359,23 @@ mod tests {
         let before = source_revision_tag(&path, &cancel).unwrap();
         assert_eq!(source_revision_tag(&path, &cancel).unwrap(), before);
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
-        std::fs::write(&path, b"replaced").unwrap();
+        let mut rewritten = std::fs::File::options().write(true).open(&path).unwrap();
+        use std::io::Write as _;
+        rewritten.write_all(b"replaced").unwrap();
+        rewritten.sync_all().unwrap();
+        drop(rewritten);
+        // Some Windows filesystems publish ChangeTime asynchronously or at a
+        // coarser resolution than the write itself. Wait for the write stamp
+        // to advance before restoring LastWriteTime, so this test specifically
+        // verifies that restoring mtime does not hide a completed rewrite.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while source_revision_tag(&path, &cancel).unwrap() == before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "source revision did not advance after replacing file contents"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         std::fs::File::options()
             .write(true)
             .open(&path)

@@ -175,9 +175,15 @@ pub(super) fn timeline_lanes(
         .flex()
         .flex_col()
         .child(div().h(px(RULER_H)).flex_shrink_0());
-    let mut tracks = div().w(px(timeline_w)).flex_shrink_0().flex().flex_col();
+    let mut tracks = div()
+        .relative()
+        .w(px(timeline_w))
+        .flex_shrink_0()
+        .flex()
+        .flex_col();
 
     let mut ticks = div()
+        .id("timeline-ruler")
         .relative()
         .h(px(RULER_H))
         .flex_shrink_0()
@@ -210,6 +216,22 @@ pub(super) fn timeline_lanes(
                 )
             });
     }
+    ticks = ticks.cursor_pointer().on_mouse_down(
+        MouseButton::Left,
+        cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+            let bounds = this.data.timeline_scroll.bounds();
+            let offset = this.data.timeline_scroll.offset();
+            let content_x = f32::from(e.position.x - bounds.origin.x) + f32::from(offset.x);
+            this.data.playhead_seconds =
+                (content_x.max(0.) as f64 / px_per_sec).clamp(0.0, duration);
+            if let Some(playback) = &this.playback
+                && let Ok(mut playback) = playback.lock()
+            {
+                playback.clock.position = this.data.playhead_seconds;
+            }
+            cx.notify();
+        }),
+    );
     tracks = tracks.child(ticks);
     // One canvas draws the gridlines of every row at the ruler ticks, under
     // the bars, in the color of the row separators it crosses.
@@ -248,6 +270,7 @@ pub(super) fn timeline_lanes(
         };
         let kind_color = theme.icon;
         let lane_id = lane.id.clone();
+        let label_lane_id = lane_id.clone();
         let first_clip = lane.clips.first().map(|c| c.clip_id.clone());
         // The tooltip shows the source and any active stream/channel override.
         let override_suffix = match data.effective_lane_analysis_source(&lane_id) {
@@ -283,6 +306,10 @@ pub(super) fn timeline_lanes(
         if active {
             label = label.cursor_pointer();
         }
+        let mute_id = label_lane_id.clone();
+        let solo_id = label_lane_id.clone();
+        let is_muted = data.muted_audio_lanes.contains(&label_lane_id);
+        let is_soloed = data.soloed_audio_lanes.contains(&label_lane_id);
         labels = labels.child(
             label
                 .tooltip(hover_tip(tip, theme))
@@ -302,9 +329,54 @@ pub(super) fn timeline_lanes(
                 )
                 .child(
                     div()
-                        .text_xs()
-                        .text_color(rgb(kind_color))
-                        .child(format!("{kind_glyph}{}", lane.number)),
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(kind_color))
+                                .child(format!("{kind_glyph}{}", lane.number)),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("lane-mute-{mute_id}")))
+                                .px_1()
+                                .rounded_sm()
+                                .text_xs()
+                                .text_color(rgb(if is_muted { theme.accent } else { theme.dim }))
+                                .cursor_pointer()
+                                .child("M")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        if !this.data.muted_audio_lanes.remove(&mute_id) {
+                                            this.data.muted_audio_lanes.insert(mute_id.clone());
+                                        }
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("lane-solo-{solo_id}")))
+                                .px_1()
+                                .rounded_sm()
+                                .text_xs()
+                                .text_color(rgb(if is_soloed { theme.accent } else { theme.dim }))
+                                .cursor_pointer()
+                                .child("S")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        if !this.data.soloed_audio_lanes.remove(&solo_id) {
+                                            this.data.soloed_audio_lanes.insert(solo_id.clone());
+                                        }
+                                        cx.notify();
+                                    }),
+                                ),
+                        ),
                 ),
         );
         // Absolute placement prevents minimum-width bars from shifting
@@ -528,6 +600,19 @@ pub(super) fn timeline_lanes(
         labels = labels.child(div().h(px(1.)).flex_shrink_0().bg(rgb(theme.separator)));
         tracks = tracks.child(div().h(px(1.)).flex_shrink_0().bg(rgb(theme.separator)));
     }
+
+    // One continuous NLE playhead overlays the ruler and every lane.
+    let playhead_height = RULER_H + data.lanes.len() as f32 * (TIMELINE_ROW_H + 1.0);
+    tracks = tracks.child(
+        div()
+            .id("timeline-playhead")
+            .absolute()
+            .left(px((data.playhead_seconds.max(0.0) * px_per_sec) as f32))
+            .top(px(0.))
+            .w(px(2.))
+            .h(px(playhead_height))
+            .bg(rgb(theme.accent)),
+    );
 
     let viewport = div()
         .id("timeline-viewport")

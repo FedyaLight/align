@@ -194,6 +194,21 @@ impl Render for AlignApp {
                     }
                     return;
                 }
+                if key == "space" {
+                    if this.data.show_export
+                        || this.data.show_path_fixer
+                        || this.data.show_sequence_results
+                        || this.data.show_search_quality
+                        || this.data.show_search_settings
+                        || this.data.show_stage_settings
+                        || this.data.show_agent_setup
+                    {
+                        return;
+                    }
+                    this.toggle_timeline_playback(cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.data.lanes.is_empty() {
                     return;
                 }

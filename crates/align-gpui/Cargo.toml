@@ -28,6 +28,7 @@ ureq = "3"
 semver = "1"
 url = "2"
 sha2.workspace = true
+cpal = "0.18.2"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1", features = ["fs"] }

@@ -10,6 +10,7 @@ mod feedback;
 mod icons;
 mod lane;
 mod motion;
+mod playback;
 mod project;
 mod settings;
 mod state;

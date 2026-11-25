@@ -555,11 +555,12 @@ pub struct TimelinePreviewItem {
     pub source_key: String,
     pub start: f64,
     pub duration: f64,
-    /// Seconds into the source where this use of it starts and ends. An
-    /// imported edit can play part of a recording, and the same recording
-    /// more than once.
+    /// Source range and source-to-timeline mapping used by export.
+    /// Timeline monitors use these same values so drift correction remains
+    /// consistent with the rendered sequence.
     pub source_in: f64,
     pub source_out: f64,
+    pub mapping_points: Vec<MappingPoint>,
     pub confidence: f64,
     pub matched: bool,
     /// Set for an unmatched clip the camera clock placed.
