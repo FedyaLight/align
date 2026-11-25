@@ -23,8 +23,8 @@ const PLUS: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16
 /// Check mark (success, export done).
 const CHECK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M2.5 8.5l3.7 3.7L13.5 4.5" stroke="white" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
 
-/// Warning triangle.
-const WARN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path fill="white" fill-rule="evenodd" d="M8 1.5L15 14H1L8 1.5zm0 3.2L3.4 12h9.2L8 4.7zM7.2 7h1.6v3.4H7.2V7zm0 4.2h1.6v1.6H7.2v-1.6z"/></svg>"#;
+/// Rounded warning triangle.
+const WARN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M6.97 3.05a1.19 1.19 0 0 1 2.06 0l5.06 8.65a1.2 1.2 0 0 1-1.04 1.8H2.95a1.2 1.2 0 0 1-1.04-1.8zM8 6.25v3" fill="none" stroke="white" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><circle cx="8" cy="11.35" r=".85" fill="white"/></svg>"#;
 
 /// Chain link (a synchronized clip).
 const LINK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path transform="rotate(-45 8 8)" d="M6.5 5H4.5a3 3 0 0 0 0 6h2M9.5 5h2a3 3 0 0 1 0 6h-2M5.5 8h5" stroke="white" stroke-width="1.7" fill="none" stroke-linecap="round"/></svg>"#;
