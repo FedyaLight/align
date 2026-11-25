@@ -9,12 +9,12 @@ use super::controls::{
 };
 use super::settings::Dropdown;
 use super::{
-    AlignApp, AnchoredPositionMode, Animation, AnimationExt, BoxShadow, ClickEvent, Context, Div,
-    Duration, Entity, ExportInputs, ExportReveals, ExportSelect, ExportTarget, FluentBuilder,
-    HashMap, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    Operation, ParentElement, PathFixerInputs, ScrollHandle, SharedString, Stateful,
-    StatefulInteractiveElement, Styled, TextInput, Theme, Window, anchored, deferred, div,
-    middle_ellipsis, point, px, rgb, rgba, svg_icon, updater,
+    AlignApp, AnchoredPositionMode, Animation, AnimationExt, BoxShadow, ClickEvent, Context,
+    Corner, Div, Duration, Entity, ExportInputs, ExportReveals, ExportSelect, ExportTarget,
+    FluentBuilder, HashMap, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    MouseMoveEvent, Operation, ParentElement, PathFixerInputs, ScrollHandle, SharedString,
+    Stateful, StatefulInteractiveElement, Styled, TextInput, Theme, Window, anchored, deferred,
+    div, middle_ellipsis, point, px, rgb, rgba, svg_icon, updater,
 };
 
 // ---------------- export sheet
@@ -1277,71 +1277,210 @@ fn export_source_bins(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Statef
     )
 }
 
-/// Saving the sheet as the starting point for new jobs, and loading the
-/// saved or Align's defaults back.
+/// Which defaults the sheet matches, with a menu that loads the saved or
+/// Align's built-in options into this sheet, or saves the sheet as the
+/// starting point for new jobs and later launches. Loading never changes
+/// what is saved. The destination and sequence name are not part of it.
 fn export_defaults_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Div {
+    const WIDTH: f32 = 160.;
+    const SEPARATOR: f32 = 9.;
     let SheetContext {
         theme,
         data,
         busy,
-        panel: ExportPanel { inputs, .. },
+        panel:
+            ExportPanel {
+                inputs,
+                select,
+                select_closing,
+                ..
+            },
         ..
     } = sheet;
     let current = data.export_settings(inputs.labels(cx));
-    let align_defaults = crate::state::ExportSettings::default();
     let saved = data.saved_export_settings.clone();
-    let status = match &saved {
-        Some(saved) if *saved == current => "Using your saved defaults.",
-        None if current == align_defaults => "Using Align's defaults.",
-        _ => "Changed for this export.",
+    let uses_saved = saved.as_ref() == Some(&current);
+    let uses_built_in = !uses_saved && current == crate::state::ExportSettings::default();
+    let value = if uses_saved {
+        "Saved"
+    } else if uses_built_in {
+        "Built-in"
+    } else {
+        "Modified"
     };
-    let mut buttons = div().flex().flex_row().flex_wrap().gap_2().px_2();
-    buttons = buttons.child(button(
-        cx,
-        theme,
-        "btn-exp-save-defaults",
-        "Save as Default",
-        !busy && saved.as_ref() != Some(&current),
-        |this, _, _, cx| this.save_export_defaults(cx),
-    ));
-    if let Some(saved) = saved.filter(|saved| *saved != current) {
-        buttons = buttons.child(button(
-            cx,
-            theme,
-            "btn-exp-revert-defaults",
-            "Revert to Saved",
-            !busy,
-            move |this, _, _, cx| this.load_export_settings(saved.clone(), cx),
-        ));
-    }
-    if current != align_defaults {
-        buttons = buttons.child(button(
-            cx,
-            theme,
-            "btn-exp-align-defaults",
-            "Use Align Defaults",
-            !busy,
-            |this, _, _, cx| this.load_export_settings(crate::state::ExportSettings::default(), cx),
-        ));
-    }
-    let note = |text: &'static str| {
+    let open = select == Some(ExportSelect::Defaults);
+    let mut trigger = secondary_chrome(
         div()
+            .id("exp-defaults")
+            .relative()
+            .w(px(WIDTH))
+            .h(px(28.))
             .px_2()
-            .text_size(px(11.))
-            .text_color(rgb(theme.dim))
-            .child(text)
-    };
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap_2(),
+        theme,
+        open,
+        !busy,
+    )
+    .child(div().min_w(px(0.)).truncate().child(value))
+    .child(div().w(px(12.)).h(px(12.)).flex_shrink_0().child(svg_icon(
+        "icons/chevron-down.svg",
+        12.,
+        theme.icon,
+    )));
+    if !busy {
+        trigger = trigger.on_click(cx.listener(|this, _, _, cx| {
+            this.toggle_export_select(ExportSelect::Defaults, cx);
+        }));
+    }
+    if open {
+        let saved_mark = match (&saved, uses_saved) {
+            (None, _) => DefaultsMark::Note("None"),
+            (Some(_), true) => DefaultsMark::Check,
+            (Some(_), false) => DefaultsMark::Empty,
+        };
+        let menu = div()
+            .id("export-defaults-menu")
+            .flex()
+            .flex_col()
+            .child(export_defaults_option(
+                cx,
+                theme,
+                "exp-defaults-saved",
+                "Saved",
+                saved_mark,
+                !busy && saved.is_some(),
+                move |this, _, _, cx| {
+                    if let Some(saved) = saved.clone() {
+                        this.load_export_settings(saved, cx);
+                    }
+                },
+            ))
+            .child(export_defaults_option(
+                cx,
+                theme,
+                "exp-defaults-built-in",
+                "Built-in",
+                if uses_built_in {
+                    DefaultsMark::Check
+                } else {
+                    DefaultsMark::Empty
+                },
+                !busy,
+                |this, _, _, cx| {
+                    this.load_export_settings(crate::state::ExportSettings::default(), cx);
+                },
+            ))
+            .child(div().mx_2().my_1().h(px(1.)).bg(rgb(theme.separator)))
+            .child(
+                export_defaults_option(
+                    cx,
+                    theme,
+                    "exp-defaults-save",
+                    "Save as Default",
+                    DefaultsMark::Empty,
+                    !busy && !uses_saved,
+                    |this, _, _, cx| this.save_export_defaults(cx),
+                )
+                .tooltip(hover_tip(
+                    "Destination and sequence name aren't saved".to_string(),
+                    theme,
+                )),
+            );
+        // The row ends the sheet, so the menu opens upward over the options.
+        let menu_height = 3. * 28. + SEPARATOR + MENU_CHROME;
+        trigger = trigger.child(
+            div().absolute().top_0().left_0().child(deferred(
+                anchored()
+                    .position_mode(AnchoredPositionMode::Local)
+                    .anchor(Corner::BottomLeft)
+                    .offset(point(px(0.), px(-4.)))
+                    .snap_to_window_with_margin(px(8.))
+                    .child(export_select_motion(
+                        dropdown_surface(theme, WIDTH, menu),
+                        ExportSelect::Defaults,
+                        menu_height,
+                        open && select_closing,
+                    )),
+            )),
+        );
+    }
     div()
+        .h(px(32.))
+        .pr_2()
         .flex()
-        .flex_col()
-        .gap_1()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_3()
         .child(export_section_title(theme, "Defaults"))
-        .child(note(status))
-        .child(buttons)
-        .child(note(
-            "New jobs and Align's next launch start from the saved defaults. The \
-             destination and sequence name are not saved.",
-        ))
+        .child(trigger)
+}
+
+/// The end of a defaults menu row: the check of the set the sheet matches,
+/// or a note on why the row is unavailable.
+#[derive(Clone, Copy)]
+enum DefaultsMark {
+    Empty,
+    Check,
+    Note(&'static str),
+}
+
+/// One row of the defaults menu: a set of options to load, or the save
+/// action. A disabled row stays visible.
+fn export_defaults_option(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    id: &'static str,
+    title: &'static str,
+    mark: DefaultsMark,
+    enabled: bool,
+    action: impl Fn(&mut AlignApp, &ClickEvent, &mut Window, &mut Context<AlignApp>) + 'static,
+) -> Stateful<Div> {
+    let mut row = div()
+        .id(id)
+        .h(px(28.))
+        .px_3()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .rounded_md()
+        .text_size(px(12.))
+        .child(div().min_w(px(0.)).truncate().child(title))
+        .map(|row| match mark {
+            DefaultsMark::Note(note) => row.child(div().flex_shrink_0().child(note)),
+            DefaultsMark::Empty | DefaultsMark::Check => row.child(
+                div()
+                    .w(px(16.))
+                    .h(px(16.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(matches!(mark, DefaultsMark::Check), |slot| {
+                        slot.child(svg_icon("icons/check.svg", 12., theme.accent))
+                    }),
+            ),
+        });
+    if enabled {
+        row = row
+            .text_color(rgb(theme.text))
+            .cursor_pointer()
+            .hover(|this| this.bg(rgb(theme.button_hover)))
+            .on_click(cx.listener(move |this, event, window, cx| {
+                action(this, event, window, cx);
+                this.close_export_select(cx);
+            }));
+    } else {
+        row = row.text_color(rgb(theme.dim));
+    }
+    row
 }
 
 /// What every section of the export sheet reads.

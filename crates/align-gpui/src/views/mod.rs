@@ -133,6 +133,7 @@ struct ExportReveals {
 enum ExportSelect {
     AafFrameRate,
     UnmatchedPlacement,
+    Defaults,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1472,7 +1473,7 @@ impl AlignApp {
                 self.data.export.targets.contains(&ExportTarget::Aaf)
             }
             Some(ExportSelect::UnmatchedPlacement) => self.data.unmatched_count() > 0,
-            None => true,
+            Some(ExportSelect::Defaults) | None => true,
         };
         if !select_is_available {
             self.clear_export_select();

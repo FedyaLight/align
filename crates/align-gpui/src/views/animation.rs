@@ -141,6 +141,8 @@ pub(super) fn export_select_motion<E: IntoElement + Styled + 'static>(
         (ExportSelect::AafFrameRate, true) => "export-aaf-select-out",
         (ExportSelect::UnmatchedPlacement, false) => "export-unmatched-select-in",
         (ExportSelect::UnmatchedPlacement, true) => "export-unmatched-select-out",
+        (ExportSelect::Defaults, false) => "export-defaults-select-in",
+        (ExportSelect::Defaults, true) => "export-defaults-select-out",
     };
     surface.with_animation(animation_id, entrance(DROPDOWN_MS), move |el, progress| {
         let visible = if closing { 1. - progress } else { progress };
