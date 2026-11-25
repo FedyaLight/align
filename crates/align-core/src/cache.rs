@@ -39,7 +39,7 @@ struct MediaPathOnly {
 
 /// Restarts an entry's retention period when it is used. Retention counts
 /// from the last use, so media worked on every day stays cached.
-fn touch(path: &Path) {
+pub fn touch(path: &Path) {
     let _ = std::fs::File::options()
         .write(true)
         .open(path)

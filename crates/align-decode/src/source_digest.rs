@@ -30,6 +30,10 @@
 //!    SMB/UNC share, disabled or resetting USN journal, read-only volume, or
 //!    denied journal/FSCTL access), fall back directly to streaming full
 //!    BLAKE3 without caching an unverified revision.
+//! 5. Like the analysis cache, an entry expires after
+//!    [`align_core::CACHE_MAX_AGE_DAYS`] without a hit. Every hit, from memory
+//!    or disk, restarts that period. Exports prune expired entries on their
+//!    first lookup in a process and then at most daily, never on a timer.
 //!
 //! Fast-path boundary: as with Unix `ctime` and `MAP_SHARED`, a process that
 //! writes through a lingering writable memory mapping after closing its file
@@ -45,6 +49,8 @@ use std::path::PathBuf;
 #[cfg(any(windows, test))]
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+#[cfg(any(windows, test))]
+use std::time::Duration;
 
 use crate::export::{ExportError, check_cancel};
 
@@ -54,6 +60,8 @@ const DIGEST_HEX_LEN: usize = 32;
 const HASH_CHUNK_BYTES: usize = 1024 * 1024;
 #[cfg(any(windows, test))]
 const MAX_MEMORY_ENTRIES: usize = 4_096;
+#[cfg(any(windows, test))]
+const RETENTION: Duration = Duration::from_secs(align_core::CACHE_MAX_AGE_DAYS * 24 * 60 * 60);
 
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -197,21 +205,59 @@ impl SourceDigestCache {
         weak_usn: i64,
         metadata: SourceMetadataGuard,
     ) -> Option<String> {
-        {
-            let memory = crate::lock_idle(&self.memory);
-            if let Some(entry) = memory.get(&key)
-                && entry.matches(key, journal, weak_usn, metadata)
-            {
-                return Some(entry.digest.clone());
+        let remembered = crate::lock_idle(&self.memory)
+            .get(&key)
+            .filter(|entry| entry.matches(key, journal, weak_usn, metadata))
+            .map(|entry| entry.digest.clone());
+        let digest = match remembered {
+            Some(digest) => digest,
+            None => {
+                let disk = self.load_disk_entry(key)?;
+                if !disk.matches(key, journal, weak_usn, metadata) {
+                    return None;
+                }
+                let digest = disk.digest.clone();
+                self.remember_in_memory(disk);
+                digest
+            }
+        };
+        // A long-running process serves repeat exports from memory, so those
+        // hits must restart the persisted entry's retention period too.
+        align_core::cache::touch(&self.entry_path(key));
+        Some(digest)
+    }
+
+    /// Removes entries unused for [`RETENTION`]. Only files named like an
+    /// entry are considered, so staged writes and anything else in the folder
+    /// stay. Failures skip the entry; losing a race with a concurrent hit
+    /// costs one re-hash, never a wrong digest.
+    fn prune_expired(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            // Entry names are 32 lowercase hex digits, the shape of a digest.
+            let is_entry = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".json"))
+                .is_some_and(is_valid_digest);
+            if !is_entry || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+            // Read the file's own timestamp right before removing it. The
+            // listing's copy can lag behind a hit from another export.
+            let expired = std::fs::symlink_metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age >= RETENTION);
+            if expired {
+                let _ = std::fs::remove_file(&path);
             }
         }
-        let disk = self.load_disk_entry(key)?;
-        if !disk.matches(key, journal, weak_usn, metadata) {
-            return None;
-        }
-        let digest = disk.digest.clone();
-        self.remember_in_memory(disk);
-        Some(digest)
     }
 
     fn store(&self, entry: CachedSourceDigest) {
@@ -379,7 +425,29 @@ mod platform {
         path: &Path,
         cancel: &AtomicBool,
     ) -> Result<String, ExportError> {
-        default_cache().tag_for_path(path, cancel)
+        let cache = default_cache();
+        let tag = cache.tag_for_path(path, cancel)?;
+        // After the lookup, so the entry this source just used is fresh.
+        prune_if_due(cache);
+        Ok(tag)
+    }
+
+    /// Prunes on the first export lookup of a process and then at most once
+    /// a day, so neither a long session nor a large export scans the folder
+    /// for every source. A concurrent export skips while one prunes.
+    fn prune_if_due(cache: &SourceDigestCache) {
+        const PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+        static LAST_PRUNE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        let mut last = match LAST_PRUNE.try_lock() {
+            Ok(last) => last,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        if last.is_some_and(|at| at.elapsed() < PRUNE_INTERVAL) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+        cache.prune_expired();
     }
 
     fn open_no_write_sharing(path: &Path) -> io::Result<File> {
@@ -876,6 +944,59 @@ mod tests {
         std::fs::write(verified.entry_path(key), b"not json").unwrap();
         let after_corrupt = SourceDigestCache::new(dir.path().to_path_buf());
         assert_eq!(after_corrupt.lookup(key, journal, 6_000, meta), None);
+    }
+
+    #[test]
+    fn digest_cache_prunes_entries_unused_for_retention_and_keeps_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = SourceDigestCache::new(dir.path().to_path_buf());
+        let entry_for = |id: u8| CachedSourceDigest {
+            file_id: [id; 16],
+            ..sample_entry(5_000, sample_digest(&[id]))
+        };
+        let (memory_hit, disk_hit, unused) = (entry_for(1), entry_for(2), entry_for(3));
+        let journal = JournalState {
+            journal_id: memory_hit.usn_journal_id,
+            lowest_valid_usn: 1_000,
+            next_usn: 10_000,
+        };
+        for entry in [&memory_hit, &disk_hit, &unused] {
+            cache.store(entry.clone());
+        }
+        // A crashed staged write and a foreign file are not cache entries.
+        let staged = dir
+            .path()
+            .join(".0123456789abcdef0123456789abcdef-x1.partial.json");
+        let foreign = dir.path().join("notes.txt");
+        std::fs::write(&staged, b"{").unwrap();
+        std::fs::write(&foreign, b"keep").unwrap();
+
+        let stale = std::time::SystemTime::now() - RETENTION - Duration::from_secs(60);
+        let entry_paths = [&memory_hit, &disk_hit, &unused].map(|e| cache.entry_path(e.key()));
+        for path in entry_paths.iter().chain([&staged, &foreign]) {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(stale)
+                .unwrap();
+        }
+
+        // `cache` still remembers its stores; a fresh instance reads disk.
+        let hit = |cache: &SourceDigestCache, entry: &CachedSourceDigest| {
+            cache.lookup(entry.key(), journal, entry.strong_usn, entry.metadata)
+        };
+        assert_eq!(hit(&cache, &memory_hit), Some(memory_hit.digest.clone()));
+        let reloaded = SourceDigestCache::new(dir.path().to_path_buf());
+        assert_eq!(hit(&reloaded, &disk_hit), Some(disk_hit.digest.clone()));
+
+        cache.prune_expired();
+        let [memory_path, disk_path, unused_path] = entry_paths;
+        assert!(memory_path.is_file());
+        assert!(disk_path.is_file());
+        assert!(!unused_path.exists());
+        assert!(staged.is_file());
+        assert!(foreign.is_file());
     }
 
     #[test]
