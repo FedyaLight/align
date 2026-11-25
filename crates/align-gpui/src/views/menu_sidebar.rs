@@ -38,6 +38,32 @@ pub(super) struct CachePage {
 }
 
 impl AlignApp {
+    fn open_app_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.data.menu = None;
+        self.app_menu_exit.cancel();
+        self.app_menu = Some(AppMenuPage::Main);
+        self.app_menu_select = None;
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    /// Alt pressed and released alone: opens the menu wherever its button
+    /// works, or closes it. A loading project, other dialogs, and the problem
+    /// report opened from the menu keep their keys.
+    pub(super) fn toggle_app_menu_from_alt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !cfg!(any(target_os = "windows", target_os = "linux"))
+            || self.projects.busy
+            || self.show_problem_report
+        {
+            return;
+        }
+        if self.app_menu.is_some() {
+            self.close_app_menu(cx);
+        } else if self.content_active() {
+            self.open_app_menu(window, cx);
+        }
+    }
+
     pub(super) fn dismiss_app_menu(&mut self, cx: &mut Context<Self>) {
         if self.app_menu_select.take().is_some() {
             cx.notify();
@@ -81,14 +107,7 @@ pub(super) fn app_menu_button(
         "btn-app-menu",
         "Menu",
         active,
-        |this, _, window, cx| {
-            this.data.menu = None;
-            this.app_menu_exit.cancel();
-            this.app_menu = Some(AppMenuPage::Main);
-            this.app_menu_select = None;
-            this.focus_handle.focus(window);
-            cx.notify();
-        },
+        |this, _, window, cx| this.open_app_menu(window, cx),
     )
 }
 

@@ -92,13 +92,16 @@ analysis cache.
 | Save project as | Cmd+Shift+S | Ctrl+Shift+S |
 | Synchronize again | Cmd+R | Ctrl+R |
 | Export | Cmd+E | Ctrl+E |
-| Zoom the timeline | Cmd or Option + scroll | Ctrl or Alt + scroll |
+| Remove selected sources (files stay on disk) | Delete or Fn+Delete | Delete |
+| Zoom the timeline in, out, to fit | Cmd+= or Cmd++, Cmd+−, Cmd+0 | Ctrl+= or Ctrl++, Ctrl+−, Ctrl+0 |
+| Zoom the timeline at the pointer | Cmd or Option + scroll | Ctrl or Alt + scroll |
 | Pan the timeline | Arrow keys (Shift for larger steps), Home, End | same |
 | Full screen | Ctrl+Cmd+F | F11 |
 | Quit | Cmd+Q | Ctrl+Q |
 
 On Windows and Linux, **Menu** opens a sidebar from the top toolbar or the
-empty start screen. **Path Fixer** appears after you import a timeline.
+empty start screen; pressing and releasing Alt on its own also opens or closes
+it. **Path Fixer** appears after you import a timeline.
 Export is available from the timeline toolbar after synchronization. On macOS,
 use the native menu bar.
 

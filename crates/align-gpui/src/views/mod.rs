@@ -40,6 +40,7 @@ mod panels;
 mod projects;
 mod root;
 mod settings;
+mod shortcuts;
 mod sources;
 mod timeline;
 mod toolbar;
@@ -350,6 +351,12 @@ impl PathFixerInputs {
             omit_extensions: cx.new(|cx| TextInput::new(cx, "jpg, png")),
         }
     }
+
+    fn any_focused(&self, window: &Window, cx: &App) -> bool {
+        [&self.old_folder, &self.omit_extensions]
+            .into_iter()
+            .any(|input| input.read(cx).is_focused(window))
+    }
 }
 
 impl ExportInputs {
@@ -507,6 +514,8 @@ pub struct AlignApp {
     app_menu: Option<menu_sidebar::AppMenuPage>,
     app_menu_select: Option<menu_sidebar::AppMenuSelect>,
     app_menu_exit: Exit,
+    /// Alt pressed and released alone toggles the menu on Windows and Linux.
+    alt_tap: shortcuts::AltTap,
     export_scroll: ScrollHandle,
     export_scroll_drag: Option<(f32, f32)>,
     export_sidebar_exit: Exit,
@@ -563,6 +572,23 @@ impl AlignApp {
             || self.data.show_camera_clock
     }
 
+    /// The window content takes pointer and keyboard input: no project is
+    /// loading and nothing covers it, the export sidebar included.
+    fn content_active(&self) -> bool {
+        !self.projects.busy && !self.dialog_open() && !self.data.show_export
+    }
+
+    fn text_field_focused(&self, window: &Window, cx: &App) -> bool {
+        self.export_inputs.any_focused(window, cx) || self.path_fixer_inputs.any_focused(window, cx)
+    }
+
+    /// Opening or closing the window resets Alt tracking: a key held while
+    /// another window had focus is not a tap here.
+    pub(crate) fn track_window_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.observe_window_activation(window, |this, _, _| this.alt_tap.reset())
+            .detach();
+    }
+
     pub fn new(
         projects: crate::project::Preferences,
         writer: crate::project::Writer,
@@ -578,6 +604,7 @@ impl AlignApp {
             app_menu: None,
             app_menu_select: None,
             app_menu_exit: Exit::default(),
+            alt_tap: shortcuts::AltTap::default(),
             export_scroll: ScrollHandle::new(),
             export_scroll_drag: None,
             export_sidebar_exit: Exit::default(),
@@ -607,22 +634,40 @@ impl AlignApp {
 
     // ---------------- actions
 
-    /// Clear the session, or remove the selected sources. A cleared session
-    /// starts the next job from the export defaults.
+    /// The trash button: clear the session, or remove the selected sources.
+    /// A cleared session starts the next job from the export defaults.
     pub(crate) fn delete_or_clear(&mut self, cx: &mut Context<Self>) {
+        if !self.data.selection.is_empty() {
+            self.remove_selected_sources(cx);
+            return;
+        }
         if self.projects.busy || self.data.has_active_job() {
             return;
         }
-        let clearing = self.data.selection.is_empty();
-        self.data.delete_or_clear();
-        if clearing {
-            self.projects.clear();
-            self.export_inputs
-                .set_labels(&self.data.export_baseline().labels, cx);
-        } else {
+        self.data.clear();
+        self.projects.clear();
+        self.export_inputs
+            .set_labels(&self.data.export_baseline().labels, cx);
+        cx.notify();
+    }
+
+    /// Removes the selected sources, from the trash button or the Delete key.
+    /// Never clears the session, whatever the selection holds.
+    fn remove_selected_sources(&mut self, cx: &mut Context<Self>) {
+        if self.projects.busy || self.data.has_active_job() || self.data.selection.is_empty() {
+            return;
+        }
+        if self.data.remove_selection() {
             self.project_changed(cx);
         }
         cx.notify();
+    }
+
+    /// A zoom button or shortcut press.
+    fn zoom_timeline(&mut self, zoom: crate::state::TimelineZoom, cx: &mut Context<Self>) {
+        if self.data.zoom_timeline(zoom) {
+            cx.notify();
+        }
     }
 
     /// The export options in the sheet, text fields included.

@@ -28,6 +28,17 @@ pub enum Operation {
     Repairing,
 }
 
+/// A step of the timeline zoom buttons and their shortcuts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimelineZoom {
+    In,
+    Out,
+    Fit,
+}
+
+/// Zoom level change of one zoom button press.
+const ZOOM_STEP: f64 = 0.2;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClipState {
     Queued,
@@ -827,6 +838,39 @@ impl AppData {
         });
     }
 
+    /// The zoom controls work on a timeline no import or job is changing.
+    pub fn timeline_zoom_available(&self) -> bool {
+        !self.lanes.is_empty() && !self.show_export && !self.importing() && !self.has_active_job()
+    }
+
+    /// Whether `zoom` would change the current zoom.
+    pub fn can_zoom(&self, zoom: TimelineZoom) -> bool {
+        match zoom {
+            TimelineZoom::In => self.zoom_level < 1.0,
+            TimelineZoom::Out => self.zoom_level > 0.0,
+            TimelineZoom::Fit => self.zoom_level > 0.001,
+        }
+    }
+
+    /// One press of a zoom button or shortcut. In and Out keep the middle of
+    /// the visible timeline in place; Fit shows the whole timeline from its
+    /// start. False when the zoom is already at that limit.
+    pub fn zoom_timeline(&mut self, zoom: TimelineZoom) -> bool {
+        if !self.can_zoom(zoom) {
+            return false;
+        }
+        let middle = f32::from(self.timeline_scroll.bounds().size.width) * 0.5;
+        match zoom {
+            TimelineZoom::In => self.zoom_at((self.zoom_level + ZOOM_STEP).min(1.0), middle),
+            TimelineZoom::Out => self.zoom_at((self.zoom_level - ZOOM_STEP).max(0.0), middle),
+            TimelineZoom::Fit => {
+                self.zoom_at(0.0, 0.0);
+                self.pan_to(Some(0.0), None);
+            }
+        }
+        true
+    }
+
     /// Timeline panning. Offsets are negative-of-scroll with (0,0) at the
     /// top-left origin, clamped to the measured content size.
     pub fn pan_to(&self, x: Option<f32>, y: Option<f32>) {
@@ -939,16 +983,19 @@ impl AppData {
         self.error = None;
     }
 
-    pub fn remove_selection(&mut self) {
-        if matches!(
-            self.operation,
-            Operation::Synchronizing | Operation::Exporting | Operation::Repairing
-        ) {
-            return;
+    /// Removes the selected sources still in the list from the session and
+    /// reports whether there were any. Selected paths no longer listed are
+    /// dropped without touching anything else, so an empty or stale selection
+    /// never changes the session. Files on disk are left alone.
+    pub fn remove_selection(&mut self) -> bool {
+        if self.has_active_job() {
+            return false;
         }
-        let selected = std::mem::take(&mut self.selection);
+        let mut selected = std::mem::take(&mut self.selection);
+        let listed: HashSet<&PathBuf> = self.clips.iter().map(|clip| &clip.url).collect();
+        selected.retain(|url| listed.contains(url));
         if selected.is_empty() {
-            return;
+            return false;
         }
         let removed_ids: HashSet<ClipId> = self
             .clips
@@ -970,7 +1017,7 @@ impl AppData {
             self.mark_sync_dirty();
             self.exported_files.clear();
             self.status = "Selection changed.".to_string();
-            return;
+            return true;
         }
         self.reset_preview();
         self.exported_files.clear();
@@ -980,14 +1027,7 @@ impl AppData {
         } else {
             ready_status(self.clips.len())
         };
-    }
-
-    pub fn delete_or_clear(&mut self) {
-        if self.selection.is_empty() {
-            self.clear();
-        } else {
-            self.remove_selection();
-        }
+        true
     }
 
     pub fn clear(&mut self) {
@@ -3371,7 +3411,7 @@ mod tests {
         assert!(data.can_synchronize());
 
         data.selection.insert(PathBuf::from("/v/a.wav"));
-        data.remove_selection();
+        assert!(data.remove_selection());
         assert_eq!(data.clips.len(), 1);
         assert!(data.selection.is_empty());
         assert_eq!(data.inputs, vec![PathBuf::from("/v/b.wav")]);
@@ -3454,21 +3494,28 @@ mod tests {
         assert!(data.can_export());
     }
 
+    /// The Delete key removes the selection; without one still listed it
+    /// must leave the session, its result, and its exports as they were.
     #[test]
-    fn trash_removes_selection_then_clears_session() {
+    fn removing_an_empty_or_stale_selection_keeps_the_session() {
         let mut data = AppData::default();
-        add_paths(
-            &mut data,
-            vec![PathBuf::from("/v/a.wav"), PathBuf::from("/v/b.wav")],
-        );
-        data.selection.insert(PathBuf::from("/v/a.wav"));
+        let inputs = vec![PathBuf::from("/v/a.wav"), PathBuf::from("/v/b.wav")];
+        add_paths(&mut data, inputs.clone());
+        data.result = Some(empty_sequence_result("Finished"));
+        data.operation = Operation::Ready;
+        data.exported_files.push(PathBuf::from("/out/timeline.xml"));
+        let status = data.status.clone();
 
-        data.delete_or_clear();
-        assert_eq!(data.inputs, vec![PathBuf::from("/v/b.wav")]);
+        assert!(!data.remove_selection());
+        data.selection.insert(PathBuf::from("/v/gone.wav"));
+        assert!(!data.remove_selection());
 
-        data.delete_or_clear();
-        assert!(data.inputs.is_empty());
-        assert!(data.clips.is_empty());
+        assert!(data.selection.is_empty());
+        assert_eq!(data.inputs, inputs);
+        assert_eq!(data.clips.len(), 2);
+        assert!(data.can_export(), "the result must stay current");
+        assert_eq!(data.exported_files.len(), 1);
+        assert_eq!(data.status, status);
     }
 
     #[test]
@@ -3682,6 +3729,22 @@ mod tests {
         assert!((data.zoom_level - 0.0).abs() < 1e-9);
         data.zoom_at(0.25, 0.0);
         assert!((data.zoom_level - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zoom_steps_stop_at_fit_and_full_zoom() {
+        let mut data = AppData::default();
+        assert!(!data.zoom_timeline(TimelineZoom::Out));
+        assert!(!data.zoom_timeline(TimelineZoom::Fit));
+        for _ in 0..5 {
+            assert!(data.zoom_timeline(TimelineZoom::In));
+        }
+        assert_eq!(data.zoom_label(), "800%");
+        assert!(!data.zoom_timeline(TimelineZoom::In));
+        assert!(data.zoom_timeline(TimelineZoom::Out));
+        assert!((data.zoom_level - 0.8).abs() < 1e-9);
+        assert!(data.zoom_timeline(TimelineZoom::Fit));
+        assert_eq!(data.zoom_label(), "100%");
     }
 
     #[test]

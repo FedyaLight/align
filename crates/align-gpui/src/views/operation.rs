@@ -238,7 +238,12 @@ pub(super) fn operation_bar(
         }
     }
     if !data.show_export && !data.lanes.is_empty() {
-        bar = bar.child(timeline_zoom_controls(cx, theme, data, active && !busy));
+        bar = bar.child(timeline_zoom_controls(
+            cx,
+            theme,
+            data,
+            active && data.timeline_zoom_available(),
+        ));
     }
     bar
 }

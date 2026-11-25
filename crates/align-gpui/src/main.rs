@@ -570,8 +570,9 @@ fn main() {
         // Initial keyboard focus: without it system shortcuts stay dead
         // until the user clicks something focusable (of which we have none).
         window
-            .update(cx, |view, window, _| {
+            .update(cx, |view, window, cx| {
                 window.focus(&view.focus_handle);
+                view.track_window_activation(window, cx);
             })
             .ok();
         cx.activate(true);

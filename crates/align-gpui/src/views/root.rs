@@ -1,5 +1,9 @@
 //! The window: layout of every panel, sheet, and overlay.
 
+use gpui::{
+    DispatchPhase, ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent, ScrollWheelEvent, canvas,
+};
+
 use super::animation::toolbar_entrance;
 use super::controls::{overlay, sidebar_scrim};
 use super::export::{ExportPanel, export_sidebar, export_sidebar_action, path_fixer_panel};
@@ -16,6 +20,7 @@ use super::panels::{
 use super::settings::{
     export_select_dismiss_layer, search_quality_dismiss_layer, search_settings_panel,
 };
+use super::shortcuts::{removes_selection, zoom_shortcut};
 use super::sources::main_content;
 use super::toolbar::toolbar;
 use super::{
@@ -41,7 +46,7 @@ impl Render for AlignApp {
         // While a modal or context menu is open the content below keeps
         // its layout but loses hover/cursor feedback (clicks are already
         // swallowed by the overlay layers).
-        let content_active = !self.projects.busy && !self.dialog_open() && !self.data.show_export;
+        let content_active = self.content_active();
         // Keys belong to the open dialog: export fields behind it give up
         // focus, and once a dialog closes the window takes focus back from
         // its fields.
@@ -62,7 +67,8 @@ impl Render for AlignApp {
             // Focusable root: without a focused view GPUI key dispatch
             // never reaches the app-level system shortcuts (Cmd+Q etc.).
             .track_focus(&self.focus_handle)
-            .capture_key_down(cx.listener(|this, _, _, cx| {
+            .capture_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
+                this.alt_tap.interrupt(e.keystroke.modifiers);
                 if this.projects.busy {
                     cx.stop_propagation();
                 }
@@ -172,7 +178,20 @@ impl Render for AlignApp {
                     this.close_export_sidebar(cx);
                     return;
                 }
-                if this.data.show_export && this.export_inputs.any_focused(window, cx) {
+                // Fields keep their keys, Backspace and Delete included.
+                if this.text_field_focused(window, cx) {
+                    return;
+                }
+                if removes_selection(&e.keystroke) {
+                    if !e.is_held && this.content_active() {
+                        this.remove_selected_sources(cx);
+                    }
+                    return;
+                }
+                if let Some(zoom) = zoom_shortcut(&e.keystroke) {
+                    if this.content_active() && this.data.timeline_zoom_available() {
+                        this.zoom_timeline(zoom, cx);
+                    }
                     return;
                 }
                 if this.data.lanes.is_empty() {
@@ -197,6 +216,15 @@ impl Render for AlignApp {
                 }
                 cx.notify();
             }));
+        if cfg!(any(target_os = "windows", target_os = "linux")) {
+            root = root
+                .on_modifiers_changed(cx.listener(|this, e: &ModifiersChangedEvent, window, cx| {
+                    if this.alt_tap.modifiers_changed(e.modifiers) {
+                        this.toggle_app_menu_from_alt(window, cx);
+                    }
+                }))
+                .child(alt_chord_watch(cx));
+        }
         if content_active && !self.data.has_active_job() {
             root = root.on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
                 this.add_paths(paths.paths().to_vec(), cx);
@@ -424,4 +452,35 @@ impl Render for AlignApp {
         }
         root
     }
+}
+
+/// Clicks and scrolls anywhere make a held Alt part of a chord, also over a
+/// dialog's scrim or the timeline, which keeps Alt+scroll zoom to itself.
+/// Pointer movement tells the Alt tracker which modifiers are held.
+fn alt_chord_watch(cx: &mut Context<AlignApp>) -> impl IntoElement {
+    let view = cx.entity().downgrade();
+    canvas(
+        |_, _, _| {},
+        move |_, _, window, _| {
+            let down = view.clone();
+            window.on_mouse_event(move |e: &MouseDownEvent, phase, _, cx| {
+                if phase == DispatchPhase::Capture {
+                    let _ = down.update(cx, |this, _| this.alt_tap.interrupt(e.modifiers));
+                }
+            });
+            let wheel = view.clone();
+            window.on_mouse_event(move |e: &ScrollWheelEvent, phase, _, cx| {
+                if phase == DispatchPhase::Capture {
+                    let _ = wheel.update(cx, |this, _| this.alt_tap.interrupt(e.modifiers));
+                }
+            });
+            window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                if phase == DispatchPhase::Capture {
+                    let _ = view.update(cx, |this, _| this.alt_tap.observe(e.modifiers));
+                }
+            });
+        },
+    )
+    .absolute()
+    .size_0()
 }
