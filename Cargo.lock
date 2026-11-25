@@ -44,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "align-aaf"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "cfb",
@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "align-cli"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "align-core",
  "align-decode",
@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "align-core"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "bincode",
  "blake3",
@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "align-decode"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "align-core",
  "blake3",
@@ -121,7 +121,7 @@ dependencies = [
 
 [[package]]
 name = "align-gpui"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "align-cli",
  "align-core",

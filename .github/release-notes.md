@@ -3,56 +3,72 @@ matching, timecode, and recording metadata.
 
 ## What's new in @VERSION@
 
-- **Source clips organized by camera and recorder.** With **Organize imported
-  source clips** in the export sheet (`--media-bins` in the CLI), editors open the
-  export with the source files grouped by the folder they were copied into:
-  Premiere Pro bins, Final Cut Pro keyword collections, and folders in the
-  DaVinci Resolve media pool made by the import script. Files Align rendered
-  for the timeline, such as drift corrections, get a group of their own.
-  Thanks to @yingaboy for suggesting it (#26).
-- **Premiere export of a camera whose audio ends early.** Exporting a MOV whose
-  audio track is shorter than its video failed with "Cannot decode audio for
-  drift correction." It now exports. Thanks to @Manuel36791 for reporting it
-  (#27).
-- **Exports checked in the editors.** Every export was opened and played back
-  in Premiere Pro 2027, Final Cut Pro 12.3 and DaVinci Resolve 21.1, and what
-  they showed is fixed:
-  - Premiere and Resolve start imported sound only on a frame, so Premiere XML,
-    Resolve XML and AAF place it on the nearest frame, within half a frame, as
-    other synchronization tools do. Align no longer renders copies of
-    recordings to shift them between frames; only drift corrections, and mono
-    channel copies for AAF, are rendered.
-  - A stereo recording or camera is one stereo clip in Premiere Pro, and a
-    multichannel recording one clip in Final Cut Pro. The Resolve import script
-    places every recording, and a camera's sound linked to its picture, as one
-    clip on a mono, stereo or adaptive track, on the sample nearest its place.
-  - Final Cut Pro imports projects without format warnings, multicam angles
-    play their sound in time, and recordings that start inside a frame stay
-    in place.
-  - Takes of one recorder stay on one track, and where two takes overlap, the
-    first now ends where the second starts in every format.
-  - In edits kept from an imported timeline, Premiere no longer freezes on
-    reversed clips, Resolve XML plays speed changes, and the Resolve import
-    script keeps dissolves, crossfades and locked tracks.
-  - Premiere opens AAF without picture at its frame rate rather than 29.97,
-    AAF timecode is drop-frame when the source's is, and AAF cameras share one
-    picture track.
-  - The usage guide lists which file to open in each editor.
-- **Faster synchronization.** Matches that would be discarded anyway are no
-  longer refined, FFmpeg reads each file's header once rather than for every
-  analysis window, and an AAF project is read once for all its sequences.
-  Eight overlapping takes synchronized in 0.85 s instead of 1.34 s, and with
-  the decoder Windows and Linux use, six AVCHD clips with AC-3 audio in 175 ms
-  instead of 317 ms.
-- **More reliable synchronization.** On macOS, a file AVFoundation stops
-  reading is read with the bundled decoder instead of stopping the run. A
-  clip whose timecode alignment with one partner was rejected now joins the
-  next one.
+- **Projects that save themselves.** Align creates a `.align` project when
+  synchronization starts and keeps it up to date as you work. Reopen it from
+  **File → Recent Projects** to get back your sources, settings, relinks,
+  corrections and placements; a timeline whose sources have not changed can be
+  exported right away. **Save As…** keeps a named copy, autosaves are removed
+  after seven days without use, and on Windows `.align` files open in Align
+  from Explorer. Thanks to @REVPKD for suggesting and prototyping project
+  recovery in [#33](https://github.com/FedyaLight/align/pull/33).
+- **Unmatched clips placed by the camera's clock.** Sony cameras record their
+  serial number and when each clip started. An unmatched clip recorded between
+  two clips of the same camera that synchronized by sound can now be placed
+  approximately from that clock: one clip at a time from its menu, with
+  **Place All**, or with `--camera-clock` in the CLI. Placed clips are named
+  `[CAMERA CLOCK]` and stay unmatched, and nothing is placed unless you ask.
+  The usage guide explains which clips qualify and how accurate the place is.
+  Thanks to @REVPKD for proposing and prototyping it in
+  [#31](https://github.com/FedyaLight/align/issues/31) and
+  [#32](https://github.com/FedyaLight/align/pull/32).
+- **AAF built into Align.** The AAF module is now written in Rust and installed
+  beside the app and CLI, replacing the bundled Python runtime. AAF export can
+  also link VC-3 (DNxHD/DNxHR) picture in MXF OP-Atom files: DaVinci Resolve
+  Studio 21.1 opens it, while Premiere Pro 27.0 left the tested DNxHR LB media
+  offline. A damaged AAF now reports what the reader rejected.
+- **A timeline that shows what it knows.** Each clip carries a mark for its
+  state: a link when synchronized, a clock when placed by camera clock, a
+  warning sign when unmatched. Clips stay striped until the analysis settles,
+  so states read without relying on color. Rest the pointer on a clip to see
+  how it got its place, with confidence and drift for a waveform match, its
+  position and its source timecode. Imported timelines show which method
+  synchronized each clip instead of marking all of them as waveform matches.
+  Clips in dark mode use quieter shades with readable names, and ruler labels
+  at 29.97 fps and other fractional rates no longer drift from their ticks.
+- **Desktop app.** On Windows and Linux the menu is a sidebar, which Alt
+  pressed on its own also opens. Delete removes the selected sources (the
+  files stay on disk), Cmd or Ctrl with =, − and 0 zoom the timeline, and
+  Escape closes every dialog. Export defaults are one **Defaults** menu. The
+  export sheet remembers the last folder, and if an export with the same name
+  is already there, Align says so before writing anything instead of
+  replacing it. The timeline highlights while files are dragged over it.
+- **Analysis cache.** By default, cached analysis is now removed after seven
+  days without use, instead of 30 days after it was written, so media you work
+  on every day is not analyzed again. **File → Analysis Cache** can also turn
+  the cache off.
+- **Faster synchronization and export.** Sequences of one project share the
+  inspection and analysis of their media, in the app and with
+  `--all-sequences`. On macOS, WAV and linear PCM movies are refined with
+  eight workers instead of four. Repeat exports on Windows no longer read every
+  source file again, multi-sequence Premiere projects are built in linear
+  time, and prepared audio renders on a queue, longest file first.
+- **Fixes.**
+  - FCP 7 XML sequences were listed in reverse, so `--sequence 1` imported the
+    last one.
+  - Some HE-AAC recordings, including Apple's, are now decoded at their full
+    sample rate and from their recorded start.
+  - A drift correction of a Broadcast Wave recording close to 4 GiB failed. It
+    is now written as RF64, and the audio is written once instead of twice.
+  - A run that read Path Fixer redirections while another run saved them
+    could erase them.
+  - The Fedora installer installs through DNF over SSH or without GTK 4
+    instead of failing.
 
-Exports from this version place sound in Premiere Pro, DaVinci Resolve and AAF
-on frames: an edit that relied on sub-frame placement in those formats can
-move by up to half a frame. Final Cut Pro and the Resolve import script keep
-sound on its sample.
+**The MCP server is removed.** `align-mcp` is no longer included; remove it
+from your MCP client's configuration. Agents run `align-cli` directly:
+`align-cli sync --output-json result.json --summary /path/to/media` saves the
+result and prints a short JSON summary. **Align → Use with AI Agents…** copies
+the installed CLI path and a prompt.
 
 ## Downloads
 
@@ -113,4 +129,5 @@ example `shasum -a 256 -c Align-@VERSION@-macOS-arm64.dmg.sha256`.
 
 Every installer in this release was built and checked by GitHub Actions: tests
 and lint on all three platforms, end-to-end synchronization and export checks,
-and a package installation test on Fedora and Arch Linux.
+a package installation test on Fedora and Arch Linux, and an AAF check of every
+installed package.
