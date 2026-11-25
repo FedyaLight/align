@@ -74,10 +74,12 @@ jobs:
           python-version: '3.x'
       - name: Install AAF fixture requirements
         run: python -m pip install -r Support/aaf/requirements.txt
-      - name: Verify AAF reference and release source checks
-        run: |
-          python -m unittest discover -s Support/aaf -v
-          python script/test-release-source.py
+      # One command per step: Windows pwsh reports only the last command's
+      # exit code, so a later success would hide an earlier failure.
+      - name: Verify AAF reference
+        run: python -m unittest discover -s Support/aaf -v
+      - name: Verify release source checks
+        run: python script/test-release-source.py
       # Rebuild the sidecars only when their build script changes. Release
       # builds always compile them fresh and verify the staged files, which
       # also catches MSYS2 toolchain changes before anything is published.
