@@ -23,8 +23,8 @@ open "/Applications/Align.app"
 While Align analyzes, clips on the timeline are striped: their place is not
 confirmed yet. Afterwards a synchronized clip has a link in its top-right
 corner and an unmatched clip a warning sign. A clip too narrow for the mark
-shows its state by color only. A wide clip that only timecode synchronized
-also reads **TC Sync** beside its link.
+shows its state by color only. On wide clips synchronized by timecode alone,
+**TC** appears beside the link.
 
 Rest the pointer on a clip to see how it got its place and only the values
 the result has for it: confidence and drift for a waveform match, where the

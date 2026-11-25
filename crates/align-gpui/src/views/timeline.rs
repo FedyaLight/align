@@ -489,7 +489,7 @@ pub(super) fn timeline_lanes(
                             .font_weight(gpui::FontWeight(600.0))
                             .whitespace_nowrap()
                             .text_color(rgb(ink))
-                            .child("TC Sync"),
+                            .child("TC"),
                     );
                 }
                 el = el.on_mouse_down(
