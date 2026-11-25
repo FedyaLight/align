@@ -362,23 +362,22 @@ pub(super) fn clip_status_icon(state: crate::lane::BarMatchState) -> Option<&'st
     }
 }
 
-/// The timecode `at` seconds into the ruler, in the timeline's frames
-/// (non-drop). The position is rounded to the nearest frame, so a tick on a
-/// whole second never shows the frame before it.
-pub(super) fn fmt_timecode(clock: crate::lane::RulerClock, at: f64) -> String {
-    let frame_duration = if clock.frame_duration > 0. {
-        clock.frame_duration
+/// The HH:MM:SS label of the ruler tick `at` seconds into the timeline, on
+/// the clock `ruler_ticks` places it by: the timecode seconds from `origin`,
+/// which wrap at midnight, or without a timecode the elapsed time, which
+/// keeps counting hours. Ticks fall on whole seconds of that clock, so the
+/// nearest second takes up the binary error of the tick's position.
+pub(super) fn fmt_ruler_label(origin: Option<f64>, at: f64) -> String {
+    let total = (origin.unwrap_or(0.) + at).round() as i64;
+    let hours = total.div_euclid(3600);
+    let hours = if origin.is_some() {
+        hours.rem_euclid(24)
     } else {
-        1. / 25.
+        hours
     };
-    let per_second = ((1. / frame_duration).round() as i64).max(1);
-    let frames = ((clock.start + at) / frame_duration).round() as i64;
-    let seconds = frames.div_euclid(per_second);
-    let f = frames.rem_euclid(per_second);
-    let h = seconds.div_euclid(3600).rem_euclid(24);
-    let m = seconds.rem_euclid(3600) / 60;
-    let s = seconds.rem_euclid(60);
-    format!("{h:02}:{m:02}:{s:02}:{f:02}")
+    let minutes = total.rem_euclid(3600) / 60;
+    let seconds = total.rem_euclid(60);
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
 pub(super) fn waveform_columns(waveform: &[f32], width: f32) -> (Vec<f32>, f32) {

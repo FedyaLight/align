@@ -364,20 +364,27 @@ mod motion_tests {
     }
 
     #[test]
-    fn ruler_timecode_counts_the_timeline_frames() {
-        use crate::lane::RulerClock;
-        use crate::views::controls::fmt_timecode;
-        let pal = RulerClock {
-            start: 0.,
-            frame_duration: 1. / 25.,
-        };
+    fn ruler_labels_name_the_second_each_tick_marks() {
+        use crate::views::controls::fmt_ruler_label;
+        // 01:00:00:00 at 29.97 fps starts the ruler 3603.6 s into the day.
+        // Each tick reads the second it stands on, not the frame count
+        // there, which is 01:00:06:12 at the first one.
+        let origin = 3603.6;
+        let labels: Vec<String> = ruler_ticks(60., 12., origin)
+            .into_iter()
+            .map(|at| fmt_ruler_label(Some(origin), at))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "01:00:10", "01:00:20", "01:00:30", "01:00:40", "01:00:50", "01:01:00"
+            ]
+        );
         // A tick on a whole second just short of it in binary arithmetic.
-        assert_eq!(fmt_timecode(pal, 360. - 1e-9), "00:06:00:00");
-        let thirty = RulerClock {
-            start: 10.,
-            frame_duration: 1. / 30.,
-        };
-        assert_eq!(fmt_timecode(thirty, 0.5), "00:00:10:15");
+        assert_eq!(fmt_ruler_label(None, 360. - 1e-9), "00:06:00");
+        // A timecode wraps at midnight; elapsed time keeps counting.
+        assert_eq!(fmt_ruler_label(Some(86_390.), 10.), "00:00:00");
+        assert_eq!(fmt_ruler_label(None, 86_400.), "24:00:00");
     }
 
     #[test]

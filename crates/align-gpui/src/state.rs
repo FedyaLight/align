@@ -384,7 +384,7 @@ pub struct AppData {
     pub selection: HashSet<PathBuf>,
     pub island_count: usize,
     pub lanes: Vec<LaneVisual>,
-    pub ruler_timecode: Option<lane::RulerClock>,
+    pub ruler_timecode: Option<f64>,
     pub live_matches: HashMap<String, LiveMatch>,
     pub visible_matches: Vec<LiveMatch>,
     /// Progress is applied in batches; the provisional layout follows once
@@ -2482,7 +2482,7 @@ fn lane_key(lane: &lane::LaneVisual) -> String {
 type ImportedPreview = (
     Vec<BarVisual>,
     Vec<(ClipId, f64, MatchEvidence)>,
-    Option<lane::RulerClock>,
+    Option<f64>,
 );
 
 fn imported_preview(result: &SyncResult) -> ImportedPreview {
@@ -2529,7 +2529,7 @@ fn imported_preview(result: &SyncResult) -> ImportedPreview {
             )
         })
         .collect();
-    (bars, states, lane::RulerClock::of(&timeline))
+    (bars, states, timeline.ruler_timecode_start())
 }
 
 fn elapsed_label(elapsed: std::time::Duration) -> String {

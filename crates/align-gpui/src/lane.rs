@@ -90,24 +90,7 @@ impl LiveMatch {
 pub struct FinalTimeline {
     pub bars: Vec<BarVisual>,
     pub states: Vec<(ClipId, f64, MatchEvidence)>,
-    pub ruler_timecode: Option<RulerClock>,
-}
-
-/// The timecode at the start of the ruler and the timeline's frame rate,
-/// which its frame digits count.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RulerClock {
-    pub start: f64,
-    pub frame_duration: f64,
-}
-
-impl RulerClock {
-    pub fn of(timeline: &ExportTimeline) -> Option<Self> {
-        Some(Self {
-            start: timeline.ruler_timecode_start()?,
-            frame_duration: timeline.frame_duration.as_seconds(),
-        })
-    }
+    pub ruler_timecode: Option<f64>,
 }
 
 /// The strongest kind of evidence that synchronized `clip`: waveform, then
@@ -250,7 +233,7 @@ pub fn final_bars(
             ruler_timecode: None,
         };
     };
-    let ruler_timecode = RulerClock::of(&timeline);
+    let ruler_timecode = timeline.ruler_timecode_start();
     let preview = timeline.preview_items(&unmatched);
     let bars = preview
         .iter()

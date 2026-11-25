@@ -2,7 +2,7 @@
 
 use super::animation::entrance;
 use super::controls::{
-    RULER_LABEL_W, ZoomDrag, ZoomDragGhost, clip_status_icon, fmt_duration, fmt_timecode,
+    RULER_LABEL_W, ZoomDrag, ZoomDragGhost, clip_status_icon, fmt_duration, fmt_ruler_label,
     hover_tip, ruler_ticks, waveform_columns,
 };
 use super::{
@@ -147,11 +147,7 @@ pub(super) fn timeline_lanes(
     let duration = timeline_duration(data);
     let zoom = data.zoom();
     let (px_per_sec, timeline_w) = timeline_scale(duration, zoom, fit_width);
-    let tick_times = ruler_ticks(
-        duration,
-        px_per_sec,
-        data.ruler_timecode.map_or(0., |clock| clock.start),
-    );
+    let tick_times = ruler_ticks(duration, px_per_sec, data.ruler_timecode.unwrap_or(0.));
     let target_poses = (!timeline_transitions.is_empty()).then(|| timeline_poses(data));
     let now = std::time::Instant::now();
     let row_stride = TIMELINE_ROW_H + 1.;
@@ -183,10 +179,7 @@ pub(super) fn timeline_lanes(
         .w(px(timeline_w));
     for &at in &tick_times {
         let x = (at * px_per_sec) as f32;
-        let label = match data.ruler_timecode {
-            Some(clock) => fmt_timecode(clock, at),
-            None => fmt_duration(at),
-        };
+        let label = fmt_ruler_label(data.ruler_timecode, at);
         ticks = ticks
             .child(
                 div()
