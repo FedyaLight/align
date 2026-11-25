@@ -1,6 +1,6 @@
 //! Motion curves and enter/exit animations shared by the views.
 
-use super::settings::QUALITY_MENU_WIDTH;
+use super::settings::QUALITY_MENU_HEIGHT;
 use super::{
     Animation, AnimationExt, DROPDOWN_MS, Duration, ExportSelect, IntoElement, ParentElement,
     SELECTION_CONTROL_CLOSE_MS, SETTINGS_MOTION_MS, SIDEBAR_CLOSE_MS, SettingsSelect, SharedString,
@@ -106,42 +106,31 @@ pub(super) fn sidebar_reveal<E: IntoElement + Styled + 'static>(
         )
 }
 
+// The dropdown motions size the menu's own surface (`dropdown_surface`),
+// which clips its rows, so no second rounded or shadowed layer is needed.
+
 pub(super) fn quality_dropdown_motion<E: IntoElement + Styled + 'static>(
-    child: E,
+    surface: E,
     closing: bool,
 ) -> impl IntoElement {
-    // Padding and border 10, five 40 px rows, separator block 37.
-    const MENU_HEIGHT: f32 = 248.;
     let reduced = crate::motion::reduced_motion();
-    div()
-        .w(px(QUALITY_MENU_WIDTH))
-        .overflow_hidden()
-        .rounded_lg()
-        .shadow_md()
-        .child(child)
-        .with_animation(
-            if closing {
-                "search-quality-dropdown-out"
-            } else {
-                "search-quality-dropdown-in"
-            },
-            entrance(DROPDOWN_MS),
-            move |el, progress| {
-                let visible = if reduced {
-                    if closing { 1. - progress } else { progress }
-                } else if closing {
-                    1. - progress
-                } else {
-                    progress
-                };
-                let height = if reduced { 1. } else { visible };
-                el.h(px(MENU_HEIGHT * height)).opacity(visible)
-            },
-        )
+    surface.with_animation(
+        if closing {
+            "search-quality-dropdown-out"
+        } else {
+            "search-quality-dropdown-in"
+        },
+        entrance(DROPDOWN_MS),
+        move |el, progress| {
+            let visible = if closing { 1. - progress } else { progress };
+            let height = if reduced { 1. } else { visible };
+            el.h(px(QUALITY_MENU_HEIGHT * height)).opacity(visible)
+        },
+    )
 }
 
 pub(super) fn export_select_motion<E: IntoElement + Styled + 'static>(
-    child: E,
+    surface: E,
     select: ExportSelect,
     menu_height: f32,
     closing: bool,
@@ -153,45 +142,33 @@ pub(super) fn export_select_motion<E: IntoElement + Styled + 'static>(
         (ExportSelect::UnmatchedPlacement, false) => "export-unmatched-select-in",
         (ExportSelect::UnmatchedPlacement, true) => "export-unmatched-select-out",
     };
-    div()
-        .w(px(160.))
-        .overflow_hidden()
-        .rounded_lg()
-        .shadow_md()
-        .child(child)
-        .with_animation(animation_id, entrance(DROPDOWN_MS), move |el, progress| {
-            let visible = if closing { 1. - progress } else { progress };
-            let height = if reduced { 1. } else { visible };
-            el.h(px(menu_height * height)).opacity(visible)
-        })
+    surface.with_animation(animation_id, entrance(DROPDOWN_MS), move |el, progress| {
+        let visible = if closing { 1. - progress } else { progress };
+        let height = if reduced { 1. } else { visible };
+        el.h(px(menu_height * height)).opacity(visible)
+    })
 }
 
 pub(super) fn settings_select_motion<E: IntoElement + Styled + 'static>(
-    child: E,
+    surface: E,
     select: SettingsSelect,
     menu_height: f32,
     closing: bool,
 ) -> impl IntoElement {
     let reduced = crate::motion::reduced_motion();
-    div()
-        .w(px(210.))
-        .overflow_hidden()
-        .rounded_lg()
-        .shadow_md()
-        .child(child)
-        .with_animation(
-            SharedString::from(format!(
-                "settings-{}-{}",
-                select.id(),
-                if closing { "out" } else { "in" }
-            )),
-            entrance(SETTINGS_MOTION_MS),
-            move |el, progress| {
-                let visible = if closing { 1. - progress } else { progress };
-                let height = if reduced { 1. } else { visible };
-                el.h(px(menu_height * height)).opacity(visible)
-            },
-        )
+    surface.with_animation(
+        SharedString::from(format!(
+            "settings-{}-{}",
+            select.id(),
+            if closing { "out" } else { "in" }
+        )),
+        entrance(SETTINGS_MOTION_MS),
+        move |el, progress| {
+            let visible = if closing { 1. - progress } else { progress };
+            let height = if reduced { 1. } else { visible };
+            el.h(px(menu_height * height)).opacity(visible)
+        },
+    )
 }
 
 pub(super) fn settings_reset_motion<E: IntoElement + Styled + 'static>(

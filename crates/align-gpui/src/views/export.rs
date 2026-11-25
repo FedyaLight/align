@@ -3,7 +3,10 @@
 use super::animation::{
     export_reveal, export_select_motion, motion_ease, sidebar_reveal, slide_in,
 };
-use super::controls::{button, hover_tip, modal_header, prominent_button};
+use super::controls::{
+    MENU_CHROME, button, dropdown_surface, hover_tip, modal_header, prominent_button,
+    raised_surface, secondary_chrome,
+};
 use super::settings::Dropdown;
 use super::{
     AlignApp, AnchoredPositionMode, Animation, AnimationExt, BoxShadow, ClickEvent, Context, Div,
@@ -114,14 +117,17 @@ pub(super) fn export_select_option(
         )
 }
 
+/// A labelled export dropdown; `menu` holds its `rows` options, each a
+/// 28 px `export_select_option`.
 pub(super) fn export_select_row(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     row: Dropdown<ExportSelect>,
     enabled: bool,
-    menu_height: f32,
+    rows: usize,
     menu: Stateful<Div>,
 ) -> Div {
+    const WIDTH: f32 = 160.;
     let Dropdown {
         id,
         label,
@@ -130,50 +136,47 @@ pub(super) fn export_select_row(
         open,
         closing,
     } = row;
-    let mut button = div()
-        .id(id)
-        .relative()
-        .w(px(160.))
-        .h(px(28.))
-        .px_2()
-        .flex_shrink_0()
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .gap_2()
-        .rounded_lg()
-        .bg(rgb(if open {
-            theme.border
-        } else {
-            theme.button_hover
-        }))
-        .text_size(px(12.))
-        .child(div().min_w(px(0.)).truncate().child(value))
-        .child(div().w(px(12.)).h(px(12.)).flex_shrink_0().child(svg_icon(
-            "icons/chevron-down.svg",
-            12.,
-            theme.icon,
-        )));
+    let mut button = secondary_chrome(
+        div()
+            .id(id)
+            .relative()
+            .w(px(WIDTH))
+            .h(px(28.))
+            .px_2()
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap_2(),
+        theme,
+        open,
+        enabled,
+    )
+    .child(div().min_w(px(0.)).truncate().child(value))
+    .child(div().w(px(12.)).h(px(12.)).flex_shrink_0().child(svg_icon(
+        "icons/chevron-down.svg",
+        12.,
+        theme.icon,
+    )));
     if enabled {
-        button = button
-            .text_color(rgb(theme.icon))
-            .cursor_pointer()
-            .hover(|this| this.bg(rgb(theme.border)))
-            .active(|this| this.opacity(0.62))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_export_select(select, cx);
-            }));
-    } else {
-        button = button.text_color(rgb(theme.dim)).opacity(0.42);
+        button = button.on_click(cx.listener(move |this, _, _, cx| {
+            this.toggle_export_select(select, cx);
+        }));
     }
     if open {
+        let menu_height = rows as f32 * 28. + MENU_CHROME;
         button = button.child(deferred(
             anchored()
                 .position_mode(AnchoredPositionMode::Local)
                 .offset(point(px(0.), px(4.)))
                 .snap_to_window_with_margin(px(8.))
-                .child(export_select_motion(menu, select, menu_height, closing)),
+                .child(export_select_motion(
+                    dropdown_surface(theme, WIDTH, menu),
+                    select,
+                    menu_height,
+                    closing,
+                )),
         ));
     }
     div()
@@ -370,7 +373,7 @@ pub(super) fn path_fixer_panel(
     inputs: &PathFixerInputs,
     max_height: f32,
 ) -> impl IntoElement {
-    let mut sheet = div()
+    let mut sheet = raised_surface(theme)
         .id("path-fixer-sheet")
         .flex()
         .flex_col()
@@ -381,11 +384,6 @@ pub(super) fn path_fixer_panel(
         .max_h(px(max_height))
         .flex_shrink_0()
         .overflow_y_scroll()
-        .rounded_lg()
-        .border_1()
-        .border_color(rgb(theme.separator))
-        .bg(rgb(theme.panel))
-        .shadow_md()
         .child(modal_header(
             cx,
             theme,
@@ -1578,23 +1576,17 @@ fn export_unmatched_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> 
     use align_core::export_model::UnmatchedPlacement as P;
     let mut group = div().flex().flex_col();
     group = group.child(export_section_title(theme, "Unmatched clips"));
-    let mut menu = div()
-        .id("export-unmatched-placement-menu")
-        .w(px(160.))
-        .flex()
-        .flex_col()
-        .p_1()
-        .rounded_lg()
-        .border_1()
-        .border_color(rgb(theme.border))
-        .bg(rgb(theme.panel))
-        .shadow_md()
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-    for (placement, title, id) in [
+    let placements = [
         (P::ByOrderAndTime, "By order & time", "exp-unmatched-time"),
         (P::ByOrderOnly, "By order only", "exp-unmatched-order"),
         (P::Remove, "Remove", "exp-unmatched-remove"),
-    ] {
+    ];
+    let rows = placements.len();
+    let mut menu = div()
+        .id("export-unmatched-placement-menu")
+        .flex()
+        .flex_col();
+    for (placement, title, id) in placements {
         menu = menu.child(export_select_option(
             cx,
             theme,
@@ -1621,7 +1613,7 @@ fn export_unmatched_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> 
             export_select_closing,
         ),
         !busy,
-        92.,
+        rows,
         menu,
     ));
     let placed = data.camera_clock_export_count();
@@ -1963,19 +1955,10 @@ fn export_formats_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
         if target == ExportTarget::Aaf
             && (reveals.aaf || reveals_closing.contains_key("export-aaf-options"))
         {
-            let mut menu = div()
-                .id("export-aaf-frame-rate-menu")
-                .w(px(160.))
-                .flex()
-                .flex_col()
-                .p_1()
-                .rounded_lg()
-                .border_1()
-                .border_color(rgb(theme.border))
-                .bg(rgb(theme.panel))
-                .shadow_md()
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-            for (id, frame_duration, title) in aaf_frame_rate_options() {
+            let rates = aaf_frame_rate_options();
+            let rows = rates.len();
+            let mut menu = div().id("export-aaf-frame-rate-menu").flex().flex_col();
+            for (id, frame_duration, title) in rates {
                 menu = menu.child(export_select_option(
                     cx,
                     theme,
@@ -2000,7 +1983,7 @@ fn export_formats_section(cx: &mut Context<AlignApp>, sheet: SheetContext) -> Di
                     export_select_closing,
                 ),
                 !busy,
-                260.,
+                rows,
                 menu,
             );
             group = group.child(export_reveal(

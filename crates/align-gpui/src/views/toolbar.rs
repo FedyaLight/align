@@ -1,9 +1,9 @@
 //! Top toolbar: sources, synchronization, and export.
 
 use super::animation::{export_button_entrance, quality_dropdown_motion, quality_shift_for_export};
-use super::controls::{icon_button, prominent_button};
+use super::controls::{dropdown_surface, icon_button, prominent_button};
 use super::menu_sidebar::app_menu_button;
-use super::settings::{search_quality_button, search_quality_menu};
+use super::settings::{QUALITY_MENU_WIDTH, search_quality_button, search_quality_menu};
 use super::timeline::zoom_slider;
 use super::{
     AlignApp, AnchoredPositionMode, Context, Div, Operation, ParentElement, Styled, Theme,
@@ -100,7 +100,11 @@ pub(super) fn toolbar(
                     .offset(point(px(0.), px(4.)))
                     .snap_to_window_with_margin(px(8.))
                     .child(quality_dropdown_motion(
-                        search_quality_menu(cx, theme, data),
+                        dropdown_surface(
+                            theme,
+                            QUALITY_MENU_WIDTH,
+                            search_quality_menu(cx, theme, data),
+                        ),
                         quality_closing,
                     )),
             ));

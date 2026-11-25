@@ -1,7 +1,7 @@
 //! Warning banner and the bottom operation bar.
 
 use super::animation::entrance;
-use super::controls::{button, icon_button, modal_header};
+use super::controls::{button, icon_button, modal_header, raised_surface};
 use super::export::export_reveal_label;
 use super::toolbar::timeline_zoom_controls;
 use super::{
@@ -248,8 +248,8 @@ pub(super) fn stage_settings_panel(
     theme: &Theme,
     data: &crate::state::AppData,
 ) -> impl IntoElement {
-    let mut panel = div().id("stage-settings").w(px(400.)).p_4().flex().flex_col()
-        .gap_2().rounded_lg().bg(rgb(theme.panel)).border_1().border_color(rgb(theme.border))
+    let mut panel = raised_surface(theme).id("stage-settings").w(px(400.)).p_4()
+        .flex().flex_col().gap_2()
         .child(modal_header(cx, theme, "Synchronization stages", "stage-close", |this, _, _, cx| {
             this.data.show_stage_settings = false;
             cx.notify();
@@ -290,17 +290,13 @@ pub(super) fn sequence_results_panel(
     theme: &Theme,
     data: &crate::state::AppData,
 ) -> impl IntoElement {
-    let mut panel = div()
+    let mut panel = raised_surface(theme)
         .id("sequence-results")
         .w(px(420.))
         .p_4()
         .flex()
         .flex_col()
         .gap_2()
-        .rounded_lg()
-        .bg(rgb(theme.panel))
-        .border_1()
-        .border_color(rgb(theme.border))
         .child(modal_header(
             cx,
             theme,
@@ -457,7 +453,7 @@ pub(super) fn camera_clock_panel(
         .result
         .as_ref()
         .is_some_and(|result| result.project.imported_timeline.is_some());
-    let mut panel = div()
+    let mut panel = raised_surface(theme)
         .id("camera-clock")
         .w(px(480.))
         .max_h(px(560.))
@@ -466,10 +462,6 @@ pub(super) fn camera_clock_panel(
         .flex()
         .flex_col()
         .gap_2()
-        .rounded_lg()
-        .bg(rgb(theme.panel))
-        .border_1()
-        .border_color(rgb(theme.border))
         .child(modal_header(
             cx,
             theme,

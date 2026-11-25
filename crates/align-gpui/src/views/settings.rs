@@ -1,7 +1,10 @@
 //! Search quality and synchronization settings.
 
 use super::animation::{entrance, settings_reset_motion, settings_select_motion};
-use super::controls::{icon_button, prominent_button, segmented_control};
+use super::controls::{
+    MENU_CHROME, dropdown_surface, icon_button, prominent_button, raised_surface, secondary_chrome,
+    segmented_control,
+};
 use super::menus::menu_row;
 use super::{
     AlignApp, AnchoredPositionMode, AnimationExt, AudioAnalysisSource, ClipOrder, Context, Div,
@@ -273,59 +276,53 @@ pub(super) fn settings_select_row(
         open,
         closing,
     } = row;
-    let menu_height = options.len() as f32 * 28. + 8.;
+    const WIDTH: f32 = 210.;
+    // 28 px options inside the menu chrome.
+    let menu_height = options.len() as f32 * 28. + MENU_CHROME;
     let mut menu = div()
         .id(SharedString::from(format!("settings-{}-menu", select.id())))
-        .w(px(210.))
         .flex()
-        .flex_col()
-        .p_1()
-        .rounded_lg()
-        .border_1()
-        .border_color(rgb(theme.border))
-        .bg(rgb(theme.panel))
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        .flex_col();
     for (index, (label, selected)) in options.into_iter().enumerate() {
         menu = menu.child(settings_menu_row(cx, theme, select, index, label, selected));
     }
-    let mut control = div()
-        .id(id)
-        .relative()
-        .w(px(210.))
-        .h(px(28.))
-        .px_2()
-        .flex_shrink_0()
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .gap_2()
-        .rounded_lg()
-        .bg(rgb(if open {
-            theme.border
-        } else {
-            theme.button_hover
-        }))
-        .text_size(px(12.))
-        .text_color(rgb(theme.icon))
-        .cursor_pointer()
-        .hover(|this| this.bg(rgb(theme.border)))
-        .active(|this| this.opacity(0.62))
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_click(cx.listener(move |this, _, _, cx| this.toggle_settings_select(select, cx)))
-        .child(div().min_w(px(0.)).truncate().child(value))
-        .child(div().w(px(12.)).h(px(12.)).flex_shrink_0().child(svg_icon(
-            "icons/chevron-down.svg",
-            12.,
-            theme.icon,
-        )));
+    let mut control = secondary_chrome(
+        div()
+            .id(id)
+            .relative()
+            .w(px(WIDTH))
+            .h(px(28.))
+            .px_2()
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap_2(),
+        theme,
+        open,
+        true,
+    )
+    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+    .on_click(cx.listener(move |this, _, _, cx| this.toggle_settings_select(select, cx)))
+    .child(div().min_w(px(0.)).truncate().child(value))
+    .child(div().w(px(12.)).h(px(12.)).flex_shrink_0().child(svg_icon(
+        "icons/chevron-down.svg",
+        12.,
+        theme.icon,
+    )));
     if open {
         control = control.child(deferred(
             anchored()
                 .position_mode(AnchoredPositionMode::Local)
                 .offset(point(px(0.), px(4.)))
                 .snap_to_window_with_margin(px(8.))
-                .child(settings_select_motion(menu, select, menu_height, closing)),
+                .child(settings_select_motion(
+                    dropdown_surface(theme, WIDTH, menu),
+                    select,
+                    menu_height,
+                    closing,
+                )),
         ));
     }
     div()
@@ -508,51 +505,46 @@ pub(super) fn search_quality_button(
         "Quality: {}",
         data.current_effective_settings().search_accuracy.label()
     );
-    let mut control = div()
-        .id("btn-search-quality")
-        .w_full()
-        .h_full()
-        .px_3()
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .gap_2()
-        .rounded_lg()
-        .bg(rgb(if data.show_search_quality {
-            theme.border
-        } else {
-            theme.button_hover
-        }))
-        .text_size(px(12.))
-        .child(div().min_w(px(0.)).truncate().child(label))
-        .child(div().w(px(12.)).h(px(12.)).flex_shrink_0().child(svg_icon(
-            "icons/chevron-down.svg",
-            12.,
-            theme.icon,
-        )));
-    if enabled {
-        control = control
-            .text_color(rgb(theme.icon))
-            .cursor_pointer()
-            .hover(|this| this.bg(rgb(theme.border)))
-            .active(|this| this.opacity(0.62))
-            .on_click(cx.listener(|this, _, _, cx| {
-                if this.data.show_search_quality {
-                    this.close_search_quality(cx);
-                } else {
-                    this.search_quality_exit.cancel();
-                    this.data.show_search_quality = true;
-                    cx.notify();
-                }
-            }));
-    } else {
-        control = control.text_color(rgb(theme.dim)).opacity(0.42);
+    let control = secondary_chrome(
+        div()
+            .id("btn-search-quality")
+            .w_full()
+            .h_full()
+            .px_3()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap_2(),
+        theme,
+        data.show_search_quality,
+        enabled,
+    )
+    .child(div().min_w(px(0.)).truncate().child(label))
+    .child(div().w(px(12.)).h(px(12.)).flex_shrink_0().child(svg_icon(
+        "icons/chevron-down.svg",
+        12.,
+        theme.icon,
+    )));
+    if !enabled {
+        return control;
     }
-    control
+    control.on_click(cx.listener(|this, _, _, cx| {
+        if this.data.show_search_quality {
+            this.close_search_quality(cx);
+        } else {
+            this.search_quality_exit.cancel();
+            this.data.show_search_quality = true;
+            cx.notify();
+        }
+    }))
 }
 
 pub(super) const QUALITY_MENU_WIDTH: f32 = 232.;
+/// Five 40 px levels and the 37 px "More settings…" block (separator
+/// margin, padding and line over a 28 px row) inside the menu chrome.
+pub(super) const QUALITY_MENU_HEIGHT: f32 =
+    MENU_CHROME + align_core::SearchAccuracy::ALL.len() as f32 * 40. + 37.;
 
 /// One-line guidance under each search level in the quality menu.
 pub(super) fn search_quality_hint(accuracy: align_core::SearchAccuracy) -> &'static str {
@@ -629,18 +621,7 @@ pub(super) fn search_quality_menu(
     data: &crate::state::AppData,
 ) -> Stateful<Div> {
     let selected = data.current_effective_settings().search_accuracy;
-    let mut menu = div()
-        .id("search-quality-menu")
-        .w(px(QUALITY_MENU_WIDTH))
-        .flex()
-        .flex_col()
-        .p_1()
-        .rounded_lg()
-        .border_1()
-        .border_color(rgb(theme.border))
-        .bg(rgb(theme.panel))
-        .shadow_md()
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+    let mut menu = div().id("search-quality-menu").flex().flex_col();
     for (index, accuracy) in align_core::SearchAccuracy::ALL.into_iter().enumerate() {
         menu = menu.child(search_quality_row(
             cx,
@@ -737,12 +718,11 @@ pub(super) fn search_settings_panel(
             ),
         ],
     );
-    div()
+    raised_surface(theme)
         .id("search-settings")
         .w(px(560.))
         .p_4()
         .flex().flex_col().gap_2()
-        .rounded_lg().bg(rgb(theme.panel)).border_1().border_color(rgb(theme.border))
         .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close_settings_select(cx)))
         .child(settings_header(cx, theme, data, close_closing, reset_closing))
         .child(div().text_size(px(12.)).text_color(rgb(theme.dim)).child(

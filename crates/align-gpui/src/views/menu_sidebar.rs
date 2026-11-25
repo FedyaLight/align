@@ -6,13 +6,13 @@ use gpui::{Action, OwnedMenu, OwnedMenuItem};
 use crate::theme::AppearancePreference;
 
 use super::animation::{SidebarEdge, entrance, sidebar_reveal};
-use super::controls::{button, modal_header};
+use super::controls::{button, menu_surface, modal_header, secondary_chrome};
 use super::export::check_row;
 use super::{
-    AlignApp, AnchoredPositionMode, AnimationExt, ClickEvent, Context, Div, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, SIDEBAR_CLOSE_MS, SharedString, Stateful,
-    StatefulInteractiveElement, Styled, Theme, ThemeMode, Window, anchored, deferred, div, point,
-    px, rgb, rgba, svg_icon,
+    AlignApp, AnchoredPositionMode, AnimationExt, ClickEvent, Context, Div, FluentBuilder,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, SIDEBAR_CLOSE_MS, SharedString,
+    Stateful, StatefulInteractiveElement, Styled, Theme, ThemeMode, Window, anchored, deferred,
+    div, point, px, rgb, rgba, svg_icon,
 };
 
 const WIDTH: f32 = 324.;
@@ -514,69 +514,62 @@ fn sidebar_select(
         AppMenuSelect::Retention => ("app-menu-retention", "Keep for"),
     };
     let open = current == Some(select);
-    let control = div()
-        .id(id)
-        .h(px(28.))
-        .px_3()
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap_2()
-        .rounded_lg()
-        .text_size(px(12.))
-        .text_color(rgb(theme.icon))
-        .bg(rgb(if open {
-            theme.border
-        } else {
-            theme.button_hover
-        }))
-        .cursor_pointer()
-        .hover(|row| row.bg(rgb(theme.border)))
-        .active(|row| row.opacity(0.62))
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.app_menu_select = Some(select);
-            cx.notify();
-            cx.stop_propagation();
-        }))
-        .child(
-            div()
-                .min_w(px(0.))
-                .truncate()
-                .child(format!("{label}: {}", value.into())),
-        )
-        .child(
-            div()
-                .flex_shrink_0()
-                .child(svg_icon("icons/chevron-down.svg", 12., theme.icon)),
-        );
+    let control = secondary_chrome(
+        div()
+            .id(id)
+            .h(px(28.))
+            .px_3()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2(),
+        theme,
+        open,
+        true,
+    )
+    .on_click(cx.listener(move |this, _, _, cx| {
+        this.app_menu_select = Some(select);
+        cx.notify();
+        cx.stop_propagation();
+    }))
+    .child(
+        div()
+            .min_w(px(0.))
+            .truncate()
+            .child(format!("{label}: {}", value.into())),
+    )
+    .child(
+        div()
+            .flex_shrink_0()
+            .child(svg_icon("icons/chevron-down.svg", 12., theme.icon)),
+    );
     let mut field = div().relative().child(control);
     if open {
         let popup =
-            div()
+            menu_surface(theme)
                 .id(SharedString::from(format!("{id}-options")))
                 .w(px(WIDTH - PADDING * 2. - 1.))
                 .flex()
                 .flex_col()
-                .p_1()
-                .rounded_lg()
-                .border_1()
-                .border_color(rgb(theme.border))
-                .bg(rgb(theme.panel))
-                .shadow_md()
                 .occlude()
                 .children(options.into_iter().enumerate().map(
                     |(index, (label, selected, action))| {
+                        // The selection is checked in the accent, as in the
+                        // other dropdowns.
                         sidebar_row(
                             cx,
                             theme,
                             format!("{id}-{index}"),
                             label,
-                            selected.then_some("icons/check.svg"),
+                            None,
                             move |this, _, window, cx| {
                                 this.dismiss_app_menu(cx);
                                 window.dispatch_action(action.boxed_clone(), cx);
                             },
                         )
+                        .when(selected, |row| {
+                            row.child(svg_icon("icons/check.svg", 12., theme.accent))
+                        })
                     },
                 ));
         field = field.child(deferred(

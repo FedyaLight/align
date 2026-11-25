@@ -1,6 +1,6 @@
 //! Diagnostics, sequence picker, and context menus.
 
-use super::controls::{button, modal_header, prominent_button};
+use super::controls::{button, menu_surface, modal_header, prominent_button, raised_surface};
 use super::settings::{
     audio_source_label, clip_order_label, match_threshold_label, track_content_label,
 };
@@ -20,18 +20,13 @@ pub(super) fn sequence_picker_panel(
     theme: &Theme,
     picker: SequencePicker,
 ) -> impl IntoElement {
-    let mut panel = div()
+    let mut panel = raised_surface(theme)
         .flex()
         .flex_col()
         .gap_1()
         .p_5()
         .m_2()
         .max_w(px(420.))
-        .rounded_lg()
-        .border_1()
-        .border_color(rgb(theme.border))
-        .bg(rgb(theme.panel))
-        .shadow_md()
         .child(modal_header(
             cx,
             theme,
@@ -147,16 +142,10 @@ pub(super) fn context_menu(
     data: &crate::state::AppData,
     menu: MenuTarget,
 ) -> impl IntoElement {
-    let mut panel = div()
+    let mut panel = menu_surface(theme)
         .id("ctx-menu")
         .flex()
         .flex_col()
-        .p_1()
-        .rounded_lg()
-        .border_1()
-        .border_color(rgb(theme.border))
-        .bg(rgb(theme.panel))
-        .shadow_md()
         .occlude()
         .min_w(px(280.))
         .max_w(px(420.))
