@@ -399,7 +399,10 @@ mod tests {
             Some("00:01:40 – 00:02:40 · 0:01:00")
         );
         assert_eq!(row(&waveform, "Source TC"), None);
-        assert_eq!(waveform.path, "/shoot/C1.MP4");
+        assert_eq!(
+            waveform.path,
+            Path::new("/shoot").join("C1.MP4").display().to_string()
+        );
         data.ruler_timecode = Some(3603.6);
         assert_eq!(
             row(&card(&data, "C1"), "Timeline"),
