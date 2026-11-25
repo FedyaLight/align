@@ -68,7 +68,10 @@ pub(super) fn allocate_entries<'a, E: Copy>(
         .zip(used)
         .filter_map(|(e, u)| (!u).then_some(*e))
         .collect();
-    let requests: Vec<_> = remaining.iter().map(request).collect();
+    let requests: Vec<_> = remaining
+        .iter()
+        .map(|entry| request(entry).assembled_at(parts(entry).0.assembled_start(kind)))
+        .collect();
     let assignments = allocate(&requests);
     let mut lanes: BTreeMap<usize, Vec<E>> = BTreeMap::new();
     for (e, r) in remaining.into_iter().zip(requests) {

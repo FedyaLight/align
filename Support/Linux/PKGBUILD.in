@@ -13,7 +13,7 @@ optdepends=('vulkan-intel: Vulkan driver for Intel graphics'
             'vulkan-radeon: Vulkan driver for AMD graphics'
             'nvidia-utils: Vulkan driver for NVIDIA graphics'
             'xdg-desktop-portal: desktop file dialogs and integration')
-# The input is already stripped. Rewriting PyInstaller binaries damages AAF.
+# The input is already stripped.
 options=('!strip' '!debug')
 source=('align-payload.tar.gz')
 sha256sums=('@PAYLOAD_SHA256@')

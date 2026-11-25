@@ -242,6 +242,75 @@ fn repeated_checkpoints_keep_the_latest_sequence_settings_after_reopen() {
 }
 
 #[test]
+fn projects_saved_with_reversed_fcp7_numbering_keep_their_sequence_settings() {
+    let (_temp, root) = fixture();
+    let writer = Writer::default();
+    let destination = Destination::autosave(&root);
+    let source = root.join("edits.xml");
+    fs::write(
+        &source,
+        "<xmeml><sequence><name>Morning</name></sequence><sequence><name>Evening</name></sequence></xmeml>",
+    ).unwrap();
+    let mut data = AppData::default();
+    let token = data.import_cancel.clone();
+    let paths = data.begin_import(vec![source.clone()]);
+    let inputs = paths
+        .into_iter()
+        .map(|path| crate::state::InputPath::inspect(path, &token))
+        .collect();
+    data.finish_import(&token, inputs);
+    data.choose_all_sequences();
+    data.settings_scope = SettingsScope::CurrentSequence;
+    assert!(data.set_scoped_search_accuracy(Some(SearchAccuracy::Exhaustive)));
+    save(&writer, &destination, &data, None);
+
+    // Earlier versions numbered FCP 7 sequences from the last one, so key 0
+    // was "Evening", and did not write the order marker.
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&destination.path).unwrap()).unwrap();
+    document["session"]
+        .as_object_mut()
+        .unwrap()
+        .remove("fcp7DocumentOrder")
+        .unwrap();
+    fs::write(&destination.path, serde_json::to_vec(&document).unwrap()).unwrap();
+
+    let reopened = restore(&destination.path);
+    assert_eq!(reopened.sequence_key_for_position(0), 1);
+    assert_eq!(reopened.sequence_key_for_position(1), 0);
+    assert_eq!(
+        reopened.effective_settings_for(1).search_accuracy,
+        SearchAccuracy::Exhaustive
+    );
+    assert_eq!(
+        reopened.effective_settings_for(0).search_accuracy,
+        SearchAccuracy::Balanced
+    );
+}
+
+#[test]
+fn opening_an_autosave_restarts_its_expiry() {
+    let (_temp, root) = fixture();
+    let writer = Writer::default();
+    let destination = Destination::autosave(&root);
+    save(&writer, &destination, &AppData::default(), None);
+    let old =
+        FileTimes::new().set_modified(SystemTime::now() - RETENTION + Duration::from_secs(60));
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&destination.path)
+        .unwrap()
+        .set_times(old)
+        .unwrap();
+
+    assert!(open(&destination.path).unwrap().destination.managed);
+    // A week after it was last written, but only minutes after it was opened.
+    let later = SystemTime::now() + Duration::from_secs(120);
+    assert_eq!(managed_projects(&root, later).len(), 1);
+    assert!(destination.path.is_file());
+}
+
+#[test]
 fn startup_expiry_keeps_manual_documents_copies_and_non_project_files() {
     let (_temp, root) = fixture();
     let project_dir = root.join("projects");
@@ -408,13 +477,13 @@ fn embedded_aaf_project_reextracts_same_media_or_keeps_a_safe_stale_result() {
             .unwrap();
         assert_eq!(rerun.project.clips[0].id, id);
         use align_core::export::TimelineExportFormat;
-        use align_decode::export::{ExportOptions, ExportRequest, export_prepared};
+        use align_decode::export::{ExportBatchRequest, ExportOptions, export_prepared_many};
         let output = root.join("export");
         let timeline = ExportTimeline::from_result(&result, true).unwrap();
-        let export = export_prepared(
-            ExportRequest {
+        let export = export_prepared_many(
+            ExportBatchRequest {
                 backend: pipe.backend(),
-                timeline: &timeline,
+                timelines: std::slice::from_ref(&timeline),
                 directory: &output,
                 options: &ExportOptions {
                     formats: vec![TimelineExportFormat::ResolveOTIO],
@@ -550,4 +619,480 @@ fn manually_saved_project_can_be_resaved_after_json_reformatting() {
         restore(&destination.path).common_settings.search_accuracy,
         SearchAccuracy::Deep
     );
+}
+
+/// A recorder and camera clips C1, C2 and C4 synchronized by sound. C3 is
+/// unmatched in the waveform stage; the timecode stage, selected, places it.
+pub(crate) fn camera_clock_shoot(root: &Path) -> SyncResult {
+    use align_core::{
+        AudioSummary, Clip, ClipId, ClipPlacement, MappingPoint, MatchEvidence, MatchSummary,
+        MediaKind, MediaTime, RecordingTimestampSource, SyncIsland, SyncProject, SyncStage,
+        SyncStageKind, TimeMap, VideoSummary,
+    };
+    const T0: i64 = 1_741_082_400;
+    let camera = |name: &str, offset: i64, duration: f64| Clip {
+        id: ClipId::new(name),
+        url: root.join(format!("{name}.MP4")),
+        kind: MediaKind::Video,
+        duration: MediaTime::seconds(duration),
+        audio: vec![AudioSummary {
+            sample_rate: 48_000.0,
+            channels: 2,
+            bit_depth: Some(16),
+            is_float: Some(false),
+            source_timecode: None,
+        }],
+        video: Some(VideoSummary {
+            width: 1920,
+            height: 1080,
+            frame_duration: Some(MediaTime::new(1, 25)),
+            source_timecode: None,
+            frame_rate_mode: None,
+        }),
+        recorded_at: Some(T0 + offset),
+        recorded_at_source: Some(RecordingTimestampSource::EmbeddedMetadata),
+        source_identifier: Some("device:Sony:ILME-FX3:4711".into()),
+        media_span: None,
+    };
+    let recorder = Clip {
+        id: ClipId::new("R"),
+        url: root.join("R.WAV"),
+        kind: MediaKind::Audio,
+        video: None,
+        recorded_at: None,
+        recorded_at_source: None,
+        source_identifier: None,
+        ..camera("R", 0, 1200.0)
+    };
+    let clips = vec![
+        recorder,
+        camera("C1", 0, 60.0),
+        camera("C2", 300, 60.0),
+        camera("C3", 600, 90.0),
+        camera("C4", 800, 60.0),
+    ];
+    let place = |name: &str, start: f64| {
+        let duration = clips.iter().find(|c| c.id.0 == name).unwrap().duration;
+        ClipPlacement {
+            clip_id: ClipId::new(name),
+            mapping: TimeMap {
+                points: vec![
+                    MappingPoint {
+                        source: MediaTime::seconds(0.0),
+                        island: MediaTime::seconds(start),
+                    },
+                    MappingPoint {
+                        source: duration,
+                        island: MediaTime::seconds(start + duration.as_seconds()),
+                    },
+                ],
+            },
+            confidence: 0.9,
+        }
+    };
+    let matched = |name: &str, evidence| MatchSummary {
+        left: ClipId::new("R"),
+        right: ClipId::new(name),
+        drift_ppm: 0.0,
+        offset: MediaTime::seconds(0.0),
+        confidence: 0.9,
+        anchors: 3,
+        covered: MediaTime::seconds(60.0),
+        residual: MediaTime::seconds(0.0),
+        evidence: Some(evidence),
+    };
+    let sound: Vec<_> = ["C1", "C2", "C4"]
+        .into_iter()
+        .map(|name| matched(name, MatchEvidence::Waveform))
+        .collect();
+    let mut placements = vec![
+        place("R", 0.0),
+        place("C1", 100.0),
+        place("C2", 400.0),
+        place("C4", 899.6),
+    ];
+    let waveform = SyncStage {
+        kind: SyncStageKind::Waveform,
+        islands: vec![SyncIsland {
+            id: 0,
+            placements: placements.clone(),
+        }],
+        unmatched: vec![ClipId::new("C3")],
+        matches: sound.clone(),
+    };
+    placements.push(place("C3", 700.0));
+    let mut with_timecode = sound;
+    with_timecode.push(matched("C3", MatchEvidence::Timecode));
+    let timecode = SyncStage {
+        kind: SyncStageKind::Timecode,
+        islands: vec![SyncIsland { id: 0, placements }],
+        unmatched: Vec::new(),
+        matches: with_timecode,
+    };
+    let mut result = SyncResult {
+        search_overrides: HashMap::new(),
+        stopped: false,
+        stages: vec![waveform, timecode],
+        selected_stage: None,
+        search_accuracy: Default::default(),
+        preserve_editing_tracks: Default::default(),
+        project: SyncProject {
+            clips,
+            warnings: Vec::new(),
+            imported_timeline: None,
+        },
+        islands: Vec::new(),
+        unmatched: Vec::new(),
+        matches: Vec::new(),
+        temporal_policy: Default::default(),
+    };
+    assert!(result.select_stage(1));
+    result
+}
+
+/// `camera_clock_shoot` with the recorder dated by its file, which places
+/// the ordinary C3 slot first.
+fn file_dated_shoot(root: &Path) -> SyncResult {
+    let mut shoot = camera_clock_shoot(root);
+    shoot.project.clips[0].recorded_at = Some(1_800_000_000);
+    shoot.project.clips[0].recorded_at_source =
+        Some(align_core::RecordingTimestampSource::FileSystem);
+    shoot
+}
+
+/// Every bar of the timeline preview: name, start, duration.
+fn bar_layout(data: &AppData) -> Vec<(String, f64, f64)> {
+    data.lanes
+        .iter()
+        .flat_map(|lane| &lane.clips)
+        .map(|bar| (bar.name.clone(), bar.start, bar.duration))
+        .collect()
+}
+
+#[test]
+fn camera_clock_choices_follow_stage_changes_and_the_project() {
+    use crate::lane::BarMatchState;
+    let (_temp, root) = fixture();
+    let c3 = align_core::ClipId::new("C3");
+    let state = |data: &AppData| {
+        data.lanes
+            .iter()
+            .flat_map(|lane| &lane.clips)
+            .find(|bar| bar.clip_id == c3)
+            .map(|bar| (bar.match_state, bar.start))
+    };
+    let mut data = AppData::default();
+    data.apply_result(file_dated_shoot(&root));
+    assert_eq!(state(&data).unwrap().0, BarMatchState::Matched);
+    assert!(!data.set_camera_clock(std::slice::from_ref(&c3), true));
+
+    // The waveform stage offers an estimate; nothing applies it unasked.
+    assert!(data.select_sync_stage(0));
+    assert_eq!(state(&data).unwrap().0, BarMatchState::Unmatched);
+    assert!(data.camera_clock_for_export(0).is_empty());
+    assert!(data.set_camera_clock(std::slice::from_ref(&c3), true));
+    let (placed, start) = state(&data).unwrap();
+    assert_eq!(placed, BarMatchState::CameraClock);
+    // Export applies the estimate the preview shows.
+    let exported = data.camera_clock_for_export(0);
+    assert_eq!(exported.len(), 1);
+    assert!((exported[0].start + 91.0 - start).abs() < 1e-6);
+
+    // Remove unmatched leaves no estimate to apply, so the preview is the
+    // ordinary one, as for a project that never chose the placement.
+    let mut settings = data.export.clone();
+    settings.unmatched = align_core::export_model::UnmatchedPlacement::Remove;
+    data.apply_export_settings(&settings);
+    assert!(data.camera_clock_for_export(0).is_empty());
+    let mut never_chosen = AppData::default();
+    never_chosen.apply_result(file_dated_shoot(&root));
+    never_chosen.select_sync_stage(0);
+    never_chosen.apply_export_settings(&settings);
+    assert_eq!(state(&never_chosen).unwrap().0, BarMatchState::Unmatched);
+    assert_eq!(bar_layout(&data), bar_layout(&never_chosen));
+    settings.unmatched = align_core::export_model::UnmatchedPlacement::ByOrderOnly;
+    data.apply_export_settings(&settings);
+    assert_eq!(state(&data), Some((placed, exported[0].start)));
+
+    // Another stage synchronizes C3; returning restores the placement.
+    assert!(data.select_sync_stage(1));
+    assert_eq!(state(&data).unwrap().0, BarMatchState::Matched);
+    assert!(data.camera_clock_for_export(0).is_empty());
+    assert!(data.select_sync_stage(0));
+    assert_eq!(state(&data).unwrap().0, BarMatchState::CameraClock);
+
+    let writer = Writer::default();
+    let destination = Destination::autosave(&root.join("projects"));
+    let placements = Arc::new(Placements::from_run(
+        std::slice::from_ref(data.result.as_ref().unwrap()),
+        Revisions::new(),
+    ));
+    save(&writer, &destination, &data, Some(placements));
+    let reopened = restore(&destination.path);
+    assert_eq!(state(&reopened).unwrap().0, BarMatchState::CameraClock);
+
+    // A project saved before camera-clock placement opens without it.
+    let mut session = serde_json::to_value(data.project_session()).unwrap();
+    assert!(
+        session
+            .as_object_mut()
+            .unwrap()
+            .remove("cameraClock")
+            .is_some()
+    );
+    let mut older = AppData::default();
+    older.restore_project(
+        serde_json::from_value(session).unwrap(),
+        vec![data.result.clone().unwrap()],
+        Vec::new(),
+        false,
+    );
+    assert_eq!(state(&older).unwrap().0, BarMatchState::Unmatched);
+}
+
+#[test]
+fn rejected_clock_choices_hold_for_place_all_one_at_a_time_and_reopen() {
+    use crate::lane::CorrectionOption;
+    use align_core::ClipId;
+    let (_temp, root) = fixture();
+    let shoot = competing_camera_clock(&root, 90.0, 90.0);
+    let ids = [ClipId::new("C3"), ClipId::new("C3b")];
+    for (pair, offset, count) in [(true, 0.0, 1), (false, 1.0, 1), (false, 3.0, 2)] {
+        let mut data = AppData::default();
+        data.apply_result(shoot.clone());
+        let correction = CorrectionOption {
+            id: "pair".into(),
+            left: ids[1].clone(),
+            right: ids[0].clone(),
+            other_name: "C3".into(),
+            offset,
+        };
+        if pair {
+            data.reject_pair(&correction);
+        } else {
+            data.reject_alignment(&correction);
+        }
+        assert!(data.set_camera_clock(&ids, true));
+        assert_eq!(data.camera_clock_for_export(0).len(), count);
+        if count == 1 {
+            assert!(data.camera_clock.refusal(&ids[1]).is_some());
+        }
+        data.set_camera_clock(&ids, false);
+        assert!(data.set_camera_clock(&ids[1..], true));
+        assert_eq!(data.set_camera_clock(&ids[..1], true), count == 2);
+        // A project may already contain both choices from before the conflict.
+        let mut session = serde_json::to_value(data.project_session()).unwrap();
+        session["cameraClock"]["0"] = serde_json::json!(ids);
+        data.restore_project(
+            serde_json::from_value(session).unwrap(),
+            vec![shoot.clone()],
+            vec![],
+            false,
+        );
+        assert_eq!(data.camera_clock_for_export(0).len(), count);
+        assert!(data.camera_clock_applied(&ids[0]));
+        assert_eq!(data.camera_clock_applied(&ids[1]), count == 2);
+    }
+}
+
+/// `camera_clock_shoot` with a second camera recording the same times against
+/// the same recorder, so C3 and C3b are unmatched and cannot both be placed.
+/// C3 is `c3` seconds long and C3b `c3b`.
+fn competing_camera_clock(root: &Path, c3: f64, c3b: f64) -> SyncResult {
+    use align_core::{ClipId, MediaTime};
+    let mut shoot = camera_clock_shoot(root);
+    assert!(shoot.select_stage(0));
+    shoot.stages.clear();
+    shoot.selected_stage = None;
+    for mut clip in shoot
+        .project
+        .clone()
+        .clips
+        .into_iter()
+        .filter(|c| c.video.is_some())
+    {
+        clip.id.0.push('b');
+        clip.url = root.join(format!("{}.MP4", clip.id.0));
+        clip.source_identifier = Some("device:Sony:ILME-FX3:4712".into());
+        shoot.project.clips.push(clip);
+    }
+    for mut p in shoot.islands[0]
+        .placements
+        .clone()
+        .into_iter()
+        .filter(|p| p.clip_id.0 != "R")
+    {
+        p.clip_id.0.push('b');
+        shoot.islands[0].placements.push(p);
+    }
+    for mut m in shoot.matches.clone() {
+        m.right.0.push('b');
+        shoot.matches.push(m);
+    }
+    shoot.unmatched.push(ClipId::new("C3b"));
+    for clip in &mut shoot.project.clips {
+        match clip.id.0.as_str() {
+            "C3" => clip.duration = MediaTime::seconds(c3),
+            "C3b" => clip.duration = MediaTime::seconds(c3b),
+            _ => {}
+        }
+    }
+    shoot
+}
+
+#[test]
+fn clearing_camera_clock_forgets_choices_cleanup_hides_and_keeps_other_sequences() {
+    use align_core::ClipId;
+    let (_temp, root) = fixture();
+    let mut data = AppData::default();
+    data.apply_result(competing_camera_clock(&root, 20.0, 2.0));
+    let long = ClipId::new("C3");
+    let short = ClipId::new("C3b");
+    assert!(!data.has_camera_clock_choice());
+    assert!(!data.clear_camera_clock());
+    assert!(data.set_camera_clock(&[long.clone(), short.clone()], true));
+    assert!(data.has_camera_clock_choice());
+
+    // Cleanup hides the short clip's estimate but keeps its choice.
+    let mut settings = data.export.clone();
+    settings.cut_shorter_than = 5.0;
+    data.apply_export_settings(&settings);
+    assert!(!data.camera_clock_applied(&short));
+
+    // Another sequence's choice, as a saved project would carry it.
+    let mut session = serde_json::to_value(data.project_session()).unwrap();
+    let choices = session["cameraClock"].as_object_mut().unwrap();
+    assert_eq!(choices.len(), 1);
+    choices.insert("7".into(), serde_json::json!(["C3"]));
+    data.restore_project(
+        serde_json::from_value(session).unwrap(),
+        vec![data.result.clone().unwrap()],
+        Vec::new(),
+        false,
+    );
+    data.apply_export_settings(&settings);
+    assert!(data.camera_clock_applied(&long));
+    data.exported_files.push(root.join("export.xml"));
+
+    assert!(data.clear_camera_clock());
+    assert!(!data.has_camera_clock_choice());
+    assert!(data.exported_files.is_empty());
+    assert!(!data.camera_clock_applied(&long));
+    assert!(data.camera_clock_for_export(0).is_empty());
+    let saved = serde_json::to_value(data.project_session()).unwrap();
+    let saved: Vec<&String> = saved["cameraClock"].as_object().unwrap().keys().collect();
+    assert_eq!(saved, ["7"]);
+
+    // Nothing hidden comes back when cleanup is turned off.
+    settings.cut_shorter_than = 0.0;
+    data.apply_export_settings(&settings);
+    assert!(!data.camera_clock_applied(&short));
+    assert!(!data.camera_clock_applied(&long));
+    assert!(!data.clear_camera_clock());
+}
+
+#[test]
+fn returning_a_clock_choice_does_not_place_the_clip_it_held_back() {
+    use crate::lane::CorrectionOption;
+    use align_core::ClipId;
+    let (_temp, root) = fixture();
+    let shoot = competing_camera_clock(&root, 90.0, 90.0);
+    let ids = [ClipId::new("C3"), ClipId::new("C3b")];
+    let mut data = AppData::default();
+    data.apply_result(shoot);
+    assert!(data.set_camera_clock(&ids, true));
+    assert_eq!(data.camera_clock_for_export(0).len(), 2);
+    // Rejecting the pair afterwards leaves only C3 placed; C3b is held back.
+    data.reject_pair(&CorrectionOption {
+        id: "pair".into(),
+        left: ids[1].clone(),
+        right: ids[0].clone(),
+        other_name: "C3".into(),
+        offset: 0.0,
+    });
+    assert!(data.camera_clock_applied(&ids[0]));
+    assert!(!data.camera_clock_applied(&ids[1]));
+
+    // Return All to Unmatched, as the panel sends it for the visible clips.
+    let visible: Vec<ClipId> = data
+        .camera_clock
+        .estimates
+        .iter()
+        .map(|e| e.clip_id.clone())
+        .collect();
+    assert_eq!(visible, vec![ids[0].clone()]);
+    assert!(data.set_camera_clock(&visible, false));
+    assert!(data.camera_clock_for_export(0).is_empty());
+    assert!(!data.camera_clock_applied(&ids[1]));
+    // Both are offered again; the choice is the user's to make anew.
+    assert_eq!(data.camera_clock.estimates.len(), 2);
+}
+
+#[test]
+fn a_clock_choice_the_cleanup_removes_does_not_block_the_clip_it_conflicts_with() {
+    use crate::lane::CorrectionOption;
+    use align_core::ClipId;
+    let (_temp, root) = fixture();
+    // C3b is two seconds long, C3 twenty.
+    let shoot = competing_camera_clock(&root, 20.0, 2.0);
+    let ids = [ClipId::new("C3"), ClipId::new("C3b")];
+    let mut data = AppData::default();
+    data.apply_result(shoot);
+    data.reject_pair(&CorrectionOption {
+        id: "pair".into(),
+        left: ids[1].clone(),
+        right: ids[0].clone(),
+        other_name: "C3".into(),
+        offset: 0.0,
+    });
+    assert!(data.set_camera_clock(&ids[1..], true));
+    assert!(data.camera_clock_applied(&ids[1]));
+    assert!(data.camera_clock.estimate(&ids[0]).is_none());
+
+    // Remove clips shorter than 5 s drops C3b; C3 is offered and places.
+    let mut settings = data.export.clone();
+    settings.cut_shorter_than = 5.0;
+    data.apply_export_settings(&settings);
+    assert!(!data.camera_clock_applied(&ids[1]));
+    assert!(data.camera_clock.estimate(&ids[0]).is_some());
+    assert!(data.set_camera_clock(&ids[..1], true));
+    let exported: Vec<_> = data
+        .camera_clock_for_export(0)
+        .into_iter()
+        .map(|e| e.clip_id)
+        .collect();
+    assert_eq!(exported, vec![ids[0].clone()]);
+
+    // Without the cleanup C3b is not restored over the placement chosen later.
+    settings.cut_shorter_than = 0.0;
+    data.apply_export_settings(&settings);
+    assert!(data.camera_clock_applied(&ids[0]));
+    assert!(!data.camera_clock_applied(&ids[1]));
+}
+
+/// A choice made at one stage outlives it, but while the stage gives the
+/// clip no estimate the preview is the ordinary one, whatever the export
+/// settings would do to the timeline.
+#[test]
+fn a_kept_clock_choice_does_not_change_the_preview_without_an_estimate() {
+    let (_temp, root) = fixture();
+    let c3 = align_core::ClipId::new("C3");
+    let prepare = |chosen: bool| {
+        let mut data = AppData::default();
+        data.apply_result(file_dated_shoot(&root));
+        if chosen {
+            assert!(data.select_sync_stage(0));
+            assert!(data.set_camera_clock(std::slice::from_ref(&c3), true));
+        }
+        let mut settings = data.export.clone();
+        settings.cut_common_gaps = true;
+        settings.trim_starts = 2.0;
+        settings.unmatched = align_core::export_model::UnmatchedPlacement::ByOrderOnly;
+        data.apply_export_settings(&settings);
+        // C3 is synchronized at this stage: nothing is left to estimate.
+        assert!(data.select_sync_stage(1));
+        assert!(data.camera_clock.estimates.is_empty());
+        data
+    };
+    assert_eq!(bar_layout(&prepare(true)), bar_layout(&prepare(false)));
 }

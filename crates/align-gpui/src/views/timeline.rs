@@ -1,26 +1,36 @@
 //! Timeline preview: toolbar, ruler, and lanes.
 
-use super::animation::{entrance, timeline_bar_motion};
+use super::animation::entrance;
+use super::clip_details::clip_tip;
 use super::controls::{
-    RULER_LABEL_W, ZoomDrag, ZoomDragGhost, clip_color, fmt_duration, fmt_timecode, hover_tip,
+    RULER_LABEL_W, ZoomDrag, ZoomDragGhost, clip_status_icon, fmt_ruler_label, hover_tip,
     ruler_ticks, waveform_columns,
 };
 use super::{
-    AlignApp, AnimationExt, AudioAnalysisSource, ClipId, Context, DragMoveEvent, FluentBuilder,
-    HashMap, InteractiveElement, IntoElement, MediaKind, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
-    TIMELINE_ROW_H, Theme, TimelineTransition, div, point, poses_differ, px, rgb, rgba, svg_icon,
-    timeline_duration, timeline_poses,
+    AlignApp, AnimationExt, AudioAnalysisSource, Context, DragMoveEvent, FluentBuilder, HashMap,
+    InteractiveElement, IntoElement, MediaKind, MouseButton, MouseDownEvent, MouseMoveEvent,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, TIMELINE_ROW_H, Theme,
+    TimelineTransition, div, point, poses_differ, px, rgb, rgba, svg_icon, timeline_duration,
+    timeline_poses,
 };
+use align_core::MatchEvidence;
 use gpui::AppContext as _;
 
 // ---------------- timeline preview (toolbar + ruler + lanes)
+
+/// Size of a clip's status mark in its top-right corner.
+const STATUS_ICON: f32 = 10.0;
+/// Gap between the status mark and the clip's top and right edges. The
+/// mark ends above the name's line, so it never covers the name.
+const STATUS_INSET: f32 = 4.0;
+/// Narrowest clip that says beside its mark that timecode synchronized it.
+const TC_BADGE_MIN_WIDTH: f32 = 120.0;
 
 pub(super) fn timeline_preview(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &crate::state::AppData,
-    timeline_transitions: &HashMap<ClipId, TimelineTransition>,
+    timeline_transitions: &HashMap<String, TimelineTransition>,
     fit_width: f32,
     active: bool,
 ) -> impl IntoElement {
@@ -40,6 +50,27 @@ pub(super) fn timeline_preview(
         root = root.opacity(0.5);
     }
     root
+}
+
+/// Static stripes over a clip the analysis has not settled yet. Nothing
+/// moves, so they read the same with reduced motion.
+fn unsettled_hatch(rounded: bool, color: u32) -> impl IntoElement {
+    gpui::canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            // The pattern is measured in device pixels.
+            let scale = window.scale_factor();
+            let stripes = gpui::pattern_slash(rgba(color).into(), 2.0 * scale, 4.0 * scale);
+            let mut quad = gpui::fill(bounds, stripes);
+            if rounded {
+                // The bar's corner inside its 1 px border.
+                quad = quad.corner_radii(px(5.0));
+            }
+            window.paint_quad(quad);
+        },
+    )
+    .absolute()
+    .inset_0()
 }
 
 /// Draggable zoom slider:
@@ -111,7 +142,7 @@ pub(super) fn timeline_lanes(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
     data: &crate::state::AppData,
-    timeline_transitions: &HashMap<ClipId, TimelineTransition>,
+    timeline_transitions: &HashMap<String, TimelineTransition>,
     fit_width: f32,
     active: bool,
 ) -> impl IntoElement {
@@ -122,6 +153,18 @@ pub(super) fn timeline_lanes(
     let (px_per_sec, timeline_w) = timeline_scale(duration, zoom, fit_width);
     let tick_times = ruler_ticks(duration, px_per_sec, data.ruler_timecode.unwrap_or(0.));
     let target_poses = (!timeline_transitions.is_empty()).then(|| timeline_poses(data));
+    let app = cx.entity();
+    let now = std::time::Instant::now();
+    let row_stride = TIMELINE_ROW_H + 1.;
+    // Bars more than a screen away from the visible part keep their element,
+    // so nothing fades in again, but not their waveform, icon, name or
+    // tooltip, which are built again once they come near.
+    let view_width = f32::from(data.timeline_scroll.bounds().size.width);
+    let view_left = -f32::from(data.timeline_scroll.offset().x);
+    let near_view = |left: f32, width: f32| {
+        view_width <= 0.
+            || (left + width >= view_left - view_width && left <= view_left + 2. * view_width)
+    };
 
     // Labels stay fixed while only the ruler and clips scroll horizontally.
     // This also makes a normal two-finger/vertical wheel pan the timeline:
@@ -147,10 +190,7 @@ pub(super) fn timeline_lanes(
         .w(px(timeline_w));
     for &at in &tick_times {
         let x = (at * px_per_sec) as f32;
-        let label = match data.ruler_timecode {
-            Some(start) => fmt_timecode(start, at),
-            None => fmt_duration(at),
-        };
+        let label = fmt_ruler_label(data.ruler_timecode, at);
         ticks = ticks
             .child(
                 div()
@@ -193,6 +233,34 @@ pub(super) fn timeline_lanes(
         }),
     );
     tracks = tracks.child(ticks);
+    // One canvas draws the gridlines of every row at the ruler ticks, under
+    // the bars, in the color of the row separators it crosses.
+    let grid_color = rgb(theme.separator);
+    let grid_x: Vec<f32> = tick_times
+        .iter()
+        .map(|&at| (at * px_per_sec) as f32)
+        .collect();
+    tracks = tracks.relative().child(
+        gpui::canvas(
+            |_, _, _| (),
+            move |bounds, (), window, _| {
+                for &x in &grid_x {
+                    window.paint_quad(gpui::fill(
+                        gpui::Bounds::new(
+                            bounds.origin + point(px(x), px(0.)),
+                            gpui::size(px(1.), bounds.size.height),
+                        ),
+                        grid_color,
+                    ));
+                }
+            },
+        )
+        .absolute()
+        .left(px(0.))
+        .top(px(RULER_H))
+        .w(px(timeline_w))
+        .h(px(data.lanes.len() as f32 * row_stride)),
+    );
 
     // Rows.
     for (lane_index, lane) in data.lanes.iter().enumerate() {
@@ -319,34 +387,50 @@ pub(super) fn timeline_lanes(
                 .w(px(timeline_w))
                 .h(px(TIMELINE_ROW_H))
                 .flex_shrink_0();
-            // Vertical gridlines at ruler ticks.
-            for &at in &tick_times {
-                let x = (at * px_per_sec) as f32;
-                track = track.child(
-                    div()
-                        .absolute()
-                        .left(px(x))
-                        .top(px(0.))
-                        .w(px(1.))
-                        .h_full()
-                        .bg(rgb(theme.separator)),
-                );
-            }
             let geometry = bar_row_geometry(&lane.clips, px_per_sec);
             for (bar, (x, width)) in lane.clips.iter().zip(geometry.iter()) {
                 let (x, width) = (*x, *width);
-                let color = clip_color(bar.match_state);
-                let ink = 0xFFFFFF;
+                let palette = theme.clip;
+                let color = palette.fill(bar.match_state);
+                let ink = palette.ink;
+                // Where the palette asks for it, the fill is laid again
+                // behind the name and status mark, muting the waveform and
+                // stripes there so the ink stays readable.
+                let backdrop = palette.backdrop(bar.match_state).map(rgba);
                 let clip_id = bar.clip_id.clone();
+                // A bar that moved to this layout glides from where it was.
+                // Its last frame is this layout, so it is drawn the same way
+                // once the move is over.
+                let (left, shown_width, top) = timeline_transitions
+                    .get(&bar.id)
+                    .filter(|transition| {
+                        target_poses
+                            .as_ref()
+                            .and_then(|poses| poses.get(&bar.id))
+                            .is_some_and(|pose| !poses_differ(transition.to, *pose))
+                    })
+                    .map_or((x, width, 0.), |transition| {
+                        let progress = transition.progress(now);
+                        let from_x = transition.from.x * timeline_w;
+                        let from_width = (transition.from.width * timeline_w).max(2.);
+                        (
+                            from_x + (x - from_x) * progress,
+                            from_width + (width - from_width) * progress,
+                            (transition.from.lane - lane_index as f32)
+                                * row_stride
+                                * (1. - progress),
+                        )
+                    });
                 // Keep narrow slivers square; cap other corner radii at 4 px.
                 let mut el = div()
-                    .id(SharedString::from(format!("bar-{}", bar.clip_id.0)))
+                    .id(SharedString::from(format!("bar-{}", bar.id)))
                     .absolute()
-                    .left(px(x))
-                    .top(px(6.0))
-                    .w(px(width))
+                    .left(px(left))
+                    .top(px(6.0 + top))
+                    .w(px(shown_width))
                     .h(px(TIMELINE_ROW_H - 12.0));
-                if width >= 8.0 {
+                let rounded = width >= 8.0;
+                if rounded {
                     el = el.rounded_md();
                 }
                 el = el
@@ -357,11 +441,14 @@ pub(super) fn timeline_lanes(
                     .px_1()
                     .overflow_hidden()
                     .cursor_default();
-                if active {
-                    el = el.tooltip(hover_tip(
-                        format!("{} · {}", bar.url.display(), fmt_duration(bar.duration)),
-                        theme,
-                    ));
+                let near = near_view(left, shown_width);
+                if active && near {
+                    el = el.tooltip(clip_tip(app.clone(), bar.id.clone(), theme));
+                }
+                // A clip the analysis has not settled is hatched at any
+                // width, under its waveform.
+                if near && bar.match_state.unsettled() {
+                    el = el.child(unsettled_hatch(rounded, palette.hatch));
                 }
                 // Icon + name when wide enough.
                 // Bar label: icon pinned top-left, text pinned to the
@@ -369,9 +456,10 @@ pub(super) fn timeline_lanes(
                 // exact bounds, so long names shape a real "…" instead of
                 // hard-clipping past the bar edge. `el` itself is
                 // absolutely positioned, hence a valid anchor.
-                if width >= 24.0 {
+                if width >= 24.0 && near {
                     if let Some(waveform) = data.waveform_previews.get(&bar.clip_id) {
                         let (columns, bar_width) = waveform_columns(waveform, width);
+                        let wave = rgba(palette.wave);
                         let preview = gpui::canvas(
                             |_, _, _| (),
                             move |bounds, (), window, _| {
@@ -387,16 +475,44 @@ pub(super) fn timeline_lanes(
                                         origin,
                                         gpui::size(px((bar_width - 1.0).max(1.0)), px(h)),
                                     );
-                                    window.paint_quad(
-                                        gpui::fill(rect, rgba(0xFFFFFF42)).corner_radii(radius),
-                                    );
+                                    window.paint_quad(gpui::fill(rect, wave).corner_radii(radius));
                                 }
                             },
                         )
                         .absolute()
-                        .inset_0()
-                        .overflow_hidden();
+                        .inset_0();
                         el = el.child(preview);
+                    }
+                    if width >= 64.0 {
+                        // A backdrop starts under the media icon and ends
+                        // just past the name; the name keeps its place and
+                        // the width it may take before it is cut short.
+                        el = el.child(
+                            div()
+                                .absolute()
+                                .left(px(5.0))
+                                .right(px(2.0))
+                                .top(px(0.))
+                                .bottom(px(0.))
+                                .flex()
+                                .flex_col()
+                                .justify_center()
+                                .items_start()
+                                .child(
+                                    div()
+                                        .max_w_full()
+                                        .pl(px(22.0))
+                                        .pr(px(2.0))
+                                        .when_some(backdrop, |name, backdrop| {
+                                            name.rounded(px(4.0)).bg(backdrop)
+                                        })
+                                        .text_xs()
+                                        .truncate()
+                                        .whitespace_nowrap()
+                                        .text_color(rgb(ink))
+                                        .child(bar.name.clone()),
+                                ),
+                        );
                     }
                     let video = matches!(bar.kind, MediaKind::Video);
                     let icon_path = if video {
@@ -411,27 +527,52 @@ pub(super) fn timeline_lanes(
                             .top(px(17.0))
                             .child(svg_icon(icon_path, 13.0, ink)),
                     );
-                    if width >= 64.0 {
-                        el = el.child(
-                            div()
-                                .absolute()
-                                .left(px(27.0))
-                                .right(px(4.0))
-                                .top(px(0.))
-                                .bottom(px(0.))
-                                .flex()
-                                .flex_col()
-                                .justify_center()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .truncate()
-                                        .whitespace_nowrap()
-                                        .text_color(rgb(ink))
-                                        .child(bar.name.clone()),
-                                ),
-                        );
-                    }
+                }
+                // The status mark sits apart from the media icon, in the
+                // corner, or centered across a bar too narrow for the
+                // corner's gap (inside its 1 px borders).
+                let status_right = ((width - 2.0 - STATUS_ICON) / 2.0).min(STATUS_INSET);
+                if near
+                    && status_right >= 1.0
+                    && let Some(icon) = clip_status_icon(bar.match_state)
+                {
+                    el = el.child(
+                        div()
+                            .absolute()
+                            .top(px(STATUS_INSET))
+                            .right(px(status_right))
+                            .size(px(STATUS_ICON))
+                            .when_some(backdrop, |mark, backdrop| {
+                                mark.rounded(px(2.0)).bg(backdrop)
+                            })
+                            .child(svg_icon(icon, STATUS_ICON, ink)),
+                    );
+                }
+                // A clip synchronized by timecode alone says so beside the
+                // link, on the same line above the name.
+                if near
+                    && width >= TC_BADGE_MIN_WIDTH
+                    && bar.match_state == crate::lane::BarMatchState::Matched
+                    && bar.evidence == Some(MatchEvidence::Timecode)
+                {
+                    el = el.child(
+                        div()
+                            .absolute()
+                            .top(px(STATUS_INSET - 1.0))
+                            .right(px(STATUS_INSET + STATUS_ICON + 3.0))
+                            .h(px(STATUS_ICON + 2.0))
+                            .px(px(3.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(3.0))
+                            .bg(rgba(0x00000038))
+                            .text_size(px(9.0))
+                            .line_height(px(STATUS_ICON + 2.0))
+                            .font_weight(gpui::FontWeight(600.0))
+                            .whitespace_nowrap()
+                            .text_color(rgb(ink))
+                            .child("TC"),
+                    );
                 }
                 el = el.on_mouse_down(
                     MouseButton::Right,
@@ -445,33 +586,13 @@ pub(super) fn timeline_lanes(
                         cx.notify();
                     }),
                 );
-                let transition =
-                    timeline_transitions
-                        .get(&bar.clip_id)
-                        .copied()
-                        .filter(|transition| {
-                            target_poses
-                                .as_ref()
-                                .and_then(|poses| poses.get(&bar.clip_id))
-                                .is_some_and(|pose| !poses_differ(transition.to, *pose))
-                        });
-                if let Some(transition) = transition {
-                    track = track.child(timeline_bar_motion(
-                        el,
-                        &bar.clip_id,
-                        transition,
-                        x,
-                        width,
-                        timeline_w,
-                        lane_index as f32,
-                    ));
-                } else {
-                    track = track.child(el.with_animation(
-                        SharedString::from(format!("timeline-clip-enter-{}", bar.clip_id.0)),
-                        entrance(220),
-                        |el, progress| el.opacity(progress),
-                    ));
-                }
+                // The same element every frame, moving or not, so a bar fades
+                // in only when it first appears.
+                track = track.child(el.with_animation(
+                    SharedString::from(format!("timeline-clip-enter-{}", bar.id)),
+                    entrance(220),
+                    |el, progress| el.opacity(progress),
+                ));
             }
             tracks = tracks.child(track);
         }

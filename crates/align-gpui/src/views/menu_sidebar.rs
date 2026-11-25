@@ -6,13 +6,13 @@ use gpui::{Action, OwnedMenu, OwnedMenuItem};
 use crate::theme::AppearancePreference;
 
 use super::animation::{SidebarEdge, entrance, sidebar_reveal};
-use super::controls::{button, modal_header};
+use super::controls::{button, menu_surface, modal_header, secondary_chrome};
 use super::export::check_row;
 use super::{
-    AlignApp, AnchoredPositionMode, AnimationExt, ClickEvent, Context, Div, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, SIDEBAR_CLOSE_MS, SharedString, Stateful,
-    StatefulInteractiveElement, Styled, Theme, ThemeMode, Window, anchored, deferred, div, point,
-    px, rgb, rgba, svg_icon,
+    AlignApp, AnchoredPositionMode, AnimationExt, ClickEvent, Context, Div, FluentBuilder,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, SIDEBAR_CLOSE_MS, SharedString,
+    Stateful, StatefulInteractiveElement, Styled, Theme, ThemeMode, Window, anchored, deferred,
+    div, point, px, rgb, rgba, svg_icon,
 };
 
 const WIDTH: f32 = 324.;
@@ -38,6 +38,32 @@ pub(super) struct CachePage {
 }
 
 impl AlignApp {
+    fn open_app_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.data.menu = None;
+        self.app_menu_exit.cancel();
+        self.app_menu = Some(AppMenuPage::Main);
+        self.app_menu_select = None;
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    /// Alt pressed and released alone: opens the menu wherever its button
+    /// works, or closes it. A loading project, other dialogs, and the problem
+    /// report opened from the menu keep their keys.
+    pub(super) fn toggle_app_menu_from_alt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !cfg!(any(target_os = "windows", target_os = "linux"))
+            || self.projects.busy
+            || self.show_problem_report
+        {
+            return;
+        }
+        if self.app_menu.is_some() {
+            self.close_app_menu(cx);
+        } else if self.content_active() {
+            self.open_app_menu(window, cx);
+        }
+    }
+
     pub(super) fn dismiss_app_menu(&mut self, cx: &mut Context<Self>) {
         if self.app_menu_select.take().is_some() {
             cx.notify();
@@ -81,14 +107,7 @@ pub(super) fn app_menu_button(
         "btn-app-menu",
         "Menu",
         active,
-        |this, _, window, cx| {
-            this.data.menu = None;
-            this.app_menu_exit.cancel();
-            this.app_menu = Some(AppMenuPage::Main);
-            this.app_menu_select = None;
-            this.focus_handle.focus(window);
-            cx.notify();
-        },
+        |this, _, window, cx| this.open_app_menu(window, cx),
     )
 }
 
@@ -514,69 +533,62 @@ fn sidebar_select(
         AppMenuSelect::Retention => ("app-menu-retention", "Keep for"),
     };
     let open = current == Some(select);
-    let control = div()
-        .id(id)
-        .h(px(28.))
-        .px_3()
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap_2()
-        .rounded_lg()
-        .text_size(px(12.))
-        .text_color(rgb(theme.icon))
-        .bg(rgb(if open {
-            theme.border
-        } else {
-            theme.button_hover
-        }))
-        .cursor_pointer()
-        .hover(|row| row.bg(rgb(theme.border)))
-        .active(|row| row.opacity(0.62))
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.app_menu_select = Some(select);
-            cx.notify();
-            cx.stop_propagation();
-        }))
-        .child(
-            div()
-                .min_w(px(0.))
-                .truncate()
-                .child(format!("{label}: {}", value.into())),
-        )
-        .child(
-            div()
-                .flex_shrink_0()
-                .child(svg_icon("icons/chevron-down.svg", 12., theme.icon)),
-        );
+    let control = secondary_chrome(
+        div()
+            .id(id)
+            .h(px(28.))
+            .px_3()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2(),
+        theme,
+        open,
+        true,
+    )
+    .on_click(cx.listener(move |this, _, _, cx| {
+        this.app_menu_select = Some(select);
+        cx.notify();
+        cx.stop_propagation();
+    }))
+    .child(
+        div()
+            .min_w(px(0.))
+            .truncate()
+            .child(format!("{label}: {}", value.into())),
+    )
+    .child(
+        div()
+            .flex_shrink_0()
+            .child(svg_icon("icons/chevron-down.svg", 12., theme.icon)),
+    );
     let mut field = div().relative().child(control);
     if open {
         let popup =
-            div()
+            menu_surface(theme)
                 .id(SharedString::from(format!("{id}-options")))
                 .w(px(WIDTH - PADDING * 2. - 1.))
                 .flex()
                 .flex_col()
-                .p_1()
-                .rounded_lg()
-                .border_1()
-                .border_color(rgb(theme.border))
-                .bg(rgb(theme.panel))
-                .shadow_md()
                 .occlude()
                 .children(options.into_iter().enumerate().map(
                     |(index, (label, selected, action))| {
+                        // The selection is checked in the accent, as in the
+                        // other dropdowns.
                         sidebar_row(
                             cx,
                             theme,
                             format!("{id}-{index}"),
                             label,
-                            selected.then_some("icons/check.svg"),
+                            None,
                             move |this, _, window, cx| {
                                 this.dismiss_app_menu(cx);
                                 window.dispatch_action(action.boxed_clone(), cx);
                             },
                         )
+                        .when(selected, |row| {
+                            row.child(svg_icon("icons/check.svg", 12., theme.accent))
+                        })
                     },
                 ));
         field = field.child(deferred(

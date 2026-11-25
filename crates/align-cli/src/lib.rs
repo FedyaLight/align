@@ -70,7 +70,7 @@ enum Command {
     },
     /// Clear the persistent fingerprint cache, print freed stats JSON.
     ClearCache {
-        /// Only clear entries older than this many days (default: all).
+        /// Only clear entries unused for this many days (default: all).
         #[arg(long, value_name = "N")]
         older_than_days: Option<u64>,
     },
@@ -109,6 +109,17 @@ struct ExportOptions {
     /// Placement policy for clips without a synchronization match.
     #[arg(long, value_enum, default_value_t = Unmatched::OrderTime)]
     unmatched: Unmatched,
+    /// Place unmatched clips approximately by their camera's clock: a camera
+    /// that records its serial number and start times (Sony), between two of
+    /// its clips that sound synchronized in one group. Placed clips are named
+    /// [CAMERA CLOCK] and stay unmatched for labels and --unmatched remove.
+    /// For an imported edit, only reports how its edits differ from the clock.
+    #[arg(long)]
+    camera_clock: bool,
+    /// With --camera-clock, leave this clip unmatched: its file name, path,
+    /// or clip ID. Repeat for more clips.
+    #[arg(long, value_name = "CLIP", requires = "camera_clock")]
+    camera_clock_except: Vec<String>,
     /// Place independent synchronization groups without overlaps.
     #[arg(long)]
     prevent_group_overlaps: bool,
@@ -159,12 +170,20 @@ type RelinkOptions = (
     Vec<String>,
 );
 
+/// The pipeline for `sequences` synchronizations of one command: sequences
+/// of one project inspect and analyse the media they share once.
+fn batch_pipeline(sequences: usize) -> Pipeline {
+    let pipeline = Pipeline::default_backend();
+    if sequences > 1 {
+        pipeline.remembering_analysis()
+    } else {
+        pipeline
+    }
+}
+
 fn relink_options(args: &RelinkArgs) -> Result<RelinkOptions, CliError> {
     let store = align_core::redirect::config_file();
-    if args.clear_redirects {
-        let _ = std::fs::remove_file(&store);
-    }
-    let mut redirects = align_core::redirect::load_from(&store);
+    let mut added = Vec::new();
     for flag in &args.redirect {
         let (old, new) =
             align_core::redirect::split_pair("--redirect", flag).map_err(CliError::Failure)?;
@@ -174,12 +193,29 @@ fn relink_options(args: &RelinkArgs) -> Result<RelinkOptions, CliError> {
                 new.display()
             )));
         }
-        let entry = align_core::redirect::PathRedirection::new(&old, new);
-        if !redirects.contains(&entry) {
-            redirects.push(entry);
-        }
+        added.push(align_core::redirect::PathRedirection::new(&old, new));
     }
-    align_core::redirect::save_to(&store, &redirects);
+    // Only an explicit change touches the saved list.
+    let redirects = if args.clear_redirects || !added.is_empty() {
+        align_core::redirect::update(&store, |saved| {
+            if args.clear_redirects {
+                saved.clear();
+            }
+            for entry in added {
+                if !saved.contains(&entry) {
+                    saved.push(entry);
+                }
+            }
+        })
+        .map_err(|error| {
+            CliError::Failure(format!(
+                "Could not save redirections to {}: {error}.",
+                store.display()
+            ))
+        })?
+    } else {
+        align_core::redirect::load_from(&store)
+    };
     let mut manual = Vec::new();
     for flag in &args.relink {
         let (name, path) =
@@ -642,13 +678,42 @@ fn sync_summary(result: &align_core::SyncResult) -> serde_json::Value {
             })
         })
         .collect();
-    json!({
+    let mut summary = json!({
         "sequence": result.project.imported_timeline.as_ref().map(|timeline| &timeline.name),
         "islands": islands,
         "unmatched": result.unmatched.iter().map(name).collect::<Vec<_>>(),
         "warnings": result.project.warnings,
         "maxAbsDriftPPM": result.matches.iter().map(|m| m.drift_ppm.abs()).reduce(f64::max),
-    })
+    });
+    let report = align_core::camera_clock::camera_clock(result, &[]);
+    if report != Default::default() {
+        let reason = |refusal: &align_core::camera_clock::CameraClockRefusal| {
+            refusal.describe(&|id| name(id))
+        };
+        let hints = align_core::camera_clock::imported_edit_hints(result, &report.estimates);
+        summary["cameraClock"] = json!({
+            "estimates": report.estimates.iter().map(|e| json!({
+                "clip": name(&e.clip_id),
+                "island": e.island,
+                "start": e.start,
+                "between": [name(&e.before), name(&e.after)],
+                "toleranceSeconds": e.tolerance,
+            })).collect::<Vec<_>>(),
+            "refusals": report.refusals.iter().map(|(id, refusal)| json!({
+                "clip": name(id),
+                "reason": reason(refusal),
+            })).collect::<Vec<_>>(),
+            "editHints": hints.iter().map(|hint| json!({
+                "clip": name(&hint.clip_id),
+                "edit": hint.edit_id,
+                "track": hint.track_label(),
+                "timelineStart": hint.timeline_start,
+                "cameraClockStart": hint.expected_start,
+                "toleranceSeconds": hint.tolerance,
+            })).collect::<Vec<_>>(),
+        });
+    }
+    summary
 }
 
 fn print_json(value: &impl serde::Serialize) -> Result<(), CliError> {
@@ -730,10 +795,10 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
                 return Err(CliError::Usage);
             }
             let sequence = sequence_index(sequence)?;
-            let pipeline = Pipeline::default_backend();
             let progress = progress_printer();
             let cancel = std::sync::atomic::AtomicBool::new(false);
             let input_sets = input_sets(&paths, sequence, all_sequences, &cancel)?;
+            let pipeline = batch_pipeline(input_sets.len());
             let mut options = settings.pipeline_options();
             let (redirects, manual, omit) = relink_options(&relink)?;
             options.redirects = redirects;
@@ -811,10 +876,10 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
                 ));
             }
             let sequence = sequence_index(sequence)?;
-            let pipeline = Pipeline::default_backend();
             let progress = progress_printer();
             let cancel = std::sync::atomic::AtomicBool::new(false);
             let input_sets = input_sets(&paths, sequence, all_sequences, &cancel)?;
+            let pipeline = batch_pipeline(input_sets.len());
             let mut options = settings.pipeline_options();
             let (redirects, manual, omit) = relink_options(&relink)?;
             options.redirects = redirects;
@@ -848,7 +913,7 @@ fn run_inner(cli: Cli) -> Result<(), CliError> {
             for result in &mut results {
                 select_stage(result, stage)?;
             }
-            let pipeline = Pipeline::default_backend();
+            let pipeline = Pipeline::without_cache();
             let cancel = std::sync::atomic::AtomicBool::new(false);
             let artifacts = export.execute(pipeline.backend(), &results, &output, &cancel)?;
             print_json(&artifacts)
@@ -944,6 +1009,9 @@ mod tests {
             "--media-bins",
             "--no-fcpxml-multicam",
             "--export-media",
+            "--camera-clock",
+            "--camera-clock-except",
+            "C0003.MP4",
             "--label-synced",
             "--label-unmatched",
             "--synced-symbol",
@@ -969,6 +1037,8 @@ mod tests {
                     no_fcpxml_timeline,
                     no_fcpxml_multicam,
                     export_media,
+                    camera_clock,
+                    camera_clock_except,
                     label_synced,
                     label_unmatched,
                     assign,
@@ -1012,6 +1082,20 @@ mod tests {
         assert!(!no_fcpxml_timeline);
         assert!(no_fcpxml_multicam);
         assert!(export_media);
+        assert!(camera_clock);
+        assert_eq!(camera_clock_except, ["C0003.MP4"]);
+        // An exception without the placement it excepts from is a usage error.
+        let error = Cli::try_parse_from([
+            "align-cli",
+            "export-json",
+            "--camera-clock-except",
+            "C0003.MP4",
+            "result.json",
+            "out",
+        ])
+        .err()
+        .expect("exception without --camera-clock");
+        assert_eq!(error.exit_code(), 2);
         assert!(label_synced);
         assert!(label_unmatched);
         assert_eq!(assign.synced_symbol.as_deref(), Some("✓"));

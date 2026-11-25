@@ -54,8 +54,8 @@ pub(super) fn summaries_fcp7(
         .collect())
 }
 
+/// `//sequence[not(ancestor::sequence)]` in document order.
 pub(super) fn top_sequences(doc: &XmlDoc) -> Vec<usize> {
-    // //sequence[not(ancestor::sequence)]
     let mut out = Vec::new();
     let mut stack = vec![(doc.root, false)];
     while let Some((idx, under_seq)) = stack.pop() {
@@ -67,7 +67,6 @@ pub(super) fn top_sequences(doc: &XmlDoc) -> Vec<usize> {
             stack.push((c, under_seq || is_seq));
         }
     }
-    out.reverse();
     out
 }
 
@@ -697,6 +696,7 @@ pub(super) fn read_fcp7(
         return Err(ImportError::NoMedia(filename));
     }
     Ok(TimelineDraft {
+        aaf_track_numbers: Vec::new(),
         source_url: path.to_path_buf(),
         name,
         frame_duration: sequence_rate,

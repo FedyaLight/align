@@ -1,6 +1,5 @@
 """Checks that release source preparation stops before packaging invalid input."""
 import importlib.util
-import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -16,7 +15,7 @@ class SourceRequirements(unittest.TestCase):
     def invoke(self, root, status='', ffmpeg=True):
         args = ['prepare-release-source', str(root / 'output'), '--platform', 'Linux',
                 '--licenses', str(root / 'licenses'),
-                '--aaf', str(root / 'aaf'), '--velopack-version', '1.2.0']
+                '--aaf-binary', str(root / 'align-aaf'), '--velopack-version', '1.2.0']
         if ffmpeg:
             args += ['--ffmpeg', str(root / 'ffmpeg')]
         with patch('sys.argv', args), patch.object(release, 'run', return_value=status) as run:
@@ -39,28 +38,10 @@ class SourceRequirements(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'ffmpeg-9.0.1.tar.xz'):
                 self.invoke(root)
 
-    def test_missing_aaf_source_is_rejected(self):
+    def test_release_without_ffmpeg_still_requires_the_built_aaf_helper(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / 'ffmpeg').mkdir()
-            (root / 'ffmpeg/version.txt').write_text('9.0.1')
-            for name in ('ffmpeg-9.0.1.tar.xz', 'build-ffmpeg-minimal.sh', 'config.mak'):
-                (root / 'ffmpeg' / name).touch()
-            (root / 'aaf/Licenses').mkdir(parents=True)
-            (root / 'aaf/Licenses/Python-LICENSE.txt').touch()
-            (root / 'aaf/versions.json').write_text(json.dumps({
-                'pyaaf2': '1.7.1', 'pyinstaller': '6.22.2',
-                'pyinstaller-hooks-contrib': '2026.7', 'python': '3.13.2',
-                'native_libraries': {},
-            }))
-            with self.assertRaisesRegex(RuntimeError, 'pyaaf2 1.7.1'):
-                self.invoke(root)
-
-    def test_release_without_ffmpeg_still_requires_aaf_sources(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / 'aaf').mkdir()
-            with self.assertRaises(FileNotFoundError):
+            with self.assertRaisesRegex(RuntimeError, 'Missing AAF build output'):
                 self.invoke(root, ffmpeg=False)
 
 

@@ -4,8 +4,8 @@ use super::*;
 /// percent-encoding; they must not resolve against the working directory.
 #[test]
 fn fcpxml_media_may_be_relative_to_the_document() {
-    let dir = std::env::temp_dir().join(format!("align-relative-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let path = dir.join("cut.fcpxml");
     std::fs::write(
         &path,
@@ -17,7 +17,6 @@ fn fcpxml_media_may_be_relative_to_the_document() {
         draft.media_urls(),
         vec![dir.join("Media").join("my clip.mov")]
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Editor exports start with a declaration, a DOCTYPE and sometimes
@@ -49,8 +48,8 @@ fn unreadable_documents_are_named_in_import_errors() {
 
 #[test]
 fn timeline_documents_are_recognized_by_root_element() {
-    let dir = std::env::temp_dir().join(format!("align-timeline-root-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let cases = [
         (
             "premiere.xml",
@@ -121,7 +120,6 @@ fn timeline_documents_are_recognized_by_root_element() {
         assert_eq!(is_timeline_document(&path), timeline, "{name}");
     }
     assert!(is_timeline_document(&dir.join("missing.xml")));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 const FCP7: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -200,9 +198,8 @@ const FCPXML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 
 #[test]
 fn fcp7_sequence_summary_and_edits() {
-    let dir = std::env::temp_dir().join(format!("align-xml-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let xml = dir.join("edit.xml");
     std::fs::write(&xml, FCP7).unwrap();
 
@@ -245,25 +242,34 @@ fn fcp7_sequence_summary_and_edits() {
         TimelineTransitionKind::CrossDissolve
     );
     assert!(draft.transitions[0].effect_xml.contains("Cross Dissolve"));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn fcp7_multi_sequence_requires_choice() {
-    let doc = XmlDoc::parse(
-        "<xmeml><sequence><name>A</name></sequence><sequence><name>B</name></sequence></xmeml>",
-    )
-    .unwrap();
-    assert_eq!(top_sequences(&doc).len(), 2);
-    let dir = std::env::temp_dir().join(format!("align-xml2-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let xml = dir.join("multi.xml");
+    let dir = tempfile::tempdir().unwrap();
+    let xml = dir.path().join("multi.xml");
+    let sequence = |name: &str| {
+        format!(
+            "<sequence><name>{name}</name><rate><timebase>25</timebase></rate><media><video><track>\
+             <clipitem id=\"{name}1\"><in>0</in><out>25</out><start>0</start><end>25</end>\
+             <file id=\"f{name}\"><pathurl>file:///tmp/{name}.mov</pathurl><duration>50</duration></file>\
+             </clipitem></track></video></media></sequence>"
+        )
+    };
     std::fs::write(
         &xml,
-        "<xmeml><sequence><name>A</name></sequence><sequence><name>B</name></sequence></xmeml>",
+        format!("<xmeml>{}{}</xmeml>", sequence("A"), sequence("B")),
     )
     .unwrap();
+    // Sequences are numbered in document order, as editors list them.
+    let names: Vec<_> = timeline_sequence_summaries(&xml)
+        .unwrap()
+        .into_iter()
+        .map(|summary| summary.name)
+        .collect();
+    assert_eq!(names, ["A", "B"]);
+    assert_eq!(read_timeline(&xml, Some(0)).unwrap().name, "A");
+    assert_eq!(read_timeline(&xml, Some(1)).unwrap().name, "B");
     assert!(matches!(
         read_timeline(&xml, None),
         Err(ImportError::MultipleSequences(_, 2))
@@ -272,14 +278,12 @@ fn fcp7_multi_sequence_requires_choice() {
         read_timeline(&xml, Some(5)),
         Err(ImportError::InvalidSequence(_, 5))
     ));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn fcpxml_reads_assets_and_links() {
-    let dir = std::env::temp_dir().join(format!("align-xml3-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let xml = dir.join("edit.fcpxml");
     std::fs::write(&xml, FCPXML).unwrap();
     let summaries = timeline_sequence_summaries(&xml).expect("summaries");
@@ -308,7 +312,6 @@ fn fcpxml_reads_assets_and_links() {
     );
     assert!((video.timeline_end - 4.0).abs() < 1e-9);
     assert_eq!(video.track_index, 1);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -366,9 +369,8 @@ fn rewrites_only_matching_fcp7_and_fcpxml_media_paths() {
 #[test]
 fn resolve_links_and_dedupes() {
     use crate::model::{AudioSummary, VideoSummary};
-    let dir = std::env::temp_dir().join(format!("align-xml4-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let xml = dir.join("edit.xml");
     std::fs::write(&xml, FCP7).unwrap();
     let draft = read_timeline(&xml, None).expect("read");
@@ -422,14 +424,12 @@ fn resolve_links_and_dedupes() {
     let warnings = draft.unresolved_warnings(&clips[..1], &[]);
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].message.contains("/tmp/b.mov"));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn relink_unique_filename() {
-    let dir = std::env::temp_dir().join(format!("align-xml5-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let xml = dir.join("edit.xml");
     std::fs::write(&xml, FCP7).unwrap();
     let draft = read_timeline(&xml, None).expect("read");
@@ -485,16 +485,14 @@ fn relink_unique_filename() {
             .iter()
             .any(|warning| warning.message.contains("matching 2 parent folders"))
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn relink_saved_redirection_without_pool() {
     use crate::redirect::PathRedirection;
 
-    let dir = std::env::temp_dir().join(format!("align-xml-redir-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let xml = dir.join("edit.xml");
     std::fs::write(&xml, FCP7).unwrap();
     let draft = read_timeline(&xml, None).expect("read");
@@ -521,14 +519,12 @@ fn relink_saved_redirection_without_pool() {
             .iter()
             .all(|w| !w.message.contains("via saved redirection"))
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn relink_manual_pick_breaks_ties() {
-    let dir = std::env::temp_dir().join(format!("align-xml-manual-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let xml = dir.join("edit.xml");
     std::fs::write(&xml, FCP7).unwrap();
     let draft = read_timeline(&xml, None).expect("read");
@@ -557,14 +553,12 @@ fn relink_manual_pick_breaks_ties() {
             .iter()
             .any(|w| w.message.contains("does not exist"))
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn unresolved_warnings_skip_omitted_extensions() {
-    let dir = std::env::temp_dir().join(format!("align-xml-omit-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let xml = dir.join("edit.xml");
     std::fs::write(&xml, FCP7).unwrap();
     let draft = read_timeline(&xml, None).expect("read");
@@ -574,15 +568,13 @@ fn unresolved_warnings_skip_omitted_extensions() {
             .unresolved_warnings(&[], &["mov".to_string()])
             .is_empty()
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 #[test]
 fn reverse_retime_imports_backward_with_negative_otio_scalar() {
     // Live-verified Resolve behavior: negative LinearTimeWarp plays
     // backward from the same source range as forward playback.
-    let dir = std::env::temp_dir().join(format!("align-xml-rev-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let xml = dir.join("rev.xml");
     // Reverse -100% with Premiere's +1 constant: values fall 1 per
     // frame from 101 to 1 over the clip (see VERIFICATION.md).
@@ -642,7 +634,6 @@ fn reverse_retime_imports_backward_with_negative_otio_scalar() {
             .contains("<parameterid>reverse</parameterid><name>reverse</name><value>TRUE</value>")
     );
     assert!(resolve.contains("<speedkfin>TRUE</speedkfin>"));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Premiere's own 200% reverse graph runs from 400 to 1, a frame short of
@@ -650,9 +641,8 @@ fn reverse_retime_imports_backward_with_negative_otio_scalar() {
 /// reverse out point, and so its frames, came out a frame early.
 #[test]
 fn premiere_reverse_takes_its_stated_speed() {
-    let dir = std::env::temp_dir().join(format!("align-xml-rev200-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let xml = dir.join("rev200.xml");
     std::fs::write(
         &xml,
@@ -685,16 +675,14 @@ fn premiere_reverse_takes_its_stated_speed() {
         "{}",
         edit.retime.playback_rate
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn non_portable_dissolve_warns_and_flattens_in_otio() {
     // Odd duration (not centered-even) → Premiere keeps it, OTIO gets
     // overlap instead of a Transition.
-    let dir = std::env::temp_dir().join(format!("align-xml-np-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let xml = dir.join("np.xml");
     std::fs::write(
         &xml,
@@ -738,15 +726,13 @@ fn non_portable_dissolve_warns_and_flattens_in_otio() {
     let text = String::from_utf8(bytes).expect("utf8");
     assert!(!text.contains("Transition.1"));
     assert!(text.contains("Clip.2"));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn variable_speed_imports_as_average_rate() {
     // 3-keyframe ramp: constant fit fails, average rate wins with warning.
-    let dir = std::env::temp_dir().join(format!("align-xml-var-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let xml = dir.join("var.xml");
     std::fs::write(
         &xml,
@@ -778,15 +764,13 @@ fn variable_speed_imports_as_average_rate() {
             .iter()
             .any(|w| w.message.contains("Variable speed change"))
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn fcp7_nested_sequence_flattens_with_window_mapping() {
     // Parent uses nested seconds 1..5 of an 8 s inner timeline at 0..4 s.
-    let dir = std::env::temp_dir().join(format!("align-xml-nest-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let xml = dir.join("nest.xml");
     std::fs::write(
         &xml,
@@ -856,14 +840,12 @@ fn fcp7_nested_sequence_flattens_with_window_mapping() {
             .any(|w| w.message.contains("no readable local file path")),
         "nested container must not raise the missing-file warning"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn fcp7_multiclip_uses_marked_angles_with_fallback_warning() {
-    let dir = std::env::temp_dir().join(format!("align-xml-mc-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let xml = dir.join("mc.xml");
     std::fs::write(
         &xml,
@@ -961,7 +943,6 @@ fn fcp7_multiclip_uses_marked_angles_with_fallback_warning() {
             .any(|w| w.message.contains("no readable local file path")),
         "multiclip must not raise the missing-file warning"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -999,9 +980,8 @@ fn fcpxml_prefers_original_and_reads_legacy_asset_sources() {
 fn fcpxml_compound_and_nested_compound_flatten() {
     // ref-clip C maps compound [0.8s, 5.6s] onto [0.4s, 5.2s];
     // inner ref-clip D maps [0s, 2s] of compound E onto [4s, 6s] of C.
-    let dir = std::env::temp_dir().join(format!("align-xml-cmp-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let xml = dir.join("cmp.fcpxml");
     std::fs::write(
         &xml,
@@ -1061,14 +1041,12 @@ fn fcpxml_compound_and_nested_compound_flatten() {
     assert!((deep.timeline_end - 5.2).abs() < 0.01);
     assert!((deep.source_in - 0.0).abs() < 1e-9);
     assert!((deep.source_out - 1.6).abs() < 0.01);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn fcpxml_multicam_segments_and_audition() {
-    let dir = std::env::temp_dir().join(format!("align-xml-mc-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let xml = dir.join("mc.fcpxml");
     std::fs::write(
         &xml,
@@ -1153,7 +1131,6 @@ fn fcpxml_multicam_segments_and_audition() {
             .any(|w| w.message.contains("Audition alternatives")),
         "audition warns"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -1200,9 +1177,8 @@ fn clip_edit_to_window_maps_forward_and_backward() {
 
 #[test]
 fn fcpxml_cyclic_compound_is_skipped_without_hanging() {
-    let dir = std::env::temp_dir().join(format!("align-xml-cyc-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let xml = dir.join("cyc.fcpxml");
     std::fs::write(
         &xml,
@@ -1239,7 +1215,6 @@ fn fcpxml_cyclic_compound_is_skipped_without_hanging() {
             .any(|w| w.message.contains("Cyclic compound")),
         "cycle warns"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -1256,9 +1231,8 @@ fn fcp7_deep_nesting_hits_the_depth_cap() {
     let doc = format!(
         r#"<?xml version="1.0"?><xmeml version="4"><sequence><name>Deep</name><rate><timebase>25</timebase><ntsc>FALSE</ntsc></rate><media><video><track><enabled>TRUE</enabled><locked>FALSE</locked>{inner}<clipitem id="flat"><name>Flat</name><in>0</in><out>100</out><start>0</start><end>100</end><file id="ff"><pathurl>file:///tmp/flat.mov</pathurl><rate><timebase>25</timebase><ntsc>FALSE</ntsc></rate><duration>100</duration></file></clipitem></track></video></media></sequence></xmeml>"#
     );
-    let dir = std::env::temp_dir().join(format!("align-xml-deep-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
     let xml = dir.join("deep.xml");
     std::fs::write(&xml, doc).unwrap();
     let draft = read_timeline(&xml, None).expect("read");
@@ -1273,7 +1247,6 @@ fn fcp7_deep_nesting_hits_the_depth_cap() {
         "depth cap warns"
     );
     // Terminates (this assertion is the test): no stack overflow.
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Minimal ExportTimeline from a draft for writer-level assertions.

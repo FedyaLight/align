@@ -20,6 +20,10 @@ pub struct AudioTrack {
 }
 #[derive(Debug, Serialize)]
 pub struct AudioClip {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserved_start: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub path: PathBuf,
     pub start: u64,
     pub source_in: u64,
@@ -129,7 +133,15 @@ impl ImportedAudio {
         })?;
         let mut edits = Vec::new();
         let mut frame_duration = None;
+        let mut aaf_track_numbers = Vec::new();
+        let (mut picture_number, mut sound_number) = (0, 0);
         for (track_index, track) in sequence.tracks.into_iter().enumerate() {
+            let track_number = match track.media_kind {
+                ImportedKind::Picture => &mut picture_number,
+                ImportedKind::Sound => &mut sound_number,
+            };
+            *track_number += 1;
+            aaf_track_numbers.push(*track_number);
             let (numerator, denominator) = track.clock();
             let rate = numerator as f64 / denominator as f64;
             if track.media_kind == ImportedKind::Picture {
@@ -176,6 +188,7 @@ impl ImportedAudio {
             ));
         }
         Ok(TimelineDraft {
+            aaf_track_numbers,
             source_url: path.to_path_buf(),
             name: sequence.name,
             // Audio AAF has no picture edit rate. Use the application's default
@@ -199,6 +212,8 @@ static READ: std::sync::LazyLock<std::sync::Mutex<ReadTimelines>> =
 type ReadTimelines = std::collections::HashMap<(PathBuf, String, PathBuf), Vec<u8>>;
 /// Responses kept at most; a long session starts over past it.
 const READ_LIMIT: usize = 64;
+const MAX_AAF_RESPONSE: usize = 64 << 20;
+const MAX_AAF_CACHE_BYTES: usize = 64 << 20;
 
 pub fn read_timeline(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, AafError> {
     if cancel.load(Ordering::Relaxed) {
@@ -237,7 +252,8 @@ pub fn read_timeline(path: &Path, cancel: &AtomicBool) -> Result<ImportedAudio, 
     };
     if let Some(key) = key.filter(unchanged) {
         let mut read = lock();
-        if read.len() >= READ_LIMIT {
+        let cached_bytes: usize = read.values().map(Vec::len).sum();
+        if read.len() >= READ_LIMIT || cached_bytes + json.len() > MAX_AAF_CACHE_BYTES {
             read.clear();
         }
         read.insert(key, json);
@@ -268,22 +284,39 @@ fn run_read_timeline(
     // A file avoids stdout pipe deadlocks on large compositions while retaining
     // cancellable process supervision and automatic temporary-file cleanup.
     let mut output = tempfile::tempfile()?;
+    let mut errors = tempfile::tempfile()?;
     let mut child = crate::process::command(executable)
         .arg("read-timeline")
         .arg(path)
         .arg(directory)
         .stdin(Stdio::null())
         .stdout(Stdio::from(output.try_clone()?))
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::from(errors.try_clone()?))
         .spawn()?;
     let status = crate::process::wait_cancellable(&mut child, cancel)?;
+    use std::io::{Read, Seek};
     if !status.success() {
-        return Err(AafError::Writer(status.to_string()));
+        errors.rewind()?;
+        let mut details = Vec::new();
+        errors.take(8192).read_to_end(&mut details)?;
+        let details = String::from_utf8_lossy(&details);
+        let details = details.trim();
+        return Err(AafError::Writer(if details.is_empty() {
+            status.to_string()
+        } else {
+            details.to_owned()
+        }));
     }
-    use std::io::{Read, Seek, SeekFrom};
-    output.seek(SeekFrom::Start(0))?;
+    output.rewind()?;
     let mut json = Vec::new();
-    output.read_to_end(&mut json)?;
+    output
+        .take(MAX_AAF_RESPONSE as u64 + 1)
+        .read_to_end(&mut json)?;
+    if json.len() > MAX_AAF_RESPONSE {
+        return Err(AafError::Writer(
+            "AAF timeline response is too large".into(),
+        ));
+    }
     Ok(json)
 }
 
@@ -447,14 +480,88 @@ pub fn audio_manifest(
 /// The audio manifest, linking the sound of `cameras` without stems as it
 /// is: an item of one of them without prepared stems refers to the file's
 /// own channels.
+/// Lanes of clips in start order (`order` breaks ties), each clip joining
+/// the first lane, of a clip `joins` accepts, whose last clip has ended. A
+/// clip the camera clock moved is packed at its assembled start first, so
+/// every other clip keeps its lane in the ordinary assembly; then it takes
+/// that lane if free at its own start, else the first free lane, else a new
+/// last one.
+fn pack_lanes<T>(
+    mut clips: Vec<(T, Option<u64>)>,
+    span: impl Fn(&T) -> (u64, u64),
+    order: impl Fn(&T, &T) -> std::cmp::Ordering,
+    joins: impl Fn(&T, &T) -> bool,
+) -> Vec<Vec<T>> {
+    let at = |(clip, assembled): &(T, Option<u64>)| assembled.unwrap_or(span(clip).0);
+    clips.sort_by(|a, b| at(a).cmp(&at(b)).then_with(|| order(&a.0, &b.0)));
+    let mut assembled: Vec<Vec<(T, Option<u64>)>> = Vec::new();
+    for entry in clips {
+        let start = at(&entry);
+        let lane = assembled.iter().position(|lane| {
+            let last = lane.last().expect("lanes are never empty");
+            joins(&lane[0].0, &entry.0) && at(last) + span(&last.0).1 <= start
+        });
+        match lane {
+            Some(index) => assembled[index].push(entry),
+            None => assembled.push(vec![entry]),
+        }
+    }
+    let mut lanes: Vec<Vec<T>> = Vec::with_capacity(assembled.len());
+    let mut moved = Vec::new();
+    for (index, lane) in assembled.into_iter().enumerate() {
+        let mut kept = Vec::with_capacity(lane.len());
+        for (clip, assembled) in lane {
+            match assembled {
+                Some(_) => moved.push((index, clip)),
+                None => kept.push(clip),
+            }
+        }
+        lanes.push(kept);
+    }
+    moved.sort_by(|a, b| {
+        span(&a.1)
+            .0
+            .cmp(&span(&b.1).0)
+            .then_with(|| order(&a.1, &b.1))
+    });
+    for (lane, clip) in moved {
+        let (start, length) = span(&clip);
+        let free = |lane: &Vec<T>| {
+            lane.first().is_none_or(|first| joins(first, &clip))
+                && lane.iter().all(|other| {
+                    let (other_start, other_length) = span(other);
+                    other_start + other_length <= start || start + length <= other_start
+                })
+        };
+        let index = if free(&lanes[lane]) {
+            lane
+        } else if let Some(index) = lanes.iter().position(free) {
+            index
+        } else {
+            lanes.push(Vec::new());
+            lanes.len() - 1
+        };
+        let lane = &mut lanes[index];
+        let at = lane.partition_point(|other| {
+            span(other).0 < start
+                || (span(other).0 == start && order(other, &clip) != std::cmp::Ordering::Greater)
+        });
+        lane.insert(at, clip);
+    }
+    lanes.retain(|lane| !lane.is_empty());
+    lanes
+}
+
 fn audio_manifest_linking(
     timeline: &align_core::export::ExportTimeline,
     cameras: &std::collections::HashSet<PathBuf>,
 ) -> Result<AudioManifest, AafError> {
     use std::collections::BTreeMap;
     let fail = |text: &str| AafError::Writer(text.to_owned());
-    let mut groups: BTreeMap<(String, u32, usize), Vec<AudioClip>> = BTreeMap::new();
+    type Placed = (AudioClip, Option<u64>);
+    let mut groups: BTreeMap<(String, u32, usize), Vec<Placed>> = BTreeMap::new();
     for island in &timeline.islands {
+        let reserve_tail = island.reserved_end().is_some();
         for item in &island.clips {
             if item.clip.video.is_some()
                 || item.linked_audio_edit.is_some()
@@ -487,6 +594,10 @@ fn audio_manifest_linking(
                 Ok(value.round() as u64)
             };
             let start = samples(item.timeline_start(align_core::MediaKind::Audio))?;
+            let assembled = item
+                .assembled_start(align_core::MediaKind::Audio)
+                .map(samples)
+                .transpose()?;
             let length = samples(item.precision_source_duration())?;
             let (source_in, frames) = if direct {
                 (
@@ -518,6 +629,8 @@ fn audio_manifest_linking(
                 }
                 let clip = match stems.get(channel) {
                     None => AudioClip {
+                        reserved_start: assembled.filter(|_| reserve_tail),
+                        display_name: item.camera_clock.as_ref().and(item.display_name.clone()),
                         path: item.clip.url.clone(),
                         start,
                         source_in,
@@ -528,6 +641,8 @@ fn audio_manifest_linking(
                         metadata: None,
                     },
                     Some(stem) => AudioClip {
+                        reserved_start: assembled.filter(|_| reserve_tail),
+                        display_name: item.camera_clock.as_ref().and(item.display_name.clone()),
                         path: stem.clone(),
                         start,
                         source_in,
@@ -541,37 +656,28 @@ fn audio_manifest_linking(
                 groups
                     .entry((source.clone(), rate as u32, channel))
                     .or_default()
-                    .push(clip);
+                    .push((clip, assembled));
             }
         }
     }
     let mut tracks = Vec::new();
-    for ((source, sample_rate, channel), mut clips) in groups {
-        clips.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.path.cmp(&b.path)));
-        let mut lanes: Vec<AudioTrack> = Vec::new();
-        for clip in clips {
-            let lane = lanes.iter().position(|track| {
-                track
-                    .clips
-                    .last()
-                    .is_none_or(|last| last.start + last.length <= clip.start)
-            });
-            let index = lane.unwrap_or_else(|| {
-                lanes.push(AudioTrack {
-                    name: format!(
-                        "{} / channel {} / lane {}",
-                        source,
-                        channel + 1,
-                        lanes.len() + 1
-                    ),
+    for ((source, sample_rate, channel), clips) in groups {
+        let lanes = pack_lanes(
+            clips,
+            |clip| (clip.start, clip.length),
+            |a, b| a.path.cmp(&b.path),
+            |_, _| true,
+        );
+        tracks.extend(
+            lanes
+                .into_iter()
+                .enumerate()
+                .map(|(index, clips)| AudioTrack {
+                    name: format!("{} / channel {} / lane {}", source, channel + 1, index + 1),
                     sample_rate,
-                    clips: Vec::new(),
-                });
-                lanes.len() - 1
-            });
-            lanes[index].clips.push(clip);
-        }
-        tracks.extend(lanes);
+                    clips,
+                }),
+        );
     }
     if tracks.is_empty() {
         return Err(fail("No AAF audio tracks"));
@@ -583,9 +689,8 @@ fn audio_manifest_linking(
     })
 }
 
-/// Stream description for the AAF module's media link without FFmpeg:
-/// QuickTime/MP4 headers are read natively, and the AAF module parses MXF
-/// itself (it ignores the description for `.mxf`).
+/// QuickTime/MP4 metadata is collected here. For `.mxf` the AAF helper
+/// reads the OP-Atom header for the package UMIDs, tracks, and descriptor.
 fn picture_metadata(path: &Path) -> Option<serde_json::Value> {
     let is_mxf = path
         .extension()
@@ -638,6 +743,10 @@ pub fn timeline_manifest_with_frame_rate(
     } else {
         audio_manifest_linking(&audio, &cameras)?.tracks
     };
+    let reserve_tail = timeline
+        .islands
+        .iter()
+        .any(|island| island.reserved_end().is_some());
     let mut pictures = Vec::new();
     let mut metadata = std::collections::HashMap::new();
     for item in timeline.islands.iter().flat_map(|island| &island.clips) {
@@ -679,30 +788,41 @@ pub fn timeline_manifest_with_frame_rate(
             metadata.insert(item.clip.url.clone(), value);
         }
         if !metadata.contains_key(&item.clip.url) {
-            let probe = crate::ff::ffprobe_bin()
-                .ok_or_else(|| fail("AAF picture export requires ffprobe"))?;
-            let mut output = tempfile::tempfile()?;
-            let mut child = crate::process::command(probe)
-                .args([
-                    "-v",
-                    "error",
-                    "-show_format",
-                    "-show_streams",
-                    "-of",
-                    "json",
-                ])
-                .arg(&item.clip.url)
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(output.try_clone()?))
-                .stderr(Stdio::inherit())
-                .spawn()?;
-            let status = crate::process::wait_cancellable(&mut child, cancel)?;
-            if !status.success() {
-                return Err(fail("AAF picture media inspection failed"));
-            }
-            use std::io::{Seek, SeekFrom};
-            output.seek(SeekFrom::Start(0))?;
-            let value: serde_json::Value = serde_json::from_reader(output)
+            // Inspection usually read this header already.
+            let header = match crate::ff::cached_probe_json(&item.clip.url) {
+                Some(header) => header,
+                None => {
+                    let probe = crate::ff::ffprobe_bin()
+                        .ok_or_else(|| fail("AAF picture export requires ffprobe"))?;
+                    let revision = crate::ff::media_revision(&item.clip.url);
+                    let mut output = tempfile::tempfile()?;
+                    let mut child = crate::process::command(probe)
+                        .args([
+                            "-v",
+                            "error",
+                            "-print_format",
+                            "json",
+                            "-show_format",
+                            "-show_streams",
+                        ])
+                        .arg(&item.clip.url)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::from(output.try_clone()?))
+                        .stderr(Stdio::inherit())
+                        .spawn()?;
+                    let status = crate::process::wait_cancellable(&mut child, cancel)?;
+                    if !status.success() {
+                        return Err(fail("AAF picture media inspection failed"));
+                    }
+                    use std::io::{Read, Seek, SeekFrom};
+                    output.seek(SeekFrom::Start(0))?;
+                    let mut header = Vec::new();
+                    output.read_to_end(&mut header)?;
+                    crate::ff::remember_probe_json(&item.clip.url, revision, &header);
+                    header
+                }
+            };
+            let value: serde_json::Value = serde_json::from_slice(&header)
                 .map_err(|error| AafError::Writer(error.to_string()))?;
             metadata.insert(item.clip.url.clone(), value);
         }
@@ -714,32 +834,42 @@ pub fn timeline_manifest_with_frame_rate(
             json!({"start":start.round().max(0.0) as u64,
                 "fps":(1.0 / clock.as_seconds()).round() as u64,"drop":tc.drop_frame})
         });
-        pictures.push(
+        let assembled = item
+            .assembled_start(align_core::MediaKind::Video)
+            .map(frame)
+            .transpose()?;
+        pictures.push((
             json!({"name":item.preferred_source_key(align_core::MediaKind::Video).unwrap_or("Video"),
             "edit_rate":{"numerator":clock.timescale,"denominator":clock.value},
             "clips":[{"path":item.clip.url,"start":start,"source_in":source_in,"length":length,
-                "timecode":timecode,"metadata":metadata[&item.clip.url]}]}),
-        );
+                "reserved_start":assembled.filter(|_| reserve_tail),"display_name":item.camera_clock.as_ref().and(item.display_name.as_ref()), "timecode":timecode,"metadata":metadata[&item.clip.url]}]}),
+            assembled,
+        ));
     }
-    pictures.sort_by_key(|track| track["clips"][0]["start"].as_u64().unwrap());
-    let mut lanes: Vec<serde_json::Value> = Vec::new();
-    for mut track in pictures {
-        let start = track["clips"][0]["start"].as_u64().unwrap();
-        let lane = lanes.iter_mut().find(|lane| {
-            let last = lane["clips"].as_array().unwrap().last().unwrap();
-            lane["name"] == track["name"]
-                && lane["edit_rate"] == track["edit_rate"]
-                && last["start"].as_u64().unwrap() + last["length"].as_u64().unwrap() <= start
-        });
-        if let Some(lane) = lane {
-            lane["clips"]
-                .as_array_mut()
-                .unwrap()
-                .push(track["clips"][0].take());
-        } else {
-            lanes.push(track);
-        }
-    }
+    let span = |track: &serde_json::Value| {
+        let clip = &track["clips"][0];
+        (
+            clip["start"].as_u64().unwrap(),
+            clip["length"].as_u64().unwrap(),
+        )
+    };
+    let lanes: Vec<serde_json::Value> = pack_lanes(
+        pictures,
+        span,
+        |_, _| std::cmp::Ordering::Equal,
+        |first, track| first["name"] == track["name"] && first["edit_rate"] == track["edit_rate"],
+    )
+    .into_iter()
+    .map(|mut lane| {
+        let clips: Vec<serde_json::Value> = lane
+            .iter_mut()
+            .map(|track| track["clips"][0].take())
+            .collect();
+        let mut track = lane.swap_remove(0);
+        track["clips"] = serde_json::Value::Array(clips);
+        track
+    })
+    .collect();
     // Linked camera sound shares its picture's media description.
     for clip in tracks.iter_mut().flat_map(|track| &mut track.clips) {
         if clip.channel.is_some() {
@@ -776,6 +906,47 @@ pub fn timeline_manifest_with_frame_rate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pictures of cameras A and B share lanes. Moving A's C3 by camera
+    /// clock into the time B0 plays must not move B0 off its lane.
+    #[test]
+    fn a_clip_moved_by_camera_clock_keeps_every_other_lane() {
+        let lanes = |moved: Option<(u64, u64)>| {
+            let mut clips = vec![
+                (("C1", 100), None),
+                (("C2", 400), None),
+                (("B0", 700), None),
+                (("C4", 900), None),
+                (("B1", 1_142), None),
+            ];
+            if let Some((start, assembled)) = moved {
+                clips.push((("C3", start), Some(assembled)));
+            } else {
+                clips.push((("C3", 961), None));
+            }
+            pack_lanes(
+                clips,
+                |&(_, start)| (start, 60),
+                |a, b| a.0.cmp(b.0),
+                |_, _| true,
+            )
+            .into_iter()
+            .map(|lane| lane.into_iter().map(|(name, _)| name).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+        };
+        let ordinary = lanes(None);
+        assert_eq!(ordinary, [vec!["C1", "C2", "B0", "C4", "C3", "B1"]]);
+        // Where its lane is taken, it opens a new last lane.
+        assert_eq!(
+            lanes(Some((690, 961))),
+            [vec!["C1", "C2", "B0", "C4", "B1"], vec!["C3"]]
+        );
+        // Where its lane is free, it stays on it.
+        assert_eq!(
+            lanes(Some((550, 961))),
+            [vec!["C1", "C2", "C3", "B0", "C4", "B1"]]
+        );
+    }
 
     #[test]
     fn picture_clock_and_separate_sound_survive_resolution() {

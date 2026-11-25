@@ -685,6 +685,56 @@ impl Library<'_> {
         xml
     }
 
+    /// Where a clip starts and for how long in a multicam angle, and where
+    /// in its file.
+    fn angle_times(
+        &self,
+        item: &ExportItem,
+        side: MediaKind,
+        origin: MediaTime,
+    ) -> (MediaTime, MediaTime, String) {
+        let frame = self.frame;
+        match side {
+            MediaKind::Video => (
+                picture_time(item.start, frame),
+                picture_time(item.timeline_duration, frame),
+                source_time(
+                    origin,
+                    picture_seconds(item.source_in, &item.clip),
+                    &item.clip,
+                    frame,
+                ),
+            ),
+            MediaKind::Audio => {
+                let start = sound_time(item.start, frame, &item.clip);
+                let duration = sound_time(audio_duration(item), frame, &item.clip);
+                let source = sum(origin, sound_time(audio_source_in(item), frame, &item.clip));
+                // Final Cut Pro moves an angle clip's source start
+                // onto a frame within its file, keeping its offset,
+                // so the clip starts there and moves with it.
+                let shift = difference(frame_within(source, origin, frame), source);
+                (
+                    sum(start, shift),
+                    difference(duration, shift),
+                    xml_text::fcpxml_time(sum(source, shift)),
+                )
+            }
+        }
+    }
+
+    /// The span a clip occupies in its multicam angle, as written; none
+    /// where the clip has no asset to write.
+    fn angle_span(&self, item: &ExportItem) -> Option<(MediaTime, MediaTime)> {
+        let side = if item.clip.video.is_some() {
+            MediaKind::Video
+        } else {
+            MediaKind::Audio
+        };
+        let (_, _, origin) = self.asset(item, side == MediaKind::Audio)?;
+        let (start, duration, _) = self.angle_times(item, side, origin);
+        Some((start, sum(start, duration)))
+    }
+
     /// The multicam resource: one angle per source, cameras first.
     fn multicam_xml(&self, island: &ExportIsland) -> String {
         let mut angle_groups: HashMap<String, Vec<&ExportItem>> = HashMap::new();
@@ -708,10 +758,62 @@ impl Library<'_> {
             "    <media id=\"{MULTICAM_ID}\" name=\"{} – Multicam\">\n      <multicam format=\"{SEQUENCE_FORMAT_ID}\">\n",
             xml_text::escape(&self.timeline.name)
         );
-        for (angle_index, key) in keys.iter().enumerate() {
-            let mut items = angle_groups[key].clone();
+        let mut angles = Vec::new();
+        let mut moved = Vec::new();
+        for key in keys {
+            let mut items = angle_groups.remove(&key).unwrap();
+            let original = angles.len();
+            items.retain(|item| {
+                if item.camera_clock.is_some() {
+                    moved.push((original, *item));
+                    false
+                } else {
+                    true
+                }
+            });
+            angles.push((key, items));
+        }
+        let original_count = angles.len();
+        moved.sort_by(|(_, a), (_, b)| {
+            a.start
+                .total_cmp(&b.start)
+                .then_with(|| a.clip.id.cmp(&b.clip.id))
+        });
+        for (original, item) in moved {
+            let key = &angles[original].0;
+            // Free where the clips as written, on the frame or sample grid
+            // of each, do not overlap.
+            let span = self.angle_span(item);
+            let free = |items: &[&ExportItem]| {
+                items
+                    .iter()
+                    .all(|other| match (span, self.angle_span(other)) {
+                        (Some((start, end)), Some((other_start, other_end))) => {
+                            other_end.as_seconds() <= start.as_seconds() + TIME_TOLERANCE
+                                || end.as_seconds() <= other_start.as_seconds() + TIME_TOLERANCE
+                        }
+                        _ => true,
+                    })
+            };
+            let angle = if free(&angles[original].1) {
+                original
+            } else if let Some(index) =
+                (original_count..angles.len()).find(|&i| angles[i].0 == *key && free(&angles[i].1))
+            {
+                index
+            } else {
+                angles.push((key.clone(), Vec::new()));
+                angles.len() - 1
+            };
+            angles[angle].1.push(item);
+        }
+        for (angle_index, (key, mut items)) in angles.into_iter().enumerate() {
             items.sort_by(|a, b| a.start.total_cmp(&b.start));
-            let angle_name = xml_text::escape(&angle_name(key, &items));
+            let mut name = angle_name(&key, &items);
+            if angle_index >= original_count {
+                name = format!("{name} · Camera clock {}", angle_index - original_count + 1);
+            }
+            let angle_name = xml_text::escape(&name);
             writeln!(
                 xml,
                 "        <mc-angle name=\"{angle_name}\" angleID=\"a{}\">",
@@ -730,34 +832,7 @@ impl Library<'_> {
                 else {
                     continue;
                 };
-                let frame = self.frame;
-                let (start, duration, source) = match side {
-                    MediaKind::Video => (
-                        picture_time(item.start, frame),
-                        picture_time(item.timeline_duration, frame),
-                        source_time(
-                            origin,
-                            picture_seconds(item.source_in, &item.clip),
-                            &item.clip,
-                            frame,
-                        ),
-                    ),
-                    MediaKind::Audio => {
-                        let start = sound_time(item.start, frame, &item.clip);
-                        let duration = sound_time(audio_duration(item), frame, &item.clip);
-                        let source =
-                            sum(origin, sound_time(audio_source_in(item), frame, &item.clip));
-                        // Final Cut Pro moves an angle clip's source start
-                        // onto a frame within its file, keeping its offset,
-                        // so the clip starts there and moves with it.
-                        let shift = difference(frame_within(source, origin, frame), source);
-                        (
-                            sum(start, shift),
-                            difference(duration, shift),
-                            xml_text::fcpxml_time(sum(source, shift)),
-                        )
-                    }
-                };
+                let (start, duration, source) = self.angle_times(item, side, origin);
                 clips.push(StoryClip {
                     start,
                     end: sum(start, duration),
@@ -836,6 +911,15 @@ impl Library<'_> {
                         item.start,
                         item.timeline_duration,
                     )
+                    .written_at(
+                        picture_time(item.start, frame).as_seconds(),
+                        sum(
+                            picture_time(item.start, frame),
+                            picture_time(item.timeline_duration, frame),
+                        )
+                        .as_seconds(),
+                    )
+                    .assembled_at(item.assembled_start(MediaKind::Video))
                 })
                 .collect::<Vec<_>>(),
         );
@@ -852,6 +936,15 @@ impl Library<'_> {
                         item.start,
                         audio_duration(item),
                     )
+                    .written_at(
+                        sound_time(item.start, frame, &item.clip).as_seconds(),
+                        sum(
+                            sound_time(item.start, frame, &item.clip),
+                            sound_time(audio_duration(item), frame, &item.clip),
+                        )
+                        .as_seconds(),
+                    )
+                    .assembled_at(item.assembled_start(MediaKind::Audio))
                 })
                 .collect::<Vec<_>>(),
         );

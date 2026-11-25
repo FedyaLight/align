@@ -1,9 +1,9 @@
 //! Top toolbar: sources, synchronization, and export.
 
 use super::animation::{export_button_entrance, quality_dropdown_motion, quality_shift_for_export};
-use super::controls::{icon_button, prominent_button};
+use super::controls::{dropdown_surface, icon_button, prominent_button};
 use super::menu_sidebar::app_menu_button;
-use super::settings::{search_quality_button, search_quality_menu};
+use super::settings::{QUALITY_MENU_WIDTH, search_quality_button, search_quality_menu};
 use super::timeline::zoom_slider;
 use super::{
     AlignApp, AnchoredPositionMode, Context, Div, Operation, ParentElement, Styled, Theme,
@@ -46,7 +46,9 @@ pub(super) fn toolbar(
         "btn-add",
         "icons/plus.svg",
         "Add Media",
-        true,
+        // Media added during a job would be dropped; the job's own bar
+        // offers Cancel.
+        !busy,
         |this, _, _, cx| this.add_media(cx),
     ));
     let trash_tip = if data.selection.is_empty() {
@@ -60,7 +62,7 @@ pub(super) fn toolbar(
         "btn-clear",
         "icons/trash.svg",
         trash_tip,
-        !data.clips.is_empty(),
+        !data.clips.is_empty() && !busy,
         |this, _, _, cx| this.delete_or_clear(cx),
     ));
     bar = bar.child(div().w(px(12.)));
@@ -98,7 +100,11 @@ pub(super) fn toolbar(
                     .offset(point(px(0.), px(4.)))
                     .snap_to_window_with_margin(px(8.))
                     .child(quality_dropdown_motion(
-                        search_quality_menu(cx, theme, data),
+                        dropdown_surface(
+                            theme,
+                            QUALITY_MENU_WIDTH,
+                            search_quality_menu(cx, theme, data),
+                        ),
                         quality_closing,
                     )),
             ));
@@ -145,6 +151,7 @@ pub(super) fn timeline_zoom_controls(
     data: &crate::state::AppData,
     active: bool,
 ) -> Div {
+    use crate::state::TimelineZoom;
     div()
         .flex()
         .flex_row()
@@ -156,12 +163,8 @@ pub(super) fn timeline_zoom_controls(
             "zoom-fit",
             "icons/fit.svg",
             "Zoom to fit",
-            active && data.zoom_level > 0.001,
-            |this, _, _, cx| {
-                this.data.zoom_at(0.0, 0.0);
-                this.data.pan_to(Some(0.0), None);
-                cx.notify();
-            },
+            active && data.can_zoom(TimelineZoom::Fit),
+            |this, _, _, cx| this.zoom_timeline(TimelineZoom::Fit, cx),
         ))
         .child(icon_button(
             cx,
@@ -169,14 +172,8 @@ pub(super) fn timeline_zoom_controls(
             "zoom-out",
             "icons/zoom-out.svg",
             "Zoom out",
-            active && data.zoom_level > 0.0,
-            |this, _, _, cx| {
-                let bounds = this.data.timeline_scroll.bounds();
-                let anchor = f32::from(bounds.size.width) * 0.5;
-                this.data
-                    .zoom_at((this.data.zoom_level - 0.2).max(0.0), anchor);
-                cx.notify();
-            },
+            active && data.can_zoom(TimelineZoom::Out),
+            |this, _, _, cx| this.zoom_timeline(TimelineZoom::Out, cx),
         ))
         .child(zoom_slider(cx, theme, data, active))
         .child(icon_button(
@@ -185,14 +182,8 @@ pub(super) fn timeline_zoom_controls(
             "zoom-in",
             "icons/zoom-in.svg",
             "Zoom in",
-            active && data.zoom_level < 1.0,
-            |this, _, _, cx| {
-                let bounds = this.data.timeline_scroll.bounds();
-                let anchor = f32::from(bounds.size.width) * 0.5;
-                this.data
-                    .zoom_at((this.data.zoom_level + 0.2).min(1.0), anchor);
-                cx.notify();
-            },
+            active && data.can_zoom(TimelineZoom::In),
+            |this, _, _, cx| this.zoom_timeline(TimelineZoom::In, cx),
         ))
         .child(
             div()

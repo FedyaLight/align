@@ -1,7 +1,12 @@
 name: align-rs
 
 on:
+  # Pushes run on main and release tags only: a pull request from a branch
+  # of this repository already runs below, so a branch push would start a
+  # second full matrix for the same commit. Tag pushes ignore path filters.
   push:
+    branches: [main]
+    tags: ["v*"]
     paths:
       - "crates/**"
       - "Cargo.toml"
@@ -67,23 +72,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      - name: Install AAF build requirements
-        shell: bash
-        env:
-          # On Windows, build PyInstaller's bootloader from source instead of
-          # shipping the prebuilt one, which malware also uses and antivirus
-          # engines therefore flag.
-          PYINSTALLER_COMPILE_BOOTLOADER: ${{ runner.os == 'Windows' && '1' || '' }}
-        run: |
-          no_binary=()
-          if [[ "${{ runner.os }}" == "Windows" ]]; then no_binary=(--no-binary pyinstaller); fi
-          python -m pip install "${no_binary[@]}" -r Support/aaf/build-requirements.txt
-      # The default shell keeps Windows-style temporary paths for the tests.
-      - name: Build AAF module
+      - name: Install AAF fixture requirements
+        run: python -m pip install -r Support/aaf/requirements.txt
+      - name: Verify AAF reference and release source checks
         run: |
           python -m unittest discover -s Support/aaf -v
           python script/test-release-source.py
-          python script/build-aaf-sidecar.py target/release
       # Rebuild the sidecars only when their build script changes. Release
       # builds always compile them fresh and verify the staged files, which
       # also catches MSYS2 toolchain changes before anything is published.
@@ -107,8 +101,8 @@ jobs:
       - name: Verify standalone sidecars (Windows)
         if: runner.os == 'Windows'
         run: python script/check-windows-sidecars.py target/ffmpeg-minimal
-      - name: Build release CLI
-        run: cargo build --locked --release -p align-cli
+      - name: Build release CLI and AAF helper
+        run: cargo build --locked --release -p align-cli -p align-aaf
       - name: Verify release end to end
         shell: bash
         run: |
@@ -178,8 +172,7 @@ jobs:
         shell: bash
         run: |
           rm -rf target/macos-package target/dmg-venv target/release-sources \
-            target/ffmpeg-minimal target/release/AAF-Sources \
-            target/release/align-aaf-runtime target/release/ThirdPartyLicenses
+            target/ffmpeg-minimal
       - uses: msys2/setup-msys2@v2
         if: runner.os == 'Windows'
         with:
@@ -196,20 +189,10 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install nasm
       - name: Build release
-        run: cargo build --locked --release -p align-cli -p align-gpui
+        run: cargo build --locked --release -p align-cli -p align-gpui -p align-aaf
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Install AAF build requirements
-        shell: bash
-        env:
-          PYINSTALLER_COMPILE_BOOTLOADER: ${{ runner.os == 'Windows' && '1' || '' }}
-        run: |
-          no_binary=()
-          if [[ "${{ runner.os }}" == "Windows" ]]; then no_binary=(--no-binary pyinstaller); fi
-          python -m pip install "${no_binary[@]}" -r Support/aaf/build-requirements.txt
-      - name: Build AAF module
-        run: python script/build-aaf-sidecar.py target/release --release-sources
       # macOS decodes and remuxes through AVFoundation and native QuickTime
       # code; its FFmpeg reads only MXF, which AVFoundation cannot open.
       - name: Build minimal FFmpeg sidecars (Linux, macOS)
@@ -232,9 +215,9 @@ jobs:
             ln -s align dist-bundle/align-cli
           fi
           cp "target/release/align-aaf$exe" dist-bundle/
-          cp -a target/release/align-aaf-runtime dist-bundle/
-          python script/check-frozen-aaf.py "dist-bundle/align-aaf$exe"
-          cp -R target/release/AAF-Licenses dist-bundle/
+          python script/check-aaf-sidecar.py "dist-bundle/align-aaf$exe"
+          mkdir dist-bundle/AAF-Licenses
+          cp crates/align-aaf/PYAAF2-LICENSE.txt dist-bundle/AAF-Licenses/
           cp LICENSE THIRD_PARTY_NOTICES.txt dist-bundle/
           cp "target/ffmpeg-minimal/ffmpeg$exe" "target/ffmpeg-minimal/ffprobe$exe" dist-bundle/
           shopt -s nullglob
@@ -254,11 +237,13 @@ jobs:
       - name: Prepare corresponding sources and dependency licenses
         shell: bash
         run: |
+          exe=""
+          if [[ "${{ runner.os }}" == "Windows" ]]; then exe=".exe"; fi
           python script/prepare-release-source.py target/release-sources \
             --platform ${{ runner.os }} \
             --licenses dist-bundle/ThirdPartyLicenses \
             --ffmpeg target/ffmpeg-minimal/Sources \
-            --aaf target/release/AAF-Sources \
+            --aaf-binary "dist-bundle/align-aaf$exe" \
             --velopack-version ${{ env.VELOPACK_VERSION }}
       - uses: actions/upload-artifact@v4
         with:
@@ -273,7 +258,6 @@ jobs:
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
           python -m venv --clear "$RUNNER_TEMP/dmg-venv"
           "$RUNNER_TEMP/dmg-venv/bin/python" -m pip install dmgbuild==1.6.7
-          AAF_DIR="$PWD/target/release" \
           RELEASE_LICENSES="$PWD/dist-bundle/ThirdPartyLicenses" \
           BUNDLE_FFMPEG=1 \
           FFMPEG_DIR="$PWD/target/ffmpeg-minimal" \
@@ -282,6 +266,18 @@ jobs:
           mkdir -p installers
           PYTHON="$RUNNER_TEMP/dmg-venv/bin/python" ./script/create-macos-dmg.sh \
             target/macos-package/Align.app "installers/Align-$version-macOS-arm64.dmg"
+      - name: Verify AAF in the mounted macOS installer
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          image=(installers/Align-*-macOS-arm64.dmg)
+          mount_dir="$(mktemp -d)"
+          trap 'hdiutil detach "$mount_dir" >/dev/null; rmdir "$mount_dir"' EXIT
+          hdiutil attach "${image[0]}" -readonly -nobrowse -mountpoint "$mount_dir"
+          bundle="$mount_dir/Align.app"
+          codesign --verify --deep --strict "$bundle"
+          python script/check-aaf-sidecar.py "$bundle/Contents/MacOS/align-aaf" \
+            --cli "$bundle/Contents/MacOS/align-cli"
       - uses: actions/setup-dotnet@v5
         if: runner.os == 'Windows'
         with:
@@ -297,6 +293,22 @@ jobs:
           rm installers/updates/com.align.app-win-Setup.exe
           mv installers/updates/* installers/
           rmdir installers/updates
+      - name: Verify AAF after Windows Setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = (Get-ChildItem installers/Align-*-Windows-x64-Setup.exe).FullName
+          $destination = Join-Path $env:RUNNER_TEMP 'align-install'
+          $log = Join-Path $env:RUNNER_TEMP 'align-setup.log'
+          $setup = Start-Process -FilePath $installer -ArgumentList @(
+            '--silent', '--installto', ('"{0}"' -f $destination), '--log', ('"{0}"' -f $log)
+          ) -Wait -PassThru
+          if ($setup.ExitCode -ne 0) {
+            if (Test-Path $log) { Get-Content $log }
+            throw "Align Setup exited with code $($setup.ExitCode)"
+          }
+          python script/check-aaf-sidecar.py "$destination/current/align-aaf.exe" `
+            --cli "$destination/current/align-cli.exe"
       - name: Build Fedora package and installer (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -328,7 +340,7 @@ jobs:
     container: archlinux:latest
     steps:
       - name: Install packaging tools
-        run: pacman -Syu --noconfirm --needed base-devel gtk4 pkgconf
+        run: pacman -Syu --noconfirm --needed base-devel gtk4 pkgconf python
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v5
         with:
@@ -350,6 +362,7 @@ jobs:
         run: |
           pacman -U --noconfirm installers/*.pkg.tar.zst
           align-cli --help >/dev/null
+          python script/check-aaf-sidecar.py /opt/align/align-aaf --cli /usr/bin/align-cli
           pacman -Qkk align
       - uses: actions/upload-artifact@v4
         with:
@@ -363,6 +376,9 @@ jobs:
     runs-on: ubuntu-24.04
     container: fedora:latest
     steps:
+      - name: Install package test tools
+        run: dnf install -y python3 tar gzip
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v5
         with:
           name: installers-Linux
@@ -370,6 +386,7 @@ jobs:
         run: |
           dnf install -y ./Align-*-Fedora-x86_64.rpm
           align-cli --help >/dev/null
+          python3 script/check-aaf-sidecar.py /opt/align/align-aaf --cli /usr/bin/align-cli
           rpm -V align
           sha256sum -c ./*.sha256
 

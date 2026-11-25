@@ -92,6 +92,17 @@ fn load_tracks(
         .collect())
 }
 
+/// The number of audio streams `inspect` reports for a file other than MXF,
+/// without its video and timecode probes: an All Mix decode asks for it on
+/// every window.
+fn audio_stream_count(path: &Path) -> Result<usize, DecodeError> {
+    if let Some(wave) = crate::pcm::PcmTrack::inspection_wave(path) {
+        return Ok(wave.probe().audio_streams.len());
+    }
+    let asset = open_asset(path)?;
+    Ok(audio_tracks(&asset)?.len())
+}
+
 fn audio_tracks(asset: &AVURLAsset) -> Result<Vec<Retained<AVAssetTrack>>, DecodeError> {
     // SAFETY: framework-provided media-type constant (copied pointer).
     let mt_opt = unsafe { AVMediaTypeAudio };
@@ -106,7 +117,7 @@ fn audio_tracks(asset: &AVURLAsset) -> Result<Vec<Retained<AVAssetTrack>>, Decod
 /// Mirrors `VideoTimingInspector.inspect` (same thresholds, same early
 /// evidence rules). Returns `None` when the asset has no video track.
 fn video_probe(asset: &AVURLAsset, path: &Path) -> Result<Option<VideoProbe>, DecodeError> {
-    use align_core::{RangeAccumulator, VideoFrameRateMode, canonical_frame_duration};
+    use align_core::{VideoFrameRateMode, canonical_frame_duration};
 
     let mt_opt = unsafe { AVMediaTypeVideo };
     let Some(mt) = mt_opt.as_ref() else {
@@ -127,47 +138,9 @@ fn video_probe(asset: &AVURLAsset, path: &Path) -> Result<Option<VideoProbe>, De
     let mode = if unsafe { track.canProvideSampleCursors() } {
         // SAFETY: cursor walk over plain-data CMTime getters.
         let range = unsafe { track.timeRange() };
-        let table_mode = table_frame_rate_mode(path, track, range);
-        match (
-            unsafe { track.makeSampleCursorWithPresentationTimeStamp(range.start) },
-            table_mode,
-        ) {
-            (None, _) => VideoFrameRateMode::Unknown,
-            (Some(_), Some(mode)) => mode,
-            (Some(cursor), None) => unsafe {
-                let mut durations = RangeAccumulator::new();
-                let mut deltas = RangeAccumulator::new();
-                let mut previous: Option<CMTime> = None;
-                loop {
-                    let duration = cursor.currentSampleDuration();
-                    if is_numeric(duration) && duration.value > 0 {
-                        durations.observe(duration.value as f64 / duration.timescale as f64);
-                    }
-                    let pts = cursor.presentationTimeStamp();
-                    if let Some(prev) = previous
-                        && is_numeric(pts)
-                        && is_numeric(prev)
-                    {
-                        // Plain-data arithmetic (outer block is unsafe).
-                        let delta = pts.subtract(prev);
-                        if is_numeric(delta) && delta.value > 0 {
-                            deltas.observe(delta.value as f64 / delta.timescale as f64);
-                        }
-                    }
-                    previous = Some(pts);
-                    if cursor.stepInPresentationOrderByCount(1) != 1 {
-                        break;
-                    }
-                }
-                let enough = durations.count().max(deltas.count()) >= 2;
-                if !enough {
-                    VideoFrameRateMode::Unknown
-                } else if durations.is_variable() || deltas.is_variable() {
-                    VideoFrameRateMode::Variable
-                } else {
-                    VideoFrameRateMode::Constant
-                }
-            },
+        match table_frame_rate_mode(path, track, range) {
+            Some(mode) if cursor_frame_rate_mode_available(track, range) => mode,
+            _ => cursor_frame_rate_mode(track, range),
         }
     } else {
         VideoFrameRateMode::Unknown
@@ -180,6 +153,59 @@ fn video_probe(asset: &AVURLAsset, path: &Path) -> Result<Option<VideoProbe>, De
         // Standard timecode track first (Sony tail enriches in pipeline).
         source_timecode: standard_timecode(asset),
     }))
+}
+
+fn cursor_frame_rate_mode_available(track: &AVAssetTrack, range: CMTimeRange) -> bool {
+    // SAFETY: creates a cursor over the loaded track; no frames are decoded.
+    unsafe { track.makeSampleCursorWithPresentationTimeStamp(range.start) }.is_some()
+}
+
+/// Frame timing from AVFoundation's sample cursor: every sample's duration
+/// and presentation spacing, in presentation order.
+fn cursor_frame_rate_mode(
+    track: &AVAssetTrack,
+    range: CMTimeRange,
+) -> align_core::VideoFrameRateMode {
+    use align_core::{RangeAccumulator, VideoFrameRateMode};
+    // SAFETY: cursor walk over plain-data CMTime getters.
+    let Some(cursor) = (unsafe { track.makeSampleCursorWithPresentationTimeStamp(range.start) })
+    else {
+        return VideoFrameRateMode::Unknown;
+    };
+    unsafe {
+        let mut durations = RangeAccumulator::new();
+        let mut deltas = RangeAccumulator::new();
+        let mut previous: Option<CMTime> = None;
+        loop {
+            let duration = cursor.currentSampleDuration();
+            if is_numeric(duration) && duration.value > 0 {
+                durations.observe(duration.value as f64 / duration.timescale as f64);
+            }
+            let pts = cursor.presentationTimeStamp();
+            if let Some(prev) = previous
+                && is_numeric(pts)
+                && is_numeric(prev)
+            {
+                // Plain-data arithmetic (outer block is unsafe).
+                let delta = pts.subtract(prev);
+                if is_numeric(delta) && delta.value > 0 {
+                    deltas.observe(delta.value as f64 / delta.timescale as f64);
+                }
+            }
+            previous = Some(pts);
+            if cursor.stepInPresentationOrderByCount(1) != 1 {
+                break;
+            }
+        }
+        let enough = durations.count().max(deltas.count()) >= 2;
+        if !enough {
+            VideoFrameRateMode::Unknown
+        } else if durations.is_variable() || deltas.is_variable() {
+            VideoFrameRateMode::Variable
+        } else {
+            VideoFrameRateMode::Constant
+        }
+    }
 }
 
 // With no reordering or edits, every positive PTS spacing is also an stts
@@ -821,8 +847,26 @@ impl MediaBackend for AppleNativeBackend {
             });
         }
 
-        let mut reusable =
+        let reusable =
             revision.filter(|_| audio_streams.len() == 1 && audio_streams[0].is_float.is_none());
+        // Fingerprinting reuses the opened asset whether or not the opening
+        // is read for LTC, which a file with timecode skips.
+        if let (Some(prepared), Some(stamp)) = (prepared, reusable) {
+            let asset = asset.clone();
+            let file = path.to_owned();
+            prepared.remember(
+                path,
+                stamp,
+                Box::new(move |source, sink| {
+                    let tracks = audio_tracks(&asset)?;
+                    let track = tracks
+                        .get(source.stream_index())
+                        .ok_or(DecodeError::InvalidPcm)?;
+                    let (reader, rate) = reader_for_track(&asset, track, None)?;
+                    fingerprint_reader(&file, reader, rate, source, sink)
+                }),
+            );
+        }
         let report = ProbeReport {
             duration_seconds: seconds,
             audio_streams,
@@ -835,22 +879,6 @@ impl MediaBackend for AppleNativeBackend {
                 let track = audio.get(index).ok_or(DecodeError::InvalidPcm)?;
                 let (session, rate) = reader_for_track(&asset, track, Some((0., 3.)))?;
                 native_blocks(path, session, rate, consume)?;
-                if let (Some(prepared), Some(stamp)) = (prepared, reusable.take()) {
-                    let asset = asset.clone();
-                    let file = path.to_owned();
-                    prepared.remember(
-                        path,
-                        stamp,
-                        Box::new(move |source, sink| {
-                            let tracks = audio_tracks(&asset)?;
-                            let track = tracks
-                                .get(source.stream_index())
-                                .ok_or(DecodeError::InvalidPcm)?;
-                            let (reader, rate) = reader_for_track(&asset, track, None)?;
-                            fingerprint_reader(&file, reader, rate, source, sink)
-                        }),
-                    );
-                }
                 Ok(())
             }),
         })
@@ -875,7 +903,7 @@ impl MediaBackend for AppleNativeBackend {
             return crate::portable::PortableBackend.decode_mono_8k(path, source, consume);
         }
         if source == AudioAnalysisSource::AllMixed {
-            let stream_count = self.inspect(path)?.audio_streams.len();
+            let stream_count = audio_stream_count(path)?;
             return crate::mix::decode_all_streams_mono_8k(self, path, stream_count, consume);
         }
         if let Some(result) = self.local_mono_8k(path, source, consume) {
@@ -901,7 +929,7 @@ impl MediaBackend for AppleNativeBackend {
             );
         }
         if source == AudioAnalysisSource::AllMixed {
-            let stream_count = self.inspect(path)?.audio_streams.len();
+            let stream_count = audio_stream_count(path)?;
             return crate::mix::decode_all_streams_window_16k(
                 self,
                 path,
@@ -984,6 +1012,60 @@ mod tests {
     use super::*;
     use crate::backend::MediaBackend;
 
+    /// The sample tables classify picture timing exactly as AVFoundation's
+    /// cursor walk does, and are used for movies with compressed sound or
+    /// none, not only for movies with PCM sound.
+    #[test]
+    fn table_picture_timing_matches_the_cursor_without_pcm_audio() {
+        let Some(ffmpeg) = crate::ff::test_ffmpeg() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let picture = ["-f", "lavfi", "-i", "testsrc2=s=64x36:r=25:d=2"];
+        let sound = ["-f", "lavfi", "-i", "sine=r=48000:d=2", "-c:a", "aac"];
+        let variable = ["-vf", "setpts='if(lt(N,20),N/25/TB,(N+N/3)/25/TB)'"];
+        let mut cases: Vec<(&str, Vec<&str>)> = vec![
+            ("aac.mp4", [&picture[..], &sound[..]].concat()),
+            ("silent.mov", picture.to_vec()),
+            (
+                "variable.mp4",
+                [
+                    &picture[..],
+                    &sound[..],
+                    &variable[..],
+                    &["-fps_mode", "vfr"][..],
+                ]
+                .concat(),
+            ),
+        ];
+        for (name, args) in &mut cases {
+            let name = *name;
+            args.extend(["-c:v", "mpeg4", "-bf", "0", "-shortest"]);
+            let path = dir.path().join(name);
+            let status = std::process::Command::new(&ffmpeg)
+                .args(["-y", "-v", "error"])
+                .args(&*args)
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{name}");
+            let asset = open_asset(&path).unwrap();
+            let video = load_tracks(&asset, unsafe { AVMediaTypeVideo }.unwrap()).unwrap();
+            let track = &video[0];
+            let range = unsafe { track.timeRange() };
+            let table = table_frame_rate_mode(&path, track, range);
+            // The tables may decline, as for this variable-rate edit; they
+            // never disagree.
+            if name != "variable.mp4" {
+                assert!(table.is_some(), "{name}");
+            }
+            assert!(
+                table.is_none_or(|mode| mode == cursor_frame_rate_mode(track, range)),
+                "{name}"
+            );
+        }
+    }
+
     fn fixture_wav(
         dir: &std::path::Path,
         name: &str,
@@ -1028,11 +1110,6 @@ mod tests {
     fn foundation_linkage_works() {
         let url = file_url(Path::new("/tmp/clip.wav")).expect("file url");
         assert!(url.isFileURL());
-    }
-
-    #[test]
-    fn backend_kind_is_native() {
-        assert_eq!(AppleNativeBackend.kind(), BackendKind::AppleNative);
     }
 
     #[test]

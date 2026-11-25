@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------- Clip IDs
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ClipId(pub String);
 
 impl ClipId {
@@ -409,6 +409,10 @@ pub struct SyncProject {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportedTimeline {
+    /// Display number within its media kind for each AAF track, in file order.
+    /// Editing and saved overrides continue to use the original track index.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aaf_track_numbers: Vec<usize>,
     pub name: String,
     pub frame_duration: MediaTime,
     pub edits: Vec<TimelineEdit>,
@@ -559,6 +563,8 @@ pub struct TimelinePreviewItem {
     pub mapping_points: Vec<MappingPoint>,
     pub confidence: f64,
     pub matched: bool,
+    /// Set for an unmatched clip the camera clock placed.
+    pub camera_clock: Option<crate::camera_clock::CameraClockMark>,
 }
 
 /// Live match preview for progress callbacks.

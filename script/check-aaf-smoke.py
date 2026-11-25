@@ -10,8 +10,9 @@ import shutil
 import wave
 import hashlib
 import struct
-from urllib.parse import unquote, urlparse
 import aaf2
+
+from align_paths import locator_path
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('cli', type=Path)
@@ -31,12 +32,6 @@ def run_cli(arguments, name):
     if proc.returncode:
         raise RuntimeError(proc.stderr)
     return json.loads(proc.stdout)
-
-def locator_file(url):
-    path = unquote(urlparse(url).path)
-    if os.name == 'nt' and len(path) >= 3 and path[0] == '/' and path[2] == ':':
-        path = path[1:]
-    return Path(path)
 
 artifacts = run_cli(['export-json', '--aaf', args.smoke.resolve() / 'sync.json', output], 'export')
 assert len(artifacts) == 1 and artifacts[0]['format'] == 'aaf'
@@ -98,7 +93,7 @@ with aaf2.open(str(repair_source), 'rw') as container:
         for locator in descriptor['Locator'].value:
             if 'URLString' not in locator:
                 continue
-            name = locator_file(locator['URLString'].value).name
+            name = locator_path(locator['URLString'].value).name
             if name not in ('a.wav', 'b.wav'):
                 continue
             found = repair_found / name
@@ -160,7 +155,7 @@ with aaf2.open(artifacts[0]['url']) as container:
         locator = source_mob.descriptor['Locator'].value[0]['URLString'].value
         # The re-export uses rendered mono stems. Decode the file URL with the
         # same standard URL rules on Windows and POSIX.
-        stem = locator_file(locator)
+        stem = locator_path(locator)
         source = args.smoke.resolve() / 'media' / ('a.wav' if index < 2 else 'b.wav')
         channel = index % 2
         with wave.open(str(source), 'rb') as reader:

@@ -308,6 +308,7 @@ pub(super) fn read_fcpxml(
         &mut next_number,
     );
     Ok(TimelineDraft {
+        aaf_track_numbers: Vec::new(),
         source_url: path.to_path_buf(),
         name,
         frame_duration,

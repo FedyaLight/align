@@ -19,14 +19,20 @@ if [ "$(uname -m)" != x86_64 ] || ! command -v dnf >/dev/null; then
   echo 'This installer requires Fedora on an x86_64 computer.' >&2
   exit 1
 fi
+if [ ! -x /usr/bin/pkexec ]; then
+  echo 'Install polkit to use the graphical installer, or install the separate package with sudo dnf install.' >&2
+  exit 1
+fi
 unpack_dir=$(mktemp -d "${TMPDIR:-/tmp}/align-setup.XXXXXX")
 trap 'rm -rf "$unpack_dir"' EXIT HUP INT TERM
 payload_line=$(awk '/^__ALIGN_PAYLOAD__$/ { print NR + 1; exit }' "$0")
 tail -n +"$payload_line" "$0" | tar -xz -C "$unpack_dir"
-if ! ldd "$unpack_dir/align-installer" 2>/dev/null | grep -q 'not found'; then
+# Without a display, as over SSH, or without GTK 4, DNF installs the RPM.
+if { [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; } &&
+   ! ldd "$unpack_dir/align-installer" 2>/dev/null | grep -q 'not found'; then
   "$unpack_dir/align-installer" "$unpack_dir/Align.rpm" "$unpack_dir/Align.png"
 else
-  echo 'GTK 4 is required for the graphical installer. Installing the RPM through DNF.'
+  echo 'Installing the RPM through DNF.'
   pkexec /usr/bin/dnf --assumeyes install "$unpack_dir/Align.rpm"
 fi
 exit 0

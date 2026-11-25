@@ -74,6 +74,8 @@ pub struct RefineEvent {
     pub left: ClipId,
     pub right: ClipId,
     pub stage: RefineStage,
+    /// The refined match, when the candidate was refined and accepted.
+    pub refined: Option<PairwiseMatch>,
 }
 
 /// A refined pair that closes a cycle below this confidence is dropped.
@@ -100,6 +102,7 @@ pub fn refine_forest(
                 left: m.left.clone(),
                 right: m.right.clone(),
                 stage: RefineStage::Rejected,
+                refined: None,
             });
         }
     }
@@ -156,11 +159,15 @@ pub fn refine_forest(
             }
             let result = pending.pop_front().unwrap().and_then(|r| r.recv().unwrap());
             let mut stage = RefineStage::Rejected;
+            let mut refined = None;
             if let Some(result) = result {
                 let connected = components.connected(&candidate.left, &candidate.right);
                 if !connected || candidate.confidence >= WEAK_CYCLE_CONFIDENCE {
                     if !connected {
                         components.union(&candidate.left, &candidate.right);
+                    }
+                    if progress.is_some() {
+                        refined = Some(result.clone());
                     }
                     accepted.push(result);
                     stage = RefineStage::Refined;
@@ -173,6 +180,7 @@ pub fn refine_forest(
                     left: candidate.left.clone(),
                     right: candidate.right.clone(),
                     stage,
+                    refined,
                 });
             }
         }
@@ -813,6 +821,13 @@ mod tests {
         let run = |candidates: &[PairwiseMatch]| {
             let stages = std::sync::Mutex::new(Vec::new());
             let report = |e: RefineEvent| {
+                // A refined event reports the match it accepted.
+                assert_eq!(
+                    e.refined
+                        .as_ref()
+                        .map(|m| (m.left.clone(), m.right.clone())),
+                    (e.stage == RefineStage::Refined).then(|| (e.left.clone(), e.right.clone()))
+                );
                 stages
                     .lock()
                     .expect("test lock")

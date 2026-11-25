@@ -31,6 +31,7 @@ use crate::updater::{self, UpdateState};
 use crate::{MinimizeWindow, ToggleFullscreen, ZoomWindow};
 
 mod animation;
+mod clip_details;
 mod controls;
 mod export;
 mod menu_sidebar;
@@ -40,6 +41,7 @@ mod panels;
 mod projects;
 mod root;
 mod settings;
+mod shortcuts;
 mod sources;
 mod timeline;
 mod toolbar;
@@ -218,16 +220,25 @@ struct TimelinePose {
 struct TimelineTransition {
     from: TimelinePose,
     to: TimelinePose,
-    generation: u64,
     started: Instant,
 }
 
 impl TimelineTransition {
+    /// Eased progress from `from` (0) to `to` (1).
+    fn progress(self, now: Instant) -> f32 {
+        motion_ease(
+            (now.duration_since(self.started).as_secs_f32()
+                / Duration::from_millis(TIMELINE_MOVE_MS).as_secs_f32())
+            .clamp(0., 1.),
+        )
+    }
+
+    fn finished(self, now: Instant) -> bool {
+        now.duration_since(self.started) >= Duration::from_millis(TIMELINE_MOVE_MS)
+    }
+
     fn presented(self, now: Instant) -> TimelinePose {
-        let progress = (now.duration_since(self.started).as_secs_f32()
-            / Duration::from_millis(TIMELINE_MOVE_MS).as_secs_f32())
-        .clamp(0., 1.);
-        let progress = motion_ease(progress);
+        let progress = self.progress(now);
         TimelinePose {
             x: self.from.x + (self.to.x - self.from.x) * progress,
             width: self.from.width + (self.to.width - self.from.width) * progress,
@@ -245,7 +256,9 @@ fn timeline_duration(data: &AppData) -> f64 {
         .max(1.0)
 }
 
-fn timeline_poses(data: &AppData) -> HashMap<ClipId, TimelinePose> {
+/// Each bar's pose by its unique id: one source file can appear in several
+/// edits of an imported timeline.
+fn timeline_poses(data: &AppData) -> HashMap<String, TimelinePose> {
     let duration = timeline_duration(data);
     let mut poses = HashMap::new();
     for (lane_index, lane) in data.lanes.iter().enumerate() {
@@ -257,7 +270,7 @@ fn timeline_poses(data: &AppData) -> HashMap<ClipId, TimelinePose> {
                     clip.duration.min((next.start - clip.start).max(0.))
                 });
             poses.insert(
-                clip.clip_id.clone(),
+                clip.id.clone(),
                 TimelinePose {
                     x: (clip.start / duration) as f32,
                     width: (visible_duration / duration) as f32,
@@ -343,21 +356,32 @@ impl PathFixerInputs {
     }
 
     fn any_focused(&self, window: &Window, cx: &App) -> bool {
-        self.old_folder.read(cx).is_focused(window)
-            || self.omit_extensions.read(cx).is_focused(window)
+        [&self.old_folder, &self.omit_extensions]
+            .into_iter()
+            .any(|input| input.read(cx).is_focused(window))
     }
 }
 
 impl ExportInputs {
     fn new(cx: &mut Context<AlignApp>) -> Self {
+        // The export defaults section compares these fields with the saved
+        // defaults, so the window redraws when one is edited.
+        let mut field = |placeholder| {
+            let input = cx.new(|cx| TextInput::new(cx, placeholder));
+            cx.subscribe(&input, |_, _, _: &crate::text_input::Edited, cx| {
+                cx.notify();
+            })
+            .detach();
+            input
+        };
         Self {
-            sequence_name: cx.new(|cx| TextInput::new(cx, "Keep source name")),
-            synced_symbol: cx.new(|cx| TextInput::new(cx, "e.g. [SYNCED]")),
-            synced_color: cx.new(|cx| TextInput::new(cx, "e.g. Green")),
-            synced_role: cx.new(|cx| TextInput::new(cx, "e.g. Dialogue")),
-            unmatched_symbol: cx.new(|cx| TextInput::new(cx, "e.g. [UNSYNCED]")),
-            unmatched_color: cx.new(|cx| TextInput::new(cx, "e.g. Rose")),
-            unmatched_role: cx.new(|cx| TextInput::new(cx, "e.g. Dialogue")),
+            sequence_name: field("Keep source name"),
+            synced_symbol: field("e.g. [SYNCED]"),
+            synced_color: field("e.g. Green"),
+            synced_role: field("e.g. Dialogue"),
+            unmatched_symbol: field("e.g. [UNSYNCED]"),
+            unmatched_color: field("e.g. Rose"),
+            unmatched_role: field("e.g. Dialogue"),
         }
     }
 
@@ -493,6 +517,8 @@ pub struct AlignApp {
     app_menu: Option<menu_sidebar::AppMenuPage>,
     app_menu_select: Option<menu_sidebar::AppMenuSelect>,
     app_menu_exit: Exit,
+    /// Alt pressed and released alone toggles the menu on Windows and Linux.
+    alt_tap: shortcuts::AltTap,
     export_scroll: ScrollHandle,
     export_scroll_drag: Option<(f32, f32)>,
     export_sidebar_exit: Exit,
@@ -507,8 +533,8 @@ pub struct AlignApp {
     selection_controls_exit: Exit,
     export_reveals_closing: HashMap<&'static str, u64>,
     export_reveal_generation: u64,
-    timeline_transitions: HashMap<ClipId, TimelineTransition>,
-    timeline_motion_generation: u64,
+    /// Bars moving to a new layout, by bar id, until their move finishes.
+    timeline_transitions: HashMap<String, TimelineTransition>,
     progress_motion: ProgressMotion,
     update_state: UpdateState,
     show_problem_report: bool,
@@ -709,6 +735,41 @@ impl AlignApp {
         .detach();
     }
 
+    /// A dialog, menu or popover covers the window. The export sidebar is
+    /// not one: the timeline beside it previews its options.
+    fn dialog_open(&self) -> bool {
+        self.show_problem_report
+            || self.app_menu.is_some()
+            || self.data.menu.is_some()
+            || self.data.show_path_fixer
+            || self.data.error.is_some()
+            || !self.data.sequence_pickers.is_empty()
+            || self.data.show_about
+            || self.data.show_agent_setup
+            || self.data.show_search_quality
+            || self.data.show_search_settings
+            || self.data.show_stage_settings
+            || self.data.show_sequence_results
+            || self.data.show_camera_clock
+    }
+
+    /// The window content takes pointer and keyboard input: no project is
+    /// loading and nothing covers it, the export sidebar included.
+    fn content_active(&self) -> bool {
+        !self.projects.busy && !self.dialog_open() && !self.data.show_export
+    }
+
+    fn text_field_focused(&self, window: &Window, cx: &App) -> bool {
+        self.export_inputs.any_focused(window, cx) || self.path_fixer_inputs.any_focused(window, cx)
+    }
+
+    /// Opening or closing the window resets Alt tracking: a key held while
+    /// another window had focus is not a tap here.
+    pub(crate) fn track_window_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.observe_window_activation(window, |this, _, _| this.alt_tap.reset())
+            .detach();
+    }
+
     pub fn new(
         projects: crate::project::Preferences,
         writer: crate::project::Writer,
@@ -724,6 +785,7 @@ impl AlignApp {
             app_menu: None,
             app_menu_select: None,
             app_menu_exit: Exit::default(),
+            alt_tap: shortcuts::AltTap::default(),
             export_scroll: ScrollHandle::new(),
             export_scroll_drag: None,
             export_sidebar_exit: Exit::default(),
@@ -739,7 +801,6 @@ impl AlignApp {
             export_reveals_closing: HashMap::new(),
             export_reveal_generation: 0,
             timeline_transitions: HashMap::new(),
-            timeline_motion_generation: 0,
             progress_motion: ProgressMotion::new(),
             update_state: UpdateState::default(),
             show_problem_report: false,
@@ -758,22 +819,40 @@ impl AlignApp {
 
     // ---------------- actions
 
-    /// Clear the session, or remove the selected sources. A cleared session
-    /// starts the next job from the export defaults.
+    /// The trash button: clear the session, or remove the selected sources.
+    /// A cleared session starts the next job from the export defaults.
     pub(crate) fn delete_or_clear(&mut self, cx: &mut Context<Self>) {
-        if self.projects.busy {
+        if !self.data.selection.is_empty() {
+            self.remove_selected_sources(cx);
             return;
         }
-        let clearing = self.data.selection.is_empty();
-        self.data.delete_or_clear();
-        if clearing {
-            self.projects.clear();
-            self.export_inputs
-                .set_labels(&self.data.export_baseline().labels, cx);
-        } else {
+        if self.projects.busy || self.data.has_active_job() {
+            return;
+        }
+        self.data.clear();
+        self.projects.clear();
+        self.export_inputs
+            .set_labels(&self.data.export_baseline().labels, cx);
+        cx.notify();
+    }
+
+    /// Removes the selected sources, from the trash button or the Delete key.
+    /// Never clears the session, whatever the selection holds.
+    fn remove_selected_sources(&mut self, cx: &mut Context<Self>) {
+        if self.projects.busy || self.data.has_active_job() || self.data.selection.is_empty() {
+            return;
+        }
+        if self.data.remove_selection() {
             self.project_changed(cx);
         }
         cx.notify();
+    }
+
+    /// A zoom button or shortcut press.
+    fn zoom_timeline(&mut self, zoom: crate::state::TimelineZoom, cx: &mut Context<Self>) {
+        if self.data.zoom_timeline(zoom) {
+            cx.notify();
+        }
     }
 
     /// The export options in the sheet, text fields included.
@@ -847,6 +926,9 @@ impl AlignApp {
     }
 
     pub(crate) fn add_media(&mut self, cx: &mut Context<Self>) {
+        if self.data.has_active_job() {
+            return;
+        }
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: true,
@@ -1064,8 +1146,13 @@ impl AlignApp {
                 crate::project::record_revision(&mut revisions, &path);
             }
             let revisions = std::sync::Mutex::new(revisions);
-            let pipeline = Pipeline::default_backend();
             let sequence_count = input_sets.len();
+            // Sequences of one project inspect and analyse shared media once.
+            let pipeline = if sequence_count > 1 {
+                Pipeline::default_backend().remembering_analysis()
+            } else {
+                Pipeline::default_backend()
+            };
             let mut results = Vec::with_capacity(sequence_count);
             for (sequence_index, (inputs, (constraints, options, targets, target_urls))) in
                 input_sets.into_iter().zip(run_settings).enumerate()
@@ -1189,35 +1276,32 @@ impl AlignApp {
         .detach();
     }
 
-    fn record_timeline_layout_change(&mut self, before: HashMap<ClipId, TimelinePose>) {
+    fn record_timeline_layout_change(&mut self, before: HashMap<String, TimelinePose>) {
+        let now = Instant::now();
         let after = timeline_poses(&self.data);
         self.timeline_transitions
-            .retain(|clip_id, _| after.contains_key(clip_id));
+            .retain(|bar, transition| after.contains_key(bar) && !transition.finished(now));
         let changes: Vec<_> = after
-            .iter()
-            .filter_map(|(clip_id, &to)| {
-                let from = before.get(clip_id).copied()?;
-                poses_differ(from, to).then(|| (clip_id.clone(), from, to))
+            .into_iter()
+            .filter_map(|(bar, to)| {
+                let from = before.get(&bar).copied()?;
+                poses_differ(from, to).then_some((bar, from, to))
             })
             .collect();
         if changes.is_empty() || crate::motion::reduced_motion() {
             return;
         }
-        self.timeline_motion_generation += 1;
-        let generation = self.timeline_motion_generation;
-        let now = Instant::now();
-        for (clip_id, previous, to) in changes {
+        for (bar, previous, to) in changes {
             let from = self
                 .timeline_transitions
-                .get(&clip_id)
+                .get(&bar)
                 .copied()
                 .map_or(previous, |transition| transition.presented(now));
             self.timeline_transitions.insert(
-                clip_id,
+                bar,
                 TimelineTransition {
                     from,
                     to,
-                    generation,
                     started: now,
                 },
             );
@@ -1570,7 +1654,7 @@ impl AlignApp {
 
     fn update_export_options(&mut self, cx: &mut Context<Self>, update: impl FnOnce(&mut AppData)) {
         let before = ExportReveals::new(&self.data).entries();
-        update(&mut self.data);
+        self.update_timeline_layout(update);
         let select_is_available = match self.export_select {
             Some(ExportSelect::AafFrameRate) => {
                 self.data.export.targets.contains(&ExportTarget::Aaf)
@@ -1780,7 +1864,7 @@ impl AlignApp {
         let cancel = self.data.cancel.clone();
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<PathRepairMsg>();
         std::thread::spawn(move || {
-            let pipeline = Pipeline::default_backend();
+            let pipeline = Pipeline::without_cache();
             let result = pipeline
                 .write_fixed_timeline_copy(&inputs, &options, &destination, &cancel)
                 .map_err(|error| error.to_string());
@@ -1888,7 +1972,7 @@ impl AlignApp {
         let Some(result) = self.data.result.clone() else {
             return;
         };
-        use align_core::export_model::{CutRemoveOptions, ExportAssemblyOptions, ExportTimeline};
+        use align_core::export_model::{ExportAssemblyOptions, ExportTimeline};
         let sequence_name = ExportInputs::value(&self.export_inputs.sequence_name, cx);
         let synced_symbol = ExportInputs::value(&self.export_inputs.synced_symbol, cx);
         let synced_color = ExportInputs::value(&self.export_inputs.synced_color, cx);
@@ -1905,18 +1989,9 @@ impl AlignApp {
         let mut timelines = Vec::with_capacity(result_count);
         for (index, result) in results.iter().enumerate() {
             let options = ExportAssemblyOptions {
-                unmatched: self.data.export.unmatched,
-                prevent_group_overlaps: self.data.export.prevent_group_overlaps,
                 disable_unmatched: self.data.export.disable_unmatched,
                 label_synced: self.data.export.label_synced,
                 label_unmatched: self.data.export.label_unmatched,
-                cut_remove: CutRemoveOptions {
-                    common_gaps: self.data.export.cut_common_gaps,
-                    lone_recorder: self.data.export.cut_lone_recorder,
-                    shorter_than: self.data.export.cut_shorter_than,
-                    trim_starts: self.data.export.trim_starts,
-                    trim_ends: self.data.export.trim_ends,
-                },
                 synced_symbol: synced_symbol.clone(),
                 synced_symbol_suffix: self.data.export.synced_symbol_suffix,
                 synced_color: synced_color.clone(),
@@ -1932,6 +2007,8 @@ impl AlignApp {
                         name.clone()
                     }
                 }),
+                camera_clock: self.data.camera_clock_for_export(index),
+                ..self.data.export.assembly_options()
             };
             let Ok(timeline) = ExportTimeline::from_result_with_options(result, options) else {
                 self.data.error = Some(format!("Sequence {} has nothing to export.", index + 1));
@@ -1968,7 +2045,7 @@ impl AlignApp {
         let media = self.data.export.media_files;
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<ExportMsg>();
         std::thread::spawn(move || {
-            let pipeline = Pipeline::default_backend();
+            let pipeline = Pipeline::without_cache();
             let mut progress = |p: align_decode::export::ExportJobProgress| {
                 let label = match &p.current {
                     Some(path) if p.kind == align_decode::export::ExportJobKind::Media => {
@@ -2105,6 +2182,30 @@ impl AlignApp {
             self.project_changed(cx);
             self.start_sync(cx);
         }
+    }
+
+    /// Apply or undo camera-clock placements of the visible sequence. The
+    /// timeline animates to the new layout; nothing is synchronized again.
+    fn set_camera_clock(&mut self, clips: Vec<ClipId>, apply: bool, cx: &mut Context<Self>) {
+        if self.data.has_active_job() {
+            return;
+        }
+        if self.update_timeline_layout(|data| data.set_camera_clock(&clips, apply)) {
+            self.project_changed(cx);
+        }
+        cx.notify();
+    }
+
+    /// Return every camera-clock placement of the visible sequence to
+    /// unmatched, including saved choices the current settings hide.
+    fn clear_camera_clock(&mut self, cx: &mut Context<Self>) {
+        if self.data.has_active_job() {
+            return;
+        }
+        if self.update_timeline_layout(AppData::clear_camera_clock) {
+            self.project_changed(cx);
+        }
+        cx.notify();
     }
 
     fn set_lane_option<T>(

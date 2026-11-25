@@ -4,7 +4,8 @@
 //! source-local lanes (takes and stems keep stable order), (2) whole source
 //! lanes merge into shared global time lanes. Non-overlapping files of one
 //! camera/recorder source reuse a row; unrelated sources share a track when
-//! they never materially overlap.
+//! they never materially overlap. A clip the camera clock moved is packed
+//! where the ordinary assembly put it, then moved alone (see [`allocate`]).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,6 +25,13 @@ pub struct TimelineTrackRequest {
     pub source_key: String,
     pub start: f64,
     pub duration: f64,
+    /// Where the ordinary assembly put this clip, when the camera clock
+    /// moved it to `start`.
+    pub assembled_start: Option<f64>,
+    /// Where the writer puts the clip once its times are on the format's
+    /// own frame or sample grid, when that differs from `start..start +
+    /// duration`. Only a clip the camera clock moved is placed by it.
+    pub written: Option<(f64, f64)>,
 }
 
 impl TimelineTrackRequest {
@@ -38,7 +46,19 @@ impl TimelineTrackRequest {
             source_key: source_key.into(),
             start,
             duration,
+            assembled_start: None,
+            written: None,
         }
+    }
+
+    pub fn assembled_at(mut self, start: Option<f64>) -> Self {
+        self.assembled_start = start;
+        self
+    }
+
+    pub fn written_at(mut self, start: f64, end: f64) -> Self {
+        self.written = Some((start, end));
+        self
     }
 }
 
@@ -64,7 +84,63 @@ pub fn source_key_for_url(url: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Track of every request. Requests the camera clock moved are first packed
+/// at their assembled start, which reproduces the ordinary assembly's tracks
+/// for every other clip. Each then takes, at its own start, that same track
+/// if it is free there, else the first free track, else a new last track.
 pub fn allocate(requests: &[TimelineTrackRequest]) -> HashMap<String, usize> {
+    if requests.iter().all(|r| r.assembled_start.is_none()) {
+        return pack(requests);
+    }
+    let assembled: Vec<TimelineTrackRequest> = requests
+        .iter()
+        .map(|r| TimelineTrackRequest {
+            start: r.assembled_start.unwrap_or(r.start),
+            ..r.clone()
+        })
+        .collect();
+    let mut out = pack(&assembled);
+    let mut occupied: Vec<Vec<(f64, f64)>> = Vec::new();
+    let span = |r: &TimelineTrackRequest| {
+        r.written
+            .unwrap_or((r.start, r.start + r.duration.max(0.0)))
+    };
+    for r in requests.iter().filter(|r| r.assembled_start.is_none()) {
+        let lane = out[&r.id];
+        if occupied.len() <= lane {
+            occupied.resize(lane + 1, Vec::new());
+        }
+        occupied[lane].push(span(r));
+    }
+    let lanes = out.values().copied().max().map_or(0, |lane| lane + 1);
+    occupied.resize(occupied.len().max(lanes), Vec::new());
+    let mut moved: Vec<&TimelineTrackRequest> = requests
+        .iter()
+        .filter(|r| r.assembled_start.is_some())
+        .collect();
+    moved.sort_by(|a, b| a.start.total_cmp(&b.start).then_with(|| a.id.cmp(&b.id)));
+    for r in moved {
+        let (start, end) = span(r);
+        let free = |lane: &Vec<(f64, f64)>| {
+            lane.iter()
+                .all(|&(s, e)| e <= start + SHARED_TOLERANCE || end <= s + SHARED_TOLERANCE)
+        };
+        let assembled = out[&r.id];
+        let lane = if free(&occupied[assembled]) {
+            assembled
+        } else {
+            occupied.iter().position(free).unwrap_or_else(|| {
+                occupied.push(Vec::new());
+                occupied.len() - 1
+            })
+        };
+        occupied[lane].push((start, end));
+        out.insert(r.id.clone(), lane);
+    }
+    out
+}
+
+fn pack(requests: &[TimelineTrackRequest]) -> HashMap<String, usize> {
     // Phase 1: source-local lanes.
     let mut by_source: HashMap<&str, Vec<&TimelineTrackRequest>> = HashMap::new();
     for r in requests {

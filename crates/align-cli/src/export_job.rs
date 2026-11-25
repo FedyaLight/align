@@ -1,9 +1,14 @@
 //! One export policy for freshly synchronized and saved single/batch results.
 use super::{CliError, ExportOptions};
-use align_core::SyncResult;
+use align_core::camera_clock::CameraClockEstimate;
+use align_core::export_model::UnmatchedPlacement;
+use align_core::model::file_name;
+use align_core::{ClipId, SyncResult};
 use align_decode::MediaBackend;
 use align_decode::export::ExportArtifact;
-use std::{path::Path, sync::atomic::AtomicBool};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 pub(super) fn read_results(path: &Path) -> Result<Vec<SyncResult>, CliError> {
     #[derive(serde::Deserialize)]
@@ -35,6 +40,116 @@ pub(super) fn read_results(path: &Path) -> Result<Vec<SyncResult>, CliError> {
     Ok(results)
 }
 
+/// Clips named by `--camera-clock-except`: a clip ID, a path, or a file
+/// name that only one source path has.
+fn excepted_clips(results: &[SyncResult], names: &[String]) -> Result<HashSet<ClipId>, CliError> {
+    let clips: Vec<&align_core::Clip> = results.iter().flat_map(|r| &r.project.clips).collect();
+    let mut excepted = HashSet::new();
+    for name in names {
+        let path = super::absolute(PathBuf::from(name));
+        let by_identity: Vec<_> = clips
+            .iter()
+            .filter(|clip| clip.id.0 == *name || clip.url == path)
+            .collect();
+        let matches = if by_identity.is_empty() {
+            clips
+                .iter()
+                .filter(|clip| file_name(&clip.url).eq_ignore_ascii_case(name))
+                .collect()
+        } else {
+            by_identity
+        };
+        let paths: HashSet<&Path> = matches.iter().map(|clip| clip.url.as_path()).collect();
+        match paths.len() {
+            0 => {
+                return Err(CliError::Failure(format!(
+                    "--camera-clock-except {name} matches no clip."
+                )));
+            }
+            1 => excepted.extend(matches.iter().map(|clip| clip.id.clone())),
+            _ => {
+                return Err(CliError::Failure(format!(
+                    "--camera-clock-except {name} names {} files; give the path of one.",
+                    paths.len()
+                )));
+            }
+        }
+    }
+    Ok(excepted)
+}
+
+/// The estimates `--camera-clock` applies to one result, reported on stderr
+/// with the clips it leaves unmatched and why. Which estimates export can
+/// apply is decided as in the desktop app.
+fn camera_clock_estimates(
+    result: &SyncResult,
+    excepted: &HashSet<ClipId>,
+    options: &align_core::export_model::ExportAssemblyOptions,
+) -> Vec<CameraClockEstimate> {
+    use align_core::camera_clock::CameraClockRefusal;
+    let report = align_core::camera_clock::for_export(result, &[], options);
+    let names = align_core::camera_clock::clip_names(result);
+    let name = |id: &ClipId| names.get(id).cloned().unwrap_or_else(|| id.0.clone());
+    let mut removed = 0;
+    for (id, refusal) in &report.refusals {
+        if *refusal != CameraClockRefusal::RemovedByAssembly {
+            eprintln!(
+                "camera clock: {} stays unmatched. {}",
+                name(id),
+                refusal.describe(&name)
+            );
+        } else if excepted.contains(id) {
+            eprintln!(
+                "camera clock: {} stays unmatched (--camera-clock-except).",
+                name(id)
+            );
+        } else if options.unmatched == UnmatchedPlacement::Remove {
+            removed += 1;
+        } else {
+            eprintln!("camera clock: cleanup leaves out {}.", name(id));
+        }
+    }
+    if removed > 0 {
+        eprintln!(
+            "camera clock: --unmatched remove leaves out {removed} clip{} the camera clock would place.",
+            if removed == 1 { "" } else { "s" }
+        );
+    }
+    let (applied, skipped): (Vec<_>, Vec<_>) = report
+        .estimates
+        .into_iter()
+        .partition(|estimate| !excepted.contains(&estimate.clip_id));
+    for estimate in &skipped {
+        eprintln!(
+            "camera clock: {} stays unmatched (--camera-clock-except).",
+            name(&estimate.clip_id)
+        );
+    }
+    if result.project.imported_timeline.is_some() {
+        for hint in align_core::camera_clock::imported_edit_hints(result, &applied) {
+            let deviation = hint.deviation();
+            let relation = if hint.agrees() {
+                "agrees with".to_string()
+            } else {
+                format!(
+                    "starts {:.2} s {} than",
+                    deviation.abs(),
+                    if deviation > 0.0 { "later" } else { "earlier" }
+                )
+            };
+            eprintln!(
+                "camera clock: edit {} of {} on {} {relation} its camera clock (±{:.1} s). Imported edits keep their placement.",
+                hint.edit_id,
+                name(&hint.clip_id),
+                hint.track_label(),
+                hint.tolerance
+            );
+        }
+        return Vec::new();
+    }
+    applied
+}
+
 impl ExportOptions {
     pub(super) fn execute(
         self,
@@ -54,6 +169,8 @@ impl ExportOptions {
             no_fcpxml_multicam,
             export_media,
             unmatched,
+            camera_clock,
+            camera_clock_except,
             prevent_group_overlaps,
             disable_unmatched,
             label_synced,
@@ -62,35 +179,65 @@ impl ExportOptions {
             assign,
         } = self;
         let result_count = results.len();
+        let excepted = excepted_clips(results, &camera_clock_except)?;
         let mut timelines = Vec::with_capacity(result_count);
         for (index, result) in results.iter().enumerate() {
-            let timeline = align_core::export_model::ExportTimeline::from_result_with_options(
-                result,
-                align_core::export_model::ExportAssemblyOptions {
-                    unmatched: unmatched.core(),
-                    prevent_group_overlaps,
-                    disable_unmatched,
-                    label_synced,
-                    label_unmatched,
-                    cut_remove: cut_remove.core()?,
-                    synced_symbol: assign.synced_symbol.clone(),
-                    synced_symbol_suffix: assign.synced_symbol_suffix,
-                    synced_color: assign.synced_color.clone(),
-                    synced_role: assign.synced_role.clone(),
-                    unmatched_symbol: assign.unmatched_symbol.clone(),
-                    unmatched_symbol_suffix: assign.unmatched_symbol_suffix,
-                    unmatched_color: assign.unmatched_color.clone(),
-                    unmatched_role: assign.unmatched_role.clone(),
-                    sequence_name: assign.sequence_name.as_ref().map(|name| {
-                        if result_count > 1 {
-                            format!("{name} {}", index + 1)
-                        } else {
-                            name.clone()
-                        }
-                    }),
-                },
-            )
-            .map_err(|e| CliError::Failure(e.to_string()))?;
+            let mut options = align_core::export_model::ExportAssemblyOptions {
+                unmatched: unmatched.core(),
+                prevent_group_overlaps,
+                disable_unmatched,
+                label_synced,
+                label_unmatched,
+                cut_remove: cut_remove.core()?,
+                synced_symbol: assign.synced_symbol.clone(),
+                synced_symbol_suffix: assign.synced_symbol_suffix,
+                synced_color: assign.synced_color.clone(),
+                synced_role: assign.synced_role.clone(),
+                unmatched_symbol: assign.unmatched_symbol.clone(),
+                unmatched_symbol_suffix: assign.unmatched_symbol_suffix,
+                unmatched_color: assign.unmatched_color.clone(),
+                unmatched_role: assign.unmatched_role.clone(),
+                sequence_name: assign.sequence_name.as_ref().map(|name| {
+                    if result_count > 1 {
+                        format!("{name} {}", index + 1)
+                    } else {
+                        name.clone()
+                    }
+                }),
+                camera_clock: Vec::new(),
+            };
+            if camera_clock {
+                options.camera_clock = camera_clock_estimates(result, &excepted, &options);
+            }
+            let estimates = options.camera_clock.clone();
+            let timeline =
+                align_core::export_model::ExportTimeline::from_result_with_options(result, options)
+                    .map_err(|e| CliError::Failure(e.to_string()))?;
+            if !estimates.is_empty() {
+                let names = align_core::camera_clock::clip_names(result);
+                let name = |id: &ClipId| names.get(id).cloned().unwrap_or_else(|| id.0.clone());
+                let placed: HashSet<_> = timeline
+                    .islands
+                    .iter()
+                    .flat_map(|i| &i.clips)
+                    .filter(|item| item.camera_clock.is_some())
+                    .map(|item| &item.clip.id)
+                    .collect();
+                for estimate in &estimates {
+                    if placed.contains(&estimate.clip_id) {
+                        eprintln!(
+                            "camera clock: {} placed. {}",
+                            name(&estimate.clip_id),
+                            align_core::camera_clock::describe_estimate(estimate, &name)
+                        );
+                    } else {
+                        eprintln!(
+                            "camera clock: cleanup leaves out {}.",
+                            name(&estimate.clip_id)
+                        );
+                    }
+                }
+            }
             timelines.push(timeline);
         }
         let mut formats = if aaf {
@@ -139,5 +286,71 @@ impl ExportOptions {
             }),
         )?;
         Ok(artifacts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(paths: &[&str]) -> SyncResult {
+        let clips: Vec<align_core::Clip> = paths
+            .iter()
+            .map(|path| align_core::Clip {
+                id: ClipId::new(format!("id-{path}")),
+                url: PathBuf::from(path),
+                kind: align_core::MediaKind::Video,
+                duration: align_core::MediaTime::seconds(1.0),
+                audio: Vec::new(),
+                video: None,
+                recorded_at: None,
+                recorded_at_source: None,
+                source_identifier: None,
+                media_span: None,
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "project": {"clips": clips, "warnings": [], "importedTimeline": null},
+            "islands": [],
+            "unmatched": [],
+            "matches": [],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn camera_clock_exceptions_name_one_source_each() {
+        let root = std::env::temp_dir();
+        let a = root.join("cam-a").join("C0003.MP4");
+        let b = root.join("cam-b").join("C0003.MP4");
+        let c = root.join("cam-a").join("C0004.MP4");
+        let paths: Vec<String> = [&a, &b, &c]
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        let saved = [result(&[&paths[0], &paths[2]]), result(&[&paths[1]])];
+        let ids = |names: &[&str]| {
+            excepted_clips(
+                &saved,
+                &names.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+            )
+            .map(|set| {
+                let mut ids: Vec<String> = set.into_iter().map(|id| id.0).collect();
+                ids.sort();
+                ids
+            })
+            .map_err(|error| match error {
+                CliError::Failure(message) => message,
+                CliError::Usage => "usage".into(),
+            })
+        };
+        assert_eq!(ids(&["c0004.mp4"]), Ok(vec![format!("id-{}", paths[2])]));
+        assert_eq!(ids(&[&paths[1]]), Ok(vec![format!("id-{}", paths[1])]));
+        assert_eq!(
+            ids(&[&format!("id-{}", paths[0])]),
+            Ok(vec![format!("id-{}", paths[0])])
+        );
+        assert!(ids(&["C0003.MP4"]).unwrap_err().contains("names 2 files"));
+        assert!(ids(&["C0009.MP4"]).unwrap_err().contains("matches no clip"));
     }
 }

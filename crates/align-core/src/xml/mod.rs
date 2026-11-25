@@ -284,6 +284,7 @@ pub struct DraftTransition {
 
 #[derive(Clone, Debug)]
 pub struct TimelineDraft {
+    pub aaf_track_numbers: Vec<usize>,
     pub source_url: PathBuf,
     pub name: String,
     pub frame_duration: MediaTime,
@@ -464,6 +465,7 @@ impl TimelineDraft {
             })
             .collect();
         let draft = Self {
+            aaf_track_numbers: self.aaf_track_numbers.clone(),
             source_url: self.source_url.clone(),
             name: self.name.clone(),
             frame_duration: self.frame_duration,
@@ -648,6 +650,7 @@ impl TimelineDraft {
             });
         }
         ImportedTimeline {
+            aaf_track_numbers: self.aaf_track_numbers.clone(),
             name: self.name.clone(),
             frame_duration: self.frame_duration,
             edits: resolved,
@@ -882,6 +885,14 @@ pub fn timeline_sequence_summaries(
     } else {
         summaries_fcp7(&doc, path)
     }
+}
+
+/// Number of top-level sequences when `path` is an FCP 7 XML document,
+/// which numbers them in document order.
+pub fn fcp7_sequence_count(path: &Path) -> Option<usize> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let doc = XmlDoc::parse(&text).ok()?;
+    (!doc.root_name().eq_ignore_ascii_case("fcpxml")).then(|| top_sequences(&doc).len())
 }
 
 /// Rewrite only media locations in FCP 7 XML or FCPXML. Unchanged events are

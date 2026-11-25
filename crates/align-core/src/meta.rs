@@ -80,79 +80,48 @@ pub struct IxmlSpeed {
 /// chunks in a single pass. Returns `None` for non-WAVE files (12-byte
 /// signature check).
 pub fn read_bwf(path: &Path) -> Option<BwfMetadata> {
-    use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).ok()?;
-    let mut header = [0u8; 12];
-    file.read_exact(&mut header).ok()?;
-    if !matches!(&header[0..4], b"RIFF" | b"RF64" | b"BW64") || &header[8..12] != b"WAVE" {
-        return None;
-    }
+    let mut chunks = crate::wav::Chunks::new(&mut file).ok()??;
 
-    let mut offset: u64 = 12;
     let mut sample_rate: Option<f64> = None;
     let mut date_text: Option<String> = None;
     let mut time_text: Option<String> = None;
     let mut time_reference: Option<u64> = None;
     let mut media_span: Option<MediaSpan> = None;
-    let mut data_size_64: Option<u64> = None;
     let mut ixml: Option<IxmlSpeed> = None;
 
-    loop {
-        file.seek(SeekFrom::Start(offset)).ok()?;
-        let mut chunk_header = [0u8; 8];
-        if file.read_exact(&mut chunk_header).is_err() {
-            break;
+    while let Some(chunk) = chunks.next_chunk() {
+        let size = chunk.size;
+        match &chunk.id {
+            b"bext" if size >= 346 => {
+                if let Ok(buf) = chunks.read(&chunk, 346) {
+                    date_text = ascii(&buf, 320, 10);
+                    time_text = ascii(&buf, 330, 8);
+                    time_reference = Some(
+                        u64::from(u32::from_le_bytes(buf[338..342].try_into().unwrap()))
+                            | (u64::from(u32::from_le_bytes(buf[342..346].try_into().unwrap()))
+                                << 32),
+                    );
+                }
+            }
+            b"fmt " if size >= 8 => {
+                if let Ok(buf) = chunks.read(&chunk, 16) {
+                    sample_rate =
+                        Some(f64::from(u32::from_le_bytes(buf[4..8].try_into().unwrap())));
+                }
+            }
+            b"link" if size > 0 && size <= 1_048_576 => {
+                if let Ok(buf) = chunks.read(&chunk, size) {
+                    media_span = parse_media_span(&buf, &file_name(path));
+                }
+            }
+            b"iXML" if size > 0 && size <= 1_048_576 => {
+                if let Ok(buf) = chunks.read(&chunk, size) {
+                    ixml = ixml_payload_text(&buf).and_then(parse_ixml_speed);
+                }
+            }
+            _ => {}
         }
-        let id = &chunk_header[0..4];
-        let size32 = u32::from_le_bytes(chunk_header[4..8].try_into().ok()?);
-        let size = if id == b"data" && size32 == u32::MAX {
-            data_size_64.unwrap_or(u64::from(size32))
-        } else {
-            u64::from(size32)
-        };
-        let payload = offset.checked_add(8)?;
-
-        if id == b"ds64" && size >= 16 {
-            file.seek(SeekFrom::Start(payload)).ok()?;
-            let mut buf = [0u8; 16];
-            if file.read_exact(&mut buf).is_ok() {
-                data_size_64 = Some(u64::from_le_bytes(buf[8..16].try_into().unwrap()));
-            }
-        } else if id == b"bext" && size >= 346 {
-            file.seek(SeekFrom::Start(payload)).ok()?;
-            let n = size.min(346) as usize;
-            let mut buf = vec![0u8; n];
-            if file.read_exact(&mut buf).is_ok() && buf.len() >= 346 {
-                date_text = ascii(&buf, 320, 10);
-                time_text = ascii(&buf, 330, 8);
-                time_reference = Some(
-                    u64::from(u32::from_le_bytes(buf[338..342].try_into().unwrap()))
-                        | (u64::from(u32::from_le_bytes(buf[342..346].try_into().unwrap())) << 32),
-                );
-            }
-        } else if id == b"fmt " && size >= 8 {
-            file.seek(SeekFrom::Start(payload)).ok()?;
-            let n = size.min(16) as usize;
-            let mut buf = vec![0u8; n];
-            if file.read_exact(&mut buf).is_ok() && buf.len() >= 8 {
-                sample_rate = Some(f64::from(u32::from_le_bytes(buf[4..8].try_into().unwrap())));
-            }
-        } else if id == b"link" && size > 0 && size <= 1_048_576 {
-            file.seek(SeekFrom::Start(payload)).ok()?;
-            let mut buf = vec![0u8; size as usize];
-            if file.read_exact(&mut buf).is_ok() {
-                media_span = parse_media_span(&buf, &file_name(path));
-            }
-        } else if id == b"iXML" && size > 0 && size <= 1_048_576 {
-            file.seek(SeekFrom::Start(payload)).ok()?;
-            let mut buf = vec![0u8; size as usize];
-            if file.read_exact(&mut buf).is_ok() {
-                ixml = ixml_payload_text(&buf).and_then(parse_ixml_speed);
-            }
-        }
-
-        let padded = size.checked_add(size & 1)?;
-        offset = payload.checked_add(padded)?;
     }
 
     Some(BwfMetadata {
@@ -563,8 +532,8 @@ fn parse_ixml_rate(text: &str) -> Option<MediaTime> {
 
 // ------------------------------------------------------------ Sony tail
 
-/// Extract Sony NonRealTimeMeta XML from the last MiB of an MXF/MP4 file.
-pub fn read_sony_tail(path: &Path) -> Option<String> {
+/// Read Sony NonRealTimeMeta XML from the last MiB of an MXF/MP4 file.
+pub fn read_sony_tail(path: &Path) -> Option<SonyMetadata> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).ok()?;
     let end = file.seek(SeekFrom::End(0)).ok()?;
@@ -578,7 +547,9 @@ pub fn read_sony_tail(path: &Path) -> Option<String> {
     const CLOSE: &[u8] = b"</NonRealTimeMeta>";
     let start = find_bytes(&buf, OPEN)?;
     let end = start + find_bytes(&buf[start..], CLOSE)? + CLOSE.len();
-    Some(String::from_utf8_lossy(&buf[start..end]).into_owned())
+    Some(SonyMetadata::parse(&String::from_utf8_lossy(
+        &buf[start..end],
+    )))
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -655,11 +626,52 @@ fn attr_local<'a>(attrs: &'a HashMap<String, String>, local: &str) -> Option<&'a
     })
 }
 
-/// Sony LTC timecode: first `LtcChange frameCount=0` value (8 digits,
-/// FFSSMMHH pairs) with the parent table's `tcFps`, else `fallback`.
-/// Always NDF (LTC carries no DF flag); ranges validated, never guessed.
-pub fn sony_timecode(xml: &str, fallback: MediaTime) -> Option<SourceTimecode> {
-    let elements = sony_elements(xml);
+/// Sony NonRealTimeMeta, parsed once for all the fields Align reads.
+pub struct SonyMetadata {
+    elements: Vec<(SonyElement, Option<usize>)>,
+}
+
+impl SonyMetadata {
+    pub fn parse(xml: &str) -> Self {
+        Self {
+            elements: sony_elements(xml),
+        }
+    }
+
+    fn element(&self, name: &str) -> Option<&SonyElement> {
+        self.elements
+            .iter()
+            .map(|(element, _)| element)
+            .find(|element| element.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Sony LTC timecode: first `LtcChange frameCount=0` value (8 digits,
+    /// FFSSMMHH pairs) with the parent table's `tcFps`, else `fallback`.
+    /// Always NDF (LTC carries no DF flag); ranges validated, never guessed.
+    pub fn timecode(&self, fallback: MediaTime) -> Option<SourceTimecode> {
+        sony_timecode(&self.elements, fallback)
+    }
+
+    /// Sony `CreationDate value` (ISO 8601) → Unix seconds, else None.
+    pub fn recording_date(&self) -> Option<i64> {
+        parse_iso8601(attr_local(&self.element("CreationDate")?.attrs, "value")?)
+    }
+
+    /// `device:manufacturer:model:serial`, rejecting empty or sentinel serials
+    /// (all zeros, u32::MAX, and all-F).
+    pub fn device_id(&self) -> Option<String> {
+        let element = self.element("Device")?;
+        let manufacturer = attr_local(&element.attrs, "manufacturer")?;
+        let model = attr_local(&element.attrs, "modelName")?;
+        let serial = attr_local(&element.attrs, "serialNo")?;
+        valid_camera_serial(serial).then(|| format!("device:{manufacturer}:{model}:{serial}"))
+    }
+}
+
+fn sony_timecode(
+    elements: &[(SonyElement, Option<usize>)],
+    fallback: MediaTime,
+) -> Option<SourceTimecode> {
     let (idx, _) = elements.iter().enumerate().find(|(_, (e, _))| {
         e.name.eq_ignore_ascii_case("LtcChange") && attr_local(&e.attrs, "frameCount") == Some("0")
     })?;
@@ -688,36 +700,11 @@ pub fn sony_timecode(xml: &str, fallback: MediaTime) -> Option<SourceTimecode> {
     SourceTimecode::from_components(hours, minutes, seconds, frames, duration, false)
 }
 
-/// Sony `CreationDate value` (ISO 8601) → Unix seconds, else None.
-pub fn sony_recording_date(xml: &str) -> Option<i64> {
-    let elements = sony_elements(xml);
-    let (_, (element, _)) = elements
-        .iter()
-        .enumerate()
-        .find(|(_, (e, _))| e.name.eq_ignore_ascii_case("CreationDate"))?;
-    parse_iso8601(attr_local(&element.attrs, "value")?)
-}
-
-/// `device:manufacturer:model:serial`, rejecting empty or sentinel serials
-/// ("0", u32::MAX, and all-F).
-pub fn sony_device_id(xml: &str) -> Option<String> {
-    let elements = sony_elements(xml);
-    let (_, (element, _)) = elements
-        .iter()
-        .enumerate()
-        .find(|(_, (e, _))| e.name.eq_ignore_ascii_case("Device"))?;
-    let manufacturer = attr_local(&element.attrs, "manufacturer")?;
-    let model = attr_local(&element.attrs, "modelName")?;
-    let serial = attr_local(&element.attrs, "serialNo")?;
-    let normalized = serial.trim().to_uppercase();
-    if normalized.is_empty()
-        || normalized == "0"
-        || normalized == "4294967295"
-        || normalized.bytes().all(|b| b == b'F')
-    {
-        return None;
-    }
-    Some(format!("device:{manufacturer}:{model}:{serial}"))
+pub(crate) fn valid_camera_serial(serial: &str) -> bool {
+    let serial = serial.trim();
+    !serial.bytes().all(|b| b == b'0')
+        && serial != "4294967295"
+        && !serial.bytes().all(|b| b.eq_ignore_ascii_case(&b'F'))
 }
 
 /// Minimal ISO 8601 (`YYYY-MM-DDTHH:MM:SS[.frac][Z|±HH[:MM]]`) → Unix.
@@ -927,21 +914,21 @@ mod tests {
     #[test]
     fn sony_tail_fields() {
         // LtcChange value "07123405" → pairs FF=07 SS=12 MM=34 HH=05.
-        let xml = SONY.replace("10123456", "07123405");
-        let tc = sony_timecode(&xml, MediaTime::new(1, 25)).expect("tc");
+        let sony = SonyMetadata::parse(&SONY.replace("10123456", "07123405"));
+        let tc = sony.timecode(MediaTime::new(1, 25)).expect("tc");
         assert_eq!(tc.text, "05:34:12:07");
         assert_eq!(tc.frame_number, 501_307);
         assert_eq!(tc.frame_duration, MediaTime::new(1, 25));
         // 2024-05-06T12:34:56+09:00 = 1714998896 − 32400.
-        assert_eq!(sony_recording_date(&xml), Some(1_714_966_496));
+        assert_eq!(sony.recording_date(), Some(1_714_966_496));
         assert_eq!(
-            sony_device_id(&xml).as_deref(),
+            sony.device_id().as_deref(),
             Some("device:Sony:PXW-Z280:1234567")
         );
         // Sentinel serials rejected.
         for bad in ["0", "4294967295", "FFFFFFFF", "   "] {
             let x = SONY.replace("1234567", bad);
-            assert!(sony_device_id(&x).is_none(), "{bad}");
+            assert!(SonyMetadata::parse(&x).device_id().is_none(), "{bad}");
         }
     }
 
@@ -954,9 +941,11 @@ mod tests {
         bytes.extend_from_slice(SONY.as_bytes());
         bytes.extend_from_slice(&[0xff, 0xfe, 0x00]);
         std::fs::write(&path, &bytes).unwrap();
-        let xml = read_sony_tail(&path).expect("tail");
-        assert!(xml.starts_with("<NonRealTimeMeta") && xml.ends_with("</NonRealTimeMeta>"));
-        assert!(sony_device_id(&xml).is_some());
+        let sony = read_sony_tail(&path).expect("tail");
+        assert_eq!(
+            sony.device_id().as_deref(),
+            Some("device:Sony:PXW-Z280:1234567")
+        );
         std::fs::write(&path, &bytes[..300_000]).unwrap();
         assert!(read_sony_tail(&path).is_none());
         std::fs::remove_dir_all(dir).unwrap();

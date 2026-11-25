@@ -514,9 +514,12 @@ pub fn read(path: &Path) -> Option<Movie> {
 fn read_movie(file: &mut File, moov: &[u8]) -> Option<Movie> {
     let body = atoms(moov).next()?.body;
     let mut movie = parse_moov(body)?;
-    if movie
-        .audio()
-        .any(|t| t.audio.as_ref().is_some_and(|a| a.is_float.is_some()))
+    // The direct PCM reader and the table-based picture timing both need
+    // the payload extents.
+    if movie.tracks.iter().any(|t| t.kind == TrackKind::Video)
+        || movie
+            .audio()
+            .any(|t| t.audio.as_ref().is_some_and(|a| a.is_float.is_some()))
     {
         // Check top-level payload extents once per parsed header. Refuse
         // the direct reader if the rest of the container is malformed.

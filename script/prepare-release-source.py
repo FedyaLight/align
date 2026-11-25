@@ -23,7 +23,7 @@ def main():
     parser.add_argument('--licenses', type=Path, required=True)
     # The FFmpeg tools' corresponding source; on macOS they read only MXF.
     parser.add_argument('--ffmpeg', type=Path)
-    parser.add_argument('--aaf', type=Path, required=True)
+    parser.add_argument('--aaf-binary', type=Path, required=True)
     parser.add_argument('--velopack-version', required=True)
     args = parser.parse_args()
     if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', args.velopack_version):
@@ -36,16 +36,8 @@ def main():
         for name in (f'ffmpeg-{ffmpeg_version}.tar.xz', 'build-ffmpeg-minimal.sh', 'config.mak'):
             if not (args.ffmpeg / name).is_file():
                 raise RuntimeError(f'Missing FFmpeg source file: {name}')
-    aaf_versions = json.loads((args.aaf / 'versions.json').read_text(encoding="utf-8"))
-    if not (args.aaf / 'Licenses/Python-LICENSE.txt').is_file():
-        raise RuntimeError('Missing AAF runtime licenses')
-    versions = {key: aaf_versions[key] for key in ('pyaaf2', 'pyinstaller', 'pyinstaller-hooks-contrib')}
-    versions.update(aaf_versions['native_libraries'])
-    versions['Python'] = aaf_versions['python'].split()[0]
-    for name, version in versions.items():
-        matches = list(args.aaf.glob(f'{name}-{version}.tar.*')) + list(args.aaf.glob(f'{name.replace("-", "_")}-{version}.tar.*'))
-        if not matches:
-            raise RuntimeError(f'Missing AAF source archive: {name} {version}')
+    if not args.aaf_binary.is_file() or not args.aaf_binary.stat().st_size:
+        raise RuntimeError(f'Missing AAF build output: {args.aaf_binary}')
     args.output.mkdir(parents=True, exist_ok=True)
     args.licenses.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='align-release-source-') as tmp:
@@ -86,13 +78,8 @@ def main():
             package = tomllib.loads((crate / 'Cargo.toml').read_text(encoding="utf-8"))['package']
             inventory.append({key: package.get(key) for key in
                               ('name', 'version', 'license', 'repository', 'authors')})
-        components = [('AAF', args.aaf)]
         if args.ffmpeg is not None:
-            components.insert(0, ('FFmpeg', args.ffmpeg))
-        for folder, origin in components:
-            if not origin.is_dir() or not any(origin.iterdir()):
-                raise RuntimeError(f'Missing {folder} source bundle: {origin}')
-            shutil.copytree(origin, source / folder)
+            shutil.copytree(args.ffmpeg, source / 'FFmpeg')
         velopack = source / 'Velopack'
         velopack.mkdir()
         archive = velopack / f'velopack-{args.velopack_version}.tar.gz'
@@ -118,28 +105,16 @@ def main():
             'component_binaries': {},
         }
         extension = '.exe' if args.platform == 'Windows' else ''
-        binaries = [args.aaf.parent / f'align-aaf{extension}']
+        binaries = [args.aaf_binary]
         if args.ffmpeg is not None:
             binaries += [args.ffmpeg.parent / f'ffmpeg{extension}',
                          args.ffmpeg.parent / f'ffprobe{extension}']
             binaries += sorted(args.ffmpeg.parent.glob('*.dylib'))
             binaries += sorted(args.ffmpeg.parent.glob('*.so.*'))
-        runtime = args.aaf.parent / 'align-aaf-runtime'
-        if not (runtime / 'base_library.zip').is_file():
-            raise RuntimeError(f'Missing frozen AAF runtime: {runtime}')
-        manifest['component_links'] = {}
-        for path in sorted(runtime.rglob('*')):
-            if path.is_symlink():
-                if not path.resolve(strict=True).is_relative_to(runtime.resolve()):
-                    raise RuntimeError(f'External runtime symlink: {path}')
-                manifest['component_links'][path.relative_to(args.aaf.parent).as_posix()] = path.readlink().as_posix()
-            elif path.is_file():
-                binaries.append(path)
         for path in binaries:
-            name = path.relative_to(args.aaf.parent).as_posix() if path.is_relative_to(args.aaf.parent) else path.name
             with path.open('rb') as stream:
-                manifest['component_binaries'][name] = hashlib.file_digest(stream, 'sha256').hexdigest()
-        for folder in [name for name, _ in components] + ['Velopack']:
+                manifest['component_binaries'][path.name] = hashlib.file_digest(stream, 'sha256').hexdigest()
+        for folder in ['FFmpeg', 'Velopack', 'crates/align-aaf']:
             for path in sorted((source / folder).rglob('*')):
                 if path.is_file():
                     with path.open('rb') as stream:

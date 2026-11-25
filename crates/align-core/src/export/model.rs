@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use sha2::{Digest, Sha256};
 
 use crate::allocator::source_key_for_clip;
+use crate::camera_clock::{CAMERA_CLOCK_LABEL, CameraClockEstimate, CameraClockMark};
 use crate::model::{
     Clip, ClipId, ImportedTimeline, MappingPoint, MediaKind, MediaTime, RATE_TOLERANCE, SyncIsland,
     SyncResult, TemporalPolicy, TimelineEdit, TimelineLinkedAudioEdit, TimelinePreviewItem,
@@ -149,6 +150,8 @@ pub struct ExportItem {
     pub transition_after: Option<ExportTransition>,
     pub audio_transition_after: Option<ExportTransition>,
     pub linked_audio_edit: Option<ExportLinkedAudio>,
+    /// Set when the camera clock, not synchronization, placed this item.
+    pub camera_clock: Option<CameraClockMark>,
 }
 
 impl ExportItem {
@@ -205,7 +208,16 @@ impl ExportItem {
             transition_after: None,
             audio_transition_after: None,
             linked_audio_edit: None,
+            camera_clock: None,
         }
+    }
+
+    /// Where the ordinary assembly plays `media` of an item the camera clock
+    /// moved; track allocation keeps every other item's track by placing it
+    /// there first.
+    pub fn assembled_start(&self, media: MediaKind) -> Option<f64> {
+        let assembled = self.camera_clock.as_ref()?.assembled_start?;
+        Some(assembled + self.timeline_start(media) - self.start)
     }
 
     pub fn source_duration(&self) -> f64 {
@@ -456,6 +468,13 @@ impl ExportItem {
         out.transition_after = out.transition_after.map(|t| t.offset_by(value));
         out.audio_transition_after = out.audio_transition_after.map(|t| t.offset_by(value));
         out.linked_audio_edit = out.linked_audio_edit.map(|l| l.offset_by(value));
+        if let Some(start) = out
+            .camera_clock
+            .as_mut()
+            .and_then(|mark| mark.assembled_start.as_mut())
+        {
+            *start += value;
+        }
         out
     }
 }
@@ -469,6 +488,20 @@ pub struct ExportIsland {
     pub id: usize,
     pub clips: Vec<ExportItem>,
     pub duration: f64,
+}
+
+impl ExportIsland {
+    /// Explicit sequence end when moving a clip left a trailing empty slot.
+    pub fn reserved_end(&self) -> Option<f64> {
+        (self
+            .clips
+            .iter()
+            .any(|item| item.assembled_start(MediaKind::Video).is_some())
+            && self.clips.iter().all(|item| {
+                item.maximum_timeline_end() < self.duration - crate::model::TIME_TOLERANCE
+            }))
+        .then_some(self.duration)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -486,6 +519,11 @@ pub struct ExportTimeline {
     pub preserve_origin: bool,
     /// Islands whose unmatched clips should be packed by stable order only.
     order_only_islands: HashSet<usize>,
+    /// Unmatched islands whose clip the camera clock moved into a group.
+    /// They keep their place in the layout, so no other clip moves, but
+    /// their clips are not played.
+    vacated_islands: HashSet<usize>,
+    preserve_vacated_end: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -528,6 +566,10 @@ pub struct ExportAssemblyOptions {
     pub unmatched_role: Option<String>,
     /// Override the exported sequence/project name.
     pub sequence_name: Option<String>,
+    /// Camera-clock estimates the user applied. Each moves its unmatched
+    /// clip into its group; Remove unmatched removes them as well, and an
+    /// imported edit keeps its own placement.
+    pub camera_clock: Vec<CameraClockEstimate>,
 }
 
 impl ExportAssemblyOptions {
@@ -1090,6 +1132,7 @@ impl ImportedAssembly<'_> {
             corrected_audio_url: None,
             precision_audio_urls: Vec::new(),
             linked_audio_edit: linked,
+            camera_clock: None,
         };
         if is_unmatched {
             self.options.apply_unmatched_assignment(&mut item);
@@ -1183,6 +1226,8 @@ impl ExportTimeline {
             prevent_group_overlaps: false,
             preserve_origin: false,
             order_only_islands: HashSet::new(),
+            vacated_islands: HashSet::new(),
+            preserve_vacated_end: false,
         }
     }
 
@@ -1257,6 +1302,15 @@ impl ExportTimeline {
             return Err(TimelineExportError::NoSynchronizedIslands);
         }
         let Some(imported) = &result.project.imported_timeline else {
+            let mut vacated_islands =
+                place_by_camera_clock(&mut groups, result, &clips_by_id, &options);
+            // The place a moved clip left holds no material of its own, and
+            // Remove common gaps closes empty time, so the layout never
+            // reserves it.
+            if options.cut_remove.common_gaps {
+                groups.retain(|group| !vacated_islands.contains(&group.id));
+                vacated_islands.clear();
+            }
             let islands = apply_cut_remove(groups, options.cut_remove);
             if islands.is_empty() {
                 return Err(TimelineExportError::NoSynchronizedIslands);
@@ -1278,6 +1332,8 @@ impl ExportTimeline {
                 prevent_group_overlaps: options.prevent_group_overlaps,
                 preserve_origin: false,
                 order_only_islands,
+                vacated_islands,
+                preserve_vacated_end: !options.cut_remove.is_active(),
             });
         };
 
@@ -1351,6 +1407,8 @@ impl ExportTimeline {
             prevent_group_overlaps: options.prevent_group_overlaps,
             preserve_origin: !result.preserve_editing_tracks.is_empty(),
             order_only_islands: HashSet::new(),
+            vacated_islands: HashSet::new(),
+            preserve_vacated_end: false,
         })
     }
 
@@ -1360,6 +1418,8 @@ impl ExportTimeline {
         self.prevent_group_overlaps = other.prevent_group_overlaps;
         self.preserve_origin = other.preserve_origin;
         self.order_only_islands = other.order_only_islands.clone();
+        self.vacated_islands = other.vacated_islands.clone();
+        self.preserve_vacated_end = other.preserve_vacated_end;
     }
 
     /// The same timeline (name, rate, chronology and assembly policies)
@@ -1373,19 +1433,58 @@ impl ExportTimeline {
 
     /// This timeline as the single sequence every writer exports.
     pub fn combined(&self) -> Self {
-        self.with_islands(vec![self.combined_island(1.0)])
+        let mut timeline = self.with_islands(vec![self.combined_island(1.0)]);
+        // The place a moved clip left can open the timeline. Keeping the
+        // coordinates keeps every other clip where the ordinary assembly
+        // put it, however often the timeline is combined again.
+        timeline.preserve_origin |= !self.vacated_islands.is_empty();
+        timeline.vacated_islands.clear();
+        timeline
     }
 
     /// One sequence for all islands and unmatched clips (gap = 1 s).
     pub fn combined_island(&self, gap: f64) -> ExportIsland {
+        let positioned = self.positioned_islands(gap);
+        // Emit each estimate in the ordinary slot's iteration order. Writers
+        // use the first source for sequence geometry and starting timecode.
+        let mut moved = HashMap::new();
+        if !self.vacated_islands.is_empty() {
+            for (island, shift) in &positioned {
+                for item in island
+                    .clips
+                    .iter()
+                    .filter(|item| item.camera_clock.is_some())
+                {
+                    moved.insert(&item.clip.id, item.offset_by(*shift));
+                }
+            }
+        }
         let mut combined = Vec::new();
-        for (island, shift) in self.positioned_islands(gap) {
-            combined.extend(island.clips.iter().map(|item| item.offset_by(shift)));
+        let mut duration = 0.0_f64;
+        for (island, shift) in positioned {
+            let reserved = self.vacated_islands.contains(&island.id);
+            if self.preserve_origin && island.clips.iter().any(|i| i.camera_clock.is_some()) {
+                duration = duration.max(island.duration + shift);
+            }
+            for item in &island.clips {
+                if reserved {
+                    if let Some(mut placed) = moved.remove(&item.clip.id) {
+                        placed.camera_clock.as_mut().unwrap().assembled_start =
+                            Some(item.start + shift);
+                        combined.push(placed);
+                    }
+                } else if self.vacated_islands.is_empty() || item.camera_clock.is_none() {
+                    combined.push(item.offset_by(shift));
+                }
+                if reserved && self.preserve_vacated_end {
+                    duration = duration.max(item.maximum_timeline_end() + shift);
+                }
+            }
         }
         let duration = combined
             .iter()
-            .map(|i| i.maximum_timeline_end())
-            .fold(0.0f64, f64::max);
+            .map(ExportItem::maximum_timeline_end)
+            .fold(duration, f64::max);
         ExportIsland {
             id: 0,
             clips: combined,
@@ -1593,15 +1692,77 @@ impl ExportTimeline {
                 mapping_points: item.mapping_points.clone(),
                 confidence: item.confidence,
                 matched: !unmatched.contains(&item.clip.id),
+                camera_clock: item.camera_clock.clone(),
             })
             .collect()
     }
 }
 
+/// Moves each applied camera-clock estimate's unmatched clip into its group
+/// and returns the islands it leaves, which keep their place in the layout.
+/// Remove unmatched removes the estimated clips too.
+fn place_by_camera_clock(
+    groups: &mut [ExportIsland],
+    result: &SyncResult,
+    clips_by_id: &HashMap<&ClipId, &Clip>,
+    options: &ExportAssemblyOptions,
+) -> HashSet<usize> {
+    let mut vacated = HashSet::new();
+    if options.unmatched == UnmatchedPlacement::Remove {
+        return vacated;
+    }
+    for estimate in &options.camera_clock {
+        let Some(clip) = clips_by_id.get(&estimate.clip_id) else {
+            continue;
+        };
+        let unmatched = result.unmatched.contains(&estimate.clip_id);
+        let slot = groups.iter().position(|group| {
+            !vacated.contains(&group.id)
+                && matches!(&group.clips[..], [item] if item.clip.id == estimate.clip_id)
+        });
+        let group = groups.iter().position(|group| {
+            group.id == estimate.island
+                && [&estimate.before, &estimate.after]
+                    .iter()
+                    .all(|anchor| group.clips.iter().any(|item| &item.clip.id == *anchor))
+        });
+        let (true, Some(slot), Some(group)) = (unmatched, slot, group) else {
+            continue;
+        };
+        let mut item = unmatched_item(clip, options).offset_by(estimate.start);
+        let name = item
+            .display_name
+            .take()
+            .unwrap_or_else(|| file_name(&clip.url));
+        item.display_name = Some(if name.starts_with(CAMERA_CLOCK_LABEL) {
+            name
+        } else {
+            format!("{CAMERA_CLOCK_LABEL} {name}")
+        });
+        item.camera_clock = Some(CameraClockMark {
+            before: estimate.before.clone(),
+            after: estimate.after.clone(),
+            tolerance: estimate.tolerance,
+            assembled_start: None,
+        });
+        vacated.insert(groups[slot].id);
+        let clips = &mut groups[group].clips;
+        clips.push(item);
+        clips.sort_by(|a, b| {
+            a.start
+                .total_cmp(&b.start)
+                .then_with(|| file_name(&a.clip.url).cmp(&file_name(&b.clip.url)))
+        });
+    }
+    vacated
+}
+
+/// Chronology of an island from its clips' timestamps. A clip the camera
+/// clock placed is not evidence of where its group belongs.
 fn chronology_key(island: &ExportIsland, policy: &TemporalPolicy) -> (i32, f64) {
     let mut recorded = Vec::new();
     let mut tc = Vec::new();
-    for i in &island.clips {
+    for i in island.clips.iter().filter(|i| i.camera_clock.is_none()) {
         let (r, t) = policy.anchors(&i.clip);
         recorded.extend(r.map(|v| v - i.start));
         tc.extend(t.map(|v| v - i.start));
@@ -2081,6 +2242,7 @@ mod tests {
                 clips: vec![camera.clone(), recorder.clone()],
                 warnings: Vec::new(),
                 imported_timeline: Some(ImportedTimeline {
+                    aaf_track_numbers: Vec::new(),
                     name: "Edited".into(),
                     frame_duration: MediaTime::new(1, 25),
                     edits: vec![

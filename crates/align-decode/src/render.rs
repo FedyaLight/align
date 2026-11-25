@@ -16,7 +16,7 @@ static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 use align_core::drift::segments;
 use align_core::model::file_name;
 use align_core::staged::StagedFile;
-use align_core::wav::{WavError, preserve_broadcast_extension};
+use align_core::wav::{WavError, rendered_broadcast_extension};
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
@@ -170,7 +170,8 @@ fn finish_tail(
 
 /// Minimal streaming WAV writer (f32le / s32le interleaved). Headers are
 /// patched on finalize — no full-file buffering, no hound dependency in
-/// the hot path.
+/// the hot path. A `bext` chunk is written with the header, so the audio is
+/// written once and the RF64 decision includes it.
 struct WavWriter {
     file: std::fs::File,
     frames_written: u64,
@@ -189,6 +190,7 @@ impl WavWriter {
         channels: usize,
         int32: bool,
         channel_mask: Option<u32>,
+        broadcast_extension: Option<&[u8]>,
     ) -> Result<Self, RenderError> {
         let mut header = Vec::new();
         header.extend_from_slice(b"RIFF");
@@ -199,6 +201,16 @@ impl WavWriter {
         header.extend_from_slice(b"JUNK");
         header.extend_from_slice(&28u32.to_le_bytes());
         header.extend_from_slice(&[0u8; 28]);
+        if let Some(payload) = broadcast_extension {
+            let size = u32::try_from(payload.len())
+                .map_err(|_| RenderError::InvalidRequest("the bext chunk exceeds 4 GiB"))?;
+            header.extend_from_slice(b"bext");
+            header.extend_from_slice(&size.to_le_bytes());
+            header.extend_from_slice(payload);
+            if payload.len() % 2 == 1 {
+                header.push(0);
+            }
+        }
         // tag 3 = FLOAT, 1 = PCM, 0xFFFE = EXTENSIBLE.
         let tag: u16 = if int32 { 1 } else { 3 };
         let extensible = channels > 2;
@@ -282,8 +294,8 @@ impl WavWriter {
 
     fn patch_header(&mut self) -> io::Result<()> {
         let len = self.file.stream_position()?;
-        // 12-byte RIFF header, 36-byte reserved ds64, 24- or 48-byte fmt,
-        // and 8-byte data header before the audio.
+        // 12-byte RIFF header, 36-byte reserved ds64, any bext, 24- or
+        // 48-byte fmt, and 8-byte data header before the audio.
         let data_size = len
             .checked_sub(self.data_offset)
             .ok_or_else(|| io::Error::other("WAV header is incomplete"))?;
@@ -507,7 +519,16 @@ pub(crate) fn render_drift_with_commit(
 
     let staged = StagedFile::new(destination).map_err(RenderError::Write)?;
     let mask = align_core::wav::channel_mask(source);
-    let mut writer = WavWriter::create(staged.path(), sample_rate as u32, channels, false, mask)?;
+    let bext =
+        rendered_broadcast_extension(source, sample_rate, channels, 32, "drift correction", 0)?;
+    let mut writer = WavWriter::create(
+        staged.path(),
+        sample_rate as u32,
+        channels,
+        false,
+        mask,
+        bext.as_deref(),
+    )?;
     for &(source_start, source_duration, target_duration) in &segments {
         check_cancel(cancel)?;
         let mut segment = GuardedSegment::new(
@@ -534,15 +555,6 @@ pub(crate) fn render_drift_with_commit(
     }
     check_cancel(cancel)?;
     writer.finalize()?;
-    preserve_broadcast_extension(
-        source,
-        staged.path(),
-        sample_rate,
-        channels,
-        32,
-        "drift correction",
-        0,
-    )?;
     commit(staged).map_err(RenderError::Write)
 }
 
@@ -737,10 +749,25 @@ pub(crate) fn render_channels_with_commit(
             .iter()
             .zip(&staged)
             .map(|((channel, _), staged)| {
-                WavWriter::create(staged.path(), sample_rate as u32, 1, int32, None)
-                    .map(|writer| (*channel, writer))
+                let bext = rendered_broadcast_extension(
+                    source,
+                    sample_rate,
+                    1,
+                    32,
+                    &format!("channel {} extraction", channel + 1),
+                    start_frame,
+                )?;
+                WavWriter::create(
+                    staged.path(),
+                    sample_rate as u32,
+                    1,
+                    int32,
+                    None,
+                    bext.as_deref(),
+                )
+                .map(|writer| (*channel, writer))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, RenderError>>()?;
         let mut remaining = take_frames;
         if int32 {
             backend.decode_native_i32(source, 0, range, &mut |block: NativeBlockI32| {
@@ -765,7 +792,7 @@ pub(crate) fn render_channels_with_commit(
                 Ok(())
             })?;
         }
-        for ((channel, mut writer), staged) in writers.into_iter().zip(&staged) {
+        for (_, mut writer) in writers {
             check_cancel(cancel)?;
             finish_tail(
                 &mut writer,
@@ -777,15 +804,6 @@ pub(crate) fn render_channels_with_commit(
                 cancel,
             )?;
             writer.finalize()?;
-            preserve_broadcast_extension(
-                source,
-                staged.path(),
-                sample_rate,
-                1,
-                32,
-                &format!("channel {} extraction", channel + 1),
-                start_frame,
-            )?;
         }
         for staged in staged {
             check_cancel(cancel)?;
@@ -853,7 +871,7 @@ mod tests {
         let dir = tmp("pcm-bits");
         for int32 in [false, true] {
             let path = dir.join(if int32 { "int.wav" } else { "float.wav" });
-            let mut writer = WavWriter::create(&path, 48000, 2, int32, None).unwrap();
+            let mut writer = WavWriter::create(&path, 48000, 2, int32, None, None).unwrap();
             let expected = if int32 {
                 let left = [i32::MIN, 0, i32::MAX];
                 let right = [1, -1, 123456789];
@@ -897,11 +915,42 @@ mod tests {
     }
 
     #[test]
+    fn wav_writer_counts_the_broadcast_extension_toward_rf64() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boundary.wav");
+        let mut bext = vec![0u8; 602];
+        bext[338..346].copy_from_slice(&48_000u64.to_le_bytes());
+        let mut writer = WavWriter::create(&path, 48000, 2, false, None, Some(&bext)).unwrap();
+        // Audio that fits a RIFF file on its own, but not with its bext.
+        let frames = (u64::from(u32::MAX) - 72) / 8;
+        writer
+            .file
+            .set_len(writer.data_offset + frames * 8)
+            .unwrap();
+        writer.file.seek(SeekFrom::End(0)).unwrap();
+        writer.frames_written = frames;
+        writer.finalize().unwrap();
+        let mut container = [0u8; 4];
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_exact(&mut container)
+            .unwrap();
+        assert_eq!(&container, b"RF64");
+        assert_eq!(
+            align_core::meta::read_bwf(&path).unwrap().time_reference,
+            Some(48_000)
+        );
+        let probe = crate::portable::PortableBackend.inspect(&path).unwrap();
+        assert!((probe.duration_seconds - frames as f64 / 48000.0).abs() < 1.0 / 48000.0);
+    }
+
+    #[test]
     fn wav_writer_promotes_large_sparse_output_to_rf64() {
         use std::io::Read;
         let dir = tmp("rf64-size");
         let path = dir.join("large.wav");
-        let mut writer = WavWriter::create(&path, 48000, 2, false, None).unwrap();
+        let mut writer = WavWriter::create(&path, 48000, 2, false, None, None).unwrap();
         // Sparse file crosses the actual RIFF boundary without allocating
         // 4 GiB of RAM or writing hours of silence during a unit test.
         let frames = (u64::from(u32::MAX) / 8) + 1;
@@ -1065,7 +1114,7 @@ mod tests {
         write_stereo_wav(&src, 48000, 1, 42);
         let mut probe = crate::portable::PortableBackend.inspect(&src).unwrap();
         let dst = dir.join("tail.wav");
-        let mut writer = WavWriter::create(&dst, 48000, 2, false, None).unwrap();
+        let mut writer = WavWriter::create(&dst, 48000, 2, false, None, None).unwrap();
         assert!(matches!(
             finish_tail(&mut writer, &probe, 1.0, 6, 48000.0, 2, cancel),
             Err(RenderError::Truncated)

@@ -16,7 +16,6 @@ BUNDLE_FFMPEG="${BUNDLE_FFMPEG:-0}"
 FFMPEG_DIR="${FFMPEG_DIR:-}"
 ALIGN_SKIP_LAUNCH_CHECK="${ALIGN_SKIP_LAUNCH_CHECK:-0}"
 MIN_MACOS="15.0"
-AAF_DIR="${AAF_DIR:-}"
 RELEASE_LICENSES="${RELEASE_LICENSES:-}"
 
 if [[ -e "$OUT_DIR" || -L "$OUT_DIR" ]]; then
@@ -25,18 +24,8 @@ if [[ -e "$OUT_DIR" || -L "$OUT_DIR" ]]; then
   exit 1
 fi
 
-# Build the self-contained AAF module before touching an existing package.
-AAF_BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/align-aaf-package.XXXXXX")"
-trap 'rm -rf "$AAF_BUILD_DIR"' EXIT
-if [[ -z "$AAF_DIR" ]]; then
-  python3 -m venv "$AAF_BUILD_DIR/venv"
-  "$AAF_BUILD_DIR/venv/bin/python" -m pip install -r "$ROOT_DIR/Support/aaf/build-requirements.txt"
-  "$AAF_BUILD_DIR/venv/bin/python" "$ROOT_DIR/script/build-aaf-sidecar.py" "$AAF_BUILD_DIR/dist"
-  AAF_DIR="$AAF_BUILD_DIR/dist"
-fi
-test -x "$AAF_DIR/align-aaf"
-test -s "$AAF_DIR/align-aaf-runtime/base_library.zip"
-test -d "$AAF_DIR/AAF-Licenses"
+PACKAGE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/align-package.XXXXXX")"
+trap 'rm -rf "$PACKAGE_TMP"' EXIT
 if [[ -n "$RELEASE_LICENSES" ]]; then
   test -f "$RELEASE_LICENSES/BUILD-MANIFEST.json"
   test -f "$RELEASE_LICENSES/Rust-Licenses.txt"
@@ -44,7 +33,7 @@ fi
 
 if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
   if [[ -z "$FFMPEG_DIR" ]]; then
-    FFMPEG_DIR="$AAF_BUILD_DIR/ffmpeg"
+    FFMPEG_DIR="$PACKAGE_TMP/ffmpeg"
     "$ROOT_DIR/script/build-ffmpeg-minimal.sh" "$FFMPEG_DIR"
   fi
   for tool in ffmpeg ffprobe; do "$FFMPEG_DIR/$tool" -version >/dev/null; done
@@ -72,7 +61,7 @@ if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
 fi
 
 echo "==> building release"
-cargo build --locked --release --manifest-path "$ROOT_DIR/Cargo.toml" -p align-gpui
+cargo build --locked --release --manifest-path "$ROOT_DIR/Cargo.toml" -p align-gpui -p align-aaf
 
 BIN_DIR="$ROOT_DIR/target/release"
 APP_BUNDLE="$OUT_DIR/$APP_NAME.app"
@@ -95,34 +84,29 @@ ln -s "Align.app/Contents/MacOS/Align" "$OUT_DIR/align-cli"
 ln -s Align "$APP_MACOS/align-cli"
 cp "$ROOT_DIR/THIRD_PARTY_NOTICES.txt" "$OUT_DIR/THIRD_PARTY_NOTICES.txt"
 cp "$ROOT_DIR/LICENSE" "$OUT_DIR/LICENSE"
-chmod +x "$OUT_DIR/align-cli" "$APP_MACOS/align-cli"
-# A PyInstaller executable physically in Contents/MacOS looks in Frameworks.
-# Keep its frozen directory intact, and expose the adjacent entry point to the CLI.
-mkdir "$RESOURCES/AAF"
-cp -p "$AAF_DIR/align-aaf" "$RESOURCES/AAF/"
-cp -a "$AAF_DIR/align-aaf-runtime" "$RESOURCES/AAF/"
-ln -s ../Resources/AAF/align-aaf "$APP_MACOS/align-aaf"
+cp -p "$BIN_DIR/align-aaf" "$APP_MACOS/align-aaf"
 ln -s Align.app/Contents/MacOS/align-aaf "$OUT_DIR/align-aaf"
-ln -s Align.app/Contents/Resources/AAF/align-aaf-runtime "$OUT_DIR/align-aaf-runtime"
-cp -R "$AAF_DIR/AAF-Licenses" "$RESOURCES/AAF-Licenses"
-cp -R "$AAF_DIR/AAF-Licenses" "$OUT_DIR/AAF-Licenses"
-chmod +x "$APP_MACOS/align-aaf" "$OUT_DIR/align-aaf"
+for folder in "$RESOURCES" "$OUT_DIR"; do
+  mkdir "$folder/AAF-Licenses"
+  cp "$ROOT_DIR/crates/align-aaf/PYAAF2-LICENSE.txt" "$folder/AAF-Licenses/"
+done
 if [[ -n "$RELEASE_LICENSES" ]]; then
   cp -R "$RELEASE_LICENSES" "$RESOURCES/ThirdPartyLicenses"
   cp -R "$RELEASE_LICENSES" "$OUT_DIR/ThirdPartyLicenses"
 fi
 
 
-# Both entry points discover adjacent sidecars.
+# Both entry points discover adjacent sidecars. The folder's links run the
+# bundle's signed tools, and dyld finds their libraries beside the bundle
+# copies, so the folder holds no second copy of FFmpeg.
 if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
   for tool in ffmpeg ffprobe; do
     cp "$FFMPEG_DIR/$tool" "$APP_MACOS/$tool"
-    cp "$FFMPEG_DIR/$tool" "$OUT_DIR/$tool"
-    chmod +x "$APP_MACOS/$tool" "$OUT_DIR/$tool"
+    chmod +x "$APP_MACOS/$tool"
+    ln -s "Align.app/Contents/MacOS/$tool" "$OUT_DIR/$tool"
   done
   for lib in ${dylibs[@]+"${dylibs[@]}"}; do
     cp "$lib" "$APP_MACOS/"
-    cp "$lib" "$OUT_DIR/"
   done
   cp "$FFMPEG_DIR/FFMPEG-LICENSE.txt" "$RESOURCES/FFMPEG-LICENSE.txt"
   cp "$FFMPEG_DIR/FFMPEG-LICENSE.txt" "$OUT_DIR/FFMPEG-LICENSE.txt"
@@ -181,7 +165,7 @@ Align — audio synchronization for video editing
 
   Align.app            — desktop application
   align-cli            — batch CLI: sync / export / export-json
-  align-aaf            — self-contained AAF module (no Python installation needed)
+  align-aaf            — built-in native AAF helper
   LICENSE              — Align license
   THIRD_PARTY_NOTICES.txt — third-party license notices
 $([ "$BUNDLE_FFMPEG" == "1" ] && echo "  ffmpeg, ffprobe      — bundled media tools for MXF
@@ -202,14 +186,13 @@ Ad-hoc signed for local use. Distribution signing and notarization are not inclu
 README
 
 echo "==> ad-hoc sign + verify"
-# Leave the PyInstaller signatures in Resources/AAF intact.
 if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
   for lib in ${dylibs[@]+"${dylibs[@]}"}; do
     codesign --force --sign - "$APP_MACOS/${lib##*/}"
   done
   codesign --force --sign - "$APP_MACOS/ffmpeg" "$APP_MACOS/ffprobe"
 fi
-codesign --force --sign - "$APP_MACOS/$APP_NAME"
+codesign --force --sign - "$APP_MACOS/$APP_NAME" "$APP_MACOS/align-aaf"
 codesign --force --sign - "$APP_BUNDLE" >/dev/null
 plutil -lint "$APP_CONTENTS/Info.plist"
 plutil -lint "$RESOURCES/PrivacyInfo.xcprivacy"
@@ -218,13 +201,16 @@ codesign -dv --verbose=2 "$APP_BUNDLE" 2>&1 | head -5
 
 echo "==> smoke test"
 "$OUT_DIR/align-cli" --help >/dev/null
-python3 "$ROOT_DIR/script/check-frozen-aaf.py" "$APP_MACOS/align-aaf"
+if [[ "$BUNDLE_FFMPEG" == "1" ]]; then
+  for tool in ffmpeg ffprobe; do "$OUT_DIR/$tool" -version >/dev/null; done
+fi
+python3 "$ROOT_DIR/script/check-aaf-sidecar.py" "$APP_MACOS/align-aaf"
 if [[ "$ALIGN_SKIP_LAUNCH_CHECK" != "1" ]]; then
-  "$APP_MACOS/$APP_NAME" >"$AAF_BUILD_DIR/launch.log" 2>&1 &
+  "$APP_MACOS/$APP_NAME" >"$PACKAGE_TMP/launch.log" 2>&1 &
   launch_pid=$!
   sleep 5
   if ! kill -0 "$launch_pid" 2>/dev/null; then
-    cat "$AAF_BUILD_DIR/launch.log" >&2
+    cat "$PACKAGE_TMP/launch.log" >&2
     echo "Application exited during the launch check." >&2
     exit 1
   fi

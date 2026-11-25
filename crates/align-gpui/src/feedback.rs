@@ -111,7 +111,7 @@ pub fn dismiss_notice() {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(path, env!("CARGO_PKG_VERSION"));
+    let _ = align_core::staged::write(&path, env!("CARGO_PKG_VERSION").as_bytes());
 }
 
 #[cfg(test)]

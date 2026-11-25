@@ -1,7 +1,7 @@
 //! Warning banner and the bottom operation bar.
 
 use super::animation::entrance;
-use super::controls::{button, icon_button, modal_header};
+use super::controls::{button, icon_button, modal_header, raised_surface};
 use super::export::export_reveal_label;
 use super::toolbar::timeline_zoom_controls;
 use super::{
@@ -238,7 +238,12 @@ pub(super) fn operation_bar(
         }
     }
     if !data.show_export && !data.lanes.is_empty() {
-        bar = bar.child(timeline_zoom_controls(cx, theme, data, active && !busy));
+        bar = bar.child(timeline_zoom_controls(
+            cx,
+            theme,
+            data,
+            active && data.timeline_zoom_available(),
+        ));
     }
     bar
 }
@@ -248,8 +253,8 @@ pub(super) fn stage_settings_panel(
     theme: &Theme,
     data: &crate::state::AppData,
 ) -> impl IntoElement {
-    let mut panel = div().id("stage-settings").w(px(400.)).p_4().flex().flex_col()
-        .gap_2().rounded_lg().bg(rgb(theme.panel)).border_1().border_color(rgb(theme.border))
+    let mut panel = raised_surface(theme).id("stage-settings").w(px(400.)).p_4()
+        .flex().flex_col().gap_2()
         .child(modal_header(cx, theme, "Synchronization stages", "stage-close", |this, _, _, cx| {
             this.data.show_stage_settings = false;
             cx.notify();
@@ -290,17 +295,13 @@ pub(super) fn sequence_results_panel(
     theme: &Theme,
     data: &crate::state::AppData,
 ) -> impl IntoElement {
-    let mut panel = div()
+    let mut panel = raised_surface(theme)
         .id("sequence-results")
         .w(px(420.))
         .p_4()
         .flex()
         .flex_col()
         .gap_2()
-        .rounded_lg()
-        .bg(rgb(theme.panel))
-        .border_1()
-        .border_color(rgb(theme.border))
         .child(modal_header(
             cx,
             theme,
@@ -344,6 +345,257 @@ pub(super) fn sequence_results_panel(
                 cx.notify();
             },
         ));
+    }
+    panel
+}
+
+// ---------------- camera clock
+
+/// Offered while the visible result has unmatched clips the camera clock
+/// can place, or imported edits it can check.
+pub(super) fn camera_clock_banner(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    data: &crate::state::AppData,
+) -> Option<impl IntoElement> {
+    // A running synchronization replaces the result it describes.
+    if data.operation == crate::state::Operation::Synchronizing {
+        return None;
+    }
+    let estimates = &data.camera_clock.estimates;
+    let imported = data
+        .result
+        .as_ref()
+        .is_some_and(|result| result.project.imported_timeline.is_some());
+    let text = if imported {
+        let hints = data.camera_clock_hints();
+        let differing = hints.iter().filter(|hint| !hint.agrees()).count();
+        if hints.is_empty() {
+            return None;
+        }
+        if differing == 0 {
+            format!(
+                "Camera clock agrees with {} imported edit{}.",
+                hints.len(),
+                plural(hints.len())
+            )
+        } else {
+            format!(
+                "{differing} imported edit{} start{} away from where the camera clock puts them.",
+                plural(differing),
+                if differing == 1 { "s" } else { "" }
+            )
+        }
+    } else if estimates.is_empty() {
+        if !data.camera_clock.refusals.iter().any(|(_, reason)| {
+            matches!(
+                reason,
+                align_core::camera_clock::CameraClockRefusal::RemovedByAssembly
+            )
+        }) {
+            return None;
+        }
+        "Camera-clock placement is unavailable with the current unmatched or cleanup settings."
+            .into()
+    } else {
+        let placed = estimates
+            .iter()
+            .filter(|e| data.camera_clock_applied(&e.clip_id))
+            .count();
+        if placed == 0 {
+            format!(
+                "{} unmatched clip{} can be placed approximately by camera clock.",
+                estimates.len(),
+                plural(estimates.len())
+            )
+        } else {
+            format!(
+                "{placed} of {} unmatched clip{} placed approximately by camera clock.",
+                estimates.len(),
+                plural(estimates.len())
+            )
+        }
+    };
+    Some(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_5()
+            .py_1()
+            .bg(rgba((0xAF52DE << 8) | 0x14))
+            .child(div().size(px(10.)).rounded_full().bg(rgb(0xAF52DE)))
+            .child(text)
+            .child(button(
+                cx,
+                theme,
+                "btn-camera-clock",
+                "Review…",
+                !data.has_active_job(),
+                |this, _, _, cx| {
+                    this.data.show_camera_clock = true;
+                    cx.notify();
+                },
+            )),
+    )
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
+pub(super) fn camera_clock_panel(
+    cx: &mut Context<AlignApp>,
+    theme: &Theme,
+    data: &crate::state::AppData,
+) -> impl IntoElement {
+    let name = |id: &align_core::ClipId| data.clip_name(id);
+    let note = |text: String| {
+        div()
+            .text_size(px(12.))
+            .text_color(rgb(theme.dim))
+            .child(text)
+    };
+    let imported = data
+        .result
+        .as_ref()
+        .is_some_and(|result| result.project.imported_timeline.is_some());
+    let mut panel = raised_surface(theme)
+        .id("camera-clock")
+        .w(px(480.))
+        .max_h(px(560.))
+        .overflow_y_scroll()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(modal_header(
+            cx,
+            theme,
+            "Camera clock",
+            "camera-clock-close",
+            |this, _, _, cx| {
+                this.data.show_camera_clock = false;
+                cx.notify();
+            },
+        ))
+        .child(note(
+            "A camera that records its serial number and start times places an unmatched \
+             clip between two of its clips that sound synchronized. The place is approximate: \
+             within about the tolerance shown, not a waveform match. Placed clips export named \
+             [CAMERA CLOCK] and remain unmatched for labels and Remove."
+                .into(),
+        ));
+    if imported {
+        panel = panel.child(note(
+            "Imported edits keep their placement. Each line compares where an edit starts with \
+             where the camera clock puts the same frame."
+                .into(),
+        ));
+        for hint in data.camera_clock_hints() {
+            let deviation = hint.deviation();
+            let relation = if hint.agrees() {
+                format!("agrees within ±{:.1} s", hint.tolerance)
+            } else {
+                format!(
+                    "{:.1} s {} than the camera clock (±{:.1} s)",
+                    deviation.abs(),
+                    if deviation > 0.0 { "later" } else { "earlier" },
+                    hint.tolerance
+                )
+            };
+            panel = panel.child(div().text_size(px(12.)).child(format!(
+                "{} · {} at {} · {relation}",
+                name(&hint.clip_id),
+                hint.track_label(),
+                super::controls::fmt_duration(hint.timeline_start)
+            )));
+        }
+    } else {
+        let estimates = &data.camera_clock.estimates;
+        let all: Vec<align_core::ClipId> = estimates.iter().map(|e| e.clip_id.clone()).collect();
+        let placed = all
+            .iter()
+            .filter(|id| data.camera_clock_applied(id))
+            .count();
+        let busy = data.has_active_job();
+        panel = panel.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(button(
+                    cx,
+                    theme,
+                    "camera-clock-place-all",
+                    "Place All",
+                    !busy && placed < all.len(),
+                    move |this, _, _, cx| this.set_camera_clock(all.clone(), true, cx),
+                ))
+                .child(button(
+                    cx,
+                    theme,
+                    "camera-clock-undo-all",
+                    "Return All to Unmatched",
+                    !busy && data.has_camera_clock_choice(),
+                    |this, _, _, cx| this.clear_camera_clock(cx),
+                )),
+        );
+        for (index, estimate) in estimates.iter().enumerate() {
+            let applied = data.camera_clock_applied(&estimate.clip_id);
+            let clip = estimate.clip_id.clone();
+            panel = panel.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(div().truncate().child(format!(
+                                "{}{}",
+                                if applied { "✓ " } else { "" },
+                                name(&estimate.clip_id)
+                            )))
+                            .child(note(align_core::camera_clock::describe_estimate(
+                                estimate, &name,
+                            ))),
+                    )
+                    .child(button(
+                        cx,
+                        theme,
+                        format!("camera-clock-{index}"),
+                        if applied { "Undo" } else { "Place" },
+                        !busy,
+                        move |this, _, _, cx| {
+                            this.set_camera_clock(vec![clip.clone()], !applied, cx)
+                        },
+                    )),
+            );
+        }
+    }
+    if !data.camera_clock.refusals.is_empty() {
+        panel = panel.child(
+            div()
+                .pt_2()
+                .text_size(px(12.))
+                .font_weight(gpui::FontWeight(600.0))
+                .child("Not placed"),
+        );
+        for (clip, refusal) in &data.camera_clock.refusals {
+            panel = panel.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(div().truncate().child(name(clip)))
+                    .child(note(refusal.describe(&name))),
+            );
+        }
     }
     panel
 }

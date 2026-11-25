@@ -22,6 +22,47 @@ struct Payload {
     fingerprints: Vec<Fingerprint>,
 }
 
+/// The fields bincode writes before a payload's fingerprints, so a cleanup
+/// that only needs the media path does not read or decode the rest.
+#[derive(Deserialize)]
+struct PayloadHeader {
+    version: u32,
+    _backend_tag: String,
+    media_path: PathBuf,
+}
+
+/// The media path of a timing or LTC entry, without the rest of it.
+#[derive(Deserialize)]
+struct MediaPathOnly {
+    media_path: PathBuf,
+}
+
+/// Restarts an entry's retention period when it is used. Retention counts
+/// from the last use, so media worked on every day stays cached.
+fn touch(path: &Path) {
+    let _ = std::fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(std::time::SystemTime::now()));
+}
+
+/// The media an entry file belongs to, read from its first bytes.
+fn entry_media_path(path: &Path) -> Option<PathBuf> {
+    use std::io::Read;
+    let file = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    match path.extension().and_then(|value| value.to_str()) {
+        Some("timing" | "ltc") => serde_json::from_reader::<_, MediaPathOnly>(file)
+            .ok()
+            .map(|entry| entry.media_path),
+        // Payload headers are a few hundred bytes; the limit bounds a
+        // damaged length prefix.
+        _ => bincode::deserialize_from::<_, PayloadHeader>(file.take(1 << 16))
+            .ok()
+            .filter(|header| header.version == CACHE_VERSION)
+            .map(|header| header.media_path),
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct TimingPayload {
     media_path: PathBuf,
@@ -98,6 +139,8 @@ pub struct FingerprintEntry<'a> {
     sample: &'a MediaSample,
     path: PathBuf,
     variant: &'a str,
+    /// The v5 key hashes the sampled bytes again; compute it at most once.
+    legacy_path: std::cell::OnceCell<PathBuf>,
 }
 
 /// v5 omitted the media path but its fingerprints remain valid. Keep this
@@ -235,22 +278,7 @@ impl FingerprintCache {
             let Ok(metadata) = entry.metadata() else {
                 continue;
             };
-            let Some(media_path) = std::fs::read(&path).ok().and_then(|bytes| {
-                if path.extension().and_then(|value| value.to_str()) == Some("timing") {
-                    serde_json::from_slice::<TimingPayload>(&bytes)
-                        .ok()
-                        .map(|p| p.media_path)
-                } else if path.extension().is_some_and(|e| e == "ltc") {
-                    serde_json::from_slice::<LtcPayload>(&bytes)
-                        .ok()
-                        .map(|p| p.media_path)
-                } else {
-                    bincode::deserialize::<Payload>(&bytes)
-                        .ok()
-                        .filter(|p| p.version == CACHE_VERSION)
-                        .map(|p| p.media_path)
-                }
-            }) else {
+            let Some(media_path) = entry_media_path(&path) else {
                 continue;
             };
             if media.contains(&normalized_path(&media_path)) && std::fs::remove_file(path).is_ok() {
@@ -269,9 +297,10 @@ impl FingerprintCache {
         removed
     }
 
-    /// Remove expired fingerprint payloads without touching any other file
-    /// in the cache directory. This is synchronous but runs only when a
-    /// production pipeline is created, never on a timer.
+    /// Remove entries unused for `max_age` without touching any other file
+    /// in the cache directory. Loading an entry restarts its period. This is
+    /// synchronous but runs only when a production pipeline is created,
+    /// never on a timer.
     pub fn prune_older_than(&self, max_age: std::time::Duration) -> CacheStatistics {
         let mut removed = CacheStatistics::default();
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
@@ -351,27 +380,7 @@ impl FingerprintCache {
             sample,
             variant,
             path: self.path_for_version(sample, variant, CACHE_VERSION),
-        }
-    }
-
-    pub fn load(&self, media: &Path, variant: &str) -> Option<Vec<Fingerprint>> {
-        self.entry(&MediaSample::read(media).ok()?, variant).load()
-    }
-
-    pub fn save(&self, fingerprints: &[Fingerprint], media: &Path, variant: &str) {
-        if let Ok(sample) = MediaSample::read(media) {
-            self.entry(&sample, variant).save(fingerprints);
-        }
-    }
-
-    pub fn load_waveform(&self, media: &Path, variant: &str) -> Option<Vec<f32>> {
-        self.entry(&MediaSample::read(media).ok()?, variant)
-            .load_waveform()
-    }
-
-    pub fn save_waveform(&self, waveform: &[f32], media: &Path, variant: &str) {
-        if let Ok(sample) = MediaSample::read(media) {
-            self.entry(&sample, variant).save_waveform(waveform);
+            legacy_path: std::cell::OnceCell::new(),
         }
     }
 
@@ -430,9 +439,9 @@ pub struct VideoTimingEntry {
 impl VideoTimingEntry {
     pub fn load(&self) -> Option<crate::VideoTimingInspection> {
         let bytes = std::fs::read(&self.path).ok()?;
-        serde_json::from_slice::<TimingPayload>(&bytes)
-            .ok()
-            .map(|p| p.timing)
+        let timing = serde_json::from_slice::<TimingPayload>(&bytes).ok()?.timing;
+        touch(&self.path);
+        Some(timing)
     }
 
     pub fn save(&self, timing: crate::VideoTimingInspection) {
@@ -460,11 +469,11 @@ pub struct LtcEntry {
 
 impl LtcEntry {
     pub fn load(&self) -> Option<Option<(usize, crate::SourceTimecode)>> {
-        Some(
-            serde_json::from_slice::<LtcPayload>(&std::fs::read(&self.path).ok()?)
-                .ok()?
-                .detection,
-        )
+        let detection = serde_json::from_slice::<LtcPayload>(&std::fs::read(&self.path).ok()?)
+            .ok()?
+            .detection;
+        touch(&self.path);
+        Some(detection)
     }
 
     pub fn save(&self, detection: Option<(usize, crate::SourceTimecode)>) {
@@ -485,28 +494,33 @@ impl LtcEntry {
 }
 
 impl FingerprintEntry<'_> {
-    pub fn exists(&self) -> bool {
-        self.path.is_file()
-            || self
-                .cache
+    fn legacy_path(&self) -> &Path {
+        self.legacy_path.get_or_init(|| {
+            self.cache
                 .path_for_version(self.sample, self.variant, LEGACY_CACHE_VERSION)
-                .is_file()
+        })
     }
+
+    pub fn exists(&self) -> bool {
+        self.path.is_file() || self.legacy_path().is_file()
+    }
+
     pub fn load(&self) -> Option<Vec<Fingerprint>> {
         if let Ok(bytes) = std::fs::read(&self.path)
             && let Ok(payload) = bincode::deserialize::<Payload>(&bytes)
             && payload.version == CACHE_VERSION
             && payload.backend_tag == self.cache.backend_tag
         {
+            // Sidecars are removed with their payload, so one touch keeps
+            // the whole entry.
+            touch(&self.path);
             return Some(payload.fingerprints);
         }
 
         // Promote v5 in place after the first successful read. The legacy
         // key still validates backend, variant, metadata, and sampled bytes.
-        let legacy_url =
-            self.cache
-                .path_for_version(self.sample, self.variant, LEGACY_CACHE_VERSION);
-        let bytes = std::fs::read(&legacy_url).ok()?;
+        let legacy_url = self.legacy_path();
+        let bytes = std::fs::read(legacy_url).ok()?;
         let payload: LegacyPayload = bincode::deserialize(&bytes).ok()?;
         if payload.version != LEGACY_CACHE_VERSION || payload.backend_tag != self.cache.backend_tag
         {
@@ -688,6 +702,16 @@ fn normalized_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    fn load(cache: &FingerprintCache, media: &Path, variant: &str) -> Option<Vec<Fingerprint>> {
+        cache.entry(&MediaSample::read(media).ok()?, variant).load()
+    }
+
+    fn save(cache: &FingerprintCache, fingerprints: &[Fingerprint], media: &Path, variant: &str) {
+        cache
+            .entry(&MediaSample::read(media).unwrap(), variant)
+            .save(fingerprints);
+    }
+
     #[test]
     fn video_timing_invalidates_and_obeys_cache_management() {
         let root =
@@ -738,48 +762,72 @@ mod tests {
 
     #[test]
     fn roundtrip_and_invalidation() {
-        let dir = std::env::temp_dir().join(format!("align-cache-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let cache = FingerprintCache::new(Some(dir.clone()));
         let media = dir.join("clip.wav");
-        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&media, vec![1u8; 4096]).unwrap();
         let fps = vec![
             Fingerprint { hash: 1, frame: 2 },
             Fingerprint { hash: 3, frame: 4 },
         ];
-        assert!(cache.load(&media, "automatic").is_none());
-        cache.save(&fps, &media, "automatic");
+        assert!(load(&cache, &media, "automatic").is_none());
+        save(&cache, &fps, &media, "automatic");
         let waveform = vec![0.0, 0.25, 1.0, 0.5];
-        cache.save_waveform(&waveform, &media, "automatic");
-        assert_eq!(cache.load(&media, "automatic"), Some(fps.clone()));
-        assert_eq!(cache.load_waveform(&media, "automatic"), Some(waveform));
+        let sample = MediaSample::read(&media).unwrap();
+        cache.entry(&sample, "automatic").save_waveform(&waveform);
+        assert_eq!(load(&cache, &media, "automatic"), Some(fps.clone()));
+        assert_eq!(
+            cache.entry(&sample, "automatic").load_waveform(),
+            Some(waveform)
+        );
         // Different variant must not collide.
-        assert!(cache.load(&media, "stream-0-automatic").is_none());
+        assert!(load(&cache, &media, "stream-0-automatic").is_none());
         // Different engine must not collide either.
         let apple = FingerprintCache::with_backend(Some(dir.clone()), "apple1");
-        assert!(apple.load(&media, "automatic").is_none());
+        assert!(load(&apple, &media, "automatic").is_none());
         let st = cache.statistics();
         assert_eq!(st.file_count, 1);
         let removed = cache.prune_older_than(std::time::Duration::ZERO);
         assert_eq!(removed.file_count, 1);
         assert_eq!(cache.statistics().file_count, 0);
-        assert!(cache.load_waveform(&media, "automatic").is_none());
-        cache.save(&fps, &media, "automatic");
+        assert!(cache.entry(&sample, "automatic").load_waveform().is_none());
+        save(&cache, &fps, &media, "automatic");
         // Content change invalidates.
         std::fs::write(&media, vec![2u8; 4096]).unwrap();
         // mtime granularity may be coarse on some FS; size change path:
         std::fs::write(&media, vec![2u8; 8192]).unwrap();
-        assert!(cache.load(&media, "automatic").is_none());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(load(&cache, &media, "automatic").is_none());
+    }
+
+    #[test]
+    fn retention_counts_from_the_last_use() {
+        let temp = tempfile::tempdir().unwrap();
+        let media = temp.path().join("clip.wav");
+        std::fs::write(&media, vec![1u8; 4096]).unwrap();
+        let cache = FingerprintCache::new(Some(temp.path().join("cache")));
+        let fingerprints = [Fingerprint { hash: 1, frame: 2 }];
+        save(&cache, &fingerprints, &media, "automatic");
+        let week = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+        let written = std::time::SystemTime::now() - week - week;
+        let sample = MediaSample::read(&media).unwrap();
+        let entry = cache.entry(&sample, "automatic");
+        std::fs::File::options()
+            .write(true)
+            .open(&entry.path)
+            .unwrap()
+            .set_modified(written)
+            .unwrap();
+
+        assert!(entry.load().is_some());
+        assert_eq!(cache.prune_older_than(week).file_count, 0);
+        assert!(entry.load().is_some());
     }
 
     #[test]
     fn clear_media_only_removes_matching_payloads() {
-        let dir =
-            std::env::temp_dir().join(format!("align-cache-current-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let first = dir.join("first.wav");
         let second = dir.join("second.wav");
         let same_content = dir.join("first-copy.wav");
@@ -787,20 +835,30 @@ mod tests {
         std::fs::write(&second, vec![2u8; 128]).unwrap();
         std::fs::hard_link(&first, &same_content).unwrap();
         let cache = FingerprintCache::new(Some(dir.join("cache")));
-        cache.save(&[Fingerprint { hash: 1, frame: 1 }], &first, "automatic");
-        cache.save(
+        save(
+            &cache,
+            &[Fingerprint { hash: 1, frame: 1 }],
+            &first,
+            "automatic",
+        );
+        save(
+            &cache,
             &[Fingerprint { hash: 1, frame: 1 }],
             &same_content,
             "automatic",
         );
-        cache.save(&[Fingerprint { hash: 2, frame: 2 }], &second, "automatic");
+        save(
+            &cache,
+            &[Fingerprint { hash: 2, frame: 2 }],
+            &second,
+            "automatic",
+        );
 
         let removed = cache.clear_media(std::slice::from_ref(&first));
         assert_eq!(removed.file_count, 1);
-        assert!(cache.load(&first, "automatic").is_none());
-        assert!(cache.load(&same_content, "automatic").is_some());
-        assert!(cache.load(&second, "automatic").is_some());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(load(&cache, &first, "automatic").is_none());
+        assert!(load(&cache, &same_content, "automatic").is_some());
+        assert!(load(&cache, &second, "automatic").is_some());
     }
 
     #[test]
@@ -872,7 +930,7 @@ mod tests {
         std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
         std::fs::write(&legacy_path, bincode::serialize(&legacy).unwrap()).unwrap();
 
-        assert_eq!(cache.load(&media, "automatic"), Some(fingerprints));
+        assert_eq!(load(&cache, &media, "automatic"), Some(fingerprints));
         assert!(
             cache
                 .entry(&MediaSample::read(&media).unwrap(), "automatic")

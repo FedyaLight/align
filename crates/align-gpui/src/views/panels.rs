@@ -1,7 +1,7 @@
 //! Updates, feedback, About, AI agent setup, and error alerts.
 
 use super::animation::slide_in;
-use super::controls::{button, hover_tip, modal_header, prominent_button};
+use super::controls::{button, hover_tip, modal_header, prominent_button, raised_surface};
 use super::{
     AlignApp, ClipboardItem, Context, Div, FluentBuilder, InteractiveElement, IntoElement,
     Operation, ParentElement, PathBuf, SharedString, StatefulInteractiveElement, Styled, Theme,
@@ -194,7 +194,7 @@ pub(super) fn problem_report_panel(
     theme: &Theme,
     error: Option<SharedString>,
 ) -> impl IntoElement {
-    let mut panel = div()
+    let mut panel = raised_surface(theme)
         .id("problem-report-panel")
         .w(px(460.))
         .max_h_full()
@@ -203,11 +203,6 @@ pub(super) fn problem_report_panel(
         .flex()
         .flex_col()
         .gap_3()
-        .rounded_lg()
-        .border_1()
-        .border_color(rgb(theme.border))
-        .bg(rgb(theme.panel))
-        .shadow_md()
         .child(modal_header(
             cx,
             theme,
@@ -368,7 +363,7 @@ pub(super) fn about_panel(
         }
     }
 
-    div()
+    raised_surface(theme)
         .id("about-panel")
         .flex()
         .flex_col()
@@ -377,11 +372,6 @@ pub(super) fn about_panel(
         .p_5()
         .m_4()
         .w(px(380.))
-        .rounded_lg()
-        .border_1()
-        .border_color(rgb(theme.border))
-        .bg(rgb(theme.panel))
-        .shadow_md()
         .child(modal_header(
             cx,
             theme,
@@ -481,7 +471,7 @@ pub(super) fn setup_text_block(theme: &Theme, text: impl Into<SharedString>) -> 
 
 pub(super) fn agent_setup_panel(cx: &mut Context<AlignApp>, theme: &Theme) -> impl IntoElement {
     let path = cli_path().display().to_string();
-    div()
+    raised_surface(theme)
         .id("agent-setup")
         .w(px(620.))
         .max_h_full()
@@ -490,11 +480,6 @@ pub(super) fn agent_setup_panel(cx: &mut Context<AlignApp>, theme: &Theme) -> im
         .flex()
         .flex_col()
         .gap_3()
-        .rounded_lg()
-        .border_1()
-        .border_color(rgb(theme.border))
-        .bg(rgb(theme.panel))
-        .shadow_md()
         .child(modal_header(
             cx,
             theme,
@@ -567,18 +552,13 @@ pub(super) fn error_alert(
     theme: &Theme,
     data: &crate::state::AppData,
 ) -> impl IntoElement {
-    let panel = div()
+    let panel = raised_surface(theme)
         .flex()
         .flex_col()
         .gap_2()
         .p_4()
         .m_4()
         .max_w(px(420.))
-        .rounded_lg()
-        .border_1()
-        .border_color(rgb(theme.border))
-        .bg(rgb(theme.panel))
-        .shadow_md()
         .child(modal_header(
             cx,
             theme,

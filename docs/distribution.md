@@ -29,6 +29,8 @@ The installers share Align's look: the DMG window has a drag-to-Applications
 layout, the Windows installer shows an animated splash (`Support/Installer`),
 and the Linux `.run` files open a GTK 4 installer (`Support/Linux/installer.c`)
 in the app's dark theme that installs the native package through polkit.
+Without a display or GTK 4 they install the package through `pkexec` with
+DNF or pacman instead.
 `script/render-installer-artwork.swift` regenerates the Windows artwork and icon
 on macOS. The Windows executable carries the app icon and version details
 (`crates/align-gpui/build.rs`). Windows installs update through the Velopack
@@ -39,9 +41,8 @@ The source archives contain the exact committed Align checkout, Cargo.lock,
 vendored Rust dependencies, a Cargo configuration for offline dependency
 resolution, and a build manifest. They also contain the FFmpeg source tarball
 used for the build, its build script and configuration. All archives contain
-the AAF component
-sources, Python's compression and crypto library sources, and the source of the
-pinned Velopack version. Checksums identify the included component files.
+the Rust AAF helper sources and the source of the pinned Velopack version.
+Checksums identify the included component files.
 
 Installers include LICENSE, THIRD_PARTY_NOTICES.txt, AAF-Licenses,
 ThirdPartyLicenses, and FFMPEG-LICENSE.txt. ThirdPartyLicenses contains the generated
@@ -52,21 +53,21 @@ Do not replace an old release's source archive with a newer version.
 ## Preparing sources locally
 
 Use a clean committed checkout and Python 3.11 or later. Generated files should
-go under `target/`. Install the AAF build requirements in a virtual environment.
+go under `target/`.
 
 ```sh
 cargo install cargo-about --version 0.9.2 --features cli --locked
-python script/build-aaf-sidecar.py target/release --release-sources
+cargo build --locked --release -p align-aaf
 ./script/build-ffmpeg-minimal.sh target/ffmpeg-minimal
 python script/prepare-release-source.py target/release-sources \
   --platform Linux \
   --licenses target/release/ThirdPartyLicenses \
   --ffmpeg target/ffmpeg-minimal/Sources \
-  --aaf target/release/AAF-Sources \
+  --aaf-binary target/release/align-aaf \
   --velopack-version 1.2.0
 ```
 
-Use `Windows` or `macOS` for those platforms. The source preparation script
+Use `Windows` or `macOS` for those platforms and the `.exe` path on Windows. The source preparation script
 rejects modified tracked files and missing component sources. It uses
 `cargo vendor --locked` and checks dependency resolution with `cargo metadata
 --frozen`. Build instructions remain in [development](development.md); the
@@ -85,7 +86,6 @@ The packaging scripts also run outside CI on a staged release directory (the
 `dmgbuild==1.6.7` in a virtual environment passed as `PYTHON`:
 
 ```sh
-AAF_DIR="$PWD/target/release" \
 RELEASE_LICENSES="$PWD/target/release/ThirdPartyLicenses" \
 BUNDLE_FFMPEG=1 FFMPEG_DIR="$PWD/target/ffmpeg-minimal" \
   ./script/package-macos.sh "$PWD/target/macos-package"
@@ -111,7 +111,8 @@ and packaging rejects tools for another architecture or minimum version, or
 linking to libraries outside the bundle and macOS system directories. The tools
 share adjacent FFmpeg libraries via `@loader_path` on macOS and `$ORIGIN`
 on Linux (the Linux build requires `patchelf`). The build manifest's component hashes
-describe the tools as built; macOS packaging re-signs its copies. The build has no video decoders: video is only parsed for timing.
+describe the tools as built; macOS packaging re-signs the copies in the app
+bundle, and the package folder links to them. The build has no video decoders: video is only parsed for timing.
 On Windows, the tools are linked statically against the MinGW-w64 runtime,
 including the winpthreads library that provides FFmpeg's clock and sleep
 functions, so they need only Windows system DLLs and run without MSYS2 or
@@ -123,19 +124,14 @@ files before packaging.
 It excludes GPL and nonfree components and retains FFmpeg's LGPL license. See
 [FFmpeg's license guidance](https://ffmpeg.org/legal.html).
 
-The AAF builder records the Python and package versions and hashes the native
-binaries collected by PyInstaller. On Windows the module is a folder build
-(`align-aaf.exe` beside `align-aaf-runtime`) with version details, and CI
-compiles PyInstaller's bootloader from source: one-file builds that unpack a
-runtime to `%TEMP%`, and the prebuilt bootloader that malware also reuses, are
-what antivirus heuristics such as Defender's `Trojan:Win32/Bearfoos.A!ml`
-match. Release binaries are still unsigned; Authenticode signing would remove
-the remaining reputation warnings. It includes the Python, pyaaf2, and
-PyInstaller license texts, including PyInstaller's distribution exception.
-The source bundle records matching native library versions and includes their
-licenses. A failure to identify a required version stops source preparation.
+The Rust AAF helper is bundled beside Align and the CLI. On macOS it lives
+in `Contents/MacOS` and is signed before the app bundle. Fedora and Arch install
+it in `/opt/align`, and Windows installs `align-aaf.exe` beside `align.exe`.
+AAF works from the installed application without a separate component download
+or a Python runtime. The source archive includes the Rust helper and the
+dictionary embedded in it. The pyaaf2 notice for that dictionary is under
+`AAF-Licenses`.
 
-The Unix AAF helper loads its adjacent frozen runtime directly. Linux packages
-install both in `/opt/align`. On macOS the signed app carries the pair in
-`Contents/Resources/AAF`, with a relative helper link in `Contents/MacOS`.
-The corresponding source manifest records runtime files and symlink targets.
+The native writer links QuickTime picture, PCM audio, and clip-wrapped VC-3
+picture in MXF OP-Atom. See [AAF details](formats.md#aaf-details) for editor
+compatibility.

@@ -13,17 +13,15 @@ done
 for notice in LICENSE THIRD_PARTY_NOTICES.txt; do
   test -s "$STAGE/$notice"
 done
-test -d "$STAGE/AAF-Licenses"
-test -s "$STAGE/align-aaf-runtime/base_library.zip"
+test -s "$STAGE/AAF-Licenses/PYAAF2-LICENSE.txt"
 test -d "$STAGE/ThirdPartyLicenses"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP"/{BUILD,RPMS,SOURCES,SPECS,SRPMS,BUILDROOT}
 # The release stages FFmpeg's runtime SONAMEs next to its executables.
-# Nested AAF libraries are private to the frozen Python process.
 shopt -s nullglob
 libraries=("$STAGE"/*.so "$STAGE"/*.so.*)
-excludes=(--exclude=./AAF-Sources)
+excludes=()
 rpm_options=()
 case "${BUNDLE_FFMPEG:-1}" in
   1)
@@ -69,12 +67,12 @@ Requires: libwayland-client.so.0()(64bit), libwayland-cursor.so.0()(64bit), libw
 Requires: alsa-lib, systemd-libs, vulkan-loader, mesa-vulkan-drivers
 Requires: fontconfig, freetype, libstdc++, libgcc
 Requires: hicolor-icon-theme
-# Binary inputs are already release-stripped; do not rewrite PyInstaller blobs.
+# Binary inputs are already release-stripped.
 %global __os_install_post %{nil}
 %global debug_package %{nil}
 %global _build_id_links none
 %global __provides_exclude_from ^/opt/align/.*
-%global __requires_exclude_from ^/opt/align/(align-aaf-runtime|AAF-Licenses|ThirdPartyLicenses)/.*
+%global __requires_exclude_from ^/opt/align/(AAF-Licenses|ThirdPartyLicenses)/.*
 
 %description
 Sync your recordings. Keep your edit.

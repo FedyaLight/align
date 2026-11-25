@@ -28,7 +28,7 @@ the user's machine and only contacts GitHub to check for updates.
 ## Getting it running
 
 You need Rust 1.100.0 (`rust-toolchain.toml` selects it), FFmpeg and ffprobe for
-the test fixtures, and Python 3.11 or later for the AAF module. The
+the test fixtures, and Python 3.11 or later for the acceptance tools. The
 [development guide](docs/development.md#prerequisites) lists the platform
 packages.
 
@@ -45,7 +45,8 @@ Where things live:
 | `crates/align-decode` | Media backends, import, audio rendering, export jobs. |
 | `crates/align-gpui` | The desktop app. |
 | `crates/align-cli` | The command-line interface. |
-| `Support/` | Icons, the privacy manifest, and the AAF module. |
+| `crates/align-aaf` | Native AAF reader, writer, and path repair. |
+| `Support/` | Icons, the privacy manifest, and the Python AAF reference. |
 | `script/` | Build, fixture, benchmark, and acceptance scripts. |
 | `docs/` | User and developer documentation. |
 

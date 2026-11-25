@@ -1,6 +1,6 @@
 //! Desktop application state and synchronization job lifecycle.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use align_core::{
@@ -27,6 +27,17 @@ pub enum Operation {
     Exported,
     Repairing,
 }
+
+/// A step of the timeline zoom buttons and their shortcuts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimelineZoom {
+    In,
+    Out,
+    Fit,
+}
+
+/// Zoom level change of one zoom button press.
+const ZOOM_STEP: f64 = 0.2;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClipState {
@@ -215,6 +226,21 @@ impl Default for ExportSettings {
 }
 
 impl ExportSettings {
+    pub fn assembly_options(&self) -> align_core::export_model::ExportAssemblyOptions {
+        align_core::export_model::ExportAssemblyOptions {
+            unmatched: self.unmatched,
+            prevent_group_overlaps: self.prevent_group_overlaps,
+            cut_remove: align_core::export_model::CutRemoveOptions {
+                common_gaps: self.cut_common_gaps,
+                lone_recorder: self.cut_lone_recorder,
+                shorter_than: self.cut_shorter_than,
+                trim_starts: self.trim_starts,
+                trim_ends: self.trim_ends,
+            },
+            ..Default::default()
+        }
+    }
+
     /// The settings-file key of the saved export defaults.
     const KEY: &'static str = "exportDefaults";
 
@@ -390,6 +416,18 @@ pub struct AppData {
     pub sequence_results: Vec<SyncResult>,
     pub active_sequence_result: usize,
     sequence_constraints: HashMap<usize, Vec<SyncConstraint>>,
+    /// Unmatched clips each sequence places by camera clock. Kept per
+    /// sequence and project, never as a default; a choice applies only
+    /// while the active stage gives that clip an estimate.
+    camera_clock_choices: HashMap<usize, BTreeSet<ClipId>>,
+    /// Estimates and refusals for the visible result, recomputed with it.
+    pub camera_clock: align_core::camera_clock::CameraClockReport,
+    /// Derived with `camera_clock` whenever it is, so views read them
+    /// instead of recomputing the report on every frame.
+    camera_clock_export_count: usize,
+    camera_clock_applied: HashSet<ClipId>,
+    camera_clock_hints: Vec<align_core::camera_clock::EditClockHint>,
+    pub show_camera_clock: bool,
     pub audio_stream_channels: HashMap<ClipId, Vec<usize>>,
     /// Timeline waveforms live only for this process and are regenerated
     /// from cached fingerprints when a sync runs.
@@ -404,6 +442,9 @@ pub struct AppData {
     /// Path Fixer state. Saved prefix redirections load once when the app
     /// starts; exact file choices are session-local and survive re-syncs.
     pub redirects: Vec<align_core::redirect::PathRedirection>,
+    /// The saved list `redirects` was edited from, so saving applies only
+    /// this window's changes to what other runs may have saved since.
+    saved_redirects: Vec<align_core::redirect::PathRedirection>,
     pub manual_relinks: Vec<(String, PathBuf)>,
     pub omit_extensions: Vec<String>,
     pub prefer_proxies: bool,
@@ -476,6 +517,12 @@ impl Default for AppData {
             sequence_results: Vec::new(),
             active_sequence_result: 0,
             sequence_constraints: HashMap::new(),
+            camera_clock_choices: HashMap::new(),
+            camera_clock: Default::default(),
+            camera_clock_export_count: 0,
+            camera_clock_applied: HashSet::new(),
+            camera_clock_hints: Vec::new(),
+            show_camera_clock: false,
             audio_stream_channels: HashMap::new(),
             waveform_previews: HashMap::new(),
             pending_count: 0,
@@ -486,6 +533,7 @@ impl Default for AppData {
             folder_inputs: HashSet::new(),
             timeline_choices: HashMap::new(),
             redirects: Vec::new(),
+            saved_redirects: Vec::new(),
             manual_relinks: Vec::new(),
             omit_extensions: Vec::new(),
             prefer_proxies: false,
@@ -514,8 +562,10 @@ impl Default for AppData {
 
 impl AppData {
     pub fn new() -> Self {
+        let redirects = align_core::redirect::load_from(&align_core::redirect::config_file());
         let mut data = Self {
-            redirects: align_core::redirect::load_from(&align_core::redirect::config_file()),
+            saved_redirects: redirects.clone(),
+            redirects,
             saved_export_settings: ExportSettings::load_saved(),
             ..Default::default()
         };
@@ -798,6 +848,39 @@ impl AppData {
         });
     }
 
+    /// The zoom controls work on a timeline no import or job is changing.
+    pub fn timeline_zoom_available(&self) -> bool {
+        !self.lanes.is_empty() && !self.show_export && !self.importing() && !self.has_active_job()
+    }
+
+    /// Whether `zoom` would change the current zoom.
+    pub fn can_zoom(&self, zoom: TimelineZoom) -> bool {
+        match zoom {
+            TimelineZoom::In => self.zoom_level < 1.0,
+            TimelineZoom::Out => self.zoom_level > 0.0,
+            TimelineZoom::Fit => self.zoom_level > 0.001,
+        }
+    }
+
+    /// One press of a zoom button or shortcut. In and Out keep the middle of
+    /// the visible timeline in place; Fit shows the whole timeline from its
+    /// start. False when the zoom is already at that limit.
+    pub fn zoom_timeline(&mut self, zoom: TimelineZoom) -> bool {
+        if !self.can_zoom(zoom) {
+            return false;
+        }
+        let middle = f32::from(self.timeline_scroll.bounds().size.width) * 0.5;
+        match zoom {
+            TimelineZoom::In => self.zoom_at((self.zoom_level + ZOOM_STEP).min(1.0), middle),
+            TimelineZoom::Out => self.zoom_at((self.zoom_level - ZOOM_STEP).max(0.0), middle),
+            TimelineZoom::Fit => {
+                self.zoom_at(0.0, 0.0);
+                self.pan_to(Some(0.0), None);
+            }
+        }
+        true
+    }
+
     /// Timeline panning. Offsets are negative-of-scroll with (0,0) at the
     /// top-left origin, clamped to the measured content size.
     pub fn pan_to(&self, x: Option<f32>, y: Option<f32>) {
@@ -910,16 +993,19 @@ impl AppData {
         self.error = None;
     }
 
-    pub fn remove_selection(&mut self) {
-        if matches!(
-            self.operation,
-            Operation::Synchronizing | Operation::Exporting | Operation::Repairing
-        ) {
-            return;
+    /// Removes the selected sources still in the list from the session and
+    /// reports whether there were any. Selected paths no longer listed are
+    /// dropped without touching anything else, so an empty or stale selection
+    /// never changes the session. Files on disk are left alone.
+    pub fn remove_selection(&mut self) -> bool {
+        if self.has_active_job() {
+            return false;
         }
-        let selected = std::mem::take(&mut self.selection);
+        let mut selected = std::mem::take(&mut self.selection);
+        let listed: HashSet<&PathBuf> = self.clips.iter().map(|clip| &clip.url).collect();
+        selected.retain(|url| listed.contains(url));
         if selected.is_empty() {
-            return;
+            return false;
         }
         let removed_ids: HashSet<ClipId> = self
             .clips
@@ -941,7 +1027,7 @@ impl AppData {
             self.mark_sync_dirty();
             self.exported_files.clear();
             self.status = "Selection changed.".to_string();
-            return;
+            return true;
         }
         self.reset_preview();
         self.exported_files.clear();
@@ -951,14 +1037,7 @@ impl AppData {
         } else {
             ready_status(self.clips.len())
         };
-    }
-
-    pub fn delete_or_clear(&mut self) {
-        if self.selection.is_empty() {
-            self.clear();
-        } else {
-            self.remove_selection();
-        }
+        true
     }
 
     pub fn clear(&mut self) {
@@ -968,12 +1047,14 @@ impl AppData {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let generation = self.generation.wrapping_add(1);
         let appearance = self.appearance;
-        let redirects = self.redirects.clone();
+        let redirects = std::mem::take(&mut self.redirects);
+        let saved_redirects = std::mem::take(&mut self.saved_redirects);
         let saved_export_settings = self.saved_export_settings.take();
         *self = Self {
             generation,
             appearance,
             redirects,
+            saved_redirects,
             saved_export_settings,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ..Default::default()
@@ -994,7 +1075,11 @@ impl AppData {
     }
 
     pub fn apply_export_settings(&mut self, settings: &ExportSettings) {
+        let changed = self.export.assembly_options() != settings.assembly_options();
         self.export.clone_from(settings);
+        if changed {
+            self.relayout_result();
+        }
     }
 
     /// What a new job starts from: the saved defaults, else Align's.
@@ -1269,17 +1354,24 @@ impl AppData {
             clip.id.clone(),
             clip.audio.iter().map(|a| a.channels).collect(),
         );
-        self.clips.push(ClipRow {
-            clip_id: Some(clip.id.clone()),
-            url: clip.url.clone(),
-            name: file_name(&clip.url),
-            kind: Some(clip.kind),
-            duration: Some(clip.duration.as_seconds()),
-            timecode: clip.source_timecode().map(|t| t.text.clone()),
-            state: ClipState::Analyzing,
-        });
-        self.clips
-            .sort_by(|a, b| a.url.to_string_lossy().cmp(&b.url.to_string_lossy()));
+        // The rows stay sorted by path, so each discovery is inserted in
+        // place instead of sorting the whole list again.
+        let key = clip.url.to_string_lossy();
+        let at = self
+            .clips
+            .partition_point(|row| row.url.to_string_lossy() <= key);
+        self.clips.insert(
+            at,
+            ClipRow {
+                clip_id: Some(clip.id.clone()),
+                url: clip.url.clone(),
+                name: file_name(&clip.url),
+                kind: Some(clip.kind),
+                duration: Some(clip.duration.as_seconds()),
+                timecode: clip.source_timecode().map(|t| t.text.clone()),
+                state: ClipState::Analyzing,
+            },
+        );
         self.layout_stale = true;
     }
 
@@ -1492,12 +1584,13 @@ impl AppData {
             })
             .collect();
 
+        self.camera_clock = self.clock_report(&result, self.current_sequence_key());
         // Final bars (sync-graph branch) or export-model preview when an
         // imported timeline reshaped the sequence.
         let (bars, states, ruler) = if result.project.imported_timeline.is_some() {
             imported_preview(&result)
         } else {
-            let final_timeline = lane::final_bars(&result);
+            let final_timeline = lane::final_bars(&result, self.clock_preview_options());
             (
                 final_timeline.bars,
                 final_timeline.states,
@@ -1572,6 +1665,7 @@ impl AppData {
         self.pending_count = 0;
         let stopped = result.stopped;
         self.result = Some(result);
+        self.refresh_camera_clock_views();
         self.operation = Operation::Ready;
         self.progress = 1.0;
         let total = self.clips.len();
@@ -1610,6 +1704,7 @@ impl AppData {
             return false;
         }
         constraints.push(constraint);
+        self.relayout_result();
         true
     }
 
@@ -1625,6 +1720,7 @@ impl AppData {
             return false;
         }
         constraints.push(constraint);
+        self.relayout_result();
         true
     }
 
@@ -1642,15 +1738,215 @@ impl AppData {
             .unwrap_or_default()
     }
 
+    // ---------------- camera clock
+
+    /// The visible or exported report of `result`, with the sequence's
+    /// choices blocking the estimates they contradict.
+    fn clock_report(
+        &self,
+        result: &SyncResult,
+        sequence: usize,
+    ) -> align_core::camera_clock::CameraClockReport {
+        let constraints = self
+            .sequence_constraints
+            .get(&sequence)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut report = align_core::camera_clock::for_export(
+            result,
+            constraints,
+            &self.export.assembly_options(),
+        );
+        if result.project.imported_timeline.is_none()
+            && let Some(chosen) = self.camera_clock_choices.get(&sequence)
+        {
+            report.apply_conflicts(chosen);
+        }
+        report
+    }
+
+    /// The preview follows export's assembly only while a chosen estimate
+    /// applies; otherwise it is the ordinary one, whatever choices are kept.
+    fn clock_preview_options(&self) -> align_core::export_model::ExportAssemblyOptions {
+        let camera_clock = self.chosen_camera_clock();
+        if camera_clock.is_empty() {
+            return Default::default();
+        }
+        align_core::export_model::ExportAssemblyOptions {
+            camera_clock,
+            ..self.export.assembly_options()
+        }
+    }
+
+    /// Estimates the visible result applies: the chosen clips that still
+    /// have one. Imported edits keep their placement, so none apply there.
+    fn visible_camera_clock(&self) -> Vec<align_core::camera_clock::CameraClockEstimate> {
+        let imported = self
+            .result
+            .as_ref()
+            .is_some_and(|result| result.project.imported_timeline.is_some());
+        if imported {
+            return Vec::new();
+        }
+        self.chosen_camera_clock()
+    }
+
+    /// The visible report's estimates of the clips chosen for this sequence.
+    fn chosen_camera_clock(&self) -> Vec<align_core::camera_clock::CameraClockEstimate> {
+        self.camera_clock_choices
+            .get(&self.current_sequence_key())
+            .map_or_else(Vec::new, |chosen| self.camera_clock.chosen(chosen))
+    }
+
+    /// The estimates export applies to the result at `position`, decided
+    /// exactly as the timeline preview decides them.
+    pub fn camera_clock_for_export(
+        &self,
+        position: usize,
+    ) -> Vec<align_core::camera_clock::CameraClockEstimate> {
+        let Some(result) = self.previous_result_for_position(position) else {
+            return Vec::new();
+        };
+        let sequence = self.sequence_key_for_position(position);
+        let Some(chosen) = self.camera_clock_choices.get(&sequence) else {
+            return Vec::new();
+        };
+        if result.project.imported_timeline.is_some() {
+            return Vec::new();
+        }
+        self.clock_report(result, sequence).chosen(chosen)
+    }
+
+    pub fn camera_clock_applied(&self, clip: &ClipId) -> bool {
+        self.camera_clock_applied.contains(clip)
+    }
+
+    /// Clips placed by camera clock across the sequences export writes.
+    pub fn camera_clock_export_count(&self) -> usize {
+        self.camera_clock_export_count
+    }
+
+    /// Edit hints for an imported visible result.
+    pub fn camera_clock_hints(&self) -> &[align_core::camera_clock::EditClockHint] {
+        &self.camera_clock_hints
+    }
+
+    pub fn clip_name(&self, clip: &ClipId) -> String {
+        self.result
+            .as_ref()
+            .and_then(|result| result.project.clips.iter().find(|c| &c.id == clip))
+            .map_or_else(|| clip.0.clone(), |c| file_name(&c.url))
+    }
+
+    /// Apply or undo the estimates of `clips` for the visible sequence and
+    /// lay the timeline out again. Returns whether anything changed.
+    ///
+    /// A saved choice without an estimate here, such as a clip the cleanup
+    /// settings remove, is kept to be restored when the estimate returns,
+    /// but it never blocks a visible one. Placing a clip withdraws the saved
+    /// choices it contradicts, and returning one to unmatched withdraws
+    /// those it was holding back, so no undo places another clip unasked.
+    pub fn set_camera_clock(&mut self, clips: &[ClipId], apply: bool) -> bool {
+        let sequence = self.current_sequence_key();
+        let mut chosen = self
+            .camera_clock_choices
+            .remove(&sequence)
+            .unwrap_or_default();
+        let mut applied: BTreeSet<ClipId> = self
+            .camera_clock
+            .chosen(&chosen)
+            .into_iter()
+            .map(|estimate| estimate.clip_id)
+            .collect();
+        let before = chosen.clone();
+        let mut returned = BTreeSet::new();
+        for clip in clips.iter().collect::<BTreeSet<_>>() {
+            if apply {
+                if self.camera_clock.estimate(clip).is_some()
+                    && self.camera_clock.conflict(clip, &applied).is_none()
+                {
+                    chosen.insert(clip.clone());
+                    applied.insert(clip.clone());
+                    let placed = BTreeSet::from([clip.clone()]);
+                    chosen.retain(|other| self.camera_clock.conflict(other, &placed).is_none());
+                }
+            } else if chosen.remove(clip) {
+                applied.remove(clip);
+                returned.insert(clip.clone());
+            }
+        }
+        chosen.retain(|other| {
+            applied.contains(other) || self.camera_clock.conflict(other, &returned).is_none()
+        });
+        let changed = chosen != before;
+        if !chosen.is_empty() {
+            self.camera_clock_choices.insert(sequence, chosen);
+        }
+        if changed {
+            self.exported_files.clear();
+            self.relayout_result();
+        }
+        changed
+    }
+
+    /// Whether the visible sequence keeps any saved placement choice, even
+    /// one the current settings hide or that has no estimate right now.
+    pub fn has_camera_clock_choice(&self) -> bool {
+        self.camera_clock_choices
+            .get(&self.current_sequence_key())
+            .is_some_and(|chosen| !chosen.is_empty())
+    }
+
+    /// Forget every saved placement choice of the visible sequence, hidden
+    /// ones included, and lay the timeline out again. Other sequences keep
+    /// theirs. Returns whether anything changed.
+    pub fn clear_camera_clock(&mut self) -> bool {
+        let changed = self
+            .camera_clock_choices
+            .remove(&self.current_sequence_key())
+            .is_some_and(|chosen| !chosen.is_empty());
+        if changed {
+            self.exported_files.clear();
+            self.relayout_result();
+        }
+        changed
+    }
+
+    /// Rebuild the visible timeline from the current result and choices.
+    pub(crate) fn relayout_result(&mut self) {
+        let Some(result) = &self.result else {
+            return;
+        };
+        if result.project.imported_timeline.is_none() {
+            self.camera_clock = self.clock_report(result, self.current_sequence_key());
+            let final_timeline = lane::final_bars(result, self.clock_preview_options());
+            self.ruler_timecode = final_timeline.ruler_timecode;
+            self.lanes = lane::layout_bars(final_timeline.bars, &self.audio_stream_channels);
+        }
+        self.refresh_camera_clock_views();
+    }
+
+    /// Recomputes what the views show about camera-clock placement, after
+    /// the report, the choices or the assembly options changed.
+    fn refresh_camera_clock_views(&mut self) {
+        self.camera_clock_export_count = (0..self.sequence_results.len().max(1))
+            .map(|position| self.camera_clock_for_export(position).len())
+            .sum();
+        self.camera_clock_applied = self
+            .visible_camera_clock()
+            .into_iter()
+            .map(|estimate| estimate.clip_id)
+            .collect();
+        self.camera_clock_hints = self.result.as_ref().map_or_else(Vec::new, |result| {
+            align_core::camera_clock::imported_edit_hints(result, &self.camera_clock.estimates)
+        });
+    }
+
     /// Clips sharing the lane's source track, even when the compact preview
     /// has packed a non-overlapping source into the same visual row.
     fn lane_group(&self, lane_id: &str) -> Option<(String, HashSet<ClipId>)> {
         let lane = self.lanes.iter().find(|l| l.id == lane_id)?;
-        let kind_name = match lane.kind {
-            MediaKind::Video => "video",
-            MediaKind::Audio => "audio",
-        };
-        let key = format!("{kind_name}:{}", lane.source_key);
+        let key = lane_key(lane);
         let ids: HashSet<ClipId> = self
             .lanes
             .iter()
@@ -1667,10 +1963,11 @@ impl AppData {
         lane_id: &str,
         select: impl FnOnce(&TrackOverrides) -> &ScopedOverride<T>,
     ) -> Option<T> {
-        let (key, _) = self.lane_group(lane_id)?;
+        // Drawn for every lane on every frame: only the key is needed.
+        let lane = self.lanes.iter().find(|l| l.id == lane_id)?;
         select(self.current_track_overrides()?)
             .by_key
-            .get(&key)
+            .get(&lane_key(lane))
             .copied()
     }
 
@@ -1986,8 +2283,25 @@ impl AppData {
         self.redirects.remove(index);
     }
 
-    pub fn save_path_redirections(&self) {
-        align_core::redirect::save_to(&align_core::redirect::config_file(), &self.redirects);
+    /// Saves the Path Fixer's additions and removals. Redirections another
+    /// run saved meanwhile are kept, and nothing is written without a change.
+    pub fn save_path_redirections(&mut self) {
+        if self.redirects == self.saved_redirects {
+            return;
+        }
+        let store = align_core::redirect::config_file();
+        match align_core::redirect::save_edits(&store, &self.saved_redirects, &self.redirects) {
+            Ok(saved) => {
+                self.saved_redirects.clone_from(&saved);
+                self.redirects = saved;
+            }
+            Err(error) => {
+                self.error = Some(format!(
+                    "Could not save redirections to {}: {error}",
+                    store.display()
+                ));
+            }
+        }
     }
 
     /// Media represented by the current session/result, for project-only
@@ -2019,6 +2333,7 @@ impl AppData {
 
     pub fn discard_path_redirection_edits(&mut self) {
         self.redirects = align_core::redirect::load_from(&align_core::redirect::config_file());
+        self.saved_redirects.clone_from(&self.redirects);
         self.path_fixer_dir = None;
     }
 
@@ -2204,6 +2519,15 @@ fn sorted_live_matches(map: &HashMap<String, LiveMatch>) -> Vec<LiveMatch> {
     rows
 }
 
+/// The track-override key of the source track a lane shows.
+fn lane_key(lane: &lane::LaneVisual) -> String {
+    let kind_name = match lane.kind {
+        MediaKind::Video => "video",
+        MediaKind::Audio => "audio",
+    };
+    format!("{kind_name}:{}", lane.source_key)
+}
+
 /// Preview items for imported timelines.
 type ImportedPreview = (
     Vec<BarVisual>,
@@ -2214,37 +2538,28 @@ type ImportedPreview = (
 fn imported_preview(result: &SyncResult) -> ImportedPreview {
     use align_core::export_model::ExportTimeline;
     let Ok(timeline) = ExportTimeline::from_result(result, true) else {
-        let fallback = lane::final_bars(result);
+        let fallback = lane::final_bars(result, Default::default());
         return (fallback.bars, fallback.states, fallback.ruler_timecode);
     };
     let unmatched: HashSet<ClipId> = result.unmatched.iter().cloned().collect();
+    let evidence = lane::match_evidence(result);
+    // Imported edits are never placed by camera clock: they keep their own.
     let bars: Vec<BarVisual> = timeline
         .preview_items(&unmatched)
         .into_iter()
-        .map(|item| {
+        .map(|mut item| {
             let state = if unmatched.contains(&item.clip_id) {
                 lane::BarMatchState::Unmatched
             } else {
                 lane::BarMatchState::Matched
             };
-            BarVisual {
-                id: item.id.clone(),
-                clip_id: item.clip_id.clone(),
-                url: item.url.clone(),
-                source_key: item.source_key.clone(),
-                name: item.name.clone(),
-                kind: item.kind,
-                start: item.start,
-                duration: item.duration,
-                confidence: item.confidence,
-                match_state: state,
-            }
+            item.camera_clock = None;
+            BarVisual::settled(item, state, &evidence)
         })
         .collect();
-    let states = bars
-        .iter()
-        .map(|b| (b.clip_id.clone(), b.confidence, MatchEvidence::Waveform))
-        .collect();
+    // Like the ordinary preview: matched clips, with the evidence that
+    // synchronized them.
+    let states = lane::matched_states(&bars);
     (bars, states, timeline.ruler_timecode_start())
 }
 
@@ -2321,6 +2636,7 @@ mod tests {
                 clips: Vec::new(),
                 warnings: Vec::new(),
                 imported_timeline: Some(align_core::ImportedTimeline {
+                    aaf_track_numbers: Vec::new(),
                     name: name.into(),
                     frame_duration: align_core::MediaTime::new(1, 25),
                     edits: Vec::new(),
@@ -2605,6 +2921,55 @@ mod tests {
             },
         ];
         result.selected_stage = Some(1);
+        // The same result imported from an editor's timeline, synchronized
+        // by timecode: rows read the same states, with that evidence.
+        let mut imported = result.clone();
+        imported.matches[0].evidence = Some(MatchEvidence::Timecode);
+        let edit =
+            |name: &str, kind: MediaKind, duration: f64, start: f64| align_core::TimelineEdit {
+                id: format!("edit-{name}"),
+                name: None,
+                clip_id: ClipId::new(name),
+                media_type: kind,
+                source_in: MediaTime::seconds(0.0),
+                source_out: MediaTime::seconds(duration),
+                timeline_start: MediaTime::seconds(start),
+                timeline_end: MediaTime::seconds(start + duration),
+                retime: Default::default(),
+                fcp7: Default::default(),
+                audio_source_channel: None,
+                fcpxml_audio_role: None,
+                track_index: 1,
+                audio_track_index: None,
+                flags: Default::default(),
+                audio_enabled: None,
+                audio_track_enabled: None,
+                audio_track_locked: None,
+                transition_after: None,
+                audio_transition_after: None,
+                linked_audio_edit: None,
+            };
+        imported.project.imported_timeline = Some(align_core::ImportedTimeline {
+            aaf_track_numbers: Vec::new(),
+            name: "Edit".into(),
+            frame_duration: MediaTime::new(1, 25),
+            edits: vec![
+                edit("a.mov", MediaKind::Video, 10.0, 0.0),
+                edit("b.wav", MediaKind::Audio, 10.0, 0.0),
+                edit("c.wav", MediaKind::Audio, 5.0, 20.0),
+            ],
+        });
+        let mut imported_data = AppData::default();
+        imported_data.apply_result(imported);
+        let states: HashMap<_, _> = imported_data
+            .clips
+            .iter()
+            .map(|r| (r.name.clone(), format!("{:?}", r.state)))
+            .collect();
+        assert!(states["a.mov"].contains("evidence: Timecode"), "{states:?}");
+        assert!(states["b.wav"].contains("evidence: Timecode"), "{states:?}");
+        assert_eq!(states["c.wav"], "Unmatched");
+
         let mut data = AppData {
             sync_started: Some(std::time::Instant::now()),
             ..AppData::default()
@@ -2736,6 +3101,10 @@ mod tests {
             duration: 10.0,
             confidence: 0.0,
             match_state: BarMatchState::Unmatched,
+            evidence: None,
+            source_in: 0.0,
+            source_out: 0.0,
+            camera_clock: None,
         };
         let mut packed_other_source = bar("c.wav");
         packed_other_source.source_key = "/other".to_string();
@@ -2871,6 +3240,10 @@ mod tests {
                     duration: 2.0,
                     confidence: 0.9,
                     match_state: BarMatchState::Matched,
+                    evidence: None,
+                    source_in: 0.0,
+                    source_out: 0.0,
+                    camera_clock: None,
                 }],
             }],
             ..Default::default()
@@ -2941,14 +3314,6 @@ mod tests {
             .status_text(),
             "TC Sync"
         );
-    }
-
-    #[test]
-    fn export_target_mapping() {
-        assert_eq!(ExportTarget::ResolveOtio.formats().len(), 2);
-        assert_eq!(ExportTarget::Premiere.formats().len(), 1);
-        assert_eq!(ExportTarget::all().len(), 5);
-        assert_eq!(ExportTarget::Aaf.formats(), vec![TimelineExportFormat::Aaf]);
     }
 
     #[test]
@@ -3043,7 +3408,7 @@ mod tests {
         assert!(data.can_synchronize());
 
         data.selection.insert(PathBuf::from("/v/a.wav"));
-        data.remove_selection();
+        assert!(data.remove_selection());
         assert_eq!(data.clips.len(), 1);
         assert!(data.selection.is_empty());
         assert_eq!(data.inputs, vec![PathBuf::from("/v/b.wav")]);
@@ -3126,21 +3491,28 @@ mod tests {
         assert!(data.can_export());
     }
 
+    /// The Delete key removes the selection; without one still listed it
+    /// must leave the session, its result, and its exports as they were.
     #[test]
-    fn trash_removes_selection_then_clears_session() {
+    fn removing_an_empty_or_stale_selection_keeps_the_session() {
         let mut data = AppData::default();
-        add_paths(
-            &mut data,
-            vec![PathBuf::from("/v/a.wav"), PathBuf::from("/v/b.wav")],
-        );
-        data.selection.insert(PathBuf::from("/v/a.wav"));
+        let inputs = vec![PathBuf::from("/v/a.wav"), PathBuf::from("/v/b.wav")];
+        add_paths(&mut data, inputs.clone());
+        data.result = Some(empty_sequence_result("Finished"));
+        data.operation = Operation::Ready;
+        data.exported_files.push(PathBuf::from("/out/timeline.xml"));
+        let status = data.status.clone();
 
-        data.delete_or_clear();
-        assert_eq!(data.inputs, vec![PathBuf::from("/v/b.wav")]);
+        assert!(!data.remove_selection());
+        data.selection.insert(PathBuf::from("/v/gone.wav"));
+        assert!(!data.remove_selection());
 
-        data.delete_or_clear();
-        assert!(data.inputs.is_empty());
-        assert!(data.clips.is_empty());
+        assert!(data.selection.is_empty());
+        assert_eq!(data.inputs, inputs);
+        assert_eq!(data.clips.len(), 2);
+        assert!(data.can_export(), "the result must stay current");
+        assert_eq!(data.exported_files.len(), 1);
+        assert_eq!(data.status, status);
     }
 
     #[test]
@@ -3247,6 +3619,9 @@ mod tests {
         data.export.fcpxml_multicam = false;
         assert!(data.export_targets().is_empty());
         assert!(!data.export_output_selected());
+
+        data.export.targets.push(ExportTarget::Aaf);
+        assert_eq!(data.export_targets(), vec![TimelineExportFormat::Aaf]);
     }
 
     #[test]
@@ -3351,6 +3726,22 @@ mod tests {
         assert!((data.zoom_level - 0.0).abs() < 1e-9);
         data.zoom_at(0.25, 0.0);
         assert!((data.zoom_level - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zoom_steps_stop_at_fit_and_full_zoom() {
+        let mut data = AppData::default();
+        assert!(!data.zoom_timeline(TimelineZoom::Out));
+        assert!(!data.zoom_timeline(TimelineZoom::Fit));
+        for _ in 0..5 {
+            assert!(data.zoom_timeline(TimelineZoom::In));
+        }
+        assert_eq!(data.zoom_label(), "800%");
+        assert!(!data.zoom_timeline(TimelineZoom::In));
+        assert!(data.zoom_timeline(TimelineZoom::Out));
+        assert!((data.zoom_level - 0.8).abs() < 1e-9);
+        assert!(data.zoom_timeline(TimelineZoom::Fit));
+        assert_eq!(data.zoom_label(), "100%");
     }
 
     #[test]

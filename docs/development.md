@@ -8,7 +8,7 @@
   of containers other than WAV/AIFF/MP3/M4A/MOV/MP4. Use a full FFmpeg build for
   fixtures; the packaged minimal build omits the synthetic sources and video
   encoders used by tests.
-- Python 3.11 or later for AAF tooling and acceptance scripts.
+- Python 3.11 or later for acceptance scripts and AAF fixtures.
 - macOS: Xcode command-line tools. The packaged application targets macOS 15+
   on Apple Silicon.
 - Windows: the MSVC Rust target and Visual Studio C++ build tools.
@@ -32,7 +32,7 @@ versions during dependency updates. Versions already in `Cargo.lock` remain usab
 ## Build
 
 ```sh
-cargo build --release -p align-cli -p align-gpui
+cargo build --release -p align-cli -p align-gpui -p align-aaf
 cargo run -p align-gpui
 cargo run -p align-cli -- --help
 ```
@@ -49,19 +49,17 @@ portable implementation on macOS.
 ### AAF module
 
 ```sh
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -r Support/aaf/build-requirements.txt
-python script/build-aaf-sidecar.py target/release
+cargo build --locked --release -p align-aaf
 ```
 
-On Windows, activate `.venv\Scripts\Activate.ps1` in PowerShell instead.
-The builder creates `align-aaf` and `AAF-Licenses` beside the CLI. It freezes
-Python and pyaaf2 with PyInstaller, so end users do not need Python installed.
-Keep the generated `align-aaf-runtime` directory beside the executable on every OS.
-On Windows, set `PYINSTALLER_COMPILE_BOOTLOADER=1` and install with
-`--no-binary pyinstaller` to match the release build.
-Build the module separately for each target OS.
+The Rust helper is `align-aaf` (`align-aaf.exe` on Windows). Keep it beside the
+desktop or CLI executable. It is included in installers and uses the same
+cancellable process boundary on all platforms. For development, `ALIGN_AAF`
+can point to a compatible helper built separately.
+
+The Python bridge in `Support/aaf` is the reference for compatibility checks.
+Install `Support/aaf/requirements.txt` in a Python virtual environment to run
+those checks and generate AAF fixtures.
 
 ## Architecture
 
@@ -69,6 +67,7 @@ Build the module separately for each target OS.
 | --- | --- |
 | `align-core` | Data model, fingerprints, matching, graph solving, time mappings, cache, and timeline writers. No platform media APIs. |
 | `align-decode` | Media backends, import orchestration, AAF bridge, audio rendering, export jobs, and media ownership. |
+| `align-aaf` | AAF reading, writing, PCM extraction, and path repair. |
 | `align-cli` | Argument parsing, synchronization, saved result loading, and common single/batch export settings. |
 | `align-gpui` | Desktop state, views, timeline interaction, and background job coordination. |
 
@@ -90,9 +89,12 @@ extracted AAF audio across the temporary-to-saved boundary. Desktop workers
 report indexed results and use cancellation flags; generation checks reject
 stale UI updates.
 
-Every generated file is written through `align_core::staged`: a temporary
+Generated files are written through `align_core::staged`: a temporary
 sibling replaces the destination only once complete, so readers never see a
-partial file and a failed write keeps the previous one. Helper processes
+partial file and a failed write keeps the previous one. Files the user keeps,
+such as fixed timelines and saved AAF media, are also flushed to storage
+before they replace the destination. Project documents use the same pattern
+with their own ownership checks and autosave lock. Helper processes
 (FFmpeg, the AAF module) start through `align_decode::process`, which hides
 console windows on Windows and stops them on cancellation.
 
@@ -114,7 +116,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo doc --workspace --no-deps
 cargo test --workspace
 python -m unittest discover -s Support/aaf -v
-cargo build --release -p align-cli
+cargo build --release -p align-cli -p align-aaf
 python script/check-end-to-end.py target/release/align-cli target/acceptance
 ```
 
@@ -125,9 +127,10 @@ to generate fixtures.
 CI also builds API documentation with `RUSTDOCFLAGS="-D warnings"` to catch
 broken Rust documentation links.
 
-The acceptance runner executes eight checks: general release behavior, basic
-editing preservation, linked AAF, picture AAF, embedded mono, embedded stereo,
-mixed edit rates, and saved-result/media lifetime. It retains per-check logs and
+The acceptance runner checks general release behavior, basic editing
+preservation, linked AAF, QuickTime and MXF OP-Atom picture links, embedded mono,
+embedded stereo, mixed edit rates, saved-result/media lifetime, and camera-clock
+placement of generated Sony-style files. It retains per-check logs and
 a `verification.json` containing status and the tested CLI's SHA-256. It does not
 open desktop or editor applications.
 

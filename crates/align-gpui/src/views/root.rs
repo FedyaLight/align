@@ -1,12 +1,17 @@
 //! The window: layout of every panel, sheet, and overlay.
 
+use gpui::{
+    DispatchPhase, ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent, ScrollWheelEvent, canvas,
+};
+
 use super::animation::toolbar_entrance;
 use super::controls::{overlay, sidebar_scrim};
 use super::export::{ExportPanel, export_sidebar, export_sidebar_action, path_fixer_panel};
 use super::menu_sidebar::app_menu_sidebar;
 use super::menus::{context_menu, menu_dismiss_layer, sequence_picker_panel};
 use super::operation::{
-    operation_bar, sequence_results_panel, stage_settings_panel, warning_banner, warning_details,
+    camera_clock_banner, camera_clock_panel, operation_bar, sequence_results_panel,
+    stage_settings_panel, warning_banner, warning_details,
 };
 use super::panels::{
     about_panel, agent_setup_panel, error_alert, feedback_notice, problem_report_panel,
@@ -15,6 +20,7 @@ use super::panels::{
 use super::settings::{
     export_select_dismiss_layer, search_quality_dismiss_layer, search_settings_panel,
 };
+use super::shortcuts::{removes_selection, zoom_shortcut};
 use super::sources::main_content;
 use super::toolbar::toolbar;
 use super::{
@@ -26,26 +32,29 @@ use super::{
 impl Render for AlignApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::current(window.appearance());
+        // Moving timeline bars are drawn at their current place each frame
+        // until their move is over.
+        let now = Instant::now();
+        self.timeline_transitions
+            .retain(|_, transition| !transition.finished(now));
+        if !self.timeline_transitions.is_empty() {
+            window.request_animation_frame();
+        }
         // Fit width excludes the label column and content padding.
         let fit_width =
             (f32::from(window.viewport_size().width) - crate::lane::LABEL_WIDTH - 16.0).max(100.0);
         // While a modal or context menu is open the content below keeps
         // its layout but loses hover/cursor feedback (clicks are already
         // swallowed by the overlay layers).
-        let content_active = !self.projects.busy
-            && !self.show_problem_report
-            && self.app_menu.is_none()
-            && self.data.menu.is_none()
-            && !self.data.show_path_fixer
-            && self.data.error.is_none()
-            && self.data.sequence_pickers.is_empty()
-            && !self.data.show_about
-            && !self.data.show_agent_setup
-            && !self.data.show_search_quality
-            && !self.data.show_search_settings
-            && !self.data.show_stage_settings
-            && !self.data.show_sequence_results
-            && !self.data.show_export;
+        let content_active = self.content_active();
+        // Keys belong to the open dialog: export fields behind it give up
+        // focus, and once a dialog closes the window takes focus back from
+        // its fields.
+        if (self.dialog_open() && self.export_inputs.any_focused(window, cx))
+            || !self.focus_handle.contains_focused(window, cx)
+        {
+            window.focus(&self.focus_handle);
+        }
         let mut root = div()
             .id("app-root")
             .relative()
@@ -58,7 +67,8 @@ impl Render for AlignApp {
             // Focusable root: without a focused view GPUI key dispatch
             // never reaches the app-level system shortcuts (Cmd+Q etc.).
             .track_focus(&self.focus_handle)
-            .capture_key_down(cx.listener(|this, _, _, cx| {
+            .capture_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
+                this.alt_tap.interrupt(e.keystroke.modifiers);
                 if this.projects.busy {
                     cx.stop_propagation();
                 }
@@ -111,13 +121,6 @@ impl Render for AlignApp {
                     this.close_settings_select(cx);
                     return;
                 }
-                if key == "escape"
-                    && this.data.show_export
-                    && !matches!(this.data.operation, Operation::Exporting)
-                {
-                    this.close_export_sidebar(cx);
-                    return;
-                }
                 if key == "escape" && this.data.show_search_quality {
                     this.close_search_quality(cx);
                     return;
@@ -138,10 +141,57 @@ impl Render for AlignApp {
                     cx.notify();
                     return;
                 }
-                if this.data.show_export && this.export_inputs.any_focused(window, cx) {
+                if key == "escape" && this.data.show_camera_clock {
+                    this.data.show_camera_clock = false;
+                    cx.notify();
                     return;
                 }
-                if this.data.show_path_fixer && this.path_fixer_inputs.any_focused(window, cx) {
+                if key == "escape" && this.data.show_stage_settings {
+                    this.data.show_stage_settings = false;
+                    cx.notify();
+                    return;
+                }
+                // With changes the settings close through Apply.
+                if key == "escape" && this.data.show_search_settings && !this.data.settings_changed
+                {
+                    this.finish_search_settings(cx);
+                    return;
+                }
+                if key == "escape" && this.data.error.is_some() {
+                    this.data.dismiss_error();
+                    cx.notify();
+                    return;
+                }
+                if key == "escape" && this.data.sequence_pickers.pop_front().is_some() {
+                    cx.notify();
+                    return;
+                }
+                // The timeline behind an open dialog does not move.
+                if this.dialog_open() {
+                    return;
+                }
+                // Last, so a dialog over the sidebar closes first.
+                if key == "escape"
+                    && this.data.show_export
+                    && !matches!(this.data.operation, Operation::Exporting)
+                {
+                    this.close_export_sidebar(cx);
+                    return;
+                }
+                // Fields keep their keys, Backspace and Delete included.
+                if this.text_field_focused(window, cx) {
+                    return;
+                }
+                if removes_selection(&e.keystroke) {
+                    if !e.is_held && this.content_active() {
+                        this.remove_selected_sources(cx);
+                    }
+                    return;
+                }
+                if let Some(zoom) = zoom_shortcut(&e.keystroke) {
+                    if this.content_active() && this.data.timeline_zoom_available() {
+                        this.zoom_timeline(zoom, cx);
+                    }
                     return;
                 }
                 if key == "space" {
@@ -181,6 +231,15 @@ impl Render for AlignApp {
                 }
                 cx.notify();
             }));
+        if cfg!(any(target_os = "windows", target_os = "linux")) {
+            root = root
+                .on_modifiers_changed(cx.listener(|this, e: &ModifiersChangedEvent, window, cx| {
+                    if this.alt_tap.modifiers_changed(e.modifiers) {
+                        this.toggle_app_menu_from_alt(window, cx);
+                    }
+                }))
+                .child(alt_chord_watch(cx));
+        }
         if content_active && !self.data.has_active_job() {
             root = root.on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
                 this.add_paths(paths.paths().to_vec(), cx);
@@ -221,6 +280,11 @@ impl Render for AlignApp {
             if self.data.show_warning_details {
                 content = content.child(warning_details(&theme, &self.data));
             }
+        }
+        if !self.data.show_export
+            && let Some(banner) = camera_clock_banner(cx, &theme, &self.data)
+        {
+            content = content.child(banner);
         }
         if let Some(notice) = &self.projects.notice {
             content = content.child(
@@ -338,6 +402,13 @@ impl Render for AlignApp {
                 sequence_results_panel(cx, &theme, &self.data),
             ));
         }
+        if modals_visible && self.data.show_camera_clock {
+            root = root.child(overlay(
+                &theme,
+                "overlay-camera-clock",
+                camera_clock_panel(cx, &theme, &self.data),
+            ));
+        }
         if modals_visible && self.data.show_search_settings {
             root = root.child(overlay(
                 &theme,
@@ -396,4 +467,35 @@ impl Render for AlignApp {
         }
         root
     }
+}
+
+/// Clicks and scrolls anywhere make a held Alt part of a chord, also over a
+/// dialog's scrim or the timeline, which keeps Alt+scroll zoom to itself.
+/// Pointer movement tells the Alt tracker which modifiers are held.
+fn alt_chord_watch(cx: &mut Context<AlignApp>) -> impl IntoElement {
+    let view = cx.entity().downgrade();
+    canvas(
+        |_, _, _| {},
+        move |_, _, window, _| {
+            let down = view.clone();
+            window.on_mouse_event(move |e: &MouseDownEvent, phase, _, cx| {
+                if phase == DispatchPhase::Capture {
+                    let _ = down.update(cx, |this, _| this.alt_tap.interrupt(e.modifiers));
+                }
+            });
+            let wheel = view.clone();
+            window.on_mouse_event(move |e: &ScrollWheelEvent, phase, _, cx| {
+                if phase == DispatchPhase::Capture {
+                    let _ = wheel.update(cx, |this, _| this.alt_tap.interrupt(e.modifiers));
+                }
+            });
+            window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                if phase == DispatchPhase::Capture {
+                    let _ = view.update(cx, |this, _| this.alt_tap.observe(e.modifiers));
+                }
+            });
+        },
+    )
+    .absolute()
+    .size_0()
 }

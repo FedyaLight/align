@@ -105,6 +105,65 @@ pub(super) fn overlay(
         .with_animation(id, entrance(250), |el, progress| el.opacity(progress))
 }
 
+/// The card every dialog and menu is drawn on: the panel fill inside one
+/// border, with large corners and a shadow that lifts it over the window.
+pub(super) fn raised_surface(theme: &Theme) -> Div {
+    div()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(theme.border))
+        .bg(rgb(theme.panel))
+        .shadow_md()
+}
+
+/// Padding and border that `menu_surface` adds around a menu's rows.
+pub(super) const MENU_CHROME: f32 = 10.;
+
+/// A dropdown or context menu: `raised_surface` with a little padding
+/// around its rows.
+pub(super) fn menu_surface(theme: &Theme) -> Div {
+    raised_surface(theme).p_1()
+}
+
+/// An open dropdown. Its opening and closing motion sizes this one layer,
+/// which clips the rows inside its border, so the border, corners and
+/// shadow follow the moving edge. A click in it stays in the menu.
+pub(super) fn dropdown_surface(theme: &Theme, width: f32, rows: impl IntoElement) -> Div {
+    menu_surface(theme)
+        .w(px(width))
+        .overflow_hidden()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(rows)
+}
+
+/// The look of a secondary control, shared by `button` and the dropdown
+/// triggers: a quiet fill that darkens on hover and while its menu is
+/// open, primary text, and a dimmed press. A disabled control fades.
+pub(super) fn secondary_chrome(
+    control: Stateful<Div>,
+    theme: &Theme,
+    open: bool,
+    enabled: bool,
+) -> Stateful<Div> {
+    let control = control
+        .rounded_lg()
+        .bg(rgb(if open {
+            theme.border
+        } else {
+            theme.button_hover
+        }))
+        .text_size(px(12.));
+    if enabled {
+        control
+            .text_color(rgb(theme.text))
+            .cursor_pointer()
+            .hover(|this| this.bg(rgb(theme.border)))
+            .active(|this| this.opacity(0.62))
+    } else {
+        control.text_color(rgb(theme.dim)).opacity(0.42)
+    }
+}
+
 pub(super) fn button(
     cx: &mut Context<AlignApp>,
     theme: &Theme,
@@ -113,27 +172,23 @@ pub(super) fn button(
     enabled: bool,
     action: impl Fn(&mut AlignApp, &ClickEvent, &mut Window, &mut Context<AlignApp>) + 'static,
 ) -> impl IntoElement {
-    let mut el = div()
-        .id(id.into())
-        .px_3()
-        .h(px(28.))
-        .flex()
-        .items_center()
-        .rounded_lg()
-        .bg(rgb(theme.button_hover))
-        .text_size(px(12.))
-        .child(label);
+    let el = secondary_chrome(
+        div()
+            .id(id.into())
+            .px_3()
+            .h(px(28.))
+            .flex()
+            .items_center()
+            .child(label),
+        theme,
+        false,
+        enabled,
+    );
     if enabled {
-        el = el
-            .text_color(rgb(theme.icon))
-            .cursor_pointer()
-            .hover(|this| this.bg(rgb(theme.border)))
-            .active(|this| this.opacity(0.62))
-            .on_click(cx.listener(move |this, e, window, cx| action(this, e, window, cx)));
+        el.on_click(cx.listener(move |this, e, window, cx| action(this, e, window, cx)))
     } else {
-        el = el.text_color(rgb(theme.dim)).opacity(0.42);
+        el
     }
-    el
 }
 
 /// Two-state segmented control: a sunken track with the selected segment
@@ -348,24 +403,52 @@ pub(super) fn ruler_ticks(duration: f64, px_per_sec: f64, origin: f64) -> Vec<f6
     (0..count).map(|i| first + i as f64 * step).collect()
 }
 
-/// Clip fill tracks synchronization: pending while analysis runs, then
-/// matched or unmatched.
-pub(super) fn clip_color(state: crate::lane::BarMatchState) -> u32 {
+/// The corner mark that says without color what a settled clip's fill
+/// says: a link only for a clip the result synchronized, a clock for a
+/// camera-clock estimate, a warning for an unmatched clip. A clip still
+/// being analyzed is hatched instead.
+pub(super) fn clip_status_icon(state: crate::lane::BarMatchState) -> Option<&'static str> {
     use crate::lane::BarMatchState;
     match state {
-        BarMatchState::Pending => 0x007AFF,
-        BarMatchState::Matched => 0x34C759,
-        BarMatchState::Unmatched => 0xFF9500,
+        BarMatchState::Pending | BarMatchState::Refined => None,
+        BarMatchState::Matched => Some("icons/link.svg"),
+        BarMatchState::Unmatched => Some("icons/warn.svg"),
+        BarMatchState::CameraClock => Some("icons/clock.svg"),
     }
 }
 
-pub(super) fn fmt_timecode(start: f64, at: f64) -> String {
-    let t = start + at;
-    let h = (t / 3600.0).floor() as i64 % 24;
-    let m = (t.rem_euclid(3600.0) / 60.0).floor() as i64;
-    let s = t.rem_euclid(60.0).floor() as i64;
-    let f = ((t - t.floor()) * 25.0).floor() as i64 % 25;
-    format!("{h:02}:{m:02}:{s:02}:{f:02}")
+/// The HH:MM:SS label of the ruler tick `at` seconds into the timeline, on
+/// the clock `ruler_ticks` places it by: the timecode seconds from `origin`,
+/// which wrap at midnight, or without a timecode the elapsed time, which
+/// keeps counting hours. Ticks fall on whole seconds of that clock, so the
+/// nearest second takes up the binary error of the tick's position.
+pub(super) fn fmt_ruler_label(origin: Option<f64>, at: f64) -> String {
+    let total = (origin.unwrap_or(0.) + at).round() as i64;
+    fmt_clock_seconds(total, origin.is_some())
+}
+
+/// A clip position shares the ruler's clock and retains subsecond precision.
+pub(super) fn fmt_timeline_position(origin: Option<f64>, at: f64) -> String {
+    let millis = ((origin.unwrap_or(0.) + at) * 1000.).round() as i64;
+    let clock = fmt_clock_seconds(millis.div_euclid(1000), origin.is_some());
+    let fraction = millis.rem_euclid(1000);
+    if fraction == 0 {
+        clock
+    } else {
+        format!("{clock}.{fraction:03}")
+    }
+}
+
+fn fmt_clock_seconds(total: i64, wrap_at_midnight: bool) -> String {
+    let hours = total.div_euclid(3600);
+    let hours = if wrap_at_midnight {
+        hours.rem_euclid(24)
+    } else {
+        hours
+    };
+    let minutes = total.rem_euclid(3600) / 60;
+    let seconds = total.rem_euclid(60);
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
 pub(super) fn waveform_columns(waveform: &[f32], width: f32) -> (Vec<f32>, f32) {

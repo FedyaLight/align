@@ -306,7 +306,7 @@ pub fn open(path: &Path) -> io::Result<Opened> {
         ));
     }
     let mut file = File::open(&path)?;
-    let document = read_document(&mut file)?;
+    let mut document = read_document(&mut file)?;
     if !document.header.supported() {
         return Err(io::Error::other(
             "This Align project format is unsupported.",
@@ -332,6 +332,7 @@ pub fn open(path: &Path) -> io::Result<Opened> {
             "The project contains an invalid media path.",
         ));
     }
+    document.session.adopt_fcp7_document_order();
     let mut changed: Vec<_> = document
         .session
         .inputs
@@ -346,11 +347,16 @@ pub fn open(path: &Path) -> io::Result<Opened> {
         .unwrap_or_default();
     changed.sort_unstable();
     changed.dedup();
+    let managed = document.header.owns(&path);
+    if managed {
+        // Opening counts as use: autosaves expire after a week unused.
+        let _ = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(SystemTime::now()));
+    }
     Ok(Opened {
-        destination: Destination {
-            managed: document.header.owns(&path),
-            path,
-        },
+        destination: Destination { managed, path },
         title: document.header.title,
         session: document.session,
         placements: document.placements,
@@ -907,4 +913,4 @@ impl Drop for WriterGuard<'_> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

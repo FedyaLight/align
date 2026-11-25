@@ -13,9 +13,23 @@ use align_core::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BarMatchState {
+    /// Still being analyzed, with no refined match yet.
     Pending,
+    /// Still being analyzed, with a refined match that the solve has not
+    /// confirmed yet.
+    Refined,
+    /// Synchronized in the finished result.
     Matched,
     Unmatched,
+    /// Unmatched, placed by its camera's clock.
+    CameraClock,
+}
+
+impl BarMatchState {
+    /// Whether the analysis is still deciding where the clip goes.
+    pub fn unsettled(self) -> bool {
+        matches!(self, Self::Pending | Self::Refined)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -30,6 +44,13 @@ pub struct BarVisual {
     pub duration: f64,
     pub confidence: f64,
     pub match_state: BarMatchState,
+    /// What synchronized a matched clip, when the result says.
+    pub evidence: Option<MatchEvidence>,
+    /// The part of the source this bar plays, in source seconds.
+    pub source_in: f64,
+    pub source_out: f64,
+    /// For a clip placed by camera clock: the mark export writes with it.
+    pub camera_clock: Option<align_core::camera_clock::CameraClockMark>,
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +96,46 @@ pub struct FinalTimeline {
     pub bars: Vec<BarVisual>,
     pub states: Vec<(ClipId, f64, MatchEvidence)>,
     pub ruler_timecode: Option<f64>,
+}
+
+/// The strongest kind of evidence that synchronized each placed clip:
+/// waveform, then file spans, then timecode. Only matches between clips of
+/// one group count, so a candidate the solve did not use to join the
+/// groups never names how a clip was placed.
+pub fn match_evidence(result: &align_core::SyncResult) -> HashMap<ClipId, MatchEvidence> {
+    let island: HashMap<&ClipId, usize> = result
+        .islands
+        .iter()
+        .flat_map(|island| island.placements.iter().map(|p| (&p.clip_id, island.id)))
+        .collect();
+    let strength = |evidence: MatchEvidence| match evidence {
+        MatchEvidence::Waveform => 0,
+        MatchEvidence::SpannedMetadata => 1,
+        MatchEvidence::Timecode => 2,
+    };
+    let mut strongest: HashMap<ClipId, MatchEvidence> = HashMap::new();
+    for m in &result.matches {
+        let Some(evidence) = m.evidence else {
+            continue;
+        };
+        let same_group = island
+            .get(&m.left)
+            .is_some_and(|left| island.get(&m.right) == Some(left));
+        if !same_group {
+            continue;
+        }
+        for clip in [&m.left, &m.right] {
+            strongest
+                .entry(clip.clone())
+                .and_modify(|known| {
+                    if strength(evidence) < strength(*known) {
+                        *known = evidence;
+                    }
+                })
+                .or_insert(evidence);
+        }
+    }
+    strongest
 }
 
 /// Provisional groups from live previews: BFS over candidate edges,
@@ -139,12 +200,18 @@ pub fn provisional_groups(
 }
 
 /// Provisional bars: cursor-packed groups (1 s gaps), refined edges green.
+/// None of them is synchronized yet: only the finished result says so.
 pub fn provisional_bars(
     clips: &HashMap<ClipId, LiveClip>,
     matches: &HashMap<String, LiveMatch>,
     confidences: &HashMap<ClipId, f64>,
 ) -> Vec<BarVisual> {
     let groups = provisional_groups(clips, matches);
+    let refined: HashSet<&ClipId> = matches
+        .values()
+        .filter(|m| m.refined)
+        .flat_map(|m| [&m.left, &m.right])
+        .collect();
     let mut cursor = 0.0;
     let mut out = Vec::new();
     for items in &groups {
@@ -156,9 +223,7 @@ pub fn provisional_bars(
             let Some(clip) = clips.get(id) else {
                 continue;
             };
-            let matched = matches
-                .values()
-                .any(|m| m.refined && (m.left == *id || m.right == *id));
+            let matched = refined.contains(id);
             out.push(BarVisual {
                 id: id.0.clone(),
                 clip_id: id.clone(),
@@ -170,10 +235,14 @@ pub fn provisional_bars(
                 duration: clip.duration,
                 confidence: confidences.get(id).copied().unwrap_or(0.0),
                 match_state: if matched {
-                    BarMatchState::Matched
+                    BarMatchState::Refined
                 } else {
                     BarMatchState::Pending
                 },
+                evidence: None,
+                source_in: 0.0,
+                source_out: clip.duration,
+                camera_clock: None,
             });
         }
         cursor += span + 1.0;
@@ -181,12 +250,15 @@ pub fn provisional_bars(
     out
 }
 
-/// Final bars from the same assembled timeline used by every exporter.
-/// This keeps timestamp/timecode placement, gaps and overlaps identical in
-/// the UI and the NLE output.
-pub fn final_bars(result: &align_core::SyncResult) -> FinalTimeline {
+/// Final bars from the same assembled timeline used by every exporter, with
+/// the camera-clock estimates export applies. This keeps timestamp/timecode
+/// placement, gaps and overlaps identical in the UI and the NLE output.
+pub fn final_bars(
+    result: &align_core::SyncResult,
+    options: align_core::export_model::ExportAssemblyOptions,
+) -> FinalTimeline {
     let unmatched: HashSet<ClipId> = result.unmatched.iter().cloned().collect();
-    let Ok(timeline) = ExportTimeline::from_result(result, true) else {
+    let Ok(timeline) = ExportTimeline::from_result_with_options(result, options) else {
         return FinalTimeline {
             bars: Vec::new(),
             states: Vec::new(),
@@ -194,49 +266,70 @@ pub fn final_bars(result: &align_core::SyncResult) -> FinalTimeline {
         };
     };
     let ruler_timecode = timeline.ruler_timecode_start();
-    let preview = timeline.preview_items(&unmatched);
-    let bars = preview
-        .iter()
-        .map(|item| BarVisual {
-            id: item.id.clone(),
-            clip_id: item.clip_id.clone(),
-            url: item.url.clone(),
-            source_key: item.source_key.clone(),
-            name: item.name.clone(),
-            kind: item.kind,
-            start: item.start,
-            duration: item.duration,
-            confidence: item.confidence,
-            match_state: if item.matched {
+    let evidence = match_evidence(result);
+    let bars: Vec<BarVisual> = timeline
+        .preview_items(&unmatched)
+        .into_iter()
+        .map(|item| {
+            let match_state = if item.matched {
                 BarMatchState::Matched
+            } else if item.camera_clock.is_some() {
+                BarMatchState::CameraClock
             } else {
                 BarMatchState::Unmatched
-            },
+            };
+            BarVisual::settled(item, match_state, &evidence)
         })
         .collect();
-    let states = preview
-        .iter()
-        .filter(|item| item.matched)
-        .map(|item| {
-            let evidence = result
-                .matches
-                .iter()
-                .filter(|m| m.left == item.clip_id || m.right == item.clip_id)
-                .filter_map(|m| m.evidence)
-                .min_by_key(|evidence| match evidence {
-                    MatchEvidence::Waveform => 0,
-                    MatchEvidence::SpannedMetadata => 1,
-                    MatchEvidence::Timecode => 2,
-                })
-                .unwrap_or(MatchEvidence::Waveform);
-            (item.clip_id.clone(), item.confidence, evidence)
-        })
-        .collect();
+    let states = matched_states(&bars);
     FinalTimeline {
         bars,
         states,
         ruler_timecode,
     }
+}
+
+impl BarVisual {
+    /// A bar of a finished timeline, with the evidence of a matched clip.
+    pub fn settled(
+        item: align_core::TimelinePreviewItem,
+        match_state: BarMatchState,
+        evidence: &HashMap<ClipId, MatchEvidence>,
+    ) -> Self {
+        Self {
+            evidence: (match_state == BarMatchState::Matched)
+                .then(|| evidence.get(&item.clip_id).copied())
+                .flatten(),
+            id: item.id,
+            clip_id: item.clip_id,
+            url: item.url,
+            source_key: item.source_key,
+            name: item.name,
+            kind: item.kind,
+            start: item.start,
+            duration: item.duration,
+            confidence: item.confidence,
+            match_state,
+            source_in: item.source_in,
+            source_out: item.source_out,
+            camera_clock: item.camera_clock,
+        }
+    }
+}
+
+/// Matched clips with their confidence and evidence, as the clip list
+/// shows them. A result without evidence reads as a waveform match there.
+pub fn matched_states(bars: &[BarVisual]) -> Vec<(ClipId, f64, MatchEvidence)> {
+    bars.iter()
+        .filter(|bar| bar.match_state == BarMatchState::Matched)
+        .map(|bar| {
+            (
+                bar.clip_id.clone(),
+                bar.confidence,
+                bar.evidence.unwrap_or(MatchEvidence::Waveform),
+            )
+        })
+        .collect()
 }
 
 /// Pack bars into V/A numbered lanes.
@@ -253,6 +346,11 @@ pub fn layout_bars(
             .iter()
             .map(|b| {
                 TimelineTrackRequest::new(b.id.clone(), b.source_key.clone(), b.start, b.duration)
+                    .assembled_at(
+                        b.camera_clock
+                            .as_ref()
+                            .and_then(|mark| mark.assembled_start),
+                    )
             })
             .collect();
         let assignments = allocate(&requests);
@@ -494,6 +592,33 @@ mod tests {
     }
 
     #[test]
+    fn provisional_bars_are_never_synchronized() {
+        // A refined pair is still a candidate: the solve can drop it, so the
+        // live preview must not show either clip as synchronized.
+        let clips: HashMap<ClipId, LiveClip> =
+            ["a", "b", "c"].iter().map(|id| live_clip(id)).collect();
+        let matches = HashMap::from([(
+            LiveMatch::id(&clip_id("a"), &clip_id("b")),
+            LiveMatch {
+                left: clip_id("a"),
+                right: clip_id("b"),
+                offset: 2.0,
+                confidence: 0.9,
+                refined: true,
+            },
+        )]);
+        let states: HashMap<String, BarMatchState> =
+            provisional_bars(&clips, &matches, &HashMap::new())
+                .into_iter()
+                .map(|bar| (bar.id, bar.match_state))
+                .collect();
+        assert_eq!(states["a"], BarMatchState::Refined);
+        assert_eq!(states["b"], BarMatchState::Refined);
+        assert_eq!(states["c"], BarMatchState::Pending);
+        assert!(states.values().all(|state| state.unsettled()));
+    }
+
+    #[test]
     fn source_names_format_device_keys() {
         assert_eq!(source_name_for("device:Sony:A:123"), "Sony A 123");
         assert_eq!(source_name_for("span:abc"), "Linked BWF");
@@ -516,6 +641,10 @@ mod tests {
                 duration: 10.0,
                 confidence: 1.0,
                 match_state: BarMatchState::Matched,
+                evidence: None,
+                source_in: 0.0,
+                source_out: 0.0,
+                camera_clock: None,
             },
             BarVisual {
                 id: "b".to_string(),
@@ -528,6 +657,10 @@ mod tests {
                 duration: 10.0,
                 confidence: 1.0,
                 match_state: BarMatchState::Matched,
+                evidence: None,
+                source_in: 0.0,
+                source_out: 0.0,
+                camera_clock: None,
             },
         ];
         let lanes = layout_bars(bars, &HashMap::new());
@@ -549,6 +682,10 @@ mod tests {
             duration,
             confidence: 1.0,
             match_state: state,
+            evidence: None,
+            source_in: 0.0,
+            source_out: 0.0,
+            camera_clock: None,
         };
         let lanes = layout_bars(
             vec![
@@ -666,7 +803,7 @@ mod tests {
         };
         let order =
             |bars: &[BarVisual]| bars.iter().map(|b| b.clip_id.0.clone()).collect::<Vec<_>>();
-        let automatic = final_bars(&result);
+        let automatic = final_bars(&result, Default::default());
         assert_eq!(order(&automatic.bars), vec!["b", "c", "a"]);
         let starts: HashMap<_, _> = automatic
             .bars
@@ -691,7 +828,10 @@ mod tests {
             },
             ..result
         };
-        assert_eq!(order(&final_bars(&timed).bars), vec!["a", "c", "b"]);
+        assert_eq!(
+            order(&final_bars(&timed, Default::default()).bars),
+            vec!["a", "c", "b"]
+        );
     }
 
     #[test]
@@ -708,6 +848,10 @@ mod tests {
             duration,
             confidence: 1.0,
             match_state: BarMatchState::Matched,
+            evidence: None,
+            source_in: 0.0,
+            source_out: 0.0,
+            camera_clock: None,
         };
         let bars = vec![
             mk("a", 10.0, 2050.0),
@@ -768,6 +912,10 @@ mod tests {
             duration,
             confidence: 1.0,
             match_state: BarMatchState::Matched,
+            evidence: None,
+            source_in: 0.0,
+            source_out: 0.0,
+            camera_clock: None,
         };
         let bars = vec![mk("a", 0.0, 10.0), mk("b", 5.0, 10.0)];
         let geometry = bar_row_geometry(&bars, 10.0);

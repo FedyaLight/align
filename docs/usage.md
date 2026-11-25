@@ -20,6 +20,19 @@ open "/Applications/Align.app"
 3. Synchronize. Review the resulting groups, unmatched clips, and warnings.
 4. Choose an export destination and the options appropriate for your editor.
 
+While Align analyzes, clips on the timeline are striped: their place is not
+confirmed yet. Afterwards a synchronized clip has a link in its top-right
+corner and an unmatched clip a warning sign. A clip too narrow for the mark
+shows its state by color only. On wide clips synchronized by timecode alone,
+**TC** appears beside the link.
+
+Rest the pointer on a clip to see how it got its place and only the values
+the result has for it: confidence and drift for a waveform match, where the
+clip sits on the timeline, its source timecode where that place starts, and
+what the camera clock says about it. When an imported edit plays part of a
+recording, or the same recording more than once, the card also shows the
+part each use plays and which use it is.
+
 The export sheet starts from Align's defaults. **Save as Default** keeps the
 current export options for new sessions and later launches; the destination
 and sequence name are not saved. **Revert to Saved** and **Use Align Defaults**
@@ -34,13 +47,35 @@ For an existing edit, enable Preserve basic editing on the tracks that should
 remain fixed. This preserves their trims, duplicates, positions, and gaps while
 other tracks align to them. See [format limits](formats.md) for unsupported edits.
 
+### Placing unmatched clips by camera clock
+
+Some unmatched clips can be placed approximately from their camera's own
+clock: the camera recorded its serial number and when each recording started,
+and two of its clips recorded before and after this one are synchronized by
+sound in the same group. When the result has such clips, a bar above the
+timeline offers them. **Review…** lists each clip with the two clips it is
+placed between and the expected accuracy, and the clips that cannot be placed
+with the reason. Place clips one at a time, from the clip's right-click menu,
+or with **Place All**; **Undo** or **Return to Unmatched** takes a clip back,
+and with it a kept choice it was holding back, so another clip is not placed
+unasked.
+
+A placed clip is purple on the timeline, with a clock instead of the link, and
+stays unmatched: the place is an estimate, not a match. Export uses exactly
+what the timeline shows. The choice is kept per sequence in the project and
+applies again after reopening, another stage, or synchronizing again, wherever
+the clip still has an estimate. New projects and projects saved by earlier
+versions place nothing, and the choice is never part of the saved export
+defaults. See [camera clock placement](formats.md#camera-clock-placement) for
+which cameras qualify, how accurate the place is, and what each format writes.
+
 ### Save and reopen projects
 
 Align creates an autosave when synchronization starts and updates that same
 project as you work. **File → Project Autosave** can turn this off or choose a
 different folder for new projects. The default is **Align** inside your system
 Documents folder. At startup, Align removes its autosaves that have gone seven
-days without an update.
+days without being opened or updated.
 
 Use **File → Recent Projects** or **Open Project…** to reopen a `.align` file.
 The Windows installer registers Align to open these files in Explorer.
@@ -65,13 +100,16 @@ analysis cache.
 | Save project as | Cmd+Shift+S | Ctrl+Shift+S |
 | Synchronize again | Cmd+R | Ctrl+R |
 | Export | Cmd+E | Ctrl+E |
-| Zoom the timeline | Cmd or Option + scroll | Ctrl or Alt + scroll |
+| Remove selected sources (files stay on disk) | Delete or Fn+Delete | Delete |
+| Zoom the timeline in, out, to fit | Cmd+= or Cmd++, Cmd+−, Cmd+0 | Ctrl+= or Ctrl++, Ctrl+−, Ctrl+0 |
+| Zoom the timeline at the pointer | Cmd or Option + scroll | Ctrl or Alt + scroll |
 | Pan the timeline | Arrow keys (Shift for larger steps), Home, End | same |
 | Full screen | Ctrl+Cmd+F | F11 |
 | Quit | Cmd+Q | Ctrl+Q |
 
 On Windows and Linux, **Menu** opens a sidebar from the top toolbar or the
-empty start screen. **Path Fixer** appears after you import a timeline.
+empty start screen; pressing and releasing Alt on its own also opens or closes
+it. **Path Fixer** appears after you import a timeline.
 Export is available from the timeline toolbar after synchronization. On macOS,
 use the native menu bar.
 
@@ -232,6 +270,17 @@ align-cli export-json --unmatched order-only --disable-unmatched \
 - `--aaf-fps` sets the AAF composition rate, the timeline's by default. Picture
   is counted in composition frames, as editors read it, and every camera is a
   layer of one picture track; this option does not retime the footage.
+- `--camera-clock` places unmatched clips approximately by their camera's
+  clock, as described in [camera clock placement](formats.md#camera-clock-placement).
+  `--camera-clock-except CLIP` leaves one clip unmatched; give its file name,
+  its path when two folders share the name, or its clip ID, and repeat it for
+  more clips. Each placement, exception, and reason for leaving a clip
+  unmatched is printed on stderr. Without `--camera-clock` nothing is placed.
+
+`sync --summary` lists the clips the camera clock can place, under
+`cameraClock`, with the reasons for the others, so you can review them before
+exporting. `export` and `export-json` compute the same placements from the
+same result and stage.
 
 Labels, roles, sequence names, gap removal, and trimming are listed in
 `align-cli export --help`. DaVinci Resolve ignores clip names and color labels
@@ -248,8 +297,8 @@ align-cli clear-cache --older-than-days 30
 ```
 
 The on-disk analysis cache stores fingerprints, waveform previews, spectral
-flux, LTC detections, and portable video timing. Align keeps entries for 7 days
-by default. Open **File → Analysis Cache** from the macOS menu bar or the
+flux, LTC detections, and portable video timing. By default Align removes an
+entry once it has gone 7 days unused. Open **File → Analysis Cache** from the macOS menu bar or the
 **Menu** sidebar on Windows and Linux to change retention, clear entries for
 the current project, or clear all entries.
 

@@ -17,6 +17,10 @@ pub(crate) struct ProjectSession {
     sequences: HashMap<usize, SequenceDefaults>,
     tracks: HashMap<usize, TrackOverrides>,
     constraints: HashMap<usize, Vec<SyncConstraint>>,
+    /// Clips each sequence places by camera clock. Projects without it,
+    /// like new ones, place none.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    camera_clock: HashMap<usize, BTreeSet<ClipId>>,
     manual_relinks: Vec<(String, PathBuf)>,
     omit_extensions: Vec<String>,
     prefer_proxies: bool,
@@ -24,6 +28,48 @@ pub(crate) struct ProjectSession {
     quality_only_dirty: bool,
     active_sequence: usize,
     stages: Vec<Option<usize>>,
+    /// FCP 7 XML sequences are numbered in document order. Projects saved
+    /// without this field numbered them from the last sequence.
+    #[serde(default)]
+    fcp7_document_order: bool,
+}
+
+impl ProjectSession {
+    /// Renumbers the FCP 7 XML sequences of a project saved when they were
+    /// numbered from the last one, so its choices and per-sequence settings
+    /// keep naming the same sequences.
+    pub(crate) fn adopt_fcp7_document_order(&mut self) {
+        if std::mem::replace(&mut self.fcp7_document_order, true) {
+            return;
+        }
+        // Per-sequence settings are keyed by the first timeline's choices.
+        let mut keys_follow = true;
+        for path in &self.inputs {
+            let Some(choices) = self.timeline_choices.get_mut(path) else {
+                continue;
+            };
+            let first = std::mem::take(&mut keys_follow);
+            let Some(count) = align_core::xml::fcp7_sequence_count(path).filter(|&n| n > 1) else {
+                continue;
+            };
+            let flip = |index: usize| count.checked_sub(index + 1).unwrap_or(index);
+            for index in choices.iter_mut() {
+                *index = flip(*index);
+            }
+            if first {
+                fn rekey<V>(map: &mut HashMap<usize, V>, flip: impl Fn(usize) -> usize) {
+                    *map = std::mem::take(map)
+                        .into_iter()
+                        .map(|(key, value)| (flip(key), value))
+                        .collect();
+                }
+                rekey(&mut self.sequences, flip);
+                rekey(&mut self.tracks, flip);
+                rekey(&mut self.constraints, flip);
+                rekey(&mut self.camera_clock, flip);
+            }
+        }
+    }
 }
 
 impl AppData {
@@ -96,6 +142,11 @@ impl AppData {
                         constraint.relink_clip(&clip.id, &next_id);
                     }
                 }
+                if let Some(chosen) = self.camera_clock_choices.get_mut(&sequence)
+                    && chosen.remove(&clip.id)
+                {
+                    chosen.insert(next_id.clone());
+                }
                 if let Some(tracks) = self.track_overrides.get_mut(&sequence) {
                     tracks.search.relink_clip(&clip.id, &next_id);
                     tracks.audio.relink_clip(&clip.id, &next_id);
@@ -118,6 +169,7 @@ impl AppData {
             sequences: self.sequence_settings.clone(),
             tracks: self.track_overrides.clone(),
             constraints: self.sequence_constraints.clone(),
+            camera_clock: self.camera_clock_choices.clone(),
             manual_relinks: self.manual_relinks.clone(),
             omit_extensions: self.omit_extensions.clone(),
             prefer_proxies: self.prefer_proxies,
@@ -131,6 +183,7 @@ impl AppData {
                 .iter()
                 .map(|r| r.selected_stage)
                 .collect(),
+            fcp7_document_order: true,
         }
     }
 
@@ -157,6 +210,7 @@ impl AppData {
         self.sequence_settings = session.sequences;
         self.track_overrides = session.tracks;
         self.sequence_constraints = session.constraints;
+        self.camera_clock_choices = session.camera_clock;
         self.manual_relinks = session.manual_relinks;
         self.omit_extensions = session.omit_extensions;
         self.prefer_proxies = session.prefer_proxies;

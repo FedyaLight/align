@@ -7,6 +7,7 @@
 pub mod allocator;
 pub mod bins;
 pub mod cache;
+pub mod camera_clock;
 pub mod drift;
 pub mod export;
 pub mod fine;

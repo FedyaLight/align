@@ -1,0 +1,24 @@
+[package]
+name = "align-aaf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+cfb = "0.16"
+flate2 = "1"
+num-integer = "0.1"
+num-rational = "0.4"
+num-traits = "0.2"
+percent-encoding = "2"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true

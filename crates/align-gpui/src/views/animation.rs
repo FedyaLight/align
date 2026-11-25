@@ -1,11 +1,10 @@
 //! Motion curves and enter/exit animations shared by the views.
 
-use super::settings::QUALITY_MENU_WIDTH;
+use super::settings::QUALITY_MENU_HEIGHT;
 use super::{
-    Animation, AnimationExt, ClipId, DROPDOWN_MS, Duration, ExportSelect, IntoElement,
-    ParentElement, SELECTION_CONTROL_CLOSE_MS, SETTINGS_MOTION_MS, SIDEBAR_CLOSE_MS,
-    SettingsSelect, SharedString, Styled, TIMELINE_MOVE_MS, TIMELINE_ROW_H, TimelineTransition,
-    div, px,
+    Animation, AnimationExt, DROPDOWN_MS, Duration, ExportSelect, IntoElement, ParentElement,
+    SELECTION_CONTROL_CLOSE_MS, SETTINGS_MOTION_MS, SIDEBAR_CLOSE_MS, SettingsSelect, SharedString,
+    Styled, div, px,
 };
 
 /// Strong UI ease-out: cubic-bezier(0.23, 1, 0.32, 1).
@@ -107,42 +106,31 @@ pub(super) fn sidebar_reveal<E: IntoElement + Styled + 'static>(
         )
 }
 
+// The dropdown motions size the menu's own surface (`dropdown_surface`),
+// which clips its rows, so no second rounded or shadowed layer is needed.
+
 pub(super) fn quality_dropdown_motion<E: IntoElement + Styled + 'static>(
-    child: E,
+    surface: E,
     closing: bool,
 ) -> impl IntoElement {
-    // Padding and border 10, five 40 px rows, separator block 37.
-    const MENU_HEIGHT: f32 = 248.;
     let reduced = crate::motion::reduced_motion();
-    div()
-        .w(px(QUALITY_MENU_WIDTH))
-        .overflow_hidden()
-        .rounded_lg()
-        .shadow_md()
-        .child(child)
-        .with_animation(
-            if closing {
-                "search-quality-dropdown-out"
-            } else {
-                "search-quality-dropdown-in"
-            },
-            entrance(DROPDOWN_MS),
-            move |el, progress| {
-                let visible = if reduced {
-                    if closing { 1. - progress } else { progress }
-                } else if closing {
-                    1. - progress
-                } else {
-                    progress
-                };
-                let height = if reduced { 1. } else { visible };
-                el.h(px(MENU_HEIGHT * height)).opacity(visible)
-            },
-        )
+    surface.with_animation(
+        if closing {
+            "search-quality-dropdown-out"
+        } else {
+            "search-quality-dropdown-in"
+        },
+        entrance(DROPDOWN_MS),
+        move |el, progress| {
+            let visible = if closing { 1. - progress } else { progress };
+            let height = if reduced { 1. } else { visible };
+            el.h(px(QUALITY_MENU_HEIGHT * height)).opacity(visible)
+        },
+    )
 }
 
 pub(super) fn export_select_motion<E: IntoElement + Styled + 'static>(
-    child: E,
+    surface: E,
     select: ExportSelect,
     menu_height: f32,
     closing: bool,
@@ -154,45 +142,33 @@ pub(super) fn export_select_motion<E: IntoElement + Styled + 'static>(
         (ExportSelect::UnmatchedPlacement, false) => "export-unmatched-select-in",
         (ExportSelect::UnmatchedPlacement, true) => "export-unmatched-select-out",
     };
-    div()
-        .w(px(160.))
-        .overflow_hidden()
-        .rounded_lg()
-        .shadow_md()
-        .child(child)
-        .with_animation(animation_id, entrance(DROPDOWN_MS), move |el, progress| {
-            let visible = if closing { 1. - progress } else { progress };
-            let height = if reduced { 1. } else { visible };
-            el.h(px(menu_height * height)).opacity(visible)
-        })
+    surface.with_animation(animation_id, entrance(DROPDOWN_MS), move |el, progress| {
+        let visible = if closing { 1. - progress } else { progress };
+        let height = if reduced { 1. } else { visible };
+        el.h(px(menu_height * height)).opacity(visible)
+    })
 }
 
 pub(super) fn settings_select_motion<E: IntoElement + Styled + 'static>(
-    child: E,
+    surface: E,
     select: SettingsSelect,
     menu_height: f32,
     closing: bool,
 ) -> impl IntoElement {
     let reduced = crate::motion::reduced_motion();
-    div()
-        .w(px(210.))
-        .overflow_hidden()
-        .rounded_lg()
-        .shadow_md()
-        .child(child)
-        .with_animation(
-            SharedString::from(format!(
-                "settings-{}-{}",
-                select.id(),
-                if closing { "out" } else { "in" }
-            )),
-            entrance(SETTINGS_MOTION_MS),
-            move |el, progress| {
-                let visible = if closing { 1. - progress } else { progress };
-                let height = if reduced { 1. } else { visible };
-                el.h(px(menu_height * height)).opacity(visible)
-            },
-        )
+    surface.with_animation(
+        SharedString::from(format!(
+            "settings-{}-{}",
+            select.id(),
+            if closing { "out" } else { "in" }
+        )),
+        entrance(SETTINGS_MOTION_MS),
+        move |el, progress| {
+            let visible = if closing { 1. - progress } else { progress };
+            let height = if reduced { 1. } else { visible };
+            el.h(px(menu_height * height)).opacity(visible)
+        },
+    )
 }
 
 pub(super) fn settings_reset_motion<E: IntoElement + Styled + 'static>(
@@ -261,40 +237,6 @@ pub(super) fn toolbar_entrance<E: IntoElement + 'static>(
         })
 }
 
-pub(super) fn timeline_bar_motion<E: IntoElement + Styled + 'static>(
-    child: E,
-    clip_id: &ClipId,
-    transition: TimelineTransition,
-    target_x: f32,
-    target_width: f32,
-    timeline_width: f32,
-    target_lane: f32,
-) -> impl IntoElement {
-    let row_stride = TIMELINE_ROW_H + 1.;
-    let from_x = transition.from.x * timeline_width;
-    let from_width = (transition.from.width * timeline_width).max(2.);
-    crate::motion::Slide {
-        child: Some(child),
-        x: from_x - target_x,
-        y: (transition.from.lane - target_lane) * row_stride,
-    }
-    .with_animation(
-        SharedString::from(format!(
-            "timeline-clip-{}-{}",
-            clip_id.0, transition.generation
-        )),
-        entrance(TIMELINE_MOVE_MS),
-        move |mut slide, progress| {
-            slide.x = (from_x - target_x) * (1. - progress);
-            slide.y = (transition.from.lane - target_lane) * row_stride * (1. - progress);
-            slide.child = slide
-                .child
-                .map(|child| child.w(px(from_width + (target_width - from_width) * progress)));
-            slide
-        },
-    )
-}
-
 pub(super) fn export_reveal<E: IntoElement + 'static>(
     child: E,
     id: &'static str,
@@ -354,7 +296,7 @@ mod motion_tests {
     use crate::views::controls::{ruler_ticks, waveform_columns};
     use crate::views::{
         AppData, ExportReveals, ExportTarget, Instant, PROGRESS_MOVE_MS, ProgressMotion,
-        TimelinePose, middle_ellipsis, poses_differ,
+        TIMELINE_MOVE_MS, TimelinePose, TimelineTransition, middle_ellipsis, poses_differ,
     };
 
     #[test]
@@ -399,6 +341,67 @@ mod motion_tests {
     }
 
     #[test]
+    fn ruler_labels_name_the_second_each_tick_marks() {
+        use crate::views::controls::fmt_ruler_label;
+        // 01:00:00:00 at 29.97 fps starts the ruler 3603.6 s into the day.
+        // Each tick reads the second it stands on, not the frame count
+        // there, which is 01:00:06:12 at the first one.
+        let origin = 3603.6;
+        let labels: Vec<String> = ruler_ticks(60., 12., origin)
+            .into_iter()
+            .map(|at| fmt_ruler_label(Some(origin), at))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "01:00:10", "01:00:20", "01:00:30", "01:00:40", "01:00:50", "01:01:00"
+            ]
+        );
+        // A tick on a whole second just short of it in binary arithmetic.
+        assert_eq!(fmt_ruler_label(None, 360. - 1e-9), "00:06:00");
+        // A timecode wraps at midnight; elapsed time keeps counting.
+        assert_eq!(fmt_ruler_label(Some(86_390.), 10.), "00:00:00");
+        assert_eq!(fmt_ruler_label(None, 86_400.), "24:00:00");
+    }
+
+    #[test]
+    fn every_edit_of_one_source_has_its_own_timeline_pose() {
+        use crate::lane::{BarMatchState, BarVisual, LaneVisual};
+        let edit = |id: &str, start: f64| BarVisual {
+            id: id.into(),
+            clip_id: align_core::ClipId::new("same-file"),
+            url: "/v/take.mov".into(),
+            source_key: "/v".into(),
+            name: "take.mov".into(),
+            kind: align_core::MediaKind::Video,
+            start,
+            duration: 2.,
+            confidence: 1.,
+            match_state: BarMatchState::Matched,
+            evidence: None,
+            source_in: 0.0,
+            source_out: 0.0,
+            camera_clock: None,
+        };
+        let mut data = AppData::default();
+        data.lanes = vec![LaneVisual {
+            id: "V1".into(),
+            kind: align_core::MediaKind::Video,
+            number: 1,
+            source_key: "/v".into(),
+            source_name: String::new(),
+            stream_channels: Vec::new(),
+            clips: vec![edit("imported-video-1", 0.), edit("imported-video-2", 4.)],
+        }];
+        let poses = crate::views::timeline_poses(&data);
+        assert_eq!(poses.len(), 2);
+        assert!(poses_differ(
+            poses["imported-video-1"],
+            poses["imported-video-2"]
+        ));
+    }
+
+    #[test]
     fn timeline_transition_reaches_the_new_position_and_size() {
         let started = Instant::now();
         let from = TimelinePose {
@@ -411,17 +414,12 @@ mod motion_tests {
             width: 0.3,
             lane: 0.,
         };
-        let transition = TimelineTransition {
-            from,
-            to,
-            generation: 1,
-            started,
-        };
+        let transition = TimelineTransition { from, to, started };
         assert!(!poses_differ(transition.presented(started), from));
-        assert!(!poses_differ(
-            transition.presented(started + Duration::from_millis(TIMELINE_MOVE_MS)),
-            to
-        ));
+        let end = started + Duration::from_millis(TIMELINE_MOVE_MS);
+        assert!(!poses_differ(transition.presented(end), to));
+        // A finished move is dropped; its bar is then drawn at `to`.
+        assert!(!transition.finished(started) && transition.finished(end));
     }
 
     #[test]
@@ -475,6 +473,38 @@ mod motion_tests {
             "/projects/…liverables"
         );
         assert_eq!(middle_ellipsis("brief", 21), "brief");
+    }
+
+    #[test]
+    fn settled_clip_states_carry_distinct_embedded_marks() {
+        // Each settled state reads without color; an unsettled one is
+        // hatched instead, so it never shows the synchronized link.
+        use crate::lane::BarMatchState;
+        use crate::views::controls::clip_status_icon;
+        use gpui::AssetSource as _;
+        let settled = [
+            BarMatchState::Matched,
+            BarMatchState::Unmatched,
+            BarMatchState::CameraClock,
+        ];
+        let marks: std::collections::HashSet<&str> = settled
+            .iter()
+            .map(|state| clip_status_icon(*state).expect("settled clips carry a mark"))
+            .collect();
+        assert_eq!(marks.len(), settled.len());
+        for mark in &marks {
+            assert!(
+                crate::icons::EmbeddedAssets
+                    .load(mark)
+                    .is_ok_and(|bytes| bytes.is_some()),
+                "{mark} is not embedded"
+            );
+            // The media-kind icon sits beside it and must not repeat.
+            assert!(!["icons/film.svg", "icons/waveform.svg"].contains(mark));
+        }
+        for state in [BarMatchState::Pending, BarMatchState::Refined] {
+            assert!(state.unsettled() && clip_status_icon(state).is_none());
+        }
     }
 
     #[test]

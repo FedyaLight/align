@@ -72,6 +72,8 @@ an existing edit.
   clips, including clips without a usable waveform match.
 - **Recording metadata:** recognize consecutive parts of a continuous recording
   and use recording timestamps to help resolve ambiguous audio matches.
+- **Camera clock:** on request, place an unmatched Sony clip approximately
+  between two clips of the same camera that sound synchronized.
 - **Existing edits:** preserve selected tracks' basic trims, duplicates,
   positions, and gaps while aligning other recordings.
 - **Clock drift:** render corrected audio from validated time mappings without
@@ -138,12 +140,12 @@ are needed for tests and for MTS/MXF/R3D media on Linux and Windows. See the
 [development guide](docs/development.md#prerequisites) for platform dependencies.
 
 ```sh
-cargo build --locked --release -p align-cli -p align-gpui
+cargo build --locked --release -p align-cli -p align-gpui -p align-aaf
 cargo run --locked --release -p align-gpui
 ```
 
-The desktop executable is `align`; the CLI is `align-cli`. AAF support needs the
-additional [AAF module](docs/development.md#aaf-module).
+The desktop executable is `align` and the CLI is `align-cli`. Both use the
+[AAF helper](docs/development.md#aaf-module) built beside them.
 
 ### Use the CLI
 

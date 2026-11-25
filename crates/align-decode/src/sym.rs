@@ -124,23 +124,16 @@ fn track_by_stream(format: &dyn FormatReader, audio: &[u32], stream: usize) -> O
 /// Returns None for non-WAVE files; Symphonia demux stays authoritative
 /// for rates/channels/duration.
 fn wav_bits(path: &Path) -> Option<(u32, bool)> {
-    use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).ok()?;
-    let mut header = [0u8; 12];
-    file.read_exact(&mut header).ok()?;
-    if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
+    let mut chunks = align_core::wav::Chunks::new(&mut file).ok()??;
+    if chunks.container() != b"RIFF" {
         return None;
     }
-    // Walk chunk headers to fmt (fmt is small and early; bounded scan).
-    let mut offset = 12u64;
+    // fmt is small and early; bounded scan.
     for _ in 0..32 {
-        file.seek(SeekFrom::Start(offset)).ok()?;
-        let mut chunk = [0u8; 8];
-        file.read_exact(&mut chunk).ok()?;
-        let size = u32::from_le_bytes(chunk[4..8].try_into().ok()?) as u64;
-        if &chunk[0..4] == b"fmt " && size >= 16 {
-            let mut fmt = vec![0u8; size.min(40) as usize];
-            file.read_exact(&mut fmt).ok()?;
+        let chunk = chunks.next_chunk()?;
+        if &chunk.id == b"fmt " && chunk.size >= 16 {
+            let fmt = chunks.read(&chunk, 40).ok()?;
             let tag = u16::from_le_bytes(fmt[0..2].try_into().ok()?);
             let bits = u16::from_le_bytes(fmt[14..16].try_into().ok()?) as u32;
             if bits == 0 || bits > 32 {
@@ -154,10 +147,9 @@ fn wav_bits(path: &Path) -> Option<(u32, bool)> {
             };
             return Some((bits, is_float));
         }
-        if size > 16 * 1024 * 1024 {
+        if chunk.size > 16 * 1024 * 1024 {
             return None;
         }
-        offset += 8 + size + (size & 1);
     }
     None
 }
